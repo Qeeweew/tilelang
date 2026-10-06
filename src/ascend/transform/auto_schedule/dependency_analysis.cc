@@ -446,6 +446,46 @@ AnalyzeDependencies(std::vector<IRStructure *> nodes, ControlNode *loop,
       }
     }
   }
+  // A selected Load3D kernel owns one invariant root configuration. Its
+  // completion is not a buffer hazard and must not be buffer-versioned.
+  // Record the same precise leaf-task RAW edges for AutoSchedule/InsertSync.
+  constexpr uint16_t kRootConfig =
+      static_cast<uint16_t>(SpecialRegister::kLoad3DConfig);
+  std::vector<std::vector<TaskNode *>> state_reads(n);
+  TaskNode *initializer = nullptr;
+  size_t initializer_node = n;
+  for (size_t i = 0; i < n; ++i) {
+    std::vector<TaskNode *> tasks;
+    CollectAllTaskNodes(nodes[i], tasks);
+    for (TaskNode *task : tasks) {
+      if (task->GetSpecialWriteMask() & kRootConfig) {
+        ICHECK(loop == nullptr && nodes[i] == task &&
+               !task->HasConditions() && initializer == nullptr)
+            << "Load3D configuration requires exactly one unconditional "
+               "kernel-root S task; repeated configuration is unsupported";
+        ICHECK_EQ(task->GetPipeMask(), PipeMask(ResourcePipe::kScalar));
+        ICHECK_EQ(task->GetCoreMask(), kCoreCube)
+            << "Load3D configuration must be owned by the AIC";
+        initializer = task;
+        initializer_node = i;
+      }
+      if (task->GetExplicitSpecialReadMask() & kRootConfig)
+        state_reads[i].push_back(task);
+    }
+  }
+  if (loop == nullptr) {
+    for (size_t i = 0; i < n; ++i) {
+      if (state_reads[i].empty())
+        continue;
+      ICHECK(initializer != nullptr && initializer_node < i)
+          << "Selected Load3D requires a preceding kernel-root configuration";
+      std::vector<DependencyTaskPair> pairs;
+      for (TaskNode *reader : state_reads[i])
+        pairs.emplace_back(initializer, reader);
+      deps.push_back({nodes[initializer_node], nodes[i], std::nullopt,
+                     std::move(pairs), 0, DependencyKind::kData});
+    }
+  }
   if (loop)
     cache.emplace(loop, deps);
   return deps;

@@ -281,7 +281,13 @@ def AscendLowerL1Gemm():
     return _ffi_api.AscendLowerL1Gemm()  # type: ignore
 
 
+def AscendSelectCubeLoads():
+    """Select native Cube transfers after physical copy-footprint normalization."""
+    return _ffi_api.AscendSelectCubeLoads()  # type: ignore
+
+
 __all__ = [
+    "AscendSelectCubeLoads",
     "AscendLowerL1Gemm",
     "AscendValidateTarget",
     "NormalizeAscendFractalStorage",

@@ -37,6 +37,7 @@
 
 #include "ascend/op/builtin.h"
 #include "ascend/op/copy.h"
+#include "ascend/op/cube_load.h"
 #include "ascend/op/utils.h"
 #include "op/copy.h"
 #include "op/fill.h"
@@ -233,7 +234,9 @@ inline uint16_t GetAscendCallPipeMask(const Call &call) {
       op.same_as(ascend_copy_gm_to_cbuf()) || op.same_as(ascend_fill_l1())) {
     return PipeMask(ResourcePipe::kMTE2);
   }
-  if (op.same_as(ascend_load_cbuf_to_ca()) ||
+  if (op.same_as(AscendCubeLoad3D::Get()) ||
+      op.same_as(ascend_load_cbuf_to_ca_3d()) ||
+      op.same_as(ascend_load_cbuf_to_ca()) ||
       op.same_as(ascend_load_cbuf_to_ca_2d()) ||
       op.same_as(ascend_load_cbuf_to_cb_2d()) ||
       op.same_as(ascend_load_cbuf_to_cb()) || op.same_as(ascend_load_ca_sf()) ||
@@ -283,6 +286,7 @@ inline uint16_t GetAscendCallPipeMask(const Call &call) {
   }
 
   if (op.same_as(ascend_set_copy_pad_value()) ||
+      op.same_as(ascend_set_load3d_config()) ||
       op.same_as(ascend_threadfence()) || op.same_as(ascend_set_hf32_mode()) ||
       op.same_as(ascend_set_mmad_direction()) ||
       op.same_as(ascend_set_atomic()) || op.same_as(ascend_set_atomic_none()) ||

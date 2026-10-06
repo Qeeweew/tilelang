@@ -514,7 +514,9 @@ std::vector<std::shared_ptr<IRStructure>> ScheduleBuilder::Z3SchedulePython(
     // kLoopControl, which every node reads, so it fences against all
     // siblings; hf32/pad match only their consumers.
     for (size_t i = 0; i < n; ++i) {
-      uint16_t wmask = nodes[i]->GetSpecialWriteMask();
+      // Root Load3D initialization uses the shared storage-free DepInfo edge.
+      uint16_t wmask = nodes[i]->GetSpecialWriteMask() &
+                       ~static_cast<uint16_t>(SpecialRegister::kLoad3DConfig);
       if (wmask == 0)
         continue;
       for (size_t j = 0; j < n; ++j) {
@@ -947,7 +949,9 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
   // hf32/pad match only their consumers. The distance bit encodes intra-iter
   // (0) vs next-iter (1) direction.
   for (size_t i = 0; i < n; ++i) {
-    uint16_t wmask = nodes[i]->GetSpecialWriteMask();
+    // Root Load3D initialization uses the shared storage-free DepInfo edge.
+    uint16_t wmask = nodes[i]->GetSpecialWriteMask() &
+                     ~static_cast<uint16_t>(SpecialRegister::kLoad3DConfig);
     if (wmask == 0)
       continue;
     for (size_t j = 0; j < n; ++j) {

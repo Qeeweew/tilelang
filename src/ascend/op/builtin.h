@@ -252,6 +252,11 @@ TVM_DLL const Op &ascend_load_cbuf_to_ca();
 // dst_gap (all geometry in 512-byte fractals), transpose (B16 tile).
 TVM_DLL const Op &ascend_load_cbuf_to_ca_2d();
 TVM_DLL const Op &ascend_load_cbuf_to_cb_2d();
+// Late pointer form of selected 2201 A 3Dv2: dst, src-leading-base,
+// physical L1 M/K, loaded M/K, source K origin (all sizes in elements).
+TVM_DLL const Op &ascend_load_cbuf_to_ca_3d();
+// One kernel-root AIC/S initialization of the four Load3D configuration SPRs.
+TVM_DLL const Op &ascend_set_load3d_config();
 
 /*!
  * \brief Ascend load from CBuf (L1) to CB (L0B).

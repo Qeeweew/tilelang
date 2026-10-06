@@ -53,6 +53,33 @@ AttrStmt RequireSemanticTaskMarker(const Stmt &stmt, const char *context) {
   return GetRef<AttrStmt>(task);
 }
 
+// InsertSync migrates a PerCoreTask's completion into each buffer-bearing
+// candidate. A single root Load3D configuration produces one completion edge,
+// so accepting compound/repeated candidates here could consume that edge more
+// than once. Keep this first slice to one flat leaf; outer scheduled controls
+// remain supported and retain their normal lexical-site projection.
+void ValidateLoad3DPerCoreLeaf(const AttrStmt &group) {
+  Stmt leaf = group->body;
+  bool has_task = false;
+  while (const auto *wrapper = leaf.as<AttrStmtNode>()) {
+    if (wrapper->attr_key == attr::kAscendTask && !has_task) {
+      has_task = true;
+    } else if (!IsScheduleGuardAttribute(wrapper)) {
+      break;
+    }
+    leaf = wrapper->body;
+  }
+  const auto *evaluate = leaf.as<EvaluateNode>();
+  const auto *call = evaluate ? evaluate->value.as<CallNode>() : nullptr;
+  ICHECK(has_task && call &&
+         (call->op.same_as(AscendCubeLoad3D::Get()) ||
+          call->op.same_as(tl::ascend_load_cbuf_to_ca_3d())))
+      << "Load3D T.PerCoreTask requires one flat T.Task leaf; compound or "
+         "internally repeated/conditional candidates are unsupported. Place "
+         "the control outside T.PerCoreTask or retain the 2D path. Got "
+      << group->body;
+}
+
 Stmt AnnotateSemanticTaskCoreMask(const AttrStmt &task, CoreMask core_mask) {
   TaskMetadata metadata;
   metadata.core_mask = core_mask;
@@ -302,12 +329,16 @@ private:
     task->outer_ctx = GetConstrSet();
     ApplyTaskResourceUsage(AnalyzeTaskResourceUsage(body), task.get());
     ApplyTaskAccesses(AnalyzeTaskAccesses(body), task.get());
+    task->SetSpecialReadMask(AnalyzeSpecialRegisterReads(body));
     uint16_t pipe_mask = task->GetPipeMask();
     if (semantic_task->attr_key == attr::kAscendPerCoreTask) {
+      if (task->GetExplicitSpecialReadMask() &
+          static_cast<uint16_t>(SpecialRegister::kLoad3DConfig))
+        ValidateLoad3DPerCoreLeaf(semantic_task);
       ICHECK_NE(pipe_mask, 0)
           << "Cannot recover the pipe of a scheduled T.PerCoreTask";
       task->MarkPerCoreTask();
-      // Atomic copy/select candidates own an internal register setup and
+      // Atomic copy/select candidates own a register setup and
       // consume sequence. Preserve that shared state when they are grouped;
       // standalone scalar SPR writers retain their existing candidate rules.
       constexpr uint16_t kInternalRegisterMask =

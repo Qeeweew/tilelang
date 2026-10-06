@@ -292,6 +292,7 @@ std::shared_ptr<IRStructure> TaskNode::Clone() const {
   new_task->SetPipeMask(GetPipeMask());
   new_task->SetHbmMask(GetHbmMask());
   new_task->SetSpecialWriteMask(GetSpecialWriteMask());
+  new_task->SetSpecialReadMask(GetExplicitSpecialReadMask());
   new_task->SetReadsPadValue(ReadsPadValueRegister());
   new_task->SetReadsAtomic(ReadsAtomicRegister());
   if (IsPerCoreTask())
@@ -384,8 +385,9 @@ void PrintIRStructure(const IRStructure *node, int indent) {
     }
     LOG(INFO) << indent_str << "  pipe_mask: 0x" << std::hex
               << task->GetPipeMask() << std::dec;
-    LOG(INFO) << indent_str << "  latency: " << task->GetLatency() << " cycles";
-    LOG(INFO) << indent_str << "  II: " << task->GetII() << " cycles";
+    LOG(INFO) << indent_str << "  latency: " << task->GetLatency()
+              << " cost-model units";
+    LOG(INFO) << indent_str << "  II: " << task->GetII() << " cost-model units";
     LOG(INFO) << indent_str
               << "  core_mask: " << static_cast<int>(task->GetCoreMask());
   } else if (node->IsControl()) {

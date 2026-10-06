@@ -72,14 +72,16 @@ def Task(latency: int | None = None, ii: int | None = None):
     core affinity; split cross-pipe or cross-core sequences into
     separate tasks. The marker does not select or launch a core by itself.
 
-    ``latency`` is the number of cycles from task issue until its outputs are
+    ``latency`` is the interval from task issue until its outputs are
     ready. ``ii`` is the minimum interval before the same hardware pipe may
     issue another instance. Task costs require ``latency >= ii``. Either value
     may be omitted, in which case the ``EstimateLatency`` pass supplies it and
     validates the final pair. Provided values are trusted exact overrides for
-    the complete task body, not hints for the enclosing loop II. These are the
-    only public task parameters. The compiler derives execution resources from
-    the task body and determines core placement.
+    the complete task body, not hints for the enclosing loop II. Both use the
+    target cost model's units: dav-2201 currently uses dimensionless ordering
+    weights, not measured cycles. Do not mix measured cycle values with that
+    uncalibrated model. These are the only public task parameters. The compiler
+    derives execution resources from the task body and determines core placement.
 
     Inside ``T.PerCoreTask()``, the same marker also denotes one concrete
     per-core candidate. Put the control flow that selects a core outside this

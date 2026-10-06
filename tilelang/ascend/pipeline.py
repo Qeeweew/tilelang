@@ -120,6 +120,10 @@ def _AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     # Expose those instruction regions after their padding writers exist and
     # before task, dependency, lifetime and buffer-version analysis.
     mod = ascend_transform.AscendNormalizeCubeCopyFootprints()(mod)
+    # The selected recipe requires the shared scheduler completion edge.
+    # Disabling the scheduler keeps the established 2D copy path.
+    if auto_schedule_enabled:
+        mod = ascend_transform.AscendSelectCubeLoads()(mod)
 
     # 2201 Parallel expressions become native MemBase tasks, with explicit UB
     # temporaries and access effects, before scheduling. This pass is a no-op

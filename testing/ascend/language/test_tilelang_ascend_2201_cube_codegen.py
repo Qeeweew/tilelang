@@ -61,7 +61,8 @@ def test_automatic_pipeline_emits_native_cube_dma_signatures(dtype, transpose_b)
     assert len(gm_args) == 10, source
     assert gm_args[2] == "1" and gm_args[5] == "0" and gm_args[8:] == ["1", "0"]
     assert "sizeof(*(" in gm_args[6]
-    assert len(_call_arguments(source, "asc_copy_l12l0a")) == 6, source
+    assert len(_call_arguments(source, "asc_copy_l12l0a")) == 17, source
+    assert "asc_set_l13d_fmatrix(" in source and "asc_set_l13d_rpt(" in source, source
     if transpose_b:
         assert len(_call_arguments(source, "asc_copy_l12l0b")) == 6, source
     else:

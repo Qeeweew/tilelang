@@ -147,6 +147,8 @@ private:
   void EmitFillL1_(const CallNode *op);
   void EmitL1ToL0Copy_(const CallNode *op, bool is_l0a);
   void EmitL1ToL0Copy2D_(const CallNode *op, bool is_l0a);
+  void EmitL1ToL0Copy3D_(const CallNode *op);
+  void EmitLoad3DConfig_(const CallNode *op);
   void EmitMxSfLoad_(const CallNode *op, bool is_l0a);
   void EmitL0cToUbufCopy_(const CallNode *op);
   void EmitL0cToGmCopy_(const CallNode *op);

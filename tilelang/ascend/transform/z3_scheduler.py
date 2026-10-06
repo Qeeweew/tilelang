@@ -88,7 +88,7 @@ def z3_schedule_python(
         MTE1=1, MTE2=2, MTE3=4, Cube=8, Vector=16, Fixpipe=32, Scalar=64.
     data_deps : list[tuple[int, int, int]]
         Directed ``(i, j, latency)`` constraints requiring task ``j`` to start
-        at least ``latency`` cycles after task ``i``.
+        at least ``latency`` cost-model units after task ``i``.
     resource_deps : list[tuple[int, int]]
         Unordered task pairs that cannot issue concurrently on one resource.
     owner_exclusion_deps : list[tuple[int, int, int, int]] | None
@@ -736,7 +736,7 @@ def z3_schedule_loop_python(
                 min_time = min(start_times[i] for i in range(n))
                 ax.set_xlim(min_time - 5, max_time + 5)
                 ax.set_ylim(-1, n)
-                ax.set_xlabel("Time (cycles)")
+                ax.set_xlabel("Time (cost-model units)")
                 ax.set_ylabel("Task Index")
                 ax.set_title(f"Z3 Schedule Timeline (Minimal II={best_ii})")
                 ax.grid(True, alpha=0.3)

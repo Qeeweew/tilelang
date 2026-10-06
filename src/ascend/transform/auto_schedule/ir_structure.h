@@ -77,6 +77,8 @@ enum class SpecialRegister : uint16_t {
   kFixpipeNz2Nd = 1 << 12,
   // Native select sets and consumes CMPMASK inside one atomic V operation.
   kCmpMask = 1 << 13,
+  // Root AIC/S setup writes FMATRIX/L3D_RPT/padding/boundary; 3Dv2 reads.
+  kLoad3DConfig = 1 << 14,
 };
 
 inline uint16_t PipeSpecialRegisterMask(uint16_t pipe_mask) {
@@ -441,6 +443,7 @@ public:
   // Special scalar registers this node *writes* (bitmask of SpecialRegister).
   // Only leaf config/control intrinsics write; everything else returns 0.
   virtual uint16_t GetSpecialWriteMask() const { return 0; }
+  virtual uint16_t GetExplicitSpecialReadMask() const { return 0; }
 
   // Special scalar registers this node *reads*:
   //   Cube (MAD) reads HF32 mode and MAD direction (derived from the Cube pipe)
@@ -449,7 +452,8 @@ public:
   //   loop_break is a fence: every node implicitly reads the loop-control
   //     register, so any loop_break write orders against all siblings.
   uint16_t GetSpecialReadMask() const {
-    uint16_t mask = static_cast<uint16_t>(SpecialRegister::kLoopControl);
+    uint16_t mask = static_cast<uint16_t>(SpecialRegister::kLoopControl) |
+                    GetExplicitSpecialReadMask();
     if (UsesPipe(ResourcePipe::kCube)) {
       mask |= static_cast<uint16_t>(SpecialRegister::kHf32Mode) |
               static_cast<uint16_t>(SpecialRegister::kMmadDirection);
@@ -537,6 +541,7 @@ public:
 
   // Special scalar registers written by this leaf (config/control intrinsics).
   uint16_t GetSpecialWriteMask() const override { return special_write_mask_; }
+  uint16_t GetExplicitSpecialReadMask() const override { return special_read_mask_; }
 
   // A padded GM->UB copy (data_select / pad_value) in this leaf reads the
   // pad-value register.
@@ -559,6 +564,7 @@ public:
   void SetPipeMask(uint16_t mask) { pipe_mask_ = mask; }
   void SetHbmMask(uint16_t mask) { hbm_mask_ = mask; }
   void SetSpecialWriteMask(uint16_t mask) { special_write_mask_ = mask; }
+  void SetSpecialReadMask(uint16_t mask) { special_read_mask_ = mask; }
   void SetReadsPadValue(bool v) { reads_pad_value_ = v; }
   void SetReadsAtomic(bool v) { reads_atomic_ = v; }
   void MarkPerCoreTask() { is_per_core_task_ = true; }
@@ -662,6 +668,7 @@ private:
   uint16_t hbm_mask_{0};
   // Special scalar registers written by this leaf (bitmask of SpecialRegister).
   uint16_t special_write_mask_{0};
+  uint16_t special_read_mask_{0};
   // Whether a padded GM->UB copy in this leaf reads the pad-value register.
   bool reads_pad_value_{false};
   bool reads_atomic_{false};
@@ -731,6 +738,14 @@ public:
     }
     return mask & static_cast<uint16_t>(
                       ~static_cast<uint16_t>(SpecialRegister::kLoopControl));
+  }
+
+  uint16_t GetExplicitSpecialReadMask() const override {
+    uint16_t mask = task ? task->GetExplicitSpecialReadMask() : 0;
+    for (const auto &child : children)
+      if (child)
+        mask |= child->GetExplicitSpecialReadMask();
+    return mask;
   }
 
   // A loop reads the pad-value register if any child (or its own task) contains

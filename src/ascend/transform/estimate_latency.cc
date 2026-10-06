@@ -50,6 +50,7 @@
 #include "ascend/op/ascend_mte_plan.h"
 #include "ascend/op/builtin.h"
 #include "ascend/op/copy.h"
+#include "ascend/op/cube_load.h"
 #include "ascend/op/utils.h"
 #include "ascend/target_utils.h"
 #include "ascend/transform/attr.h"
@@ -1613,8 +1614,11 @@ private:
     static const auto gemm_op = Op::Get("tl.tileop.gemm");
     static const auto gemm_blockscaled_op =
         Op::Get("tl.tileop.gemm_blockscaled");
-    if (IsAscendCopyCall(op)) {
-      AscendCopy copy_obj(op->args, op->annotations);
+    if (IsAscendCopyCall(op) || op->op.same_as(AscendCubeLoad3D::Get())) {
+      Array<PrimExpr> copy_args =
+          IsAscendCopyCall(op) ? op->args
+                               : Array<PrimExpr>{op->args[0], op->args[1]};
+      AscendCopy copy_obj(copy_args, op->annotations);
       const AscendCopyNode *copy = copy_obj.get();
       MteGeometry geometry = InferMteGeometry(copy);
       features_.copy_infos.push_back({copy->src.scope(), copy->dst.scope(),

@@ -57,8 +57,8 @@ struct DepInfo {
   IRStructure *prod_node;
   IRStructure *cons_node;
   // Storage identity shared by every Buffer alias participating in this
-  // dependency. Undefined for an explicit conflict between distinct storage
-  // keys; those edges do not participate in buffer versioning.
+  // dependency. Undefined for storage-free ordering (explicit conflicts or
+  // invariant SPR state); those edges do not participate in buffer versioning.
   ffi::Optional<Var> storage;
   // Conflicting access pairs. For kData these are directed producer→consumer
   // pairs; for kOwnerExclusion they identify the two unordered owner sides.
