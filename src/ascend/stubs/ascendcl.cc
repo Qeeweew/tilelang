@@ -27,6 +27,9 @@
 #endif
 
 #include <dlfcn.h>
+#if defined(__linux__)
+#include <link.h>
+#endif
 
 #include <cstdlib>
 #include <stdexcept>
@@ -37,17 +40,36 @@ namespace tvm::tl::ascendcl {
 
 namespace {
 
-// First missing required symbol, recorded so get() can name it.
-std::string missing_symbol;
+// Library handles and the resolved callbacks deliberately live until process
+// exit. Module destruction can still call ACL after other Python extensions
+// release their dlopen references.
+struct LoadedAscendCL {
+  AscendCLAPI api{};
+  void *handle{nullptr};
+  bool library_found{false};
+  std::string missing_symbol;
+  std::vector<void *> retained_libraries;
+};
 
-template <typename T> T GetSymbol(void *handle, const char *name) {
+void *StubModuleBase() {
+  Dl_info info{};
+  dladdr(reinterpret_cast<void *>(&StubModuleBase), &info);
+  return info.dli_fbase;
+}
+
+void *ExternalSymbol(void *scope, const char *name) {
   (void)dlerror();
-  void *sym = dlsym(handle, name);
-  const char *error = dlerror();
-  if (error != nullptr) {
+  void *symbol = dlsym(scope, name);
+  if (dlerror() != nullptr || symbol == nullptr) {
     return nullptr;
   }
-  return reinterpret_cast<T>(sym);
+  Dl_info info{};
+  if (dladdr(symbol, &info) == 0 || info.dli_fbase == StubModuleBase()) {
+    return nullptr;
+  }
+  // Compare DSO identities, not &aclrtGetDevice: ELF symbol preemption can
+  // make the address of our wrapper refer to the real library or a profiler.
+  return symbol;
 }
 
 std::vector<std::string> LibAscendCLPathCandidates() {
@@ -71,21 +93,7 @@ std::vector<std::string> LibAscendCLPathCandidates() {
   return candidates;
 }
 
-void *TryLoadLibAscendCL() {
-  // Prefer already-loaded symbols (e.g. if torch_npu is imported first).
-  // We use a representative symbol and ensure we don't just find ourselves.
-  void *sym = dlsym(RTLD_DEFAULT, "aclrtGetDevice");
-  if (sym != nullptr && sym != reinterpret_cast<void *>(&aclrtGetDevice)) {
-    return RTLD_DEFAULT;
-  }
-  sym = dlsym(RTLD_NEXT, "aclrtGetDevice");
-  if (sym != nullptr && sym != reinterpret_cast<void *>(&aclrtGetDevice)) {
-    return RTLD_NEXT;
-  }
-
-  // Otherwise, attempt to dlopen the library directly. If a copy is already
-  // mapped (e.g. under a different path), the dynamic loader dedups by SONAME
-  // and returns the existing mapping.
+void *LoadRuntimeLibrary() {
   for (const std::string &path : LibAscendCLPathCandidates()) {
     void *handle = dlopen(path.c_str(), RTLD_LAZY | RTLD_LOCAL);
     if (handle != nullptr) {
@@ -95,23 +103,101 @@ void *TryLoadLibAscendCL() {
   return nullptr;
 }
 
-AscendCLAPI CreateAscendCLAPI() {
-  AscendCLAPI api{};
-  void *handle = AscendCLAPI::get_handle();
+#if defined(__linux__)
+struct LoadedSymbolSearch {
+  const char *name;
+  void *symbol{nullptr};
+  void *retained_library{nullptr};
+};
+
+int SearchLoadedLibrary(dl_phdr_info *info, size_t, void *data) {
+  if (info->dlpi_name == nullptr || info->dlpi_name[0] == '\0') {
+    return 0;
+  }
+  auto *search = static_cast<LoadedSymbolSearch *>(data);
+  void *handle = dlopen(info->dlpi_name, RTLD_LAZY | RTLD_LOCAL | RTLD_NOLOAD);
   if (handle == nullptr) {
-    return api;
+    return 0;
+  }
+  search->symbol = ExternalSymbol(handle, search->name);
+  if (search->symbol != nullptr) {
+    search->retained_library = handle;
+    return 1;
+  }
+  dlclose(handle);
+  return 0;
+}
+#endif
+
+template <typename T> T GetSymbol(LoadedAscendCL *library, const char *name) {
+  // Resolve each entrypoint separately. A profiler may interpose only launch
+  // while the other callbacks come from libascendcl; its launch hook must stay
+  // in the call chain even when the stub precedes libascendcl in load order.
+  void *symbol = ExternalSymbol(RTLD_DEFAULT, name);
+  if (symbol == nullptr) {
+    symbol = ExternalSymbol(RTLD_NEXT, name);
+  }
+  void *retained = nullptr;
+#if defined(__linux__)
+  if (symbol == nullptr) {
+    // RTLD_NEXT uses the caller's lookup scope, which may exclude DSOs that
+    // were dlopened afterwards. Visit already-loaded modules in loader order
+    // before opening CANN directly, preserving a later profiler's launch hook.
+    LoadedSymbolSearch search{name};
+    dl_iterate_phdr(SearchLoadedLibrary, &search);
+    symbol = search.symbol;
+    retained = search.retained_library;
+  }
+#endif
+  if (symbol == nullptr) {
+    if (library->handle == nullptr) {
+      library->handle = LoadRuntimeLibrary();
+    }
+    if (library->handle != nullptr) {
+      symbol = ExternalSymbol(library->handle, name);
+    }
+  }
+  if (symbol == nullptr) {
+    return nullptr;
+  }
+
+  if (retained == nullptr) {
+    Dl_info info{};
+    dladdr(symbol, &info);
+    retained = dlopen(info.dli_fname, RTLD_LAZY | RTLD_LOCAL);
+  }
+  if (retained == nullptr) {
+    return nullptr;
+  }
+  library->retained_libraries.push_back(retained);
+  return reinterpret_cast<T>(symbol);
+}
+
+LoadedAscendCL *LoadAscendCL() {
+  auto *library = new LoadedAscendCL();
+  // RTLD_DEFAULT is a valid lookup scope with the value nullptr on Linux.
+  // Record availability explicitly instead of using the scope as a boolean.
+  library->api.aclrtGetDevice_ =
+      GetSymbol<decltype(library->api.aclrtGetDevice_)>(library,
+                                                        "aclrtGetDevice");
+  library->library_found =
+      library->api.aclrtGetDevice_ != nullptr || library->handle != nullptr;
+  if (!library->library_found) {
+    return library;
   }
 
 // Required symbols: record the first missing name (older CANN releases may
-// lack e.g. aclrtLaunchKernelWithHostArgs) so get() can report it instead of
-// leaving a null pointer behind.
+// lack e.g. aclrtLaunchKernelWithHostArgs) rather than leaving a usable partial
+// API table. get_or_null() must remain safe on error-message paths.
 #define LOOKUP(symbol)                                                         \
-  api.symbol##_ = GetSymbol<decltype(api.symbol##_)>(handle, #symbol);         \
-  if (api.symbol##_ == nullptr) {                                              \
-    if (missing_symbol.empty()) {                                              \
-      missing_symbol = #symbol;                                                \
-    }                                                                          \
-    return AscendCLAPI{};                                                      \
+  if (library->api.symbol##_ == nullptr) {                                     \
+    library->api.symbol##_ =                                                   \
+        GetSymbol<decltype(library->api.symbol##_)>(library, #symbol);         \
+  }                                                                            \
+  if (library->api.symbol##_ == nullptr) {                                     \
+    library->missing_symbol = #symbol;                                         \
+    library->api = AscendCLAPI{};                                              \
+    return library;                                                            \
   }
 
   LOOKUP(aclrtBinaryLoadFromData)
@@ -122,40 +208,45 @@ AscendCLAPI CreateAscendCLAPI() {
 #undef LOOKUP
 
   // Optional: wrappers return nullptr when absent.
-  api.aclGetRecentErrMsg_ = GetSymbol<decltype(api.aclGetRecentErrMsg_)>(
-      handle, "aclGetRecentErrMsg");
-  return api;
+  library->api.aclGetRecentErrMsg_ =
+      GetSymbol<decltype(library->api.aclGetRecentErrMsg_)>(
+          library, "aclGetRecentErrMsg");
+  return library;
+}
+
+LoadedAscendCL *GetLoadedAscendCL() {
+  static LoadedAscendCL *library = LoadAscendCL();
+  return library;
 }
 
 } // namespace
 
-void *AscendCLAPI::get_handle() {
-  static void *handle = TryLoadLibAscendCL();
-  return handle;
+void *AscendCLAPI::get_handle() { return GetLoadedAscendCL()->handle; }
+
+bool AscendCLAPI::is_available() {
+  LoadedAscendCL *library = GetLoadedAscendCL();
+  return library->library_found && library->missing_symbol.empty();
 }
 
-bool AscendCLAPI::is_available() { return get_handle() != nullptr; }
-
 AscendCLAPI *AscendCLAPI::get_or_null() {
-  static AscendCLAPI singleton = CreateAscendCLAPI();
-  return &singleton;
+  return is_available() ? &GetLoadedAscendCL()->api : nullptr;
 }
 
 AscendCLAPI *AscendCLAPI::get() {
-  AscendCLAPI *api = get_or_null();
-  if (!is_available()) {
+  LoadedAscendCL *library = GetLoadedAscendCL();
+  if (!library->library_found) {
     throw std::runtime_error(
         "CANN runtime library (libascendcl.so) not found. Install the Ascend "
         "CANN toolkit and source its set_env.sh (or import torch_npu first) "
         "before using TileLang's Ascend backend.");
   }
-  if (!missing_symbol.empty()) {
+  if (!library->missing_symbol.empty()) {
     throw std::runtime_error(
         "libascendcl.so was found but does not provide the required symbol `" +
-        missing_symbol +
+        library->missing_symbol +
         "`. TileLang's Ascend backend requires a newer CANN toolkit.");
   }
-  return api;
+  return &library->api;
 }
 
 } // namespace tvm::tl::ascendcl
@@ -199,7 +290,7 @@ int32_t aclrtLaunchKernelWithHostArgs(void *func, uint32_t numBlocks,
 const char *aclGetRecentErrMsg(void) {
   // Error-message path: must never throw, callers handle nullptr.
   AscendCLAPI *api = AscendCLAPI::get_or_null();
-  if (!AscendCLAPI::is_available() || api->aclGetRecentErrMsg_ == nullptr) {
+  if (api == nullptr || api->aclGetRecentErrMsg_ == nullptr) {
     return nullptr;
   }
   return api->aclGetRecentErrMsg_();
