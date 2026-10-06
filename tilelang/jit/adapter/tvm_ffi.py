@@ -1,8 +1,8 @@
 """Utilities to adapt TVM-FFI kernels to Torch tensors.
 
 TVM-FFI obtains the active work stream through Torch's DLPack Exchange API.
-The Ascend adapter installs TileLang's Torch NPU callback before the first
-tensor reaches an executable.
+The Ascend adapter uses a private zero-copy argument bridge whose stream
+callback remains correct if Torch tensors previously reached TVM-FFI.
 """
 
 from __future__ import annotations
@@ -43,6 +43,12 @@ def _install_torch_stream_exchange() -> None:
     )
 
     install_torch_npu_stream_exchange()
+
+
+def _prepare_torch_arguments(arguments):
+    from tilelang.ascend.torch_exchange import wrap_torch_npu_tensor_arguments
+
+    return wrap_torch_npu_tensor_arguments(arguments)
 
 
 class TVMFFIKernelAdapter(BaseKernelAdapter):
@@ -336,7 +342,10 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
             if out_device is not None:
                 self._prepare_torch_device(out_device)
             executable = self._get_executable()
-            executable(*tensor_list)
+            if out_device is not None and out_device.type == "npu":
+                executable(*_prepare_torch_arguments(tensor_list))
+            else:
+                executable(*tensor_list)
 
             # Return outputs in the requested form
             if len(self.result_idx) == 1:
@@ -376,7 +385,10 @@ class TVMFFIKernelAdapter(BaseKernelAdapter):
                 # a zero-element anchor solely for that allocator/device state.
                 allocator_anchor = torch.empty(0, device=device)
 
-            result = self._get_executable()(*inputs, allocator_anchor)
+            arguments = (*inputs, allocator_anchor)
+            if device.type == "npu":
+                arguments = _prepare_torch_arguments(arguments)
+            result = self._get_executable()(*arguments)
             if len(self.result_idx) == 1:
                 return result
             return list(result)

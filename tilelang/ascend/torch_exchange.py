@@ -4,7 +4,7 @@ from __future__ import annotations
 
 
 def install_torch_npu_stream_exchange() -> bool:
-    """Make TVM-FFI submit Ascend kernels to Torch's current NPU stream."""
+    """Initialize the private zero-copy NPU argument bridge for TVM-FFI."""
 
     try:
         import torch_npu  # noqa: F401
@@ -21,13 +21,20 @@ def install_torch_npu_stream_exchange() -> bool:
 
 
 def is_torch_npu_stream_exchange_installed() -> bool:
-    """Return whether TileLang owns Torch's current Exchange API table."""
+    """Return whether TileLang's private NPU argument bridge is initialized."""
 
     from tilelang_ascend_npu_exchange import (
         is_torch_npu_stream_exchange_installed as is_installed,
     )
 
     return bool(is_installed())
+
+
+def wrap_torch_npu_tensor_arguments(arguments):
+    """Prepare NPU arguments with a stable, current-stream Exchange API."""
+    from tilelang_ascend_npu_exchange import wrap_torch_npu_tensor_arguments as wrap
+
+    return wrap(arguments)
 
 
 def npu_current_device():
@@ -58,6 +65,7 @@ def npu_current_raw_stream():
 __all__ = [
     "install_torch_npu_stream_exchange",
     "is_torch_npu_stream_exchange_installed",
+    "wrap_torch_npu_tensor_arguments",
     "npu_current_device",
     "npu_current_raw_stream",
 ]
