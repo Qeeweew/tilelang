@@ -34,6 +34,32 @@ def test_canonical_allocation_rounds_only_fractal_axes(shape, dtype, padded):
     tvm.ir.assert_structural_equal(after, transform.NormalizeAscendFractalStorage()(after))
 
 
+@pytest.mark.parametrize("marked", [False, True])
+@pytest.mark.parametrize("full", [False, True])
+def test_padding_intent_uses_canonical_axes_after_reshape(marked, full):
+    owner = tirx.decl_buffer((2, 16), "float16", name="owner", scope="shared.l1")
+    alias = tirx.decl_buffer((4, 8), "float16", data=owner.data)
+    region = tirx.Call("handle", tvm.ir.Op.get("tl.region"), [alias[0, 0], 2, 4 if full else 1, 8])
+    fill = tirx.Call("handle", tvm.ir.Op.get("tl.tileop.fill"), [region, tirx.const(0, "float16")], {"tl.ascend.initialize_l1_padding": tirx.IntImm("int32", 1)} if marked else {})
+    after = transform.NormalizeAscendFractalStorage()(_module(owner, owner, tirx.Evaluate(fill)))
+    (rewritten,) = calls(after, "tl.tileop.fill")
+    destination = rewritten.args[0]
+    assert tuple(int(value) for value in destination.args[0].buffer.shape) == (16, 16)
+    expected = (16, 16) if full and marked else (2, 16) if full else (1, 8)
+    assert tuple(int(value) for value in destination.args[2:]) == expected
+    assert "tl.ascend.initialize_l1_padding" not in rewritten.annotations
+
+
+def test_padding_intent_follows_rank_changing_alias_coordinates():
+    owner = tirx.decl_buffer((2, 17, 19), "float16", name="owner", scope="shared.l1")
+    alias = tirx.decl_buffer((34, 19), "float16", data=owner.data)
+    region = tirx.Call("handle", tvm.ir.Op.get("tl.region"), [alias[0, 0], 2, 34, 19])
+    fill = tirx.Call("handle", tvm.ir.Op.get("tl.tileop.fill"), [region, tirx.const(0, "float16")], {"tl.ascend.initialize_l1_padding": tirx.IntImm("int32", 1)})
+    after = transform.NormalizeAscendFractalStorage()(_module(owner, owner, tirx.Evaluate(fill)))
+    (rewritten,) = calls(after, "tl.tileop.fill")
+    assert tuple(int(value) for value in rewritten.args[0].args[2:]) == (2, 32, 32)
+
+
 @pytest.mark.parametrize("kind", ["view", "reshape", "reinterpret"])
 def test_alias_accesses_use_one_canonical_allocation(kind):
     owner_shape = (15, 15) if kind == "view" else (225,)

@@ -19,6 +19,7 @@
 #include "arith/pattern_match.h"
 
 #include "ascend/op/builtin.h"
+#include "ascend/target_utils.h"
 #include "backend/common/target_utils.h"
 #include "transform/common/attr.h"
 
@@ -30,6 +31,51 @@ namespace {
 
 constexpr const char *kModeMerging = "MODE_MERGING";
 constexpr const char *kSimdOpPrefix = "tl.simd.";
+
+// LowerScheduledTIR can clone a cthread binding into several core regions.
+// These bind the same immutable hardware SID, rather than defining new SSA
+// values. Collect them within one emitted function so their declarations
+// dominate nested and sibling C++ scopes. VF regions emit separate functions.
+class CthreadBindingCollector : public tirx::StmtVisitor {
+public:
+  explicit CthreadBindingCollector(arith::Analyzer *analyzer)
+      : analyzer_(analyzer) {}
+
+  std::vector<Var> variables;
+
+private:
+  void VisitStmt_(const AttrStmtNode *op) final {
+    if (op->attr_key == tirx::attr::thread_extent ||
+        op->attr_key == s_tir::attr::virtual_thread) {
+      if (const auto *iv = op->node.as<IterVarNode>();
+          iv != nullptr && iv->thread_tag == "cthread") {
+        const Var &var = iv->var;
+        ICHECK(var.dtype().lanes() == 1 &&
+               (var.dtype().is_int() || var.dtype().is_uint()))
+            << "Ascend cthread binding requires a scalar integer variable";
+        auto [it, inserted] = extents_.emplace(var.get(), op->value);
+        if (inserted) {
+          variables.push_back(var);
+        } else {
+          ICHECK(analyzer_->CanProveEqual(it->second, op->value))
+              << "Repeated Ascend cthread binding for " << var
+              << " has inconsistent extents: " << it->second << " and "
+              << op->value;
+        }
+      }
+    }
+    tirx::StmtVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const SBlockNode *op) final {
+    if (op->name_hint != "SIMT_VF" && op->name_hint != "SIMD_VF") {
+      tirx::StmtVisitor::VisitStmt_(op);
+    }
+  }
+
+  arith::Analyzer *analyzer_;
+  std::unordered_map<const VarNode *, PrimExpr> extents_;
+};
 
 bool IsSimdOp(const CallNode *op, std::string *op_name = nullptr) {
   if (auto call_op = op->op.as<Op>()) {
@@ -539,6 +585,10 @@ void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
   ICHECK(IsOutsideVF())
       << "Ascend VF mode leaked across PrimFunc code generation";
   this->InitFuncState(f);
+  Target target = f->GetAttr<Target>(tvm::attr::kTarget)
+                      .value_or(Target("ascend"));
+  is_dav2201_ = tl::GetAscendTargetInfo(target).architecture ==
+               tl::AscendArchitecture::kDav2201;
   has_gemm_l0_ = false;
   has_gemm_l1_ = false;
   unroll_factor_.clear();
@@ -699,7 +749,16 @@ void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
   stream << ") {\n";
   this->PreFunctionBody(f);
   int func_scope = this->BeginScope();
+  EmitCthreadBindings(f->body);
   this->PrintStmt(f->body);
+  // Native Cube/MTE/Vector instructions issue asynchronously. The entry must
+  // drain them before returning, just as the AscendC TPipe teardown does. This
+  // is a kernel lifetime boundary, independent of task dependency completion.
+  if (f->GetAttr<Integer>(tvm::attr::kCallingConv) ==
+      CallingConv::kDeviceKernelLaunch) {
+    this->PrintIndent();
+    this->stream << "asc_sync_pipe(PIPE_ALL);\n";
+  }
   this->EndScope(func_scope);
   this->PrintIndent();
   this->stream << "}\n\n";
@@ -709,6 +768,41 @@ void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
 
 void CodeGenTileLangAscend::PreFunctionBody(const PrimFunc &f) {
   this->stream << "  asc_init();\n";
+  if (is_dav2201_ &&
+      f->GetAttr<Integer>(tvm::attr::kCallingConv) ==
+          CallingConv::kDeviceKernelLaunch) {
+    // On dav-2201, CTRL[48]=0 saturates half/bfloat16 arithmetic and narrowing
+    // (Inf -> finite maximum, NaN -> 0). Ordinary TileLang arithmetic and casts
+    // require non-saturating results. InitSocState/asc_init does not set it.
+    this->stream << "  asc_set_ctrl(asc_get_ctrl() | (uint64_t(1) << 48));\n";
+  }
+}
+
+void CodeGenTileLangAscend::EmitCthreadBindings(const Stmt &body,
+                                                bool vf_local_bindings) {
+  CthreadBindingCollector collector(&analyzer_);
+  collector(body);
+  if (collector.variables.empty()) {
+    return;
+  }
+
+  std::string sid = name_supply_->FreshName("cthread_value");
+  PrintIndent();
+  stream << "const ";
+  PrintType(DataType::Int(64), stream);
+  stream << " " << sid << " = asc_get_sub_block_id();\n";
+  for (const Var &var : collector.variables) {
+    // VF emission temporarily inherits the enclosing name map. A binding
+    // local to the helper must not refer to a declaration in the kernel body.
+    if (vf_local_bindings) {
+      var_idmap_.erase(var.get());
+    }
+    std::string alias = AllocVarID(var.get());
+    PrintIndent();
+    stream << "const ";
+    PrintType(var.dtype(), stream);
+    stream << " " << alias << " = " << sid << ";\n";
+  }
 }
 
 ffi::Array<Var>
@@ -798,6 +892,7 @@ void CodeGenTileLangAscend::EmitVFFunction(const SBlockNode *op,
     // the helper signature use the surrounding kernel ABI, so keeping them in
     // VF mode can change scalar capture types (for example fp8_e4_t).
     VFModeScope vf_mode_scope(this, vf_mode);
+    EmitCthreadBindings(op->body, true);
     this->VisitStmt(op->body);
     helper_body = FixIndent(stream.str());
   }
@@ -1335,7 +1430,10 @@ void CodeGenTileLangAscend::EmitPipeBarrier_(const CallNode *op) {
   ICHECK(kValidPipes.count(pipe))
       << "Unsupported Ascend pipeline barrier: " << pipe;
 
-  if (pipe == "PIPE_V") {
+  // 2201 MemBase issue order does not complete dependent UB accesses.
+  // Preserve the completion selected by InsertSync. The existing 3510 VF
+  // path keeps its separate implicit-order contract.
+  if (pipe == "PIPE_V" && !is_dav2201_) {
     return;
   }
   PrintIndent();
@@ -1386,6 +1484,7 @@ void CodeGenTileLangAscend::EmitGmToUbufCopy_(const CallNode *op) {
 
   // burstLen and stride use bytes; right_pad uses elements of the buffer dtype.
   std::string pointer_type = "uint8_t";
+  int copy_element_bytes = 1;
   const auto *right_pad = op->args[6].as<IntImmNode>();
   if (right_pad && right_pad->value != 0) {
     DataType element_type = op->args[0].dtype();
@@ -1401,6 +1500,27 @@ void CodeGenTileLangAscend::EmitGmToUbufCopy_(const CallNode *op) {
         << "Ascend padded GM->UB copy supports 8/16/32-bit elements, got "
         << bits;
     pointer_type = "uint" + std::to_string(bits) + "_t";
+    copy_element_bytes = bits / 8;
+  }
+
+  if (is_dav2201_) {
+    PrimExpr zero = IntImm(DataType::Int(32), 0);
+    PrimExpr block = IntImm(DataType::Int(32), 32);
+    PrimExpr padded_bytes = op->args[4] +
+        (op->args[5] + op->args[6]) * copy_element_bytes;
+    PrimExpr ub_burst_bytes = tvm::ceildiv(padded_bytes, block) * block;
+    bool one_burst = analyzer_.CanProveEqual(op->args[3], 1);
+    PrimExpr gm_gap = one_burst ? zero : op->args[9] - op->args[4];
+    PrimExpr ub_gap = one_burst ? zero :
+        tvm::floordiv(op->args[10] - ub_burst_bytes, block);
+    // Native 2201 uses byte length, element padding, GM byte gaps and UB
+    // 32-byte gaps. Its API has neither 3510's L2 nor loop-pitch controls.
+    EmitCApiCall_("asc_copy_gm2ub_align",
+                  {{op->args[0], "(__ubuf__ " + pointer_type + "*)(", ")"},
+                   {op->args[1], "(__gm__ " + pointer_type + "*)(", ")"},
+                   {op->args[3]}, {op->args[4]}, {op->args[5]}, {op->args[6]},
+                   {analyzer_.Simplify(gm_gap)}, {analyzer_.Simplify(ub_gap)}});
+    return;
   }
 
   // IR arg 2 is sid, which asc_copy_gm2ub_align does not take.
@@ -1421,6 +1541,22 @@ void CodeGenTileLangAscend::EmitUbufToGmCopy_(const CallNode *op) {
   ICHECK_EQ(op->args.size(), 8)
       << "tl.ascend_copy_ubuf_to_gm expects exactly 8 arguments";
 
+  if (is_dav2201_) {
+    PrimExpr zero = IntImm(DataType::Int(32), 0);
+    PrimExpr block = IntImm(DataType::Int(32), 32);
+    PrimExpr ub_burst_bytes = tvm::ceildiv(op->args[4], block) * block;
+    bool one_burst = analyzer_.CanProveEqual(op->args[3], 1);
+    PrimExpr ub_gap = one_burst ? zero :
+        tvm::floordiv(op->args[7] - ub_burst_bytes, block);
+    PrimExpr gm_gap = one_burst ? zero : op->args[6] - op->args[4];
+    EmitCApiCall_("asc_copy_ub2gm_align",
+                  {{op->args[0], "(__gm__ uint8_t*)(", ")"},
+                   {op->args[1], "(__ubuf__ uint8_t*)(", ")"},
+                   {op->args[3]}, {op->args[4]}, {zero}, {zero},
+                   {analyzer_.Simplify(ub_gap)}, {analyzer_.Simplify(gm_gap)}});
+    return;
+  }
+
   // IR arg 2 is sid, which asc_copy_ub2gm_align does not take.
   EmitCApiCall_("asc_copy_ub2gm_align",
                 {{op->args[0], "(__gm__ uint8_t*)(", ")"},
@@ -1438,6 +1574,25 @@ void CodeGenTileLangAscend::EmitGmToL1Copy_(const CallNode *op) {
 
   const bool use_dn2nz =
       GetIntImmArg(op, 9, "tl.ascend_copy_gm_to_cbuf", "transpose") != 0;
+  if (is_dav2201_) {
+    ICHECK(!use_dn2nz) << "dav-2201 does not provide GM->L1 DN2NZ";
+    // The 2201 API carries ND2NZ strides directly. The common IR's source
+    // row pitch is bytes, whereas src_d_value is an element count.
+    const std::string source = PrintExpr(op->args[1]);
+    EmitCApiCall_("asc_copy_gm2l1_nd2nz",
+                  {{op->args[0]},
+                   {op->args[1]},
+                   {IntImm(DataType::Int(32), 1)},
+                   {op->args[5]},
+                   {op->args[6]},
+                   {IntImm(DataType::Int(32), 0)},
+                   {op->args[3], "static_cast<uint16_t>((",
+                    ") / sizeof(*(" + source + ")))"},
+                   {op->args[10]},
+                   {IntImm(DataType::Int(32), 1)},
+                   {IntImm(DataType::Int(32), 0)}});
+    return;
+  }
   const std::string nz_c0_stride = PrintExpr(op->args[10]);
   PrintIndent();
   stream << "asc_set_gm2l1_nz_para(1, 1, static_cast<uint16_t>(" << nz_c0_stride
@@ -1493,6 +1648,31 @@ void CodeGenTileLangAscend::EmitL0cToUbufCopy_(const CallNode *op) {
 void CodeGenTileLangAscend::EmitL0cToGmCopy_(const CallNode *op) {
   ICHECK_EQ(op->args.size(), 25)
       << "tl.ascend_copy_matrix_cc_to_gm expects exactly 25 arguments";
+
+  if (is_dav2201_) {
+    // Native 2201 Fixpipe supports NZ->ND directly; its signature does not
+    // contain the 3510 loop enhancement or NZ->DN controls.
+    // The C API copy only issues FIX and does not initialize ND_PARA. Match
+    // dav_c220 Basic Fixpipe: one matrix, then drain FIX before using this
+    // configuration. Keep configuration and transfer in the same FIX task.
+    PrintIndent();
+    stream << "asc_set_l0c_copy_params(1, 0, 0);\n";
+    PrintIndent();
+    stream << "asc_sync_pipe(PIPE_FIX);\n";
+    EmitCApiCall_("asc_copy_l0c2gm",
+                  {{op->args[0]},
+                   {op->args[1]},
+                   {op->args[3]},
+                   {op->args[4]},
+                   {op->args[5]},
+                   {op->args[6]},
+                   {op->args[9]},
+                   {op->args[10]},
+                   {op->args[11]},
+                   {op->args[12]},
+                   {op->args[13]}});
+    return;
+  }
 
   PrintIndent();
   stream << "asc_set_l0c_copy_nz_para(1, 0, 0);\n";
@@ -1592,6 +1772,25 @@ void CodeGenTileLangAscend::EmitMxSfLoad_(const CallNode *op, bool is_l0a) {
                  {op->args[5]},
                  {op->args[6]},
                  {op->args[7]}});
+}
+
+void CodeGenTileLangAscend::EmitL1ToL0Copy2D_(const CallNode *op, bool is_l0a) {
+  ICHECK_EQ(op->args.size(), 7);
+  const bool transpose = GetIntImmArg(op, 6, "LoadData2D", "transpose") != 0;
+  if (transpose) {
+    // dav_c220 LoadData2DParams uses the classic B16 load transpose bit.
+    // The C API's *_trans function is a different enhanced transpose load.
+    EmitCApiCall_(is_l0a ? "load_cbuf_to_ca" : "load_cbuf_to_cb",
+                  {{op->args[0]}, {op->args[1]}, {op->args[2]}, {op->args[3]},
+                   {op->args[4]}, {op->args[5]},
+                   {IntImm(DataType::Int(32), 0)},
+                   {IntImm(DataType::Int(32), 1)},
+                   {IntImm(DataType::Int(32), 0), "(addr_cal_mode_t)", ""}});
+  } else {
+    EmitCApiCall_(is_l0a ? "asc_copy_l12l0a" : "asc_copy_l12l0b",
+                  {{op->args[0]}, {op->args[1]}, {op->args[2]}, {op->args[3]},
+                   {op->args[4]}, {op->args[5]}});
+  }
 }
 
 void CodeGenTileLangAscend::EmitUbufToL1Copy_(const CallNode *op) {
@@ -1738,6 +1937,9 @@ bool CodeGenTileLangAscend::EmitAscendMemoryCall_(const CallNode *op) {
   } else if (op->op.same_as(tl::ascend_load_cbuf_to_ca()) ||
              op->op.same_as(tl::ascend_load_cbuf_to_cb())) {
     EmitL1ToL0Copy_(op, op->op.same_as(tl::ascend_load_cbuf_to_ca()));
+  } else if (op->op.same_as(tl::ascend_load_cbuf_to_ca_2d()) ||
+             op->op.same_as(tl::ascend_load_cbuf_to_cb_2d())) {
+    EmitL1ToL0Copy2D_(op, op->op.same_as(tl::ascend_load_cbuf_to_ca_2d()));
   } else if (op->op.same_as(tl::ascend_load_ca_sf()) ||
              op->op.same_as(tl::ascend_load_cb_sf())) {
     EmitMxSfLoad_(op, op->op.same_as(tl::ascend_load_ca_sf()));
@@ -3016,14 +3218,17 @@ void CodeGenTileLangAscend::VisitStmt_(const AttrStmtNode *op) {
       }
       if (std::string::npos == iv->thread_tag.find("threadIdx.") &&
           std::string::npos == iv->thread_tag.find("blockIdx.")) {
+        if (iv->thread_tag == "cthread") {
+          ICHECK(var_idmap_.count(iv->var.get()))
+              << "Ascend cthread binding was not materialized in this "
+                 "function's prologue";
+          this->VisitStmt(op->body);
+          return;
+        }
         PrintIndent();
         PrintType(iv->var.dtype(), stream);
         stream << " " << AllocVarID(iv->var.get()) << " = ";
-        if (iv->thread_tag == "cthread") {
-          stream << "asc_get_sub_block_id()";
-        } else {
-          stream << "0";
-        }
+        stream << "0";
         stream << ";\n";
       } else if (iv->thread_tag == "blockIdx.x") {
         var_idmap_[iv->var.get()] = "block_idx";

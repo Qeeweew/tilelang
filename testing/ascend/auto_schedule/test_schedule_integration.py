@@ -395,5 +395,7 @@ def test_scalar_snapshot_precedes_pipeline_update():
             T.copy(out, O)
 
     a = torch.arange(16, dtype=torch.float32)
-    result = tilelang.compile(main, target="ascend", out_idx=-1)(a.npu())
+    # Snapshot ordering is independent of VF instructions and chip generation.
+    target = tvm.target.Target({"kind": "ascend", "arch": "dav-2201"})
+    result = tilelang.compile(main, target=target, out_idx=-1)(a.npu())
     torch.testing.assert_close(result.cpu(), 2 * (a.cumsum(0) - a), rtol=0, atol=0)

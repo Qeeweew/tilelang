@@ -51,6 +51,7 @@
 #include "ascend/op/builtin.h"
 #include "ascend/op/copy.h"
 #include "ascend/op/utils.h"
+#include "ascend/target_utils.h"
 #include "ascend/transform/attr.h"
 #include "op/copy.h"
 #include "op/gemm.h"
@@ -268,8 +269,8 @@ struct TaskCostFeatures {
 // is implemented separately in estimate_latency.cc.
 class TaskCostEstimator {
 public:
-  explicit TaskCostEstimator(Hf32ModeMap hf32_modes)
-      : hf32_modes_(std::move(hf32_modes)) {}
+  explicit TaskCostEstimator(Hf32ModeMap hf32_modes, bool ordinal_costs)
+      : hf32_modes_(std::move(hf32_modes)), ordinal_costs_(ordinal_costs) {}
 
   // Estimate latency and initiation interval for one Ascend task.
   void Estimate(TaskNode *task);
@@ -321,6 +322,9 @@ private:
 
   AscendLatencyParams params_;
   Hf32ModeMap hf32_modes_;
+  // 2201 has no calibrated timing model yet. A unit per leaf operation is a
+  // dimensionless ordering weight, never a cycle estimate or a bandwidth.
+  bool ordinal_costs_;
 
   // ====================================================================
   // Every divisor is guarded so an unknown bandwidth/throughput contributes
@@ -1910,6 +1914,11 @@ bool IsComposedLatencyStmt(const Stmt &stmt) {
 
 void TaskCostEstimator::Estimate(TaskNode *task) {
   ICHECK(task != nullptr);
+  if (ordinal_costs_) {
+    task->SetLatency(1);
+    task->SetII(1);
+    return;
+  }
   arith::Analyzer analyzer;
   task->outer_ctx.Populate(analyzer);
   TaskCostFeatures cost_features =
@@ -2052,15 +2061,17 @@ using TaskCostMap =
 
 class TaskCostCollector : public TaskAwareConstrVisitor {
 public:
-  static TaskCostMap Collect(const Stmt &body, const ConstrSet &outer_ctx) {
-    TaskCostCollector collector(body, outer_ctx);
+  static TaskCostMap Collect(const Stmt &body, const ConstrSet &outer_ctx,
+                             bool ordinal_costs) {
+    TaskCostCollector collector(body, outer_ctx, ordinal_costs);
     collector(body);
     return std::move(collector.costs_);
   }
 
 private:
-  TaskCostCollector(const Stmt &body, const ConstrSet &outer_ctx)
-      : estimator_(Hf32ModeAnalyzer::Analyze(body)) {
+  TaskCostCollector(const Stmt &body, const ConstrSet &outer_ctx,
+                    bool ordinal_costs)
+      : estimator_(Hf32ModeAnalyzer::Analyze(body), ordinal_costs) {
     constr_stack_ = outer_ctx.constrs_;
   }
 
@@ -2241,8 +2252,9 @@ private:
   const TaskCostMap &costs_;
 };
 
-Stmt RunEstimateLatency(const Stmt &body, const ConstrSet &outer_ctx) {
-  TaskCostMap costs = TaskCostCollector::Collect(body, outer_ctx);
+Stmt RunEstimateLatency(const Stmt &body, const ConstrSet &outer_ctx,
+                         bool ordinal_costs) {
+  TaskCostMap costs = TaskCostCollector::Collect(body, outer_ctx, ordinal_costs);
   ICHECK(!costs.empty()) << "EstimateLatency found no schedulable tasks inside "
                             "tilelang_root";
   TaskAnnotationRewriter rewriter(costs);
@@ -2253,12 +2265,19 @@ Stmt RunEstimateLatency(const Stmt &body, const ConstrSet &outer_ctx) {
 
 tvm::transform::Pass EstimateLatency() {
   auto pass_func = [](PrimFunc func, const IRModule &, const PassContext &) {
+    const auto target = func->GetAttr<Target>(tvm::attr::kTarget);
+    const bool ordinal_costs =
+        GetAscendTargetInfo(target.value_or(Target::Current())).architecture ==
+        AscendArchitecture::kDav2201;
+    func = WithAttr(std::move(func), "tl.ascend.cost_model",
+                    ffi::String(ordinal_costs ? "dav-2201.ordinal.uncalibrated"
+                                              : "dav-3510.cycles"));
     return RewriteTilelangKernels(
         std::move(func), "EstimateLatency",
-        [](const TilelangKernelContext &context) {
+        [ordinal_costs](const TilelangKernelContext &context) {
           SBlock root = context.root;
           root.CopyOnWrite()->body =
-              RunEstimateLatency(root->body, context.outer_ctx);
+              RunEstimateLatency(root->body, context.outer_ctx, ordinal_costs);
           return root;
         },
         /*require_kernel=*/false);

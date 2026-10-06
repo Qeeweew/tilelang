@@ -48,6 +48,7 @@
 #include "ascend/transform/auto_schedule/multi_buffer.h"
 #include "ascend/transform/auto_schedule/scheduled_tir.h"
 #include "ascend/transform/buffer_version.h"
+#include "ascend/transform/storage_footprint.h"
 #include "op/builtin.h"
 #include "transform/common/attr.h"
 
@@ -569,11 +570,13 @@ class MultiBufferOwnerPlanner {
 public:
   static ControlStorageClaims
   Plan(const std::vector<std::shared_ptr<IRStructure>> &root,
-       const StorageSet &excluded_storages, const L0StorageGroups &groups) {
+       const StorageSet &excluded_storages, const L0StorageGroups &groups,
+       const CompilerWorkspaceStorageSet &compiler_workspaces) {
     MultiBufferOwnerPlanner planner;
     StorageSet seen;
     for (const auto &node : root) {
-      for (const Var &storage : node->GetOnChipStorages()) {
+      for (const Var &storage :
+           node->GetMultiBufferCandidateStorages(compiler_workspaces)) {
         Var representative = groups.Representative(storage);
         if (!seen.insert(representative).second ||
             excluded_storages.count(representative))
@@ -703,7 +706,8 @@ public:
         expanded.insert(member);
     excluded_storages = std::move(expanded);
     ControlStorageClaims claims = MultiBufferOwnerPlanner::Plan(
-        scheduled_tir->tree, excluded_storages, groups);
+        scheduled_tir->tree, excluded_storages, groups,
+        GetCompilerWorkspaceStorages(scheduled_tir->metadata.kernel_root));
     MultiBufferAnnotator annotator(std::move(claims), std::move(manual_buffers),
                                    std::move(single_version_buffers), groups);
     annotator.RewriteNodes(scheduled_tir->tree);

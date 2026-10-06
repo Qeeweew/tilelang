@@ -34,6 +34,7 @@
 #include <string>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -43,6 +44,7 @@
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/ir/function.h>
 #include <tvm/runtime/logging.h>
+#include <tvm/tirx/analysis.h>
 #include <tvm/tirx/buffer.h>
 #include <tvm/tirx/builtin.h>
 #include <tvm/tirx/expr.h>
@@ -59,6 +61,7 @@
 #include "./auto_schedule/task_analysis.h"
 #include "./auto_schedule/task_annotations.h"
 #include "ascend/op/builtin.h"
+#include "ascend/target_utils.h"
 #include "ascend/transform/attr.h"
 #include "buffer_alias.h"
 #include "buffer_version.h"
@@ -74,6 +77,68 @@ using namespace ascend;
 using ffi::GetRef;
 
 namespace {
+
+// One logical version is one physical collective counter on dav-2201. On
+// dav-3510, mode 4 addresses an independent Cube-side counter for each AIV.
+// Allocation, steady-state issue, and finite fill/drain use this same contract.
+struct CrossCoreSyncContract {
+  bool collective;
+  int num_aiv_subcores;
+
+  int Mode() const { return collective ? 2 : 4; }
+  int CubeChannels() const { return collective ? 1 : num_aiv_subcores; }
+  int CubeFlagBase(int base_id, int channel) const {
+    ICHECK_LT(channel, CubeChannels());
+    return base_id + (collective ? 0 : 16 * channel);
+  }
+};
+
+std::vector<Var> CollectAivLaneVariables(const Stmt &body) {
+  std::vector<Var> result;
+  PostOrderVisit(body, [&](const ffi::ObjectRef &node) {
+    const auto *attribute = node.as<AttrStmtNode>();
+    if (!attribute || attribute->attr_key != tirx::attr::thread_extent)
+      return;
+    const auto *binding = attribute->node.as<IterVarNode>();
+    if (binding && binding->thread_tag == "cthread")
+      result.push_back(binding->var);
+  });
+  return result;
+}
+
+// Follow existing lexical Bind/range facts; proving a guard under itself
+// would conceal lane divergence. Mutable reads have no uniformity contract.
+// Data predicates inside task bodies are deliberately excluded so an empty
+// owner still reaches its completion task.
+bool HasNonuniformCollectiveControl(const PrimExpr &expression,
+                                    const ConstrSet &context,
+                                    const std::vector<Var> &lane_variables) {
+  std::unordered_set<const VarNode *> varying;
+  for (const Var &lane : lane_variables)
+    varying.insert(lane.get());
+  auto is_varying = [&](const PrimExpr &value) {
+    bool result = false;
+    PostOrderVisit(value, [&](const ffi::ObjectRef &node) {
+      if (const auto *var = node.as<VarNode>())
+        result |= varying.count(var) != 0;
+      if (node.as<BufferLoadNode>() || node.as<ProducerLoadNode>())
+        result = true;
+      if (const auto *call = node.as<CallNode>())
+        result |= SideEffect(GetRef<PrimExpr>(call)) > CallEffectKind::kPure;
+    });
+    return result;
+  };
+  for (const Constr &constraint : context.constrs_) {
+    if (constraint.kind == Constr::kBindValue && is_varying(constraint.value)) {
+      varying.insert(constraint.var.get());
+    } else if (constraint.kind == Constr::kBindRange &&
+               (is_varying(constraint.range->min) ||
+                is_varying(constraint.range->extent))) {
+      varying.insert(constraint.var.get());
+    }
+  }
+  return is_varying(expression);
+}
 
 // ============================================================================
 // Synchronization site/edge model, collection, and lookup
@@ -764,11 +829,17 @@ std::string GetHardEvent(const std::string &producer_pipe,
 }
 
 // These are the same-pipe dependencies the materializer satisfies without a
-// barrier. MTE/FIX issue order alone does not protect overlapping accesses.
+// barrier. On dav-2201, native MemBase vector instructions need PIPE_V
+// completion for dependent UB accesses; instruction issue order is weaker.
+// Leave the existing dav-3510 VF behavior unchanged; its completion contract
+// needs separate evidence. MTE/FIX issue order alone does not protect
+// overlapping accesses either.
 // SyncInsertionSite stores raw GetResourcePipeName values; the PIPE_ prefix
 // belongs only to names emitted for flags and barriers.
-bool HasImplicitSamePipeOrder(const std::string &pipe) {
-  return pipe == "S" || pipe == "V" || pipe == "M";
+bool HasImplicitSamePipeOrder(const std::string &pipe,
+                             AscendArchitecture architecture) {
+  return pipe == "S" || pipe == "M" ||
+         (pipe == "V" && architecture != AscendArchitecture::kDav2201);
 }
 
 // ============================================================================
@@ -778,12 +849,14 @@ class SyncAnalyzer : public BufferAliasAnalysisContext {
 public:
   explicit SyncAnalyzer(const MultiBufferPlan &multi_buffer_plan,
                         const EpochDomainRegistry &domains,
+                        AscendArchitecture architecture,
                         BufferVersionMap manual = {},
                         ConflictHintList root_conflicts = {},
                         L0StorageGroups storage_groups = L0StorageGroups())
       : storage_groups_(std::move(storage_groups)),
         multi_buffer_plan_(multi_buffer_plan), domains_(domains),
-        manual_(std::move(manual)), root_conflicts_(std::move(root_conflicts)),
+        architecture_(architecture), manual_(std::move(manual)),
+        root_conflicts_(std::move(root_conflicts)),
         site_registry_(domains) {
     for (const MultiBufferInfo &info : multi_buffer_plan_.Infos()) {
       ICHECK(!info.owners.empty());
@@ -937,7 +1010,7 @@ private:
     const auto &sites = site_registry_.Sites();
     return sites[src].core == sites[dst].core &&
            sites[src].pipe == sites[dst].pipe &&
-           HasImplicitSamePipeOrder(sites[src].pipe);
+           HasImplicitSamePipeOrder(sites[src].pipe, architecture_);
   }
 
   bool HasCompletionEdge(const DepClosure &closure, size_t src,
@@ -1454,7 +1527,7 @@ private:
           int64_t distance = int64_t(a.path_begin->GetStage()) -
                              b.path_begin->GetStage() + (src < dst ? 0 : 1);
           ICHECK(order.AddEdge(src, dst, std::max<int64_t>(distance, 0),
-                               HasImplicitSamePipeOrder(a.pipe)));
+                               HasImplicitSamePipeOrder(a.pipe, architecture_)));
         }
       }
     }
@@ -1734,6 +1807,7 @@ private:
   L0StorageGroups storage_groups_;
   const MultiBufferPlan &multi_buffer_plan_;
   const EpochDomainRegistry &domains_;
+  AscendArchitecture architecture_;
   BufferVersionMap manual_;
   MultiBufferOwnerMap multi_buffer_owners_;
   ConflictHintList root_conflicts_;
@@ -1788,6 +1862,9 @@ struct FlagAllocation {
 // range regardless of mode.
 class ExplicitCrossCoreFlagCollector : public TaskAwareConstrVisitor {
 public:
+  explicit ExplicitCrossCoreFlagCollector(const CrossCoreSyncContract &contract)
+      : contract_(contract) {}
+
   CrossCoreFlagReservation Collect(const Stmt &stmt) {
     operator()(stmt);
     return std::move(reservation_);
@@ -1801,10 +1878,23 @@ private:
           << "ascend_cross_core_set_flag/wait_flag expects exactly 3 "
              "arguments";
 
+      if (contract_.collective) {
+        const auto *mode = op->args[0].as<IntImmNode>();
+        ICHECK(mode && mode->value >= 0 && mode->value <= 2)
+            << "dav-2201 cross-core synchronization supports modes 0, 1, 2; "
+               "mode 4 and independent per-AIV Cube counters require dav-3510";
+      }
       const PrimExpr &flag_id = op->args[2];
       arith::Analyzer analyzer;
       GetConstrSet().Populate(analyzer);
       arith::ConstIntBound bound = analyzer.const_int_bound(flag_id);
+      if (contract_.collective) {
+        ICHECK_GE(bound->min_value, 0)
+            << "dav-2201 cross-core flag IDs must be provably in [0, 15]";
+        ICHECK_LE(bound->max_value, 15)
+            << "dav-2201 cross-core flag IDs must be provably in [0, 15]; "
+               "per-AIV flag + 16 channels require dav-3510";
+      }
       arith::Analyzer unconstrained_analyzer;
       Var unconstrained_flag_id("unconstrained_cross_core_flag_id",
                                 flag_id.dtype());
@@ -1827,12 +1917,13 @@ private:
     ConstrVisitor::VisitExpr_(op);
   }
 
+  const CrossCoreSyncContract &contract_;
   CrossCoreFlagReservation reservation_;
 };
 
-CrossCoreFlagReservation
-CollectExplicitCrossCoreFlags(const Stmt &kernel_body) {
-  ExplicitCrossCoreFlagCollector collector;
+CrossCoreFlagReservation CollectExplicitCrossCoreFlags(
+    const Stmt &kernel_body, const CrossCoreSyncContract &contract) {
+  ExplicitCrossCoreFlagCollector collector(contract);
   return collector.Collect(kernel_body);
 }
 
@@ -1842,11 +1933,11 @@ public:
                 std::vector<SyncPoint> &sync_points,
                 const std::set<std::pair<size_t, size_t>> &reusable_pairs,
                 const CrossCoreFlagReservation &cross_core_flag_reservation,
-                int num_aiv_subcores)
+                const CrossCoreSyncContract &cross_core_contract)
       : site_registry_(site_registry), sync_points_(sync_points),
         reusable_pairs_(reusable_pairs),
         cross_core_flag_reservation_(cross_core_flag_reservation),
-        num_aiv_subcores_(num_aiv_subcores) {}
+        cross_core_contract_(cross_core_contract) {}
 
   void Plan() {
     allocations_.clear();
@@ -1876,8 +1967,8 @@ public:
            "integer range cannot be bounded; constrain the flag_id with a "
            "constant-range loop or disable AutoSchedule";
 
-    // All cross-core modes share the same 16 base slots. The Cube side may
-    // additionally address slot + 16 for the second Vector core.
+    // All cross-core modes share 16 base slots. Only dav-3510 mode 4 has
+    // separate Cube-side channels addressed by slot + 16 * AIV lane.
     std::array<bool, kCrossCoreFlagLimit> cross_core_slots{};
     for (const auto &[lo, hi] :
          cross_core_flag_reservation_.explicit_id_ranges) {
@@ -2110,19 +2201,25 @@ private:
         flag_infos_.push_back(FlagInfo{kCoreVector, Integer(base_id + version),
                                        producer_pipe, 1});
       }
-      for (int sid = 0; sid < num_aiv_subcores_; ++sid) {
+      for (int channel = 0; channel < cross_core_contract_.CubeChannels();
+           ++channel) {
         for (int version = 0; version < allocation.num_versions; ++version) {
-          flag_infos_.push_back(FlagInfo{kCoreCube,
-                                         Integer(base_id + sid * 16 + version),
-                                         consumer_pipe, 2});
+          flag_infos_.push_back(FlagInfo{
+              kCoreCube,
+              Integer(cross_core_contract_.CubeFlagBase(base_id, channel) +
+                      version),
+              consumer_pipe, 2});
         }
       }
     } else {
-      for (int sid = 0; sid < num_aiv_subcores_; ++sid) {
+      for (int channel = 0; channel < cross_core_contract_.CubeChannels();
+           ++channel) {
         for (int version = 0; version < allocation.num_versions; ++version) {
-          flag_infos_.push_back(FlagInfo{kCoreCube,
-                                         Integer(base_id + sid * 16 + version),
-                                         producer_pipe, 1});
+          flag_infos_.push_back(FlagInfo{
+              kCoreCube,
+              Integer(cross_core_contract_.CubeFlagBase(base_id, channel) +
+                      version),
+              producer_pipe, 1});
         }
       }
       for (int version = 0; version < allocation.num_versions; ++version) {
@@ -2139,7 +2236,7 @@ private:
   std::vector<SyncPoint> &sync_points_;
   const std::set<std::pair<size_t, size_t>> &reusable_pairs_;
   const CrossCoreFlagReservation &cross_core_flag_reservation_;
-  int num_aiv_subcores_;
+  const CrossCoreSyncContract &cross_core_contract_;
   std::vector<FlagAllocation> allocations_;
   FlagInfoList flag_infos_;
   std::vector<size_t> counter_channel_representative_;
@@ -2346,9 +2443,13 @@ public:
   SyncMaterializer(const SyncSiteRegistry &site_registry,
                    const std::vector<SyncPoint> &sync_points,
                    const std::vector<FlagAllocation> &allocations,
-                   int num_aiv_subcores)
+                   AscendArchitecture architecture,
+                   const CrossCoreSyncContract &cross_core_contract,
+                   const std::vector<Var> &lane_variables)
       : site_registry_(site_registry), sync_points_(sync_points),
-        allocations_(allocations), num_aiv_subcores_(num_aiv_subcores) {}
+        allocations_(allocations), architecture_(architecture),
+        cross_core_contract_(cross_core_contract),
+        lane_variables_(lane_variables) {}
 
   void Run(std::vector<std::shared_ptr<IRStructure>> &root) {
     InsertSyncPoints();
@@ -2369,8 +2470,7 @@ private:
 
       if (!site_registry_.IsCrossCore(sync_point) &&
           producer_pipe == consumer_pipe) {
-        if (producer_pipe == "PIPE_S" || producer_pipe == "PIPE_V" ||
-            producer_pipe == "PIPE_M") {
+        if (HasImplicitSamePipeOrder(src.pipe, architecture_)) {
           continue;
         }
         InsertStatement(dst.path_end, MakeAscendPipeBarrier(producer_pipe),
@@ -2385,33 +2485,44 @@ private:
                                           sync_point.num_versions, base_id);
 
       if (site_registry_.IsCrossCore(sync_point)) {
+        if (cross_core_contract_.collective) {
+          ICHECK_EQ(cross_core_contract_.num_aiv_subcores, 2)
+              << "dav-2201 mixed completion requires both physical AIV lanes; "
+                 "use MixedKernel(sids=2) and keep empty-owner predicates "
+                 "inside data task bodies";
+          ValidateCollectiveSite(src);
+          ValidateCollectiveSite(dst);
+        }
+        int mode = cross_core_contract_.Mode();
         if (src.core == kCoreVector) {
           InsertStatement(
               src.path_end,
-              MakeAscendCrossCoreSetFlag(4, producer_pipe, event_id), false,
+              MakeAscendCrossCoreSetFlag(mode, producer_pipe, event_id), false,
               src.core, producer_guard);
-          for (int sid = 0; sid < num_aiv_subcores_; ++sid) {
-            PrimExpr wait_id =
-                MakeFlagEventId(sync_point.flag_iteration,
-                                sync_point.num_versions, base_id + 16 * sid);
+          for (int channel = 0; channel < cross_core_contract_.CubeChannels();
+               ++channel) {
+            PrimExpr wait_id = MakeFlagEventId(
+                sync_point.flag_iteration, sync_point.num_versions,
+                cross_core_contract_.CubeFlagBase(base_id, channel));
             InsertStatement(
                 dst.path_end,
-                MakeAscendCrossCoreWaitFlag(4, consumer_pipe, wait_id), true,
+                MakeAscendCrossCoreWaitFlag(mode, consumer_pipe, wait_id), true,
                 dst.core, consumer_guard);
           }
         } else {
-          for (int sid = 0; sid < num_aiv_subcores_; ++sid) {
-            PrimExpr set_id =
-                MakeFlagEventId(sync_point.flag_iteration,
-                                sync_point.num_versions, base_id + 16 * sid);
+          for (int channel = 0; channel < cross_core_contract_.CubeChannels();
+               ++channel) {
+            PrimExpr set_id = MakeFlagEventId(
+                sync_point.flag_iteration, sync_point.num_versions,
+                cross_core_contract_.CubeFlagBase(base_id, channel));
             InsertStatement(
                 src.path_end,
-                MakeAscendCrossCoreSetFlag(4, producer_pipe, set_id), false,
+                MakeAscendCrossCoreSetFlag(mode, producer_pipe, set_id), false,
                 src.core, producer_guard);
           }
           InsertStatement(
               dst.path_end,
-              MakeAscendCrossCoreWaitFlag(4, consumer_pipe, event_id), true,
+              MakeAscendCrossCoreWaitFlag(mode, consumer_pipe, event_id), true,
               dst.core, consumer_guard);
         }
         continue;
@@ -2422,6 +2533,46 @@ private:
       InsertStatement(dst.path_end, MakeAscendWaitFlag(hard_event, event_id),
                       true, dst.core, consumer_guard);
     }
+  }
+
+  static ConstrSet GetSiteContext(const SyncInsertionSite &site) {
+    if (site.path_end->IsTask())
+      return static_cast<TaskNode *>(site.path_end)
+          ->GetContextBeforeConditionGuards();
+    return static_cast<ControlNode *>(site.path_end)
+        ->task->GetContextBeforeConditionGuards();
+  }
+
+  void ValidateCollectiveSite(const SyncInsertionSite &site) const {
+    const EpochDomain &domain = site_registry_.Domain(site);
+    ICHECK(!HasNonuniformCollectiveControl(
+        domain.active_guard, GetSiteContext(site), lane_variables_))
+        << "dav-2201 collective epoch activation must be uniform across AIC "
+           "and both AIV lanes; keep lane/empty data predicates inside tasks";
+    for (IRStructure *node : site.path_end->PathFrom()) {
+      ConstrSet context =
+          node->IsTask()
+              ? static_cast<TaskNode *>(node)->GetContextBeforeConditionGuards()
+              : static_cast<ControlNode *>(node)
+                    ->task->GetContextBeforeConditionGuards();
+      ICHECK(!HasNonuniformCollectiveControl(node->GetConditionGuard(), context,
+                                             lane_variables_))
+          << "dav-2201 collective completion cannot be enclosed by a "
+             "lane-dependent or mutable task guard; keep the data predicate "
+             "inside T.Task/T.PerCoreTask so empty lanes still complete";
+      if (node->IsControl()) {
+        const For &loop = static_cast<ControlNode *>(node)->control;
+        ICHECK(!HasNonuniformCollectiveControl(loop->min, context,
+                                               lane_variables_) &&
+               !HasNonuniformCollectiveControl(loop->extent, context,
+                                               lane_variables_))
+            << "dav-2201 collective completion requires a uniform owner loop; "
+               "a possibly empty lane traversal belongs inside a data task";
+      }
+    }
+    ICHECK(!HasNonuniformCollectiveControl(
+        site.GetGuard(), GetSiteContext(site), lane_variables_))
+        << "dav-2201 collective synchronization guard must be uniform";
   }
 
   void MaterializeInsertions(std::vector<std::shared_ptr<IRStructure>> &nodes,
@@ -2476,15 +2627,22 @@ private:
   const SyncSiteRegistry &site_registry_;
   const std::vector<SyncPoint> &sync_points_;
   const std::vector<FlagAllocation> &allocations_;
-  int num_aiv_subcores_;
+  AscendArchitecture architecture_;
+  const CrossCoreSyncContract &cross_core_contract_;
+  const std::vector<Var> &lane_variables_;
 };
 
 // ============================================================================
 // Kernel-level validation and scheduled-TIR rewrite
 // ============================================================================
-SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir) {
+SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
+                        Target target, const std::vector<Var> &lane_variables) {
   std::vector<std::shared_ptr<IRStructure>> &root = scheduled_tir.tree;
-  int num_aiv_subcores = scheduled_tir.metadata.num_aiv_subcores.value_or(2);
+  const AscendTargetInfo &target_info = GetAscendTargetInfo(target);
+  CrossCoreSyncContract cross_core_contract{
+      target_info.architecture == AscendArchitecture::kDav2201,
+      scheduled_tir.metadata.num_aiv_subcores.value_or(
+          target_info.aiv_per_aic)};
   L0StorageGroups groups(
       CollectL0SFBindings(scheduled_tir.metadata.kernel_root));
   MultiBufferPlan multi_buffer_plan =
@@ -2497,7 +2655,8 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir) {
   }
   EpochDomainRegistry domains(root, multi_buffer_plan);
   SyncAnalyzer analyzer(
-      multi_buffer_plan, domains, scheduled_tir.metadata.manual_buffer_versions,
+      multi_buffer_plan, domains, target_info.architecture,
+      scheduled_tir.metadata.manual_buffer_versions,
       std::move(scheduled_tir.metadata.root_conflict_hints), groups);
   scheduled_tir.metadata.root_conflict_hints = {};
   analyzer.Analyze(root);
@@ -2505,13 +2664,14 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir) {
   scheduled_tir.metadata.has_buffer_aliases = true;
 
   CrossCoreFlagReservation cross_core_flag_reservation =
-      CollectExplicitCrossCoreFlags(kernel_body);
-  FlagAllocator flag_allocator(analyzer.SiteRegistry(), analyzer.SyncPoints(),
-                               analyzer.ReusablePairs(),
-                               cross_core_flag_reservation, num_aiv_subcores);
+      CollectExplicitCrossCoreFlags(kernel_body, cross_core_contract);
+  FlagAllocator flag_allocator(
+      analyzer.SiteRegistry(), analyzer.SyncPoints(), analyzer.ReusablePairs(),
+      cross_core_flag_reservation, cross_core_contract);
   flag_allocator.Plan();
   SyncMaterializer(analyzer.SiteRegistry(), analyzer.SyncPoints(),
-                   flag_allocator.Allocations(), num_aiv_subcores)
+                   flag_allocator.Allocations(), target_info.architecture,
+                   cross_core_contract, lane_variables)
       .Run(root);
   FlagInfoList flag_infos = flag_allocator.TakeFlagInfos();
 
@@ -2526,11 +2686,13 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir) {
                            info.core_mask, 0));
     } else if (info.mode == 1) {
       prefix.push_back(MakeSyncTaskNode(
-          MakeAscendCrossCoreSetFlag(4, info.hardevent, info.flag_var),
+          MakeAscendCrossCoreSetFlag(cross_core_contract.Mode(), info.hardevent,
+                                     info.flag_var),
           info.core_mask, 0));
     } else if (info.mode == 2) {
       suffix.push_back(MakeSyncTaskNode(
-          MakeAscendCrossCoreWaitFlag(4, info.hardevent, info.flag_var),
+          MakeAscendCrossCoreWaitFlag(cross_core_contract.Mode(),
+                                      info.hardevent, info.flag_var),
           info.core_mask, 0));
     }
   }
@@ -2552,12 +2714,18 @@ tvm::transform::Pass InsertSync() {
   using namespace tirx::transform;
   auto pass_func = [](PrimFunc func, const IRModule &,
                       const tvm::transform::PassContext &) -> PrimFunc {
+    auto target_opt = func->GetAttr<Target>(tvm::attr::kTarget);
+    ICHECK(target_opt.defined()) << "InsertSync requires a bound Ascend target "
+                                    "before completion planning";
+    Target target = target_opt.value();
+    std::vector<Var> lane_variables = CollectAivLaneVariables(func->body);
     return RewriteTilelangKernels(
         std::move(func), "InsertSync",
-        [](const TilelangKernelContext &context) {
+        [&](const TilelangKernelContext &context) {
           ScheduledTIR scheduled_tir = DecodeScheduledTIR(
               context.root, context.outer_ctx, MakeSyncInsertionExtraInfo);
-          return InsertKernelSync(context.root->body, std::move(scheduled_tir));
+          return InsertKernelSync(context.root->body, std::move(scheduled_tir),
+                                  target, lane_variables);
         });
   };
   return CreatePrimFuncPass(pass_func, 0, "tl.InsertSync", {});

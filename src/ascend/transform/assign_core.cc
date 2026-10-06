@@ -262,11 +262,9 @@ private:
       : root_(root), all_tasks_(all_tasks), availability_(all_tasks) {
     if (outer_sid.has_value())
       availability_.SetExternalVarCoreMask(outer_sid.value(), kCoreVector);
-    for (TaskNode *task : all_tasks_) {
-      ICHECK_EQ(task->GetCoreMask(), kCoreUnassigned)
-          << "AssignCore expects unresolved scheduled TIR and must run once "
-             "before PrepareMultiBuffer";
-    }
+    // Materialization can already supply a lexical CUBE/VECTOR ownership
+    // constraint. Candidate assignment intersects it with instruction
+    // capabilities before dataflow further narrows placement.
   }
 
   void Run() {
@@ -342,8 +340,16 @@ private:
   }
 
   void AssignCandidateCoreMasks() {
-    for (TaskNode *task : all_tasks_)
-      task->SetCoreMask(GetCandidateCoreMask(task));
+    for (TaskNode *task : all_tasks_) {
+      CoreMask candidate = GetCandidateCoreMask(task);
+      if (task->GetCoreMask() != kCoreUnassigned)
+        candidate &= task->GetCoreMask();
+      ICHECK_NE(candidate, kCoreUnassigned)
+          << "Task instruction resources conflict with its CUBE/VECTOR "
+             "core ownership metadata: "
+          << task->stmt;
+      task->SetCoreMask(candidate);
+    }
   }
 
   void PropagateCandidateCapabilities() {

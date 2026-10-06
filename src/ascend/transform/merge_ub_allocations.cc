@@ -295,15 +295,16 @@ MemoryPlan BuildAliasMemoryPlan(const AllocationMap &allocations,
   for (size_t index = 0; index < ordered_vars.size(); ++index) {
     const Var &var = ordered_vars[index];
     const AllocBufferNode *alloc = allocations.at(var.get());
-    std::optional<int64_t> elements =
-        GetRef<AllocBuffer>(alloc).ConstantAllocationSize();
-    if (!elements.has_value()) {
+    arith::Analyzer analyzer;
+    PrimExpr bytes =
+        analyzer.Simplify(GetBufferSizeBytes(alloc, DataType::Int(64)));
+    const auto *constant_bytes = bytes.as<IntImmNode>();
+    if (!constant_bytes) {
       dynamic.push_back(var);
       continue;
     }
-    int elem_bits = alloc->buffer->dtype.bits() * alloc->buffer->dtype.lanes();
-    size_t size =
-        static_cast<size_t>(PackedBytesFromElems(elements.value(), elem_bits));
+    ICHECK_GE(constant_bytes->value, 0);
+    size_t size = static_cast<size_t>(constant_bytes->value);
     constant.push_back({var, size,
                         std::max(align_bytes, AscendScopeAlignBytes(alloc)),
                         index});

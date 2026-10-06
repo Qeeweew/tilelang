@@ -6,6 +6,17 @@ from tilelang.transform import _ffi_api
 from . import z3_scheduler  # noqa: F401
 
 
+def AscendValidateTarget():
+    """Check frontend operations against the bound Ascend architecture.
+
+    Run once before layout inference and scheduling. The initial dav-2201
+    native path supports FP16/BF16 Cube GEMM. Logical Cube/vector handoffs and
+    ordinary vector expressions proceed to their ownership and lowering
+    boundaries; unavailable hardware interfaces are rejected here.
+    """
+    return _ffi_api.AscendValidateTarget()  # type: ignore
+
+
 def InsertNd2Nz():
     """Rewrite layout-driven UB ND->UB NZ and UB->L1 ND->NZ copies."""
     return _ffi_api.InsertNd2Nz()  # type: ignore
@@ -134,6 +145,34 @@ def AscendSimdVFLowerParallel():
     return _ffi_api.AscendSimdVFLowerParallel()  # type: ignore
 
 
+def AscendLowerGMHandoff():
+    """Expose 2201 logical L0C->UB and UB->L1 routes through GM buffers."""
+    return _ffi_api.AscendLowerGMHandoff()  # type: ignore
+
+
+def AscendLowerMixedPartition():
+    """Establish two private AIV row owners for common mixed vector intent."""
+    return _ffi_api.AscendLowerMixedPartition()  # type: ignore
+
+
+def AscendLowerVectorReduce():
+    """Lower trailing-axis 2201 reductions with visible partial UB scratch."""
+    return _ffi_api.AscendLowerVectorReduce()  # type: ignore
+
+
+def AscendLowerVectorTiles():
+    """Lower ordinary pure-vector 2201 Parallel tiles to native MemBase ops.
+
+    Run after layout inference and OOB normalization, before scheduling. Dense
+    float16/float32 arithmetic becomes native count-mode vector instructions;
+    temporary private UB allocations and exact pointer effects are visible to
+    scheduling. Outer row traversal remains a control loop for row broadcasts.
+    Unsupported layouts, expressions, and mixed-core ownership are diagnosed.
+    The dav-3510 VF path is preserved.
+    """
+    return _ffi_api.AscendLowerVectorTiles()  # type: ignore
+
+
 def AscendThreadSync(storage_scope: str):
     """Insert thread-storage synchronization independently within each SIMT_VF."""
     return _ffi_api.AscendThreadSync(storage_scope)
@@ -162,6 +201,16 @@ def AscendInsertOOBPadding():
     codegen emits as asc_fill_l1.
     """
     return _ffi_api.AscendInsertOOBPadding()  # type: ignore
+
+
+def AscendNormalizeCubeCopyFootprints():
+    """Expose dav-2201 whole-fractal L1->L0 reads/writes after OOB padding.
+
+    The same native geometry proof is consumed by late copy lowering. These
+    typed regions let scheduling order padding producers and buffer reuse;
+    the logical GEMM domain is unchanged. Other architectures are unaffected.
+    """
+    return _ffi_api.AscendNormalizeCubeCopyFootprints()  # type: ignore
 
 
 def InferBufferAliases():
@@ -222,12 +271,29 @@ def RewriteFlagToBuf():
     return _ffi_api.RewriteFlagToBuf()  # type: ignore
 
 
+def AscendLowerL1Gemm():
+    """Expose dav-2201 L1-to-L0 copies, operand buffers, and sub-K MADs.
+
+    Runs before layout inference and scheduling. A bounded serial sub-K loop
+    and at most one static tail preserve the logical regions and accumulator
+    semantics without expanding the K trip count into the compiler IR.
+    """
+    return _ffi_api.AscendLowerL1Gemm()  # type: ignore
+
+
 __all__ = [
+    "AscendLowerL1Gemm",
+    "AscendValidateTarget",
     "NormalizeAscendFractalStorage",
     "AnnotateMultiBufferEligible",
     "AscendRemoveNoOp",
     "AscendInsertOOBPadding",
+    "AscendNormalizeCubeCopyFootprints",
     "AscendSimdVFLowerParallel",
+    "AscendLowerVectorTiles",
+    "AscendLowerVectorReduce",
+    "AscendLowerGMHandoff",
+    "AscendLowerMixedPartition",
     "AscendThreadSync",
     "AscendLayoutInference",
     "AscendLowerTileOp",

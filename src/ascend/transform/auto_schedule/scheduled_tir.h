@@ -64,6 +64,17 @@ inline bool IsScheduleGuardAttribute(const ffi::String &key) {
          key == tl::attr::kAssumeRequiresRuntimeCheck;
 }
 
+inline bool IsScheduledCthreadBinding(const tirx::AttrStmtNode *attribute) {
+  const auto *thread = attribute->node.as<tirx::IterVarNode>();
+  return attribute->attr_key == tirx::attr::thread_extent &&
+         thread != nullptr && thread->thread_tag == "cthread";
+}
+
+inline bool IsScheduleGuardAttribute(const tirx::AttrStmtNode *attribute) {
+  return IsScheduleGuardAttribute(attribute->attr_key) ||
+         IsScheduledCthreadBinding(attribute);
+}
+
 inline tirx::Stmt WrapScheduledGuards(tirx::Stmt body,
                                       const GuardList &guards) {
   for (auto it = guards.rbegin(); it != guards.rend(); ++it)

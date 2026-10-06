@@ -216,7 +216,14 @@ private:
     return SeqStmt::Flatten(sequence);
   }
 
-  Stmt VisitStmt_(const SBlockNode *op) final { return GetRef<SBlock>(op); }
+  Stmt VisitStmt_(const SBlockNode *op) final {
+    // Core ownership is a scope, not an atomic instruction. Its control
+    // expressions require the same evaluate-on-entry snapshots as unscoped
+    // serial loops. VF and user atomic blocks retain their existing boundary.
+    if (op->name_hint == "CUBE" || op->name_hint == "VECTOR")
+      return StmtExprMutator::VisitStmt_(op);
+    return GetRef<SBlock>(op);
+  }
 };
 
 using namespace tirx::transform;

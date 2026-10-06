@@ -73,6 +73,10 @@ enum class SpecialRegister : uint16_t {
   kPipeFixpipe = 1 << 9,
   kPipeScalar = 1 << 10,
   kMmadDirection = 1 << 11, // set_mmad_direction <- read by Cube (MAD) ops
+  // NZ-to-ND copy configuration is set and consumed inside each FIX copy.
+  kFixpipeNz2Nd = 1 << 12,
+  // Native select sets and consumes CMPMASK inside one atomic V operation.
+  kCmpMask = 1 << 13,
 };
 
 inline uint16_t PipeSpecialRegisterMask(uint16_t pipe_mask) {
@@ -399,19 +403,24 @@ public:
     return ReadsStorage(storage) || WritesStorage(storage);
   }
 
-  // Return unique on-chip storage identities touched by this node. Composite
+  // Return unique automatic-version candidates touched by this node. Composite
   // nodes include their complete subtree through GetRead/WriteRegions().
   // MX scale-factor handles count as storage here so the multi-buffer
   // eligibility planner claims an owner loop for them; their version count
   // is never chosen independently — AutoSchedule copies it from the bound
   // data tile after selection.
-  std::vector<Var> GetOnChipStorages() const {
+  // Only compiler-registered GM workspace joins the on-chip candidates;
+  // ordinary external tensors and unknown global scratch retain one storage.
+  std::vector<Var> GetMultiBufferCandidateStorages(
+      const std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual>
+          &compiler_workspaces) const {
     std::vector<Var> storages;
     std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> seen;
     auto collect = [&](const std::vector<BufferRegion> &regions) {
       for (const BufferRegion &region : regions) {
         if ((IsAscendOnChipBuffer(region->buffer) ||
-             IsL0SFBuffer(region->buffer)) &&
+             IsL0SFBuffer(region->buffer) ||
+             compiler_workspaces.count(region->buffer->data)) &&
             seen.insert(region->buffer->data).second) {
           storages.push_back(region->buffer->data);
         }
@@ -449,6 +458,13 @@ public:
       mask |= static_cast<uint16_t>(SpecialRegister::kPadValue);
     if (ReadsAtomicRegister())
       mask |= static_cast<uint16_t>(SpecialRegister::kAtomicMode);
+    if (UsesPipe(ResourcePipe::kFixpipe))
+      mask |= static_cast<uint16_t>(SpecialRegister::kFixpipeNz2Nd);
+    // select_bits owns a nonescaping CMPMASK write/consume pair. Only that
+    // task reads the mask; ordinary Vector arithmetic is independent of it.
+    if (GetSpecialWriteMask() &
+        static_cast<uint16_t>(SpecialRegister::kCmpMask))
+      mask |= static_cast<uint16_t>(SpecialRegister::kCmpMask);
     mask |= PipeSpecialRegisterMask(GetPipeMask());
     return mask;
   }

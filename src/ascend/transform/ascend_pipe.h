@@ -199,6 +199,9 @@ inline uint16_t GetAscendCallPipeMask(const Call &call) {
   const Op &op = callee.value();
   const std::string &name = op->name;
 
+  if (name.rfind("tl.ascend_membase.", 0) == 0)
+    return PipeMask(ResourcePipe::kVector);
+
   static const Op &fill_op = Op::Get("tl.tileop.fill");
   if (IsAscendCopyCall(call.get())) {
     Copy copy(call->args, call->annotations);
@@ -231,6 +234,8 @@ inline uint16_t GetAscendCallPipeMask(const Call &call) {
     return PipeMask(ResourcePipe::kMTE2);
   }
   if (op.same_as(ascend_load_cbuf_to_ca()) ||
+      op.same_as(ascend_load_cbuf_to_ca_2d()) ||
+      op.same_as(ascend_load_cbuf_to_cb_2d()) ||
       op.same_as(ascend_load_cbuf_to_cb()) || op.same_as(ascend_load_ca_sf()) ||
       op.same_as(ascend_load_cb_sf())) {
     return PipeMask(ResourcePipe::kMTE1);

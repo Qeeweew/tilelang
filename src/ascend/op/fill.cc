@@ -108,11 +108,23 @@ Stmt LowerL1Fill(const FillNode &op, const LowerArgs &lower_args,
                          make_const(c0_range->min.dtype(), 32));
   int fill_word_bits = bits <= 16 ? 16 : 32;
 
-  return Evaluate(
+  // Padding may be empty on a full tile. Keep this data predicate inside the
+  // already scheduled fill task so its completion still participates, while
+  // only issuing native create_cbuf_matrix with positive repeat/block counts.
+  PrimExpr has_data = analyzer->Simplify(
+      (repeat_times > make_zero(repeat_times.dtype())) &&
+      (block_num > make_zero(block_num.dtype())));
+  if (is_zero(has_data))
+    return Evaluate(make_zero(DataType::Int(32)));
+
+  Stmt fill = Evaluate(
       Call(DataType::Void(), ascend_fill_l1(),
            {MakeL1BasePtr(op), byte_offset, make_const(DataType::UInt(32), 0),
             repeat_times, block_num, dst_gap,
             make_const(DataType::Int(32), fill_word_bits)}));
+  if (!is_one(has_data))
+    fill = IfThenElse(has_data, fill);
+  return fill;
 }
 
 Stmt LowerAscendFill(const FillNode &op, const LowerArgs &lower_args,

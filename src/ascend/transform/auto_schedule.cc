@@ -26,6 +26,7 @@
 #include <cmath>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -67,6 +68,7 @@
 #include "backend/common/target_utils.h"
 #include "op/utils.h"
 #include "runtime/thread_storage_scope.h"
+#include "storage_footprint.h"
 #include "support/check.h"
 #include "tir/transforms/ir_utils.h"
 #include "transform/common/collector.h"
@@ -79,6 +81,10 @@ using namespace tirx;
 using namespace ascend;
 
 namespace {
+
+// Ascend's Pipelined(None) records intent separately from the upstream maximum
+// buffer-version annotation. An explicit zero never emits this marker.
+constexpr const char *kAutoPipeline = "tl.ascend_auto_pipeline";
 
 // AutoSchedule target resource limits.
 
@@ -103,40 +109,13 @@ inline bool HasSimtVF(const tirx::Stmt &stmt) {
   return detector.found;
 }
 
-inline int64_t GetSharedMemoryLimit(const tirx::Stmt &kernel_body) {
-  constexpr int64_t kPhysicalUnifiedBufferSize = 248 * 1024;
-  constexpr int64_t kSimtVFThreadContextSize = 32 * 1024;
-  return HasSimtVF(kernel_body)
-             ? kPhysicalUnifiedBufferSize - kSimtVFThreadContextSize
-             : kPhysicalUnifiedBufferSize;
-}
-
-inline int64_t GetL1MemoryLimit(Target target) {
-  if (TargetIsAscend(target)) {
-    return 512 * 1024; // 512 KB L1 cache on Ascend
-  }
-  return 0;
-}
-
-inline int64_t GetL0CMemoryLimit(Target target) {
-  if (TargetIsAscend(target)) {
-    return 256 * 1024; // 256 KB L0C buffer on Ascend
-  }
-  return 0;
-}
-
-inline int64_t GetL0AMemoryLimit(Target target) {
-  if (TargetIsAscend(target)) {
-    return 64 * 1024; // 64 KB L0A buffer on Ascend
-  }
-  return 0;
-}
-
-inline int64_t GetL0BMemoryLimit(Target target) {
-  if (TargetIsAscend(target)) {
-    return 64 * 1024; // 64 KB L0B buffer on Ascend
-  }
-  return 0;
+inline int64_t GetSharedMemoryLimit(const tirx::Stmt &kernel_body,
+                                    const AscendTargetInfo &target_info) {
+  bool has_simt_vf = HasSimtVF(kernel_body);
+  ICHECK(!has_simt_vf || target_info.supports_simt_vf)
+      << "SimtVF is not supported on " << target_info.arch;
+  return target_info.ub_bytes -
+         (has_simt_vf ? target_info.simt_vf_context_bytes : 0);
 }
 
 // Scheduler.
@@ -190,6 +169,14 @@ public:
 
   void SetMemoryLimit(const std::string &scope, int64_t bytes) {
     memory_limits_[scope] = bytes;
+  }
+
+  void SetStorageSlotBytes(ffi::Map<Var, PrimExpr> slots) {
+    storage_slot_bytes_ = std::move(slots);
+  }
+
+  void SetCompilerWorkspaces(CompilerWorkspaceStorageSet storages) {
+    compiler_workspaces_ = std::move(storages);
   }
 
   // Set manual buffer version overrides (from annotate_buffer_versions).
@@ -261,6 +248,8 @@ private:
   }
 
   L0StorageGroups storage_groups_;
+  ffi::Map<Var, PrimExpr> storage_slot_bytes_;
+  CompilerWorkspaceStorageSet compiler_workspaces_;
   std::map<std::string, int64_t> memory_limits_;
   BufferVersionMap buffer_version_overrides_;
   BufferVersionMap manual_buffer_versions_;
@@ -707,15 +696,47 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
   if (num_stages_val.has_value()) {
     num_stages = num_stages_val.value().cast<IntImm>()->value;
   }
+  ICHECK_GT(num_stages, 0)
+      << "Ascend pipeline buffer-version bound must be positive";
+  bool auto_pipeline = false;
+  if (auto intent = ctrl->control->annotations.Get(kAutoPipeline))
+    auto_pipeline = intent.value().cast<bool>();
+  int stage_horizon = 0;
+  if (auto_pipeline && !manual_schedule) {
+    // Bound the search by the number of active asynchronous endpoints and the
+    // frontend maximum (four by default). This is a small optimization horizon,
+    // not a completeness guarantee or a required depth. The joint solve still
+    // chooses fewer stages/versions when dependencies or capacity favor that.
+    uint16_t pipes = ctrl->GetPipeMask() & ~PipeMask(ResourcePipe::kScalar);
+    int pipe_count = 0;
+    while (pipes != 0) {
+      pipe_count += pipes & 1;
+      pipes >>= 1;
+    }
+    num_stages = std::min(num_stages, std::max(pipe_count, 1));
+    num_stages = static_cast<int>(std::min<int64_t>(
+        num_stages, std::max<int64_t>(ctrl->GetTripCount(), 1)));
+    stage_horizon = num_stages;
+  }
 
   // When false, the Z3 loop scheduler keeps each resource's tasks within a
   // single II window (max(start) - min(start) < II). Sourced from the loop's
-  // "enable_offset" annotation; defaults to false (constraint applied).
-  bool enable_offset = false;
+  // "enable_offset" annotation. Automatic Pipelined intent enables offsets;
+  // otherwise preserve upstream's false default (constraint applied).
+  bool enable_offset = auto_pipeline;
   auto enable_offset_val =
       ctrl->control.get()->annotations.Get("enable_offset");
   if (enable_offset_val.has_value()) {
     enable_offset = enable_offset_val.value().cast<bool>();
+  }
+  if (!auto_pipeline && !manual_schedule && !num_stages_val.has_value() &&
+      !enable_offset) {
+    // A plain serial loop (including explicit Pipelined(num_stages=0))
+    // has no epoch-offset request. Keep every task in its original iteration.
+    // Leaving k unconstrained makes the solver search unbounded cross-pipe
+    // stages even though no pipeline was requested. Explicit
+    // positive version bounds and enable_offset retain their upstream policy.
+    stage_horizon = 1;
   }
 
   if (manual_schedule) {
@@ -732,7 +753,7 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
           << "Non-zero T.Stage values require enable_offset=True on the "
              "enclosing loop";
     }
-    if (!num_stages_val.has_value()) {
+    if (!num_stages_val.has_value() || auto_pipeline) {
       num_stages = max_manual_stage + 1;
     }
   }
@@ -784,6 +805,9 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
   std::vector<int64_t> group_capacities;
   std::vector<std::string> group_scopes;
   std::vector<std::vector<int64_t>> group_indices;
+  // Independent int64 byte-representation bounds, never an aggregate GM
+  // hardware capacity or a charge against an on-chip memory pool.
+  std::vector<int64_t> workspace_version_ids;
   for (const auto &entry : memory_limits_) {
     if (entry.second > 0) {
       scope_to_group[entry.first] = (int)group_capacities.size();
@@ -794,23 +818,21 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
   }
   std::unordered_map<Var, int, ObjectPtrHash, ObjectPtrEqual>
       annotated_storage_versions;
-  auto get_buffer_size = [](const Buffer &buffer) -> int64_t {
-    // Bits-based: dtype.bits()*lanes()/8 truncates sub-byte dtypes to 0
-    // (fp4 -> 0). Accumulate elements, then ceil(elements*bits/8).
-    int64_t elem_bits = buffer->dtype.bits() * buffer->dtype.lanes();
-    PrimExpr elems = IntImm(DataType::Int(64), 1);
-    for (const auto &dim : buffer->shape) {
-      elems *= dim;
-    }
-    PrimExpr size = FloorDiv(elems * IntImm(DataType::Int(64), elem_bits) +
-                                 IntImm(DataType::Int(64), 7),
-                             IntImm(DataType::Int(64), 8));
+  auto get_buffer_size = [&](const Buffer &buffer) -> int64_t {
+    auto slot = storage_slot_bytes_.Get(buffer->data);
+    ICHECK(slot.has_value())
+        << "AutoSchedule cannot find the allocation owner for storage "
+        << buffer->data->name_hint;
     arith::Analyzer analyzer;
-    auto size_val = analyzer.Simplify(size);
-    if (const auto *int_imm = size_val.as<IntImmNode>()) {
-      return int_imm->value;
-    }
-    return 0;
+    PrimExpr size = analyzer.Simplify(slot.value());
+    const auto *constant = size.as<IntImmNode>();
+    ICHECK(constant)
+        << "AutoSchedule requires a static physical storage footprint for "
+        << buffer->data->name_hint << ", got " << size;
+    ICHECK_GE(constant->value, 0)
+        << "AutoSchedule found a negative physical storage footprint for "
+        << buffer->data->name_hint;
+    return constant->value;
   };
   auto enumerate_buffers = [&](auto &&visit) {
     for (const auto &r : ctrl->GetReadRegions())
@@ -820,8 +842,9 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
   };
   enumerate_buffers([&](const Buffer &buffer) {
     if (!IsSharedBuffer(buffer) && !IsL1Buffer(buffer) &&
-        !IsL0CBuffer(buffer) && !IsL0ABuffer(buffer) && !IsL0BBuffer(buffer)) {
-      return; // Only consider on-chip buffers for multi-buffer
+        !IsL0CBuffer(buffer) && !IsL0ABuffer(buffer) && !IsL0BBuffer(buffer) &&
+        !compiler_workspaces_.count(buffer->data)) {
+      return;
     }
     if (seen_storages.insert(buffer->data).second)
       storage_resources.push_back({buffer->data, buffer});
@@ -830,6 +853,23 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
   for (const StorageResource &resource : storage_resources) {
     const Var &storage = resource.storage;
     const Buffer &buffer = resource.representative;
+    if (compiler_workspaces_.count(storage)) {
+      if (!ctrl->IsMultiBufferEligible(storage))
+        continue;
+      int64_t slot_bytes = get_buffer_size(buffer);
+      auto override_it = buffer_version_overrides_.find(storage);
+      if (override_it != buffer_version_overrides_.end()) {
+        int versions = (*override_it).second;
+        CheckCompilerWorkspaceVersionBytes(storage, slot_bytes, versions);
+        annotated_storage_versions[storage] = versions;
+      } else {
+        size_t id = storage_sizes.size();
+        storage_version_id.emplace(storage, id);
+        workspace_version_ids.push_back(static_cast<int64_t>(id));
+        storage_sizes.push_back(slot_bytes);
+      }
+      continue;
+    }
     std::string scope;
     if (IsL1Buffer(buffer)) {
       scope = "shared.l1";
@@ -869,15 +909,14 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
   for (size_t g = 0; g < group_capacities.size(); ++g) {
     int64_t capacity = group_capacities[g];
     const auto &idxs = group_indices[g];
+    if (capacity < 0) {
+      LOG(FATAL) << "Z3 loop scheduling failed: scope \"" << group_scopes[g]
+                 << "\" capacity is negative (" << capacity
+                 << "). Non-eligible and fixed-version buffers already exceed"
+                 << " the memory limit. Try using T.annotate_unlimit_memory(\""
+                 << group_scopes[g] << "\") or reduce buffer sizes.";
+    }
     if (!idxs.empty()) {
-      if (capacity < 0) {
-        LOG(FATAL)
-            << "Z3 loop scheduling failed: scope \"" << group_scopes[g]
-            << "\" capacity is negative (" << capacity
-            << "). Non-eligible and fixed-version buffers already exceed"
-            << " the memory limit. Try using T.annotate_unlimit_memory(\""
-            << group_scopes[g] << "\") or reduce buffer sizes.";
-      }
       int64_t min_usage = 0;
       for (int64_t idx : idxs) {
         min_usage += storage_sizes[idx];
@@ -1101,6 +1140,12 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
     }
     tvm_memory_groups.push_back(group);
   }
+  for (int64_t id : workspace_version_ids) {
+    // Z3 integers cannot overflow. Constrain the final per-allocation byte
+    // extent before selecting versions, while leaving GM out of device
+    // resource-capacity accounting. Different workspaces are not summed.
+    tvm_memory_groups.push_back({std::numeric_limits<int64_t>::max(), id});
+  }
 
   // Extract results
   // Python function returns (start_times, storage_versions, best_ii) as a
@@ -1111,7 +1156,7 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
                    tvm_data_deps, tvm_resource_deps, tvm_owner_exclusion_deps,
                    tvm_pipe_order_deps, tvm_storage_sizes, tvm_memory_groups,
                    tvm_stage_order_deps, enable_offset, tvm_manual_stages,
-                   manual_schedule)
+                   manual_schedule, stage_horizon)
           .cast<ffi::Tuple<ffi::Array<int64_t>, ffi::Array<int>, int64_t>>();
 
   ffi::Array<int64_t> start_times = return_val.get<0>();
@@ -1142,6 +1187,9 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
     GetAutoScheduleExtraInfo(nodes[i])->SetStartTime(start_times[i] -
                                                      min_start_time);
   }
+  // Intent has now become the native task stages and kernel buffer-version
+  // plan. Downstream consumers use those facts rather than selecting again.
+  ctrl->control.CopyOnWrite()->annotations.erase(kAutoPipeline);
   auto phys_time = [&](const std::shared_ptr<IRStructure> &c) -> int64_t {
     return GetAutoScheduleExtraInfo(c.get())->GetStartTime() -
            c->GetStage() * ii;
@@ -1338,12 +1386,17 @@ static void ScheduleSingleKernel(const Stmt &kernel_body, Target target,
   metadata.manual_buffer_versions = ExpandL0StorageGroupValues(
       metadata.manual_buffer_versions, groups, "manual version counts");
   unit_builder.SetStorageGroups(groups);
-  int64_t shared_mem_limit = GetSharedMemoryLimit(kernel_body);
+  unit_builder.SetCompilerWorkspaces(
+      GetCompilerWorkspaceStorages(metadata.kernel_root));
+  unit_builder.SetStorageSlotBytes(StorageFootprintCollector::SlotBytes(
+      metadata.kernel_root, metadata.manual_buffer_versions));
+  const AscendTargetInfo &target_info = GetAscendTargetInfo(target);
+  int64_t shared_mem_limit = GetSharedMemoryLimit(kernel_body, target_info);
   unit_builder.SetMemoryLimit("shared", shared_mem_limit);
-  unit_builder.SetMemoryLimit("shared.l1", GetL1MemoryLimit(target));
-  unit_builder.SetMemoryLimit("shared.l0c", GetL0CMemoryLimit(target));
-  unit_builder.SetMemoryLimit("shared.l0a", GetL0AMemoryLimit(target));
-  unit_builder.SetMemoryLimit("shared.l0b", GetL0BMemoryLimit(target));
+  unit_builder.SetMemoryLimit("shared.l1", target_info.l1_bytes);
+  unit_builder.SetMemoryLimit("shared.l0c", target_info.l0c_bytes);
+  unit_builder.SetMemoryLimit("shared.l0a", target_info.l0a_bytes);
+  unit_builder.SetMemoryLimit("shared.l0b", target_info.l0b_bytes);
   constexpr int64_t kUnlimitedMemory = 1LL << 40;
   for (const String &scope : metadata.unlimit_memory_scopes) {
     unit_builder.SetMemoryLimit(scope, kUnlimitedMemory);

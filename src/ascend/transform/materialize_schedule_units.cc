@@ -73,15 +73,163 @@ bool IsTaskBoundary(const Stmt &stmt) {
          stmt.as<BindNode>() || stmt.as<WhileNode>() || stmt.as<SBlockNode>();
 }
 
+bool IsCoreRegion(const SBlockNode *block) {
+  return block->name_hint == "CUBE" || block->name_hint == "VECTOR";
+}
+
 class TaskNormalizer : public StmtMutator {
 public:
-  static Stmt Rewrite(const Stmt &body) {
-    TaskNormalizer normalizer;
-    return normalizer(body);
+  static SBlock Rewrite(SBlock root) {
+    TaskNormalizer normalizer(root);
+    Stmt body = normalizer(root->body);
+    auto *writer = root.CopyOnWrite();
+    writer->body = std::move(body);
+    writer->alloc_buffers = std::move(normalizer.allocations_);
+    if (!normalizer.layouts_.empty())
+      writer->annotations.Set(tl::attr::kLayoutMap, normalizer.layouts_);
+    if (normalizer.vector_count_.has_value())
+      writer->annotations.Set(kVectorCount, normalizer.vector_count_.value());
+    return root;
   }
 
 private:
+  explicit TaskNormalizer(const SBlock &root)
+      : allocations_(root->alloc_buffers) {
+    for (const Buffer &buffer : allocations_)
+      allocation_owners_.Set(buffer->data, buffer);
+    if (auto layouts = root->annotations.Get(tl::attr::kLayoutMap))
+      MergeLayouts(layouts.value());
+    if (auto count = root->annotations.Get(kVectorCount))
+      RecordVectorCount(count.value());
+  }
+
+  void MergeLayouts(const ffi::Any &value) {
+    // Scheduling also accepts frontend IR before layout inference. Preserve
+    // its Var-keyed map, or the inferred Buffer-keyed map, without inventing
+    // a conversion between these two layout-inference stage contracts.
+    for (const auto &[key, layout] :
+         value.cast<ffi::Map<ObjectRef, Layout>>()) {
+      bool buffer_key = key.as<BufferNode>() != nullptr;
+      ICHECK(buffer_key || key.as<VarNode>())
+          << "Ascend layout_map keys must be Buffers or Vars";
+      ICHECK(!buffer_layout_keys_.has_value() ||
+             buffer_layout_keys_.value() == buffer_key)
+          << "Ascend ownership regions cannot mix frontend Var-keyed and "
+             "inferred Buffer-keyed layout maps";
+      buffer_layout_keys_ = buffer_key;
+      if (auto previous = layouts_.Get(key))
+        ICHECK(previous.value()->IsEqual(layout.get()))
+            << "Conflicting layout on an Ascend core region storage " << key;
+      layouts_.Set(key, layout);
+    }
+  }
+
+  void RecordVectorCount(const ffi::Any &value) {
+    auto count = value.try_cast<Integer>();
+    ICHECK(!value.as<bool>().has_value() && count.has_value() &&
+           !count.value()->dtype.is_bool() &&
+           (count.value()->value == 1 || count.value()->value == 2))
+        << "Ascend core region vector_count must be the integer 1 or 2";
+    ICHECK(!vector_count_.has_value() ||
+           vector_count_.value()->value == count.value()->value)
+        << "Conflicting Ascend core region vector_count values";
+    vector_count_ = count.value();
+  }
+
+  TaskMetadata OwnershipMetadata(const ffi::Any &existing) const {
+    TaskMetadata metadata;
+    if (core_mask_ == kCoreUnassigned)
+      return metadata;
+    TaskMetadata previous = ParseTaskMetadata(existing);
+    CoreMask narrowed =
+        previous.core_mask.value_or(kCoreBroadcast) & core_mask_;
+    ICHECK_NE(narrowed, kCoreUnassigned)
+        << "T.Task core_mask conflicts with its CUBE/VECTOR ownership region";
+    metadata.core_mask = narrowed;
+    return metadata;
+  }
+
+  Stmt VisitStmt_(const SBlockRealizeNode *op) final {
+    if (!IsCoreRegion(op->block.get()))
+      return StmtMutator::VisitStmt_(op);
+    ICHECK(op->iter_values.empty())
+        << "Ascend core ownership regions require an unbound block";
+    Stmt body = VisitStmt(op->block);
+    if (is_one(op->predicate))
+      return body;
+    return IfThenElse(op->predicate, std::move(body));
+  }
+
+  Stmt VisitStmt_(const AttrStmtNode *op) final {
+    if (IsScheduledCthreadBinding(op)) {
+      const Var &sid = Downcast<IterVar>(op->node)->var;
+      ICHECK(sid.dtype().lanes() == 1 &&
+             (sid.dtype().is_int() || sid.dtype().is_uint()))
+          << "Ascend cthread binding requires a scalar integer variable";
+      RecordVectorCount(op->value);
+      if (auto previous = sid_extents_.Get(sid))
+        ICHECK(analyzer_.CanProveEqual(previous.value(), op->value))
+            << "Repeated Ascend cthread binding has inconsistent extents";
+      sid_extents_.Set(sid, op->value);
+    }
+    return StmtMutator::VisitStmt_(op);
+  }
+
+  Stmt VisitStmt_(const SBlockNode *op) final {
+    if (!IsCoreRegion(op))
+      return StmtMutator::VisitStmt_(op);
+    ICHECK_EQ(task_marker_depth_, 0)
+        << "CUBE/VECTOR ownership regions must enclose complete T.Task "
+           "boundaries, rather than appear inside an atomic T.Task";
+    ICHECK(op->iter_vars.empty() && op->match_buffers.empty() &&
+           !op->init.defined() && op->reads.empty() && op->writes.empty())
+        << "Ascend core ownership regions cannot carry bound iterators, "
+           "init, match buffers, or explicit block access declarations";
+    CoreMask requested = op->name_hint == "CUBE" ? kCoreCube : kCoreVector;
+    ICHECK(core_mask_ == kCoreUnassigned || core_mask_ == requested)
+        << "Nested CUBE/VECTOR regions have incompatible core ownership";
+
+    for (const auto &[key, value] : op->annotations) {
+      if (key == kVectorCount) {
+        ICHECK_EQ(requested, kCoreVector)
+            << "vector_count belongs to an AIV ownership region";
+        RecordVectorCount(value);
+      } else if (key == tl::attr::kLayoutMap) {
+        // Move the existing layout fact to the root before removing the shell.
+        MergeLayouts(value);
+      } else {
+        LOG(FATAL) << "Unsupported Ascend core ownership annotation: " << key;
+      }
+    }
+    for (const Buffer &buffer : op->alloc_buffers) {
+      // A root allocation outlives the ownership shell. Static capacity keeps
+      // its size independent of control variables whose scopes are removed.
+      for (const PrimExpr &extent : buffer->shape)
+        ICHECK(as_const_int(extent) != nullptr)
+            << "Ascend core region allocations require static capacities";
+      if (auto previous = allocation_owners_.Get(buffer->data)) {
+        ICHECK(previous.value().same_as(buffer))
+            << "Conflicting allocation owners for Ascend core region buffer "
+            << buffer->name;
+      } else {
+        allocations_.push_back(buffer);
+        allocation_owners_.Set(buffer->data, buffer);
+      }
+    }
+    CoreMask previous = core_mask_;
+    core_mask_ = requested;
+    Stmt body = VisitStmt(op->body);
+    core_mask_ = previous;
+    return body;
+  }
+
   Stmt VisitStmt(const Stmt &stmt) final {
+    // Ownership shells must be opened before the ordinary atomic-block rule.
+    if (const auto *block = stmt.as<SBlockNode>(); block && IsCoreRegion(block))
+      return VisitStmt_(block);
+    if (const auto *realize = stmt.as<SBlockRealizeNode>();
+        realize && IsCoreRegion(realize->block.get()))
+      return VisitStmt_(realize);
     if (const auto *attribute = stmt.as<AttrStmtNode>()) {
       if (attribute->attr_key == tl::attr::kAscendStage) {
         ICHECK_EQ(task_marker_depth_, 0)
@@ -97,7 +245,7 @@ private:
         --task_marker_depth_;
         const auto *normalized = result.as<AttrStmtNode>();
         ICHECK(normalized && normalized->attr_key == tl::attr::kAscendTask);
-        TaskMetadata metadata;
+        TaskMetadata metadata = OwnershipMetadata(normalized->node);
         return AttrStmt(MergeTaskMetadata(metadata, normalized->node),
                         normalized->attr_key, normalized->value,
                         normalized->body, normalized->span);
@@ -109,7 +257,7 @@ private:
         ++per_core_task_depth_;
         Stmt body = VisitStmt(attribute->body);
         --per_core_task_depth_;
-        TaskMetadata metadata;
+        TaskMetadata metadata = OwnershipMetadata(attribute->node);
         return AttrStmt(MergeTaskMetadata(metadata, attribute->node),
                         attribute->attr_key, attribute->value, std::move(body),
                         attribute->span);
@@ -133,7 +281,7 @@ private:
           << stmt;
     }
 
-    TaskMetadata metadata;
+    TaskMetadata metadata = OwnershipMetadata(IntImm(DataType::Int(32), 0));
     return AttrStmt(MergeTaskMetadata(metadata, IntImm(DataType::Int(32), 0)),
                     tl::attr::kAscendTask, IntImm(DataType::Int(32), 1), stmt,
                     stmt->span);
@@ -141,6 +289,14 @@ private:
 
   int task_marker_depth_{0};
   int per_core_task_depth_{0};
+  CoreMask core_mask_{kCoreUnassigned};
+  Array<Buffer> allocations_;
+  ffi::Map<Var, Buffer> allocation_owners_;
+  ffi::Map<ObjectRef, Layout> layouts_;
+  std::optional<bool> buffer_layout_keys_;
+  std::optional<Integer> vector_count_;
+  ffi::Map<Var, PrimExpr> sid_extents_;
+  arith::Analyzer analyzer_;
 };
 
 ScheduleUnitMetadata MakeInitialScheduleMetadata() {
@@ -278,6 +434,55 @@ struct ValidatedTask {
   bool has_buffer_access{false};
 };
 
+// A user Task is atomic to scheduling/synchronization. Compiler lowering may
+// expand one expression into several native MemBase instructions; retaining
+// the atomic wrapper would hide their completion edges. A single select_bits
+// helper remains one primitive with its internal CMPMASK setup/consume.
+class AtomicNativeTaskValidator : public StmtExprVisitor {
+public:
+  static void Validate(const Stmt &body) {
+    AtomicNativeTaskValidator validator;
+    validator(body);
+    ICHECK(validator.native_count_ <= 1 && !validator.repeated_native_)
+        << "T.Task contains multiple or repeated native MemBase operations; "
+           "leave ordinary Parallel/vector expressions outside T.Task or "
+           "split them into separate primitive T.Task regions so their "
+           "completion dependencies can be scheduled";
+  }
+
+private:
+  void VisitExpr_(const CallNode *op) final {
+    if (const auto *callee = op->op.as<OpNode>();
+        callee && std::string(callee->name).rfind("tl.ascend_membase.", 0) == 0) {
+      ++native_count_;
+      repeated_native_ |= repeat_depth_ > 0;
+    }
+    StmtExprVisitor::VisitExpr_(op);
+  }
+
+  void VisitStmt_(const ForNode *op) final {
+    bool repeated = !is_one(op->extent);
+    repeat_depth_ += repeated;
+    StmtExprVisitor::VisitStmt_(op);
+    repeat_depth_ -= repeated;
+  }
+
+  void VisitStmt_(const WhileNode *op) final {
+    ++repeat_depth_;
+    StmtExprVisitor::VisitStmt_(op);
+    --repeat_depth_;
+  }
+
+  void VisitStmt_(const SBlockNode *op) final {
+    if (op->name_hint != "SIMT_VF" && op->name_hint != "SIMD_VF")
+      StmtExprVisitor::VisitStmt_(op);
+  }
+
+  int native_count_{0};
+  int repeat_depth_{0};
+  bool repeated_native_{false};
+};
+
 ValidatedTask ValidateTask(const AttrStmtNode *op, bool inside_per_core_task) {
   ICHECK_EQ(op->attr_key, tl::attr::kAscendTask);
 
@@ -285,11 +490,16 @@ ValidatedTask ValidateTask(const AttrStmtNode *op, bool inside_per_core_task) {
   TaskMarkerControlValidator control_validator(
       inside_per_core_task, IsStandaloneCrossCoreSync(task_body));
   control_validator(task_body);
+  AtomicNativeTaskValidator::Validate(task_body);
 
   Stmt task = GetRef<Stmt>(op);
   TaskResourceUsage resource_usage = AnalyzeTaskResourceUsage(task);
   uint16_t issue_pipe_mask = resource_usage.pipe_mask;
-  if (AnalyzeSpecialRegisterWrites(task) != 0)
+  // FIX copies and native predicate selection configure/consume their SPR
+  // inside one atomic data operation. Independent SPR writers still add S.
+  if ((AnalyzeSpecialRegisterWrites(task) &
+       ~(static_cast<uint16_t>(SpecialRegister::kFixpipeNz2Nd) |
+         static_cast<uint16_t>(SpecialRegister::kCmpMask))) != 0)
     issue_pipe_mask |= static_cast<uint16_t>(ResourcePipe::kScalar);
   ICHECK((issue_pipe_mask & (issue_pipe_mask - 1)) == 0)
       << "T.Task supports exactly one Ascend hardware pipe, but its body uses "
@@ -364,7 +574,7 @@ private:
         << "Nested T.PerCoreTask regions are not supported";
     ICHECK_NE(op->attr_key, attr::kScheduleUnit)
         << "T.PerCoreTask contains an already-materialized schedule unit";
-    ICHECK(IsScheduleGuardAttribute(op->attr_key))
+    ICHECK(IsScheduleGuardAttribute(op))
         << "MaterializeScheduleUnits only supports known scheduling AttrStmt "
            "wrappers inside T.PerCoreTask. Unsupported attr_key: "
         << op->attr_key;
@@ -518,7 +728,7 @@ private:
         unit = AssignStage(unit, static_cast<int>(stage->value));
       return body;
     }
-    ICHECK(IsScheduleGuardAttribute(op->attr_key))
+    ICHECK(IsScheduleGuardAttribute(op))
         << "MaterializeScheduleUnits only supports known scheduling AttrStmt "
            "wrappers inside the schedulable tilelang_root body. Unsupported "
            "attr_key: "
@@ -562,8 +772,8 @@ tvm::transform::Pass MaterializeScheduleUnits() {
     return RewriteTilelangKernels(
         std::move(func), "MaterializeScheduleUnits",
         [](const TilelangKernelContext &context) {
-          SBlock root = context.root;
-          Stmt normalized = TaskNormalizer::Rewrite(root->body);
+          SBlock root = TaskNormalizer::Rewrite(context.root);
+          Stmt normalized = root->body;
           root.CopyOnWrite()->body =
               ScheduleUnitMaterializer::Rewrite(normalized);
           return root;

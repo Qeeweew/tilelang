@@ -24,9 +24,9 @@ from .annotations import (  # noqa: F401
 from .copy_op import copy, dual_copy  # noqa: F401
 from .gemm_op import gemm, gemm_blockscaled  # noqa: F401
 
-# T.reduce and its thin wrappers shadow the common surface: inside SimdVF a
-# shared-to-shared reduce is emitted directly on the UB regions (no fragment
-# round-trip exists there); see ascend/language/reduce_op.py.
+# T.reduce retains UB regions for native MemBase or SimdVF lowering. Target
+# lowering chooses the instruction algorithm; the frontend creates no GPU
+# fragment round-trip. See ascend/language/reduce_op.py.
 from .reduce_op import (  # noqa: F401
     reduce,
     reduce_abssum,
@@ -39,9 +39,9 @@ from .reduce_op import (  # noqa: F401
     reduce_sum,
 )
 
-# Ascend owns the unroll-factor knob: the Ascend codegen lowers the
-# "pragma_unroll_factor" annotation to `#pragma unroll N`.
-from .loop import unroll  # noqa: F401
+# Ascend preserves automatic Pipelined intent and owns the unroll-factor knob.
+# The common loop defaults remain unchanged.
+from .loop import Pipelined, unroll  # noqa: F401
 
 # Ascend owns its launch and its thread-scope accessors. These deliberately
 # shadow the common surface imported above: `T.Kernel` here is the 1-D NPU core
@@ -91,6 +91,7 @@ _ASCEND_API_ALL = (
     "CubeFrame",
     "MixedKernel",
     "PerCoreTask",
+    "Pipelined",
     "Stage",
     "Task",
     "SimdVF",

@@ -43,6 +43,18 @@ def _estimate_gemm_cost(*args, **kwargs):
     return metadata["latency"][-1], metadata["ii"][-1]
 
 
+def test_2201_costs_do_not_inherit_3510_timing():
+    target = tvm.target.Target({"kind": "ascend", "arch": "dav-2201"})
+    for extent in (16, 64):
+        mod = tvm.IRModule({"main": _make_gemm_cost_program(extent, extent, 64, dtype="float16").with_attr("target", target)})
+        mod = tilelang.transform.MaterializeKernelLaunch()(mod)
+        mod = tilelang.transform.Simplify()(mod)
+        mod = ascend_transform.EstimateLatency()(_materialize_schedule_units(mod))
+        assert str(mod["main"].attrs["tl.ascend.cost_model"]) == "dav-2201.ordinal.uncalibrated"
+        metadata = _collect_task_metadata(mod)
+        assert (metadata["latency"][-1], metadata["ii"][-1]) == (1, 1)
+
+
 @pytest.mark.parametrize("dynamic_k", [False, True])
 def test_l0_gemm_effective_k_cost(dynamic_k):
     # A5 HF32: 4096 ops/cycle plus67 completion cycles. Allocation stays64.

@@ -15,6 +15,7 @@ from tilelang.backend.pass_pipeline.pipeline_utils import (
 )
 
 from . import transform as ascend_transform
+from .target import normalize_ascend_target
 
 _MERGE_UB_ALIGNMENT = 32
 
@@ -34,7 +35,17 @@ def allow_autoschedule(pass_ctx=None) -> bool:
 
 
 def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
+    target = normalize_ascend_target(target) or target
+    # Layout/vector planning uses Target.current() as well as bound function
+    # attributes. Both must describe this compilation, including when callers
+    # invoke tilelang.lower outside a Target context.
+    with target:
+        return _AscendPassPipelineBody(mod, target)
+
+
+def _AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     mod = tirx.transform.BindTarget(target)(mod)
+    mod = ascend_transform.AscendValidateTarget()(mod)
     # Materialize the target-neutral kernel-launch nest emitted by T.Kernel.
     # Ascend's NPU launch is a real 1-D blockIdx.x core grid, so the grid loop
     # becomes a thread_extent AttrStmt; there is no threadIdx at kernel scope,
@@ -60,11 +71,15 @@ def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     if should_enable_race_check(pass_ctx=pass_ctx):
         mod = tilelang.transform.VerifyParallelLoop()(mod)
     mod = tilelang.transform.InjectAssumes()(mod)
+    # 2201 logical Cube/vector transitions become real GM handoff copies and
+    # a root workspace before ownership/layout. The 3510 pass is a no-op.
+    mod = ascend_transform.AscendLowerGMHandoff()(mod)
+
     # Expand AIV-side dual copies before layout, OOB, and scheduling passes.
     # Reuse an enclosing cthread sid from an explicit T.Vector block; an
     # auto-scheduled mixed T.Kernel gets one synthesized before its core
-    # sections are materialized. L0C->UB remains a hardware dual-destination
-    # copy on AIC.
+    # sections are materialized. On 3510, L0C->UB remains a hardware
+    # dual-destination copy on AIC; 2201 already has explicit GM handoffs.
     mod = ascend_transform.RewriteDualCopy()(mod)
     # MODE_MERGING preserves inactive destination lanes, so it is a
     # read-modify-write operation rather than a pure value expression. Expose
@@ -80,6 +95,12 @@ def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     mod = ascend_transform.UnrollLoopSkipVF()(mod)
     mod = tilelang.transform.Simplify()(mod)
 
+    # Expose 2201's sub-K loads, L0 scratch and MAD tasks before layout and
+    # scheduling. The 3510 path retains its existing fused L1 GEMM lowering.
+    mod = ascend_transform.AscendLowerL1Gemm()(mod)
+    # Reuse cthread and ordinary buffers/regions for two private AIV owners.
+    # Local shapes must be established before their physical layout.
+    mod = ascend_transform.AscendLowerMixedPartition()(mod)
     mod = ascend_transform.AscendLayoutInference()(mod)
     mod = tilelang.transform.ReducerPlanAndMaterialize()(mod)
     LayoutVisual(mod)
@@ -90,15 +111,26 @@ def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     # emitted ops.
     mod = ascend_transform.InsertNd2Nz()(mod)
 
-    # Run VFChecker after InsertNd2Nz: the UB->L1 copies it would otherwise
-    # reject (e.g. casting copies) are by now rewritten into a SIMD_VF scatter.
-    tilelang.ascend.analysis.VFChecker()(mod)
-
     # Clamp DMA copy OOB tails and emit GM->L1 padding as semantic T.fill ops so
     # AutoSchedule sees each fill's exact L1 write region. LowerTileOp converts
     # them to ascend_fill_l1 after scheduling, which codegen emits as
     # asc_fill_l1. Must run before AutoSchedule.
     mod = ascend_transform.AscendInsertOOBPadding()(mod)
+    # Native 2201 L1 loads read/write whole fractals, including padded lanes.
+    # Expose those instruction regions after their padding writers exist and
+    # before task, dependency, lifetime and buffer-version analysis.
+    mod = ascend_transform.AscendNormalizeCubeCopyFootprints()(mod)
+
+    # 2201 Parallel expressions become native MemBase tasks, with explicit UB
+    # temporaries and access effects, before scheduling. This pass is a no-op
+    # for 3510, whose Parallel loops retain their existing VF execution domain.
+    mod = ascend_transform.AscendLowerVectorReduce()(mod)
+    mod = ascend_transform.AscendLowerVectorTiles()(mod)
+
+    # Storage/copy VF checks consume the established execution domain. The
+    # 2201 path has no remaining Parallel loops; InsertNd2Nz has already made
+    # the 3510 UB->L1 conversion's SIMD_VF domain explicit.
+    tilelang.ascend.analysis.VFChecker()(mod)
 
     if auto_schedule_enabled:
         mod = ascend_transform.NormalizeControlFlowForSchedule()(mod)

@@ -82,10 +82,10 @@ Layout MakeTaggedAscendFractalLayout(Array<PrimExpr> input_size,
 }
 
 std::pair<LogicalAxis, LogicalAxis> GetAxesForKind(AscendFractalKind kind) {
-  ICHECK(kind == AscendFractalKind::kMajorK ||
-         kind == AscendFractalKind::kMajorMN ||
+  ICHECK(IsAscendMajorKind(kind) ||
          kind == AscendFractalKind::kL0C || kind == AscendFractalKind::kSF);
-  if (kind == AscendFractalKind::kMajorMN) {
+  if (kind == AscendFractalKind::kMajorMN ||
+      kind == AscendFractalKind::kL0AMajorMN) {
     return {LogicalAxis::kRow, LogicalAxis::kCol};
   }
   return {LogicalAxis::kCol, LogicalAxis::kRow};
@@ -197,6 +197,23 @@ Layout MakeAscendMajorMNLayout(const Buffer &buffer, int k_align) {
 
 Layout MakeAscendNZLayout(const Buffer &buffer) {
   return MakeAscendMajorKLayout(buffer);
+}
+
+Layout MakeAscendL0A2201Layout(const Buffer &buffer, bool transpose) {
+  ICHECK(buffer.defined() && buffer->shape.size() >= 2);
+  ICHECK(buffer->dtype.is_float16() || buffer->dtype.is_bfloat16())
+      << "dav-2201 L0A layout currently requires FP16 or BF16";
+  size_t n = buffer->shape.size();
+  Var row = InputPlaceholder(0);
+  Var col = InputPlaceholder(1);
+  PrimExpr m = transpose ? col : row;
+  PrimExpr k = transpose ? row : col;
+  auto base = MakeTaggedAscendFractalLayout(
+      {buffer->shape[n - 2], buffer->shape[n - 1]},
+      {FloorDiv(m, 16), FloorDiv(k, 16), FloorMod(m, 16), FloorMod(k, 16)},
+      transpose ? AscendFractalKind::kL0AMajorMN
+                : AscendFractalKind::kL0AMajorK);
+  return ExpandLayout2D(base, buffer);
 }
 
 Layout MakeAscendCompactNZLayout(const Buffer &buffer) {
@@ -376,7 +393,13 @@ bool TryExtractAscendFractalRegion(const Layout &layout,
   if (phys.size() < 4)
     return false;
   size_t n = phys.size();
-  *out = {phys[n - 4], phys[n - 3], phys[n - 2], phys[n - 1]};
+  const auto *tagged = layout.as<AscendFractalLayoutNode>();
+  bool native_l0a = tagged &&
+      (tagged->Kind() == AscendFractalKind::kL0AMajorK ||
+       tagged->Kind() == AscendFractalKind::kL0AMajorMN);
+  // Return semantic C0/row16 axes independently of physical outer order.
+  *out = {phys[n - (native_l0a ? 3 : 4)],
+          phys[n - (native_l0a ? 4 : 3)], phys[n - 2], phys[n - 1]};
   return true;
 }
 
@@ -450,6 +473,7 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = reflection;
   AscendFractalLayoutNode::RegisterReflection();
   refl::GlobalDef()
+      .def("tl.make_ascend_l0a_2201_layout", MakeAscendL0A2201Layout)
       .def("tl.make_ascend_major_k_layout",
            [](const Buffer &buffer, int k_align) {
              return MakeAscendMajorKLayout(buffer, k_align);

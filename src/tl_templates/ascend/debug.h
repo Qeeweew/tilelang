@@ -4,6 +4,8 @@
 #include <type_traits>
 
 #include "c_api/asc_simd.h"
+#include "utils/debug/asc_assert.h"
+#include "utils/debug/asc_printf.h"
 
 // ---------------------------------------------------------------------------
 // Ascend debug-print runtime.
@@ -281,11 +283,15 @@
   }
 
 namespace __asc_aicore {
-TL_DEFINE_ASCEND_DEBUG(__aicore__, block_idx)
+// CANN's variadic printf must receive the integer value, not the compiler's
+// non-copyable builtin-variable proxy.
+TL_DEFINE_ASCEND_DEBUG(__aicore__, static_cast<int>(block_idx))
 } // namespace __asc_aicore
 
+#if __NPU_ARCH__ == 3510
 namespace __asc_simt_vf {
 TL_DEFINE_ASCEND_DEBUG(__simt_callee__, blockIdx.x)
 } // namespace __asc_simt_vf
+#endif
 
 #undef TL_DEFINE_ASCEND_DEBUG

@@ -142,12 +142,67 @@ BoundedDMACopyRanges ClampDMACopyTail(const AscendCopyNode &op,
     }
   }
 
+  // Avoid end additions even for an int64 index. Once origin/extent are
+  // nonnegative and origin<=shape, shape-origin is representable and can be
+  // compared with the request without overflow.
+  auto wide = [](PrimExpr value) { return cast(DataType::Int(64), value); };
+  auto end_is_in_bounds = [&](const Range &range, const PrimExpr &shape) {
+    PrimExpr origin = wide(range->min), extent = wide(range->extent);
+    PrimExpr capacity = wide(shape);
+    if (!analyzer->CanProve(origin >= 0 && extent >= 0 && origin <= capacity,
+                            arith::ProofStrength::kSymbolicBound))
+      return false;
+    return analyzer->CanProve(extent <= capacity - origin,
+                              arith::ProofStrength::kSymbolicBound);
+  };
+  auto clamped_extent = [&](const Range &range, const PrimExpr &shape) {
+    PrimExpr origin = wide(range->min);
+    PrimExpr zero = make_zero(DataType::Int(64));
+    // Clamp calculations must also be representable on inactive paths.
+    // Active matrix origins are proven nonnegative below; fixed selectors
+    // retain their independent 0/1 validity predicate.
+    PrimExpr remaining = wide(shape) - Max(origin, zero);
+    return Min(wide(range->extent), Max(remaining, zero));
+  };
+  PrimExpr has_data = const_true();
+  for (const auto &ranges : {op.src_range, op.dst_range})
+    for (const Range &range : ranges)
+      has_data = has_data && (range->extent > make_zero(range->extent.dtype()));
+  has_data = analyzer->Simplify(has_data);
+  if (is_zero(has_data))
+    return result;
+  // LegalizeNegativeIndex already handles supported Python-style negatives.
+  // This tail-only DMA boundary must not silently reinterpret a remaining
+  // negative or unknown matrix window as an empty or head-padded transfer.
+  auto require_nonnegative_origin = [&](const Range &range) {
+    With<arith::ConstraintContext> active_copy(analyzer, has_data);
+    ICHECK(analyzer->CanProve(wide(range->min) >= 0,
+                              arith::ProofStrength::kSymbolicBound))
+        << "Ascend DMA copy requires a proven nonnegative matrix origin "
+           "after LegalizeNegativeIndex; establish a legal range or T.assume "
+           "for the origin. Head padding is not supported. Got "
+        << range->min;
+  };
   bool needs_clamp = false;
   for (size_t i = 0; i < src_axes.size(); ++i) {
     size_t src_axis = src_axes[i];
     size_t dst_axis = dst_axes[i];
     const Range &src = op.src_range[src_axis];
     const Range &dst = op.dst_range[dst_axis];
+    require_nonnegative_origin(src);
+    require_nonnegative_origin(dst);
+    if (dma_path == DMAPath::kGMToL1) {
+      With<arith::ConstraintContext> active_copy(analyzer, has_data);
+      // The L1 padding writers handle a partial upper tail, not a completely
+      // absent source matrix. Otherwise clamping the copy to zero could leave
+      // L1 storage uninitialized for a later whole-fractal L0 load.
+      ICHECK(analyzer->CanProve(wide(src->min) < wide(op.src->shape[src_axis]),
+                                arith::ProofStrength::kSymbolicBound))
+          << "Ascend GM->L1 tail copy requires a proven in-bounds source "
+             "matrix origin on its nonempty path; fully out-of-bounds matrix "
+             "origins are unsupported. Got "
+          << src->min << " for shape " << op.src->shape[src_axis];
+    }
     if (!analyzer->CanProveEqual(src->extent, dst->extent)) {
       // GM->L1 permits a larger destination region. A size difference is not
       // itself OOB; when bounds require clamping, transfer the source extent.
@@ -155,10 +210,8 @@ BoundedDMACopyRanges ClampDMACopyTail(const AscendCopyNode &op,
           !analyzer->CanProve(src->extent <= dst->extent))
         return result;
     }
-    if (!analyzer->CanProve(src->min + src->extent <= op.src->shape[src_axis],
-                            arith::ProofStrength::kSymbolicBound) ||
-        !analyzer->CanProve(dst->min + dst->extent <= op.dst->shape[dst_axis],
-                            arith::ProofStrength::kSymbolicBound)) {
+    if (!end_is_in_bounds(src, op.src->shape[src_axis]) ||
+        !end_is_in_bounds(dst, op.dst->shape[dst_axis])) {
       needs_clamp = true;
     }
   }
@@ -168,8 +221,7 @@ BoundedDMACopyRanges ClampDMACopyTail(const AscendCopyNode &op,
                                     const std::vector<size_t> &singleton_axes) {
     for (auto &i : singleton_axes) {
       const Range &range = ranges[i];
-      if (!analyzer->CanProve(range->min + range->extent <= shape[i],
-                              arith::ProofStrength::kSymbolicBound)) {
+      if (!end_is_in_bounds(range, shape[i])) {
         needs_clamp = true;
       }
     }
@@ -187,20 +239,16 @@ BoundedDMACopyRanges ClampDMACopyTail(const AscendCopyNode &op,
     size_t src_axis = src_axes[i];
     size_t dst_axis = dst_axes[i];
     DataType dtype = op.src_range[src_axis]->extent.dtype();
-    auto cast_to_dtype = [dtype](PrimExpr value) {
-      return value.dtype() == dtype ? value : cast(dtype, value);
-    };
-    PrimExpr zero = make_zero(dtype);
-    PrimExpr extent = cast_to_dtype(op.src_range[src_axis]->extent);
-    PrimExpr src_remaining = cast_to_dtype(op.src->shape[src_axis]) -
-                             cast_to_dtype(op.src_range[src_axis]->min);
-    PrimExpr dst_remaining = cast_to_dtype(op.dst->shape[dst_axis]) -
-                             cast_to_dtype(op.dst_range[dst_axis]->min);
-    PrimExpr src_valid_extent = Min(extent, Max(src_remaining, zero));
-    PrimExpr dst_valid_extent = Min(extent, Max(dst_remaining, zero));
+    PrimExpr src_valid_extent =
+        clamped_extent(op.src_range[src_axis], op.src->shape[src_axis]);
+    PrimExpr dst_valid_extent =
+        clamped_extent(op.dst_range[dst_axis], op.dst->shape[dst_axis]);
     PrimExpr valid_extent = Min(src_valid_extent, dst_valid_extent);
-    src_valid_extent = analyzer->Simplify(src_valid_extent);
-    valid_extent = analyzer->Simplify(valid_extent);
+    // For a nonnegative request these results lie in [0, requested_extent],
+    // so only the final clamped extent is narrowed. Negative requests remain
+    // nonpositive and are skipped by the late empty-copy guard.
+    src_valid_extent = cast(dtype, analyzer->Simplify(src_valid_extent));
+    valid_extent = cast(dtype, analyzer->Simplify(valid_extent));
 
     // A destination OOB tail only reduces the L0C->GM transfer count. It must
     // not rewrite the producer's L0C matrix geometry: lowering uses the source
@@ -218,24 +266,22 @@ BoundedDMACopyRanges ClampDMACopyTail(const AscendCopyNode &op,
   // 0/1 extent. LowerDMACopy consumes that information to build the final
   // in-bounds guard after AutoSchedule, then normalizes a possibly-empty unit
   // axis to extent 1 only for hardware DMA geometry.
-  auto clamp_singleton_axes =
-      [&](const Array<Range> &original, const Array<PrimExpr> &shape,
-          const std::vector<size_t> &axes, Array<Range> *clamped) {
-        for (size_t axis : axes) {
-          const Range &range = original[axis];
-          DataType dtype = range->extent.dtype();
-          auto cast_to_dtype = [dtype](PrimExpr value) {
-            return value.dtype() == dtype ? value : cast(dtype, value);
-          };
-          PrimExpr zero = make_zero(dtype);
-          PrimExpr remaining =
-              cast_to_dtype(shape[axis]) - cast_to_dtype(range->min);
-          PrimExpr valid_extent =
-              Min(cast_to_dtype(range->extent), Max(remaining, zero));
-          clamped->Set(axis, Range::FromMinExtent(
-                                 range->min, analyzer->Simplify(valid_extent)));
-        }
-      };
+  auto clamp_singleton_axes = [&](const Array<Range> &original,
+                                  const Array<PrimExpr> &shape,
+                                  const std::vector<size_t> &axes,
+                                  Array<Range> *clamped) {
+    for (size_t axis : axes) {
+      const Range &range = original[axis];
+      DataType dtype = range->extent.dtype();
+      PrimExpr valid_extent = clamped_extent(range, shape[axis]);
+      valid_extent =
+          Select(wide(range->min) >= 0 && wide(range->min) < wide(shape[axis]),
+                 valid_extent, make_zero(DataType::Int(64)));
+      valid_extent = cast(dtype, analyzer->Simplify(valid_extent));
+      clamped->Set(axis, Range::FromMinExtent(
+                             range->min, analyzer->Simplify(valid_extent)));
+    }
+  };
   clamp_singleton_axes(op.src_range, op.src->shape, src_singleton_axes,
                        &src_range);
   clamp_singleton_axes(op.dst_range, op.dst->shape, dst_singleton_axes,

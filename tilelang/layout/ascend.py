@@ -92,6 +92,17 @@ def make_ascend_l0c_layout(buffer: BufferLikeType):
     return _ffi_api.make_ascend_l0c_layout(buf)
 
 
+def make_ascend_l0a_2201_layout(buffer: BufferLikeType, transpose: bool = False):
+    """Create dav-2201's native L0A ZA layout.
+
+    Logical ``[M, K]`` maps to ``[M/16, K/16, M%16, K%16]``. For a
+    transposed logical ``[K, M]`` operand, swap the input axes. The native
+    order is retained by storage normalization and consumed by 2D loads.
+    """
+    buf, _, _ = _get_buffer_info(buffer)
+    return _ffi_api.make_ascend_l0a_2201_layout(buf, transpose)
+
+
 def make_ascend_sf_layout(buffer: BufferLikeType):
     """
     Create an Ascend SF layout for MX scale-factor L1 buffers.
@@ -133,13 +144,14 @@ class FractalLayoutInfo:
     remaining fields are derived from that tag and the buffer.
 
     Attributes:
-        kind: 0 = MajorK, 1 = L0C (fixed 16×16), 2 = SF, 3 = MajorMN
+        kind: 0 = MajorK, 1 = L0C (fixed 16×16), 2 = SF, 3 = MajorMN,
+            4/5 = dav-2201 L0A (logical MajorK/MajorMN)
         c0: C0 value (or 16 for L0C, pack for SF)
         row_frac: always 16
         rows: logical rows (dim -2)
         cols: logical cols (dim -1)
-        outer0: full physical extent of C0-axis outer for matrix data or row16-axis outer for SF
-        outer1: full physical extent of row16-axis outer for matrix data or C0-axis outer for SF
+        outer0: semantic extent of C0-axis outer for matrix data or row16-axis outer for SF
+        outer1: semantic extent of row16-axis outer for matrix data or C0-axis outer for SF
         c0_axis: 0 = row, 1 = col (pack axis for SF)
         row16_axis: 0 = row, 1 = col
     """

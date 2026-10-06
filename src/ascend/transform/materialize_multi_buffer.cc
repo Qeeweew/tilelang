@@ -31,6 +31,7 @@
 
 #include <algorithm>
 #include <memory>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -41,6 +42,7 @@
 #include "./auto_schedule/scheduled_tir.h"
 #include "layout/layout.h"
 #include "op/builtin.h"
+#include "storage_footprint.h"
 #include "transform/common/attr.h"
 
 namespace tvm {
@@ -53,28 +55,24 @@ using ffi::Map;
 
 namespace {
 
-PrimExpr BufferStoragePitch(const Buffer &buffer) {
-  if (!buffer->strides.empty())
-    return buffer->strides[0] * buffer->shape[0];
-  DataType index_dtype =
-      buffer->shape.empty() ? DataType::Int(32) : buffer->shape[0].dtype();
-  PrimExpr pitch = make_const(index_dtype, 1);
-  for (const PrimExpr &extent : buffer->shape)
-    pitch = pitch * extent;
-  return pitch;
-}
-
-PrimExpr BufferStoragePitchBits(const Buffer &buffer) {
-  PrimExpr pitch = BufferStoragePitch(buffer);
-  int element_bits = buffer->dtype.bits() * buffer->dtype.lanes();
-  return pitch * make_const(pitch.dtype(), element_bits);
-}
-
-PrimExpr StoragePitchInElements(const PrimExpr &storage_pitch_bits,
+PrimExpr StoragePitchInElements(const PrimExpr &storage_pitch_bytes,
                                 const Buffer &buffer) {
   int element_bits = buffer->dtype.bits() * buffer->dtype.lanes();
-  PrimExpr divisor = make_const(storage_pitch_bits.dtype(), element_bits);
   arith::Analyzer analyzer;
+  if (element_bits % 8 == 0) {
+    PrimExpr divisor =
+        make_const(storage_pitch_bytes.dtype(), element_bits / 8);
+    ICHECK(analyzer.CanProveEqual(indexmod(storage_pitch_bytes, divisor), 0))
+        << "Automatic multi-buffer storage pitch " << storage_pitch_bytes
+        << " bytes is not divisible by alias element width " << element_bits
+        << " bits for buffer " << buffer->name;
+    // Whole-byte storage, including GM, must not overflow an intermediate
+    // bytes*8 product when its byte extent and element stride are legal.
+    return analyzer.Simplify(indexdiv(storage_pitch_bytes, divisor));
+  }
+  PrimExpr storage_pitch_bits =
+      storage_pitch_bytes * make_const(storage_pitch_bytes.dtype(), 8);
+  PrimExpr divisor = make_const(storage_pitch_bits.dtype(), element_bits);
   ICHECK(analyzer.CanProveEqual(indexmod(storage_pitch_bits, divisor), 0))
       << "Automatic multi-buffer storage pitch " << storage_pitch_bits
       << " bits is not divisible by alias element width " << element_bits
@@ -88,20 +86,22 @@ Array<PrimExpr> ExplicitStrides(const Buffer &buffer) {
   if (buffer->shape.empty())
     return {};
   std::vector<PrimExpr> compact(buffer->shape.size());
-  PrimExpr stride = make_const(buffer->shape.back().dtype(), 1);
+  // A compact workspace has an int64 grid axis and int32 matrix axes. Its
+  // row*column pitch must not overflow before reaching the grid dimension.
+  PrimExpr stride = make_const(DataType::Int(64), 1);
   for (size_t i = buffer->shape.size(); i > 0; --i) {
     compact[i - 1] = stride;
-    stride = stride * buffer->shape[i - 1];
+    stride = stride * cast(DataType::Int(64), buffer->shape[i - 1]);
   }
   return Array<PrimExpr>(compact.begin(), compact.end());
 }
 
 Buffer CreateMultiVersionBuffer(const Buffer &buffer, int num_versions,
-                                const PrimExpr &storage_pitch_bits) {
+                                const PrimExpr &storage_pitch_bytes) {
   ObjectPtr<BufferNode> versioned =
       tvm::ffi::make_object<BufferNode>(*(buffer.get()));
   versioned->shape.insert(versioned->shape.begin(), PrimExpr(num_versions));
-  Array<PrimExpr> strides{StoragePitchInElements(storage_pitch_bits, buffer)};
+  Array<PrimExpr> strides{StoragePitchInElements(storage_pitch_bytes, buffer)};
   for (const PrimExpr &stride : ExplicitStrides(buffer))
     strides.push_back(stride);
   versioned->strides = std::move(strides);
@@ -116,11 +116,32 @@ public:
       if (info.NeedsVersionDimension())
         storage_versions_.emplace(info.storage, info.num_versions);
     }
-    CollectAllocationPitches(kernel_root);
+    auto slots = StorageFootprintCollector::SlotBytes(kernel_root);
+    CompilerWorkspaceStorageSet workspaces =
+        GetCompilerWorkspaceStorages(kernel_root);
+    for (const auto &[storage, versions] : storage_versions_) {
+      auto bytes = slots.Get(storage);
+      ICHECK(bytes.has_value()) << "Cannot find the physical allocation for "
+                                   "automatic multi-buffer storage "
+                                << storage->name_hint;
+      std::string scope = GetPtrStorageScope(storage);
+      if (scope.empty() || scope == "global") {
+        ICHECK(workspaces.count(storage))
+            << "Automatic global multi-buffer storage " << storage->name_hint
+            << " must be a compiler-created workspace";
+        arith::Analyzer analyzer;
+        PrimExpr size = analyzer.Simplify(bytes.value());
+        const auto *constant = size.as<IntImmNode>();
+        ICHECK(constant) << "Ascend compiler workspace " << storage->name_hint
+                         << " requires a static physical byte footprint";
+        CheckCompilerWorkspaceVersionBytes(storage, constant->value, versions);
+      }
+      storage_pitch_bytes_.emplace(storage, bytes.value());
+    }
     for (const MultiBufferInfo &info : plan.Infos()) {
       if (!info.NeedsVersionDimension())
         continue;
-      ICHECK(storage_pitch_bits_.count(info.storage))
+      ICHECK(storage_pitch_bytes_.count(info.storage))
           << "Cannot find the physical allocation for automatic multi-buffer "
              "storage "
           << info.storage->name_hint;
@@ -137,49 +158,16 @@ public:
     if (storage == storage_versions_.end())
       return buffer;
     Buffer expanded = CreateMultiVersionBuffer(
-        buffer, storage->second, storage_pitch_bits_.at(buffer->data));
+        buffer, storage->second, storage_pitch_bytes_.at(buffer->data));
     buffer_remap_.emplace(buffer, expanded);
     expanded_buffers_.insert(expanded);
     return expanded;
   }
 
 private:
-  void RegisterAllocation(const Buffer &buffer) {
-    if (!storage_versions_.count(buffer->data))
-      return;
-    PrimExpr pitch_bits = BufferStoragePitchBits(buffer);
-    auto [it, inserted] = storage_pitch_bits_.emplace(buffer->data, pitch_bits);
-    ICHECK(inserted || ffi::StructuralEqual()(it->second, pitch_bits))
-        << "Automatic multi-buffer storage " << buffer->data->name_hint
-        << " has inconsistent physical allocation pitches";
-  }
-
-  void CollectAllocationPitches(const SBlock &kernel_root) {
-    class Collector : public StmtVisitor {
-    public:
-      explicit Collector(VersionedBufferRegistry *registry)
-          : registry_(registry) {}
-
-    private:
-      void VisitStmt_(const SBlockNode *op) final {
-        for (const Buffer &buffer : op->alloc_buffers)
-          registry_->RegisterAllocation(buffer);
-        StmtVisitor::VisitStmt_(op);
-      }
-
-      void VisitStmt_(const AllocBufferNode *op) final {
-        registry_->RegisterAllocation(op->buffer);
-        StmtVisitor::VisitStmt_(op);
-      }
-
-      VersionedBufferRegistry *registry_;
-    } collector(this);
-    collector(kernel_root);
-  }
-
   std::unordered_map<Var, int, ObjectPtrHash, ObjectPtrEqual> storage_versions_;
   std::unordered_map<Var, PrimExpr, ObjectPtrHash, ObjectPtrEqual>
-      storage_pitch_bits_;
+      storage_pitch_bytes_;
   std::unordered_map<Buffer, Buffer, ObjectPtrHash, ObjectPtrEqual>
       buffer_remap_;
   std::unordered_set<Buffer, ObjectPtrHash, ObjectPtrEqual> expanded_buffers_;

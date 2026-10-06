@@ -14,6 +14,7 @@
 #include "op/copy.h"
 
 #include <tvm/ir/cow.h>
+#include <utility>
 
 namespace tvm {
 namespace tl {
@@ -106,6 +107,16 @@ public:
  *        synthesized by shared passes.
  */
 bool IsAscendCopyCall(const tirx::CallNode *call);
+
+namespace ascend {
+// Prove native dav-2201 LoadData2D legality and return its exact whole-fractal
+// source/destination regions. Buffers must already have normalized storage;
+// leading/version axes and empty-copy predicates retain their semantics.
+std::pair<Array<Range>, Array<Range>>
+Normalize2201L1ToL0Footprint(const AscendCopyNode &copy,
+                             const LayoutMap &layout_map,
+                             arith::Analyzer *analyzer);
+} // namespace ascend
 
 } // namespace tl
 } // namespace tvm

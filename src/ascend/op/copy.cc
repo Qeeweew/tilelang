@@ -9,6 +9,7 @@
 
 #include "ascend/layout/ascend_layouts.h"
 #include "ascend/op/builtin.h"
+#include "ascend/target_utils.h"
 #include "ascend_mte_plan.h"
 #include "backend/common/target_utils.h"
 #include "layout/layout.h"
@@ -24,6 +25,7 @@
 #include <tvm/tirx/stmt_functor.h>
 
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -197,13 +199,21 @@ Stmt LowerDMACopy(const AscendCopyNode &op, const LowerArgs &T,
   // analysis. Once the predicate is captured, normalize a dynamic 0/1 unit
   // axis to one solely for building legal DMA geometry; the final guard
   // preserves the original semantics.
-  PrimExpr has_data =
-      MakeCopyHasDataPredicate(op.src_range, op.dst_range, analyzer);
+  Array<Range> input_src = op.src_range, input_dst = op.dst_range;
+  if ((dma_path == DMAPath::kL1ToL0A || dma_path == DMAPath::kL1ToL0B) &&
+      GetAscendTargetInfo(T.target).architecture ==
+          AscendArchitecture::kDav2201) {
+    // Direct LowerTileOp callers use the same proof as the pre-schedule pass;
+    // ordinary compilation already carries these exact instruction regions.
+    std::tie(input_src, input_dst) =
+        Normalize2201L1ToL0Footprint(op, T.layout_map, analyzer);
+  }
+  PrimExpr has_data = MakeCopyHasDataPredicate(input_src, input_dst, analyzer);
   if (is_zero(has_data)) {
     return Evaluate(0);
   }
-  Array<Range> src_range = NormalizeEmptyUnitAxesForMTE(op.src_range, analyzer);
-  Array<Range> dst_range = NormalizeEmptyUnitAxesForMTE(op.dst_range, analyzer);
+  Array<Range> src_range = NormalizeEmptyUnitAxesForMTE(input_src, analyzer);
+  Array<Range> dst_range = NormalizeEmptyUnitAxesForMTE(input_dst, analyzer);
 
   auto make_access_ptr = [&](const Buffer &buf, PrimExpr offset,
                              PrimExpr extent, int rw_mask) -> PrimExpr {
@@ -287,6 +297,41 @@ Stmt LowerDMACopy(const AscendCopyNode &op, const LowerArgs &T,
         analyzer->CanProveEqual(plan.n_rows, I(1)) ||
         (analyzer->CanProveEqual(plan_src_stride_bytes, plan_row_bytes) &&
          analyzer->CanProveEqual(plan_dst_stride_bytes, plan_row_bytes));
+
+    if (GetAscendTargetInfo(T.target).architecture ==
+        AscendArchitecture::kDav2201) {
+      With<arith::ConstraintContext> nonempty_copy(analyzer, has_data);
+      const bool load = dma_path == DMAPath::kGMToUB;
+      PrimExpr ub_offset_bytes = AscendMTEBytesFromElements(
+          load ? plan.dst_offset : plan.src_offset, elem_bits);
+      TVM_FFI_CHECK(analyzer->CanProveEqual(FloorMod(ub_offset_bytes, I(32)),
+                                           I(0)), ValueError)
+          << "dav-2201 GM <-> UB copy requires a 32-byte-aligned UB origin, "
+             "got byte offset " << ub_offset_bytes;
+      // One burst can carry a contiguous tile of any rank. Multiple native
+      // bursts each advance the UB side by its rounded 32-byte footprint.
+      const bool one_burst = analyzer->CanProveEqual(plan.n_rows, I(1)) ||
+                             (plan_single_row && !do_pad);
+      if (!one_burst) {
+        TVM_FFI_CHECK(analyzer->CanProve(plan.n_rows <= I(4095)), ValueError)
+            << "dav-2201 aligned DMA burst count must fit its 12-bit field, "
+               "got " << plan.n_rows;
+        PrimExpr ub_pitch = load ? plan_dst_stride_bytes : plan_src_stride_bytes;
+        PrimExpr gm_pitch = load ? plan_src_stride_bytes : plan_dst_stride_bytes;
+        PrimExpr padded_row_bytes = plan_row_bytes +
+            I(load ? right_pad_elems * elem_bits / 8 : 0);
+        PrimExpr ub_footprint =
+            ceildiv(padded_row_bytes, I(32)) * I(32);
+        TVM_FFI_CHECK(analyzer->CanProve(ub_pitch >= ub_footprint) &&
+                          analyzer->CanProveEqual(FloorMod(ub_pitch, I(32)),
+                                                  I(0)), ValueError)
+            << "dav-2201 multi-row DMA requires a 32-byte-aligned UB row "
+               "pitch covering the rounded burst footprint, got pitch "
+            << ub_pitch << " and footprint " << ub_footprint;
+        TVM_FFI_CHECK(analyzer->CanProve(gm_pitch >= plan_row_bytes), ValueError)
+            << "dav-2201 multi-row DMA requires a nonnegative GM byte gap";
+      }
+    }
 
     if (dma_path == DMAPath::kGMToUB) {
       if (do_pad) {
@@ -396,6 +441,18 @@ Stmt LowerDMACopy(const AscendCopyNode &op, const LowerArgs &T,
     }
 
     PrimExpr transpose_flag = I(needs_transpose ? 1 : 0);
+    if (GetAscendTargetInfo(T.target).architecture ==
+        AscendArchitecture::kDav2201) {
+      TVM_FFI_CHECK(analyzer->CanProve(src_row.stride <= I(65535)), ValueError)
+          << "dav-2201 ND2NZ source row stride must fit uint16 elements, got "
+          << src_row.stride;
+    }
+    if (GetAscendTargetInfo(T.target).architecture ==
+            AscendArchitecture::kDav2201 && needs_transpose) {
+      TVM_FFI_THROW(ValueError)
+          << "Ascend dav-2201 GM -> L1 DN-to-NZ transpose is unsupported; "
+             "keep L1 in native NZ order and transpose during L1 -> L0";
+    }
     // For dn2nz (transpose), SDK expects nValue=width(cols) and
     // dValue=height(rows), which is the reverse of nd2nz.
     PrimExpr n_value = needs_transpose ? physical_inner_elems : valid_n_rows;
@@ -530,6 +587,68 @@ Stmt LowerDMACopy(const AscendCopyNode &op, const LowerArgs &T,
           << op.dst->name;
     }
 
+    if (GetAscendTargetInfo(T.target).architecture ==
+        AscendArchitecture::kDav2201) {
+      const bool is_l0a = dma_path == DMAPath::kL1ToL0A;
+      PrimExpr repeat =
+          is_l0a ? dst_region.outer0->extent : dst_region.outer1->extent;
+      PrimExpr loop_count =
+          is_l0a ? dst_region.outer1->extent : dst_region.outer0->extent;
+      const bool loop_source_rows = is_l0a != needs_transpose;
+      size_t src_ndim = src_range.size();
+      size_t source_row_axis =
+          src_ndim - (src_info.row16_axis == LogicalAxis::kRow ? 2 : 1);
+      size_t source_c0_axis =
+          src_ndim - (src_info.c0_axis == LogicalAxis::kRow ? 2 : 1);
+      auto native =
+          is_l0a ? ascend_load_cbuf_to_ca_2d() : ascend_load_cbuf_to_cb_2d();
+      // Without a fractal transpose, a full physical N slice of L1 NZ is
+      // already contiguous in L0B ZB order. CANN 9.1 Matmul uses one 2D load
+      // for this case. Compare the padded allocation pitch, not logical N;
+      // leading versions remain in the pointers and sub-K in start_index.
+      PrimExpr merged_repeat =
+          cast(DataType::Int(64), loop_count) * cast(DataType::Int(64), repeat);
+      bool merge_b =
+          !is_l0a && !needs_transpose &&
+          analyzer->CanProveEqual(src_range[source_row_axis]->min, I(0)) &&
+          analyzer->CanProveEqual(
+              FloorMod(src_range[source_c0_axis]->min, src_info.c0), I(0)) &&
+          analyzer->CanProveEqual(m_start, I(0)) &&
+          analyzer->CanProveEqual(m_step, src_stride) &&
+          analyzer->CanProveEqual(repeat, m_step) &&
+          analyzer->CanProveEqual(loop_count, k_step) &&
+          analyzer->CanProve(merged_repeat <= I(255));
+      Stmt native_copy;
+      if (merge_b) {
+        native_copy =
+            Evaluate(Call(DataType::Void(), native,
+                          {dst_ptr, src_base_ptr, k_start * src_stride,
+                           merged_repeat, I(1), I(0), I(0)}));
+      } else {
+        Var frac("l0_fractal", DataType::Int(32));
+        // L0A is M-major ZA; L0B is K-major ZB. Select the source NZ fractal
+        // sequence that becomes contiguous in that native destination order.
+        PrimExpr start = k_start * src_stride + m_start +
+                         frac * (loop_source_rows ? I(1) : src_stride);
+        PrimExpr stride = loop_source_rows ? src_stride : I(1);
+        Array<Range> chunk = dst_range;
+        const LogicalAxis loop_axis =
+            is_l0a ? dst_info.row16_axis : dst_info.c0_axis;
+        size_t axis = chunk.size() - (loop_axis == LogicalAxis::kRow ? 2 : 1);
+        chunk.Set(axis, Range::FromMinExtent(frac * I(16), I(16)));
+        PrimExpr chunk_dst =
+            MakeAccessPtrFromRegion(BufferRegion(op.dst, chunk), 2);
+        native_copy =
+            For(frac, I(0), loop_count, ForKind::kSerial,
+                Evaluate(Call(DataType::Void(), native,
+                              {chunk_dst, src_base_ptr, start, repeat, stride,
+                               I(0), I(needs_transpose ? 1 : 0)})));
+      }
+      if (!is_one(has_data) && !analyzer->CanProve(has_data))
+        native_copy = IfThenElse(has_data, native_copy);
+      return native_copy;
+    }
+
     auto intrinsic = dma_path == DMAPath::kL1ToL0A ? ascend_load_cbuf_to_ca()
                                                    : ascend_load_cbuf_to_cb();
     Array<PrimExpr> ld_args = {
@@ -568,7 +687,9 @@ Stmt LowerDMACopy(const AscendCopyNode &op, const LowerArgs &T,
                                          &compact_src_region))
         << "Failed to map L0C->UB source region through layout for buffer "
         << op.src->name;
-    loop_src_stride = compact_src_region.outer1->extent * info.row_frac;
+    // NZ column groups keep the allocation's padded M pitch. Clamping the
+    // logical read region (for a tail or handoff) must not compact its storage.
+    loop_src_stride = info.outer1 * info.row_frac;
 
     int dual_dst_ctl = op.dual_dst_ctl;
     PrimExpr copy_inner = src_inner.size;
@@ -686,7 +807,9 @@ Stmt LowerDMACopy(const AscendCopyNode &op, const LowerArgs &T,
                                          &compact_src_region))
         << "Failed to map L0C->GM source region through layout for buffer "
         << op.src->name;
-    loop_src_stride = compact_src_region.outer1->extent * info.row_frac;
+    // The copied rows describe validity, not the distance between NZ column
+    // groups. A small valid-M region still lives in the full L0C allocation.
+    loop_src_stride = info.outer1 * info.row_frac;
     // L0C->GM needs the physical distance between adjacent destination rows,
     // not the logical last dimension.  They are equal for compact tensors but
     // differ for padded/runtime StridedTensor outputs.
@@ -970,6 +1093,160 @@ struct AscendCopyImpl {
     return LowerAscendNormalCopy(op, T, analyzer);
   }
 };
+
+// The public helper is shared by early IR normalization and late emission.
+std::pair<Array<Range>, Array<Range>>
+Normalize2201L1ToL0Footprint(const AscendCopyNode &op,
+                             const LayoutMap &layout_map,
+                             arith::Analyzer *analyzer) {
+  auto I = [](int64_t value) { return make_const(DataType::Int(32), value); };
+  DMAPath dma_path = GetDMAPath(op.src, op.dst);
+  ICHECK(dma_path == DMAPath::kL1ToL0A || dma_path == DMAPath::kL1ToL0B);
+  PrimExpr has_data =
+      MakeCopyHasDataPredicate(op.src_range, op.dst_range, analyzer);
+  if (is_zero(has_data))
+    return {op.src_range, op.dst_range};
+  const bool always_has_data = analyzer->CanProve(has_data);
+  With<arith::ConstraintContext> nonempty_copy(analyzer, has_data);
+  Array<Range> src_range = NormalizeEmptyUnitAxesForMTE(op.src_range, analyzer);
+  Array<Range> dst_range = NormalizeEmptyUnitAxesForMTE(op.dst_range, analyzer);
+  NormalizeTrailingMTE2DLayout(op.src, src_range, analyzer,
+                               "Ascend L1->L0 source footprint");
+  NormalizeTrailingMTE2DLayout(op.dst, dst_range, analyzer,
+                               "Ascend L1->L0 destination footprint");
+  CheckCompactL0Region(op.dst, dst_range, analyzer,
+                       "Ascend L1->L0 compact destination");
+  auto src_layout = FindLayoutForBuffer(layout_map, op.src);
+  auto dst_layout = FindLayoutForBuffer(layout_map, op.dst);
+  AscendFractalLayoutInfo src_info, dst_info;
+  AscendFractalRegionInfo src_region, dst_region;
+  ICHECK(src_layout.defined() && dst_layout.defined() &&
+         TryExtractAscendFractalLayout(src_layout.value(), op.src, &src_info) &&
+         TryExtractAscendFractalLayout(dst_layout.value(), op.dst, &dst_info))
+      << "dav-2201 LoadData2D requires canonical fractal layouts";
+  size_t src_ndim = src_range.size();
+  size_t source_row_axis =
+      src_ndim - (src_info.row16_axis == LogicalAxis::kRow ? 2 : 1);
+  size_t source_c0_axis =
+      src_ndim - (src_info.c0_axis == LogicalAxis::kRow ? 2 : 1);
+  ICHECK(
+      analyzer->CanProveEqual(
+          FloorMod(src_range[source_row_axis]->min, src_info.row_frac), I(0)) &&
+      analyzer->CanProveEqual(
+          FloorMod(src_range[source_c0_axis]->min, src_info.c0), I(0)))
+      << "dav-2201 LoadData2D requires a row16/C0-aligned source origin; "
+      << op.src->name << " has source region " << src_range;
+  auto in_source_axis = [&](const PrimExpr &origin, const PrimExpr &extent,
+                            const PrimExpr &capacity) {
+    PrimExpr wide_origin = cast(DataType::Int(64), origin);
+    PrimExpr wide_extent = cast(DataType::Int(64), extent);
+    PrimExpr wide_capacity = cast(DataType::Int(64), capacity);
+    if (!analyzer->CanProve(wide_origin >= 0 && wide_extent >= 0 &&
+                            wide_origin <= wide_capacity))
+      return false;
+    return analyzer->CanProve(wide_extent <= wide_capacity - wide_origin);
+  };
+  // Prove bounds before MapRegionBounds forms min+extent in the input dtype.
+  // A wrapped narrow interval must never turn an out-of-allocation origin
+  // into a benign-looking mapped fractal. The capacity is physical padding,
+  // even for direct LowerTileOp callers whose buffer still has a logical shape.
+  PrimExpr row_capacity = cast(DataType::Int(64), src_info.outer1) *
+                          cast(DataType::Int(64), src_info.row_frac);
+  PrimExpr c0_capacity = cast(DataType::Int(64), src_info.outer0) *
+                         cast(DataType::Int(64), src_info.c0);
+  ICHECK(in_source_axis(src_range[source_row_axis]->min,
+                        src_range[source_row_axis]->extent, row_capacity) &&
+         in_source_axis(src_range[source_c0_axis]->min,
+                        src_range[source_c0_axis]->extent, c0_capacity))
+      << "dav-2201 LoadData2D source footprint exceeds or cannot be proven "
+         "within the physical L1 allocation "
+      << op.src->name;
+  ICHECK(
+      TryExtractAscendFractalRegion(src_layout.value(), src_range,
+                                    &src_region) &&
+      TryExtractAscendFractalRegion(dst_layout.value(), dst_range, &dst_region))
+      << "dav-2201 LoadData2D requires canonical fractal regions";
+  PrimExpr m_start = src_region.outer1->min;
+  PrimExpr k_start = src_region.outer0->min;
+  PrimExpr m_step = src_region.outer1->extent;
+  PrimExpr k_step = src_region.outer0->extent;
+  bool needs_transpose =
+      (op.transpose != 0) ^ (src_info.c0_axis != dst_info.c0_axis);
+  ICHECK(op.src->dtype.is_float16() || op.src->dtype.is_bfloat16())
+      << "dav-2201 native LoadData2D currently requires FP16 or BF16";
+  const bool is_l0a = dma_path == DMAPath::kL1ToL0A;
+  ICHECK(!is_l0a || dst_info.kind == AscendFractalKind::kL0AMajorK ||
+         dst_info.kind == AscendFractalKind::kL0AMajorMN)
+      << "dav-2201 L0A requires its native ZA layout";
+  // A native MAD tile is compact. Larger allocations may hold separate
+  // versions, but the selected trailing tile has one physical pitch.
+  ICHECK(analyzer->CanProveEqual(dst_region.outer0->extent, dst_info.outer0) &&
+         analyzer->CanProveEqual(dst_region.outer1->extent, dst_info.outer1))
+      << "dav-2201 LoadData2D destination must cover its compact padded "
+         "L0 tile; allocate a separate sub-K L0 tile";
+  PrimExpr repeat =
+      is_l0a ? dst_region.outer0->extent : dst_region.outer1->extent;
+  PrimExpr loop_count =
+      is_l0a ? dst_region.outer1->extent : dst_region.outer0->extent;
+  const bool loop_source_rows = is_l0a != needs_transpose;
+  PrimExpr read_rows = loop_source_rows ? loop_count : repeat;
+  PrimExpr read_columns = loop_source_rows ? repeat : loop_count;
+  // Hardware reads complete fractals. A larger L0 destination cannot
+  // authorize additional L1 reads beyond the declared source footprint.
+  ICHECK(analyzer->CanProveEqual(read_rows, m_step) &&
+         analyzer->CanProveEqual(read_columns, k_step))
+      << "dav-2201 LoadData2D requires matching physical source/destination "
+         "fractal footprints; source "
+      << op.src->name << " covers " << m_step << "x" << k_step
+      << " fractals, but the compact L0 tile reads " << read_rows << "x"
+      << read_columns
+      << ". Materialize source padding in L1 before copying a larger tile; "
+         "a larger destination does not authorize extra source reads.";
+  ICHECK(in_source_axis(m_start, read_rows, src_info.outer1) &&
+         in_source_axis(k_start, read_columns, src_info.outer0))
+      << "dav-2201 LoadData2D source footprint exceeds or cannot be proven "
+         "within the physical L1 allocation "
+      << op.src->name
+      << ". This L1 tail requires explicit padding in a sufficient L1 "
+         "allocation before native loading.";
+  for (const auto &[buffer, ranges] :
+       {std::make_pair(op.src, src_range), std::make_pair(op.dst, dst_range)}) {
+    for (size_t axis = 0; axis + 2 < ranges.size(); ++axis) {
+      ICHECK(in_source_axis(ranges[axis]->min, ranges[axis]->extent,
+                            buffer->shape[axis]))
+          << "dav-2201 LoadData2D leading/version axis " << axis
+          << " exceeds or cannot be proven within allocation " << buffer->name
+          << ": " << ranges[axis];
+    }
+  }
+  ICHECK(analyzer->CanProve(repeat <= I(255)))
+      << "dav-2201 LoadData2D repeat count must fit uint8";
+  ICHECK_EQ(op.src->dtype, op.dst->dtype)
+      << "dav-2201 LoadData2D preserves operand dtype";
+  // These regions describe the instruction, including padded lanes. They are
+  // established before scheduling so padding producers and later reuse have
+  // the same RAW/WAR facts as native lowering. GEMM keeps its logical domain.
+  auto physical = [&](const Array<Range> &original,
+                      const AscendFractalLayoutInfo &info,
+                      const AscendFractalRegionInfo &mapped) {
+    Array<Range> ranges = original;
+    for (size_t axis = original.size() - 2; axis < original.size(); ++axis) {
+      bool row16 = (axis == original.size() - 2) ==
+                   (info.row16_axis == LogicalAxis::kRow);
+      PrimExpr extent = row16 ? mapped.outer1->extent * info.row_frac
+                              : mapped.outer0->extent * info.c0;
+      // Keep an empty copy empty; a data predicate must not disappear when
+      // its active instruction footprint rounds to a complete fractal.
+      extent = analyzer->Simplify(extent);
+      if (!always_has_data)
+        extent = Select(has_data, extent, make_zero(extent.dtype()));
+      ranges.Set(axis, Range::FromMinExtent(original[axis]->min, extent));
+    }
+    return ranges;
+  };
+  return {physical(op.src_range, src_info, src_region),
+          physical(op.dst_range, dst_info, dst_region)};
+}
 
 } // namespace ascend
 

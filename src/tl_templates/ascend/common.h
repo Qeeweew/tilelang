@@ -4,6 +4,11 @@
 
 #include "acl/acl.h"
 #include "c_api/asc_simd.h"
+#if __NPU_ARCH__ == 2201
+#include "tl_templates/ascend/membase_copy.h"
+#include "tl_templates/ascend/membase_select.h"
+#endif
+#if __NPU_ARCH__ == 3510
 #include "simt_api/asc_bf16.h"
 #include "simt_api/asc_fp16.h"
 #include "simt_api/asc_fp8.h"
@@ -12,6 +17,9 @@
 #include "tl_templates/ascend/numeric_limits.h"
 #include "tl_templates/ascend/reduce.h"
 #include "tl_templates/ascend/simd_inst.h"
+#else
+#include "tl_templates/ascend/numeric_limits.h"
+#endif
 
 // Use standard unsigned types instead of macros to avoid conflicts with system
 // headers

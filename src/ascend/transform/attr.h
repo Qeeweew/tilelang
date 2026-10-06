@@ -1,11 +1,6 @@
 /*!
  * \file tl/ascend/transform/attr.h
- * \brief Attributes owned by the Ascend scheduler and its scheduled-TIR
- * pipeline.
- *
- * These annotate the IR only between MaterializeScheduleUnits and
- * LowerScheduledTIR, so they live with the passes that read them rather than in
- * transform/common/attr.h.
+ * \brief Attributes owned by Ascend lowering and scheduling.
  */
 
 #ifndef TVM_TL_ASCEND_TRANSFORM_ATTR_H_
@@ -36,6 +31,17 @@ constexpr const char *kAscendStage = "tl.ascend_stage";
 // LowerScheduledTIR. It carries stage/guard metadata without introducing task
 // grouping or core-placement semantics.
 constexpr const char *kScheduleUnit = "tl.schedule_unit";
+
+// Root Array<Var> provenance for compiler-created global handoff allocations.
+// Regions carry ownership and dependencies; this set only distinguishes
+// versionable workspace from external tensors and user-created global storage.
+constexpr const char *kCompilerWorkspaceStorages =
+    "tl.ascend.compiler_workspace_storages";
+
+// A logical zero fill created by GM handoff lowering. Storage normalization
+// extends complete matrix axes to their physical padding and consumes this
+// intent before scheduling; partial slices and empty domains stay bounded.
+constexpr const char *kInitializeL1Padding = "tl.ascend.initialize_l1_padding";
 
 } // namespace attr
 } // namespace tl

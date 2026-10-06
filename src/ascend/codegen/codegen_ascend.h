@@ -124,6 +124,7 @@ private:
       unroll_factor_;
 
   ffi::Array<Var> CollectVFCaptures(const SBlockNode *op) const;
+  void EmitCthreadBindings(const Stmt &body, bool vf_local_bindings = false);
   void EmitVFFunction(const SBlockNode *op, const ffi::Array<Var> &captures,
                       const std::string &helper_name,
                       const std::string &func_attrs, VFMode vf_mode);
@@ -145,6 +146,7 @@ private:
   void EmitGmToL1Copy_(const CallNode *op);
   void EmitFillL1_(const CallNode *op);
   void EmitL1ToL0Copy_(const CallNode *op, bool is_l0a);
+  void EmitL1ToL0Copy2D_(const CallNode *op, bool is_l0a);
   void EmitMxSfLoad_(const CallNode *op, bool is_l0a);
   void EmitL0cToUbufCopy_(const CallNode *op);
   void EmitL0cToGmCopy_(const CallNode *op);
@@ -162,6 +164,7 @@ private:
   AscendKernelMode kernel_mode_{AscendKernelMode::kVector};
   int mix_aiv_count_{2};
   bool enable_fast_math_{false};
+  bool is_dav2201_{false};
 
   // Accumulates constraints along the traversal
   arith::Analyzer analyzer_;

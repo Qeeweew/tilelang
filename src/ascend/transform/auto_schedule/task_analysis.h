@@ -53,12 +53,22 @@ namespace ascend {
 
 using namespace tirx;
 
+inline bool IsFlatTaskWrapper(const AttrStmtNode *attribute) {
+  if (attribute == nullptr)
+    return false;
+  if (attribute->attr_key == tl::attr::kAscendTask ||
+      attribute->attr_key == tl::attr::kScheduleUnit)
+    return true;
+  const auto *thread = attribute->node.as<IterVarNode>();
+  return attribute->attr_key == tirx::attr::thread_extent &&
+         thread != nullptr && thread->thread_tag == "cthread";
+}
+
 inline ffi::Optional<Bind> GetFlatTaskBind(const Stmt &stmt) {
   if (const auto *bind = stmt.as<BindNode>())
     return ffi::GetRef<Bind>(bind);
   const auto *attribute = stmt.as<AttrStmtNode>();
-  if (attribute && (attribute->attr_key == tl::attr::kAscendTask ||
-                    attribute->attr_key == tl::attr::kScheduleUnit))
+  if (IsFlatTaskWrapper(attribute))
     return GetFlatTaskBind(attribute->body);
   return std::nullopt;
 }
@@ -67,9 +77,9 @@ inline Stmt ReplaceFlatTaskBind(const Stmt &stmt, const Bind &replacement) {
   if (stmt.as<BindNode>())
     return replacement;
   const auto *attribute = stmt.as<AttrStmtNode>();
-  ICHECK(attribute && (attribute->attr_key == tl::attr::kAscendTask ||
-                       attribute->attr_key == tl::attr::kScheduleUnit))
-      << "Expected a flat Task/schedule-unit wrapper around Bind, got " << stmt;
+  ICHECK(IsFlatTaskWrapper(attribute))
+      << "Expected a flat Task/schedule-unit/cthread wrapper around Bind, got "
+      << stmt;
   return AttrStmt(attribute->node, attribute->attr_key, attribute->value,
                   ReplaceFlatTaskBind(attribute->body, replacement),
                   attribute->span);
@@ -83,8 +93,9 @@ protected:
 
   void VisitStmt_(const SeqStmtNode *op) final {
     // Mirror ConstrVisitor's own SeqStmt handling: a flat Bind (here wrapped
-    // in a Task/schedule-unit attr) defines its variable for the following
-    // statements of this sequence, but not while its value is evaluated.
+    // in Task/schedule-unit/cthread attrs) defines its variable for the
+    // following statements of this sequence, but not while its value is
+    // evaluated.
     size_t old_size = constr_stack_.size();
     for (const Stmt &stmt : op->seq) {
       VisitStmt(stmt);
@@ -265,6 +276,17 @@ private:
     } else if (op->op.same_as(tl::ascend_set_atomic()) ||
                op->op.same_as(tl::ascend_set_atomic_none())) {
       Add(SpecialRegister::kAtomicMode);
+    } else if (IsAscendCopyCall(op)) {
+      AscendCopy copy(op->args, op->annotations);
+      if (IsL0CBuffer(copy->src) &&
+          (IsGlobalBuffer(copy->dst) || IsSharedBuffer(copy->dst)))
+        Add(SpecialRegister::kFixpipeNz2Nd);
+    } else if (op->op.same_as(tl::ascend_copy_matrix_cc_to_gm()) ||
+               op->op.same_as(tl::ascend_copy_matrix_cc_to_ub())) {
+      Add(SpecialRegister::kFixpipeNz2Nd);
+    } else if (const auto *callee = op->op.as<OpNode>();
+               callee && callee->name == "tl.ascend_membase.select_bits") {
+      Add(SpecialRegister::kCmpMask);
     } else if (IsCrossCoreSyncCall(op)) {
       ICHECK_EQ(op->args.size(), 3)
           << "ascend_cross_core_set_flag/wait_flag expects 3 arguments";
@@ -303,9 +325,15 @@ private:
     StmtExprVisitor::VisitExpr_(op);
   }
 
-  // Task-level blocks are atomic to all task analyses.
+  // VF is one hardware V operation. Ordinary CUBE/VECTOR blocks describe
+  // ownership only: their copies, fills and math still issue on their actual
+  // hardware pipes. In particular, an AIV GM load is MTE2 rather than V.
   void VisitStmt_(const SBlockNode *op) final {
-    usage_.pipe_mask |= PipeMask(GetAscendBlockPipe(op->name_hint));
+    if (op->name_hint == "SIMT_VF" || op->name_hint == "SIMD_VF") {
+      usage_.pipe_mask |= PipeMask(ResourcePipe::kVector);
+      return;
+    }
+    StmtExprVisitor::VisitStmt_(op);
   }
 
   TaskResourceUsage usage_;

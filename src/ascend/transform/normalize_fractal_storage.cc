@@ -18,8 +18,10 @@
 #include "ascend/op/ascend_mte_plan.h"
 #include "ascend/op/copy.h"
 #include "ascend/op/utils.h"
+#include "ascend/transform/attr.h"
 #include "op/builtin.h"
 #include "op/copy.h"
+#include "op/fill.h"
 #include "op/utils.h"
 #include "transform/common/attr.h"
 
@@ -173,6 +175,11 @@ private:
       break;
     case AscendFractalKind::kMajorMN:
       padded_layout = MakeAscendMajorMNLayout(padded);
+      break;
+    case AscendFractalKind::kL0AMajorK:
+    case AscendFractalKind::kL0AMajorMN:
+      padded_layout = MakeAscendL0A2201Layout(
+          padded, info.kind == AscendFractalKind::kL0AMajorMN);
       break;
     case AscendFractalKind::kL0C:
       padded_layout = MakeAscendL0CLayout(padded);
@@ -388,6 +395,47 @@ private:
     return store;
   }
   PrimExpr VisitExpr_(const CallNode *op) final {
+    if (op->op.same_as(Fill::Get()) &&
+        op->annotations.count(attr::kInitializeL1Padding)) {
+      Fill logical(op->args, op->annotations);
+      ICHECK(IsL1Buffer(logical->dst) && buffers_.count(logical->dst))
+          << "GM handoff padding requires normalized canonical L1 storage";
+      ICHECK(analyzer_->CanProveEqual(logical->value,
+                                     make_zero(logical->value.dtype())));
+      Call call = Downcast<Call>(Parent::VisitExpr_(op));
+      Fill physical(call->args, call->annotations);
+      Array<Range> ranges = physical->region;
+      // Region rewriting has absorbed any dense reshape alias. Whole axes
+      // must be recognized in that canonical logical coordinate system,
+      // never by comparing old alias axes with new allocation axes.
+      const auto &logical_shape = anchors_[logical->dst->data]->shape;
+      for (size_t axis = ranges.size() - 2; axis < ranges.size(); ++axis) {
+        const Range &before = physical->region[axis];
+        if (!analyzer_->CanProveEqual(before->min, 0))
+          continue;
+        PrimExpr extent;
+        if (analyzer_->CanProveEqual(before->extent, logical_shape[axis])) {
+          extent = physical->dst->shape[axis];
+        } else if (const auto *select = before->extent.as<SelectNode>()) {
+          if (analyzer_->CanProveEqual(select->true_value,
+                                       logical_shape[axis]) &&
+              analyzer_->CanProveEqual(select->false_value, 0)) {
+            extent = Select(select->condition,
+                            physical->dst->shape[axis],
+                            make_zero(before->extent.dtype()));
+          }
+        }
+        if (extent.defined())
+          ranges.Set(axis, Range::FromMinExtent(
+                               ranges[axis]->min,
+                               cast(ranges[axis]->extent.dtype(), extent)));
+      }
+      auto *writer = call.CopyOnWrite();
+      writer->args.Set(0, MakeRegion_(BufferRegion(physical->dst, ranges),
+                                      Downcast<Call>(call->args[0])));
+      writer->annotations.erase(attr::kInitializeL1Padding);
+      return call;
+    }
     if (op->op.same_as(region())) {
       BufferRegion buffer_region = NormalizeToBufferRegion(GetRef<Call>(op));
       if (buffers_.count(buffer_region->buffer))

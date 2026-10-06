@@ -248,6 +248,10 @@ TVM_DLL const Op &ascend_fill_l1();
  * mStep, kStep, srcStride, dstStride, transpose)
  */
 TVM_DLL const Op &ascend_load_cbuf_to_ca();
+// Native dav-2201 LoadData2D: dst, src, start_index, repeat, src_stride,
+// dst_gap (all geometry in 512-byte fractals), transpose (B16 tile).
+TVM_DLL const Op &ascend_load_cbuf_to_ca_2d();
+TVM_DLL const Op &ascend_load_cbuf_to_cb_2d();
 
 /*!
  * \brief Ascend load from CBuf (L1) to CB (L0B).

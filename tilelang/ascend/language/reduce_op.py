@@ -1,11 +1,9 @@
 """Ascend dialect of the reduce operators.
 
-Same surface as :mod:`tilelang.language.reduce_op`, plus the SimdVF direct
-path: a SimdVF region has no thread domain, so the common implementation's
-fragment round-trip (alloc_fragment + copy in + reduce + copy out) for
-shared-to-shared reductions cannot lower there. Inside SimdVF the reduce is
-emitted directly on the UB regions and AscendSimdVFLowerParallel lowers it to
-the SIMD reduction intrinsics.
+Same surface as :mod:`tilelang.language.reduce_op`. Shared-to-shared reductions
+retain their UB regions: native MemBase lowering owns the 2201 path, and
+AscendSimdVFLowerParallel owns reductions inside a 3510 SimdVF. Neither path
+uses the common GPU fragment round-trip.
 
 The thin ``reduce_*`` wrappers are redeclared because the common ones call
 the common ``reduce`` by module-level binding and would bypass this dialect's
@@ -24,8 +22,6 @@ from tilelang.language.reduce_op import (
 )
 from tilelang.language.utils import _normalize_annotations
 from tilelang.utils.language import is_shared, retrieve_shape, to_buffer_region, to_tile_region
-
-from .frame import inside_simdvf
 
 __all__ = [
     "reduce",
@@ -49,12 +45,12 @@ def reduce(
     batch: int = 1,
     annotations: dict | None = None,
 ) -> None:
-    """Common :func:`tilelang.language.reduce_op.reduce` plus the SimdVF path."""
-    if not (inside_simdvf() and is_shared(buffer) and is_shared(out)):
+    """Emit UB reduction intent without introducing GPU fragments."""
+    if not (is_shared(buffer) and is_shared(out)):
         return _common_reduce(buffer, out, reduce_type, dim, clear, batch=batch, annotations=annotations)
 
-    # Same validation as the common reduce, then a direct emission on the UB
-    # regions: no fragment exists inside SimdVF to round-trip through.
+    # Preserve logical regions until the bound target selects an instruction
+    # algorithm and exposes its scratch and effects before scheduling.
     if batch < 1:
         raise ValueError(f"batch must be >= 1, got {batch}")
     out_buffer = to_buffer_region(out).buffer
@@ -79,7 +75,7 @@ def reduce(
             "handle",
             tirx.op.Op.get(_REDUCE_OP_KEY),
             to_tile_region(buffer, access_type="r"),
-            to_tile_region(out, access_type="w"),
+            to_tile_region(out, access_type="w" if clear else "rw"),
             reduce_type,
             dim,
             clear,

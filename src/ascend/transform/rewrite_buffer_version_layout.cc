@@ -23,6 +23,7 @@
  */
 
 #include "buffer_version.h"
+#include "storage_footprint.h"
 
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/reflection/registry.h>
@@ -47,8 +48,6 @@ using namespace tirx;
 using namespace ffi;
 
 namespace {
-
-constexpr int kVersionAlignmentBits = 256;
 
 bool IsUnifiedBuffer(const Var &data) {
   String scope = GetPtrStorageScope(data);
@@ -184,7 +183,9 @@ public:
       // logical slot. Compute the slot size in bits so aliases of a different
       // dtype resolve against the same shared storage.
       int elem_bits = owner->dtype.bits() * owner->dtype.lanes();
-      ICHECK_EQ(kVersionAlignmentBits % elem_bits, 0)
+      const int alignment_bits =
+          ascend::AscendScopeAlignBytes(GetPtrStorageScope(data)) * 8;
+      ICHECK_EQ(alignment_bits % elem_bits, 0)
           << "32-byte version alignment cannot be represented in "
           << owner->dtype << " elements";
       PrimExpr slot_elems = make_const(index_dtype, 1);
@@ -198,18 +199,33 @@ public:
       slot_elems = layout_analyzer.Simplify(slot_elems);
       PrimExpr compact_slot_bits =
           slot_elems * make_const(index_dtype, elem_bits);
+      // MaterializeMultiBuffer already gives automatic versions an aligned
+      // leading stride. Preserve it rather than treating its physical offset
+      // as a compact offset and applying alignment a second time. Layout
+      // lowering may reconstruct compact slots; those still use the path below.
+      if (!owner->strides.empty()) {
+        PrimExpr stride_bits =
+            owner->strides[0] * make_const(index_dtype, elem_bits);
+        if (layout_analyzer.CanProveEqual(
+                indexmod(stride_bits, make_const(index_dtype, alignment_bits)),
+                0) &&
+            layout_analyzer.CanProve(stride_bits >= compact_slot_bits))
+          continue;
+        ICHECK(layout_analyzer.CanProveEqual(stride_bits, compact_slot_bits))
+            << "Versioned UB storage requires compact or aligned slot strides: "
+            << owner->name;
+      }
       PrimExpr aligned_slot_bits = layout_analyzer.Simplify(
           indexdiv(compact_slot_bits +
-                       make_const(index_dtype, kVersionAlignmentBits - 1),
-                   make_const(index_dtype, kVersionAlignmentBits)) *
-          make_const(index_dtype, kVersionAlignmentBits));
+                       make_const(index_dtype, alignment_bits - 1),
+                   make_const(index_dtype, alignment_bits)) *
+          make_const(index_dtype, alignment_bits));
       if (layout_analyzer.CanProveEqual(aligned_slot_bits, compact_slot_bits)) {
         continue;
       }
-      // AutoSchedule accounts for the compact slot size when checking UB
-      // capacity. We intentionally do not feed this per-version padding back
-      // into that check: unaligned version slots are expected only in small
-      // kernels where the extra allocation cannot approach the UB limit.
+      // The scheduler charges the same aligned slot footprint. This late
+      // rewrite preserves manual compact-version semantics and layouts that
+      // were materialized after the scheduled-TIR boundary.
       PrimExpr physical_extent_bits = layout_analyzer.Simplify(
           aligned_slot_bits * make_const(index_dtype, num_versions));
       PrimExpr storage_base = owner->elem_offset.defined()

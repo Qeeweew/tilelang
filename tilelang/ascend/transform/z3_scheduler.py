@@ -79,9 +79,10 @@ def z3_schedule_python(
     Parameters
     ----------
     latencies : list[int]
-        Execution latency of each task in cycles.
+        Task durations in the cost model's units (cycles for calibrated models,
+        dimensionless ordering weights for uncalibrated models).
     iis : list[int]
-        Initiation interval of each task in cycles.
+        Task issue intervals in the same units as ``latencies``.
     resource_flags : list[int]
         Resource pipe mask for each task (bitmask of ResourcePipe values):
         MTE1=1, MTE2=2, MTE3=4, Cube=8, Vector=16, Fixpipe=32, Scalar=64.
@@ -283,6 +284,7 @@ def z3_schedule_loop_python(
     manual_schedule: bool = False,
     seed: int | None = 42,
     verbose: bool = False,
+    stage_horizon: int | None = None,
 ) -> tuple[list[int], list[int], int]:
     """Schedule a loop body with modulo, stage, and storage constraints.
 
@@ -295,10 +297,15 @@ def z3_schedule_loop_python(
     ----------
     num_stages : int
         Maximum number of physical versions available to automatic buffers.
+    stage_horizon : int | None
+        Optional maximum number of task stages for automatic Ascend pipelines.
+        Bounds the same joint solve that selects order and physical versions;
+        an explicit manual schedule retains its existing stage policy.
     latencies : list[int]
-        Execution latency of each task in cycles.
+        Task durations in the cost model's units (cycles for calibrated models,
+        dimensionless ordering weights for uncalibrated models).
     iis : list[int]
-        Initiation interval of each task in cycles.
+        Task issue intervals in the same units as ``latencies``.
     resource_flags : list[int]
         Resource pipe mask for each task (bitmask of ResourcePipe values):
         MTE1=1, MTE2=2, MTE3=4, Cube=8, Vector=16, Fixpipe=32, Scalar=64.
@@ -352,6 +359,8 @@ def z3_schedule_loop_python(
     # For small number of tasks, return trivial schedule
     if n < 1:
         raise RuntimeError("Z3 loop scheduling failed: n too small")
+    if stage_horizon is not None and stage_horizon < 1:
+        raise ValueError("Automatic pipeline stage_horizon must be positive")
 
     if stage_order_deps is None:
         stage_order_deps = []
@@ -420,6 +429,8 @@ def z3_schedule_loop_python(
 
         for i in range(n):
             solver.add(k_vars[i] >= 0)
+            if stage_horizon is not None and not manual_schedule:
+                solver.add(k_vars[i] < stage_horizon)
             solver.add(r_vars[i] >= 0)
             solver.add(r_vars[i] < ii_mid)
 
@@ -797,6 +808,7 @@ def z3_schedule_loop_ffi(
     enable_offset=False,
     manual_stages=None,
     manual_schedule=False,
+    stage_horizon=0,
 ):
     """FFI wrapper for z3_schedule_loop_python.
 
@@ -847,6 +859,7 @@ def z3_schedule_loop_ffi(
             manual_stages=manual_stages_list,
             manual_schedule=bool(manual_schedule),
             seed=42,
+            stage_horizon=int(stage_horizon) if stage_horizon else None,
         )
 
     # Return start_times and buffer_versions as separate arrays for easier FFI handling

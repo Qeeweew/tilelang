@@ -69,7 +69,7 @@ Stmt StripScheduledGuards(Stmt body) {
       continue;
     }
     if (const auto *attribute = body.as<AttrStmtNode>()) {
-      if (!IsScheduleGuardAttribute(attribute->attr_key))
+      if (!IsScheduleGuardAttribute(attribute))
         break;
       body = attribute->body;
       continue;
@@ -223,12 +223,21 @@ private:
           attribute->attr_key == tl::attr::kAscendPerCoreTask) {
         return DecodeNode(marker, body, std::move(*guards));
       }
-      ICHECK(IsScheduleGuardAttribute(attribute->attr_key))
+      ICHECK(IsScheduleGuardAttribute(attribute))
           << "DecodeScheduledTIR found an unsupported guard AttrStmt key "
           << attribute->attr_key;
       guards->push_back(
           std::make_unique<AttributeGuard>(attribute->node, attribute->attr_key,
                                            attribute->value, attribute->span));
+      if (IsScheduledCthreadBinding(attribute)) {
+        const Var &sid = Downcast<IterVar>(attribute->node)->var;
+        // Hardware lane range is a lexical binding, not an activation guard.
+        // In particular, lane 1's empty data work still reaches completion.
+        auto scope = MakeGuard(
+            sid, Range::FromMinExtent(make_zero(sid.dtype()),
+                                      cast(sid.dtype(), attribute->value)));
+        return DecodeGuardedNode(marker, attribute->body, guards);
+      }
       if (attribute->attr_key == tirx::attr::tilelang_assume) {
         auto scope = MakeGuard(Downcast<PrimExpr>(attribute->node),
                                /*is_assume=*/true);
@@ -298,6 +307,14 @@ private:
       ICHECK_NE(pipe_mask, 0)
           << "Cannot recover the pipe of a scheduled T.PerCoreTask";
       task->MarkPerCoreTask();
+      // Atomic copy/select candidates own an internal register setup and
+      // consume sequence. Preserve that shared state when they are grouped;
+      // standalone scalar SPR writers retain their existing candidate rules.
+      constexpr uint16_t kInternalRegisterMask =
+          static_cast<uint16_t>(SpecialRegister::kFixpipeNz2Nd) |
+          static_cast<uint16_t>(SpecialRegister::kCmpMask);
+      task->SetSpecialWriteMask(AnalyzeSpecialRegisterWrites(body) &
+                               kInternalRegisterMask);
     } else {
       task->SetSpecialWriteMask(AnalyzeSpecialRegisterWrites(body));
     }
@@ -476,11 +493,17 @@ ScheduledTIR DecodeScheduledTIR(const SBlock &root, const ConstrSet &outer_ctx,
     scheduled_tir.metadata.has_buffer_aliases = true;
   }
   if (auto value = root->annotations.Get(kVectorCount)) {
-    const auto *count = value.value().as<IntImmNode>();
-    ICHECK(count != nullptr && (count->value == 1 || count->value == 2))
+    // Map<String, Any> preserves a Python integer as an FFI primitive. Integer
+    // has the pinned TVM fallback conversion for that standard representation
+    // as well as the IntImm emitted by the scheduled-TIR encoder.
+    auto count = value.value().try_cast<Integer>();
+    ICHECK(!value.value().as<bool>().has_value() && count.has_value() &&
+           !count.value()->dtype.is_bool() &&
+           (count.value()->value == 1 || count.value()->value == 2))
         << "Mixed-kernel vector_count must be the constant integer 1 or 2, got "
         << value.value();
-    scheduled_tir.metadata.num_aiv_subcores = static_cast<int>(count->value);
+    scheduled_tir.metadata.num_aiv_subcores =
+        static_cast<int>(count.value()->value);
   }
   if (auto value = root->annotations.Get(kRootConflictHints)) {
     scheduled_tir.metadata.root_conflict_hints =

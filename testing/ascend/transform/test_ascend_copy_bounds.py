@@ -1,6 +1,7 @@
 """DMA bounds are clamped without introducing scheduling-time copy guards."""
 
 import pytest
+import tilelang
 from tilelang import tvm
 from tilelang.ascend import language as T, transform
 from tilelang.layout import make_ascend_nz_layout, make_ascend_major_k_layout
@@ -80,6 +81,11 @@ def test_in_bounds_copy_does_not_fill_extra_storage(case):
 def test_tile_aligned_opaque_offset_has_no_partial_row_padding():
     index = tirx.decl_buffer((1,), "int32", scope="local.var")[0]
     before = _copy_module((64, 16), (16, 16), [index * 16, 0], [16, 16])
+    # Opaque selectors need a valid source-tile range: this boundary supports
+    # tail padding, rather than inventing a value for a fully OOB source tile.
+    func = before["main"]
+    before["main"] = func.with_body(tirx.SeqStmt([tirx.Evaluate(tirx.assume((index >= 0) & (index <= 3))), func.body]))
+    before = tilelang.transform.InjectAssumes()(before)
     after = transform.AscendInsertOOBPadding()(before)
     assert not calls(after, "tl.tileop.fill")
 

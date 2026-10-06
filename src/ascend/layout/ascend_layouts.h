@@ -22,6 +22,8 @@ namespace tl {
 // an alias of MajorK during the transition.
 Layout MakeAscendMajorKLayout(const tirx::Buffer &buffer, int k_align = 1);
 Layout MakeAscendMajorMNLayout(const tirx::Buffer &buffer, int k_align = 1);
+// Native dav-2201 L0A ZA order: M fractals precede K fractals.
+Layout MakeAscendL0A2201Layout(const tirx::Buffer &buffer, bool transpose);
 Layout MakeAscendL0CLayout(const tirx::Buffer &buffer);
 Layout MakeAscendSFLayout(const tirx::Buffer &buffer);
 Layout MakeAscendNZLayout(const tirx::Buffer &buffer);
@@ -77,11 +79,15 @@ enum class AscendFractalKind {
   kL0C = 1,     // [col/16, row/16, row%16, col%16] (fixed accumulator)
   kSF = 2,      // [row/16, col/pack, row%16, col%pack] for MX scale factors
   kMajorMN = 3, // [row/C0, col/16, col%16, row%C0]
+  kL0AMajorK = 4,  // [row/16, col/C0, row%16, col%C0]
+  kL0AMajorMN = 5, // [col/16, row/C0, col%16, row%C0]
 };
 
 inline bool IsAscendMajorKind(AscendFractalKind kind) {
   return kind == AscendFractalKind::kMajorK ||
-         kind == AscendFractalKind::kMajorMN;
+         kind == AscendFractalKind::kMajorMN ||
+         kind == AscendFractalKind::kL0AMajorK ||
+         kind == AscendFractalKind::kL0AMajorMN;
 }
 
 enum class LogicalAxis {
@@ -95,9 +101,9 @@ struct AscendFractalLayoutInfo {
   PrimExpr row_frac; // always 16
   PrimExpr rows;     // logical rows (dim -2)
   PrimExpr cols;     // logical cols (dim -1)
-  PrimExpr outer0;   // full physical extent of C0-axis outer for matrix data or
+  PrimExpr outer0;   // semantic extent of C0-axis outer for matrix data or
                      // row16-axis outer for SF
-  PrimExpr outer1;   // full physical extent of row16-axis outer for matrix data
+  PrimExpr outer1;   // semantic extent of row16-axis outer for matrix data
                      // or C0-axis outer for SF
   LogicalAxis c0_axis;    // which logical axis is grouped by C0/pack
   LogicalAxis row16_axis; // which logical axis is grouped by 16
@@ -122,7 +128,8 @@ bool TryExtractAscendFractalLayout(const Layout &layout,
                                    AscendFractalLayoutInfo *out);
 
 /// Map a logical region through \p layout and extract the trailing four
-/// physical output ranges into \p out.
+/// physical output ranges into the semantic axes in \p out. Native 2201
+/// L0A swaps the outer physical order while retaining the same logical axes.
 bool TryExtractAscendFractalRegion(const Layout &layout,
                                    const ffi::Array<Range> &logical_region,
                                    AscendFractalRegionInfo *out);

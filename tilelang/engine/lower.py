@@ -77,9 +77,16 @@ def host_codegen(
     """
     target_host = context.target_host
     host_mod = tirx.transform.BindTarget(target_host)(host_mod)
+    if context.name == "ascend":
+        # The pinned storage legalizers remap pointer definitions in Bind,
+        # but require an existing remap when visiting AllocBuffer. Lower the
+        # native-device workspace allocations to Bind before legalizing their
+        # host-side storage; device functions retain their native dtypes.
+        host_mod = tirx.transform.LowerTVMBuiltin()(host_mod)
     host_mod = tirx.transform.FP8StorageLegalize()(host_mod)
     host_mod = tirx.transform.BF16StorageLegalize()(host_mod)
-    host_mod = tirx.transform.LowerTVMBuiltin()(host_mod)
+    if context.name != "ascend":
+        host_mod = tirx.transform.LowerTVMBuiltin()(host_mod)
     host_mod = tirx.transform.LowerCustomDatatypes()(host_mod)
     host_mod = tilelang.transform.LowerIntrin()(host_mod)
     combine_context_call = getattr(tirx.transform, "CombineContextCall", None)

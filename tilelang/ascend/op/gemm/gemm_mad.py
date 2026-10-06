@@ -5,12 +5,14 @@ from tilelang.ascend import language as T
 from tilelang.layout import (
     make_ascend_major_k_layout,
     make_ascend_major_mn_layout,
+    make_ascend_l0a_2201_layout,
     try_extract_fractal_layout,
 )
 from tilelang.transform.simplify import _Simplify
 from tvm import DataType, arith, tirx
 from tvm.ir import Range
 from tvm.target import Target
+import tvm_ffi
 
 
 GEMM_INST_MAD = "ascend.mad"
@@ -125,9 +127,15 @@ class GemmMAD(GemmBase):
         # K-alignment for the MX scale groups:
         #   A: trans_A=False -> K-major; trans_A=True -> MN-major
         #   B: trans_B=True  -> K-major; trans_B=False -> MN-major
+        # Native 2201 L0A additionally keeps M-fractals before K-fractals in
+        # ZA order; the logical reduce-K axis remains grouped by C0.
         k_align = 64 if self.is_blockscaled else 1
+        info = tvm_ffi.get_global_func("tl.GetAscendTargetInfo")(target)
+        native_l0a = str(info["arch"]) == "dav-2201"
 
         def _a_layout(buf):
+            if native_l0a and buf.scope().startswith("shared.l0a"):
+                return make_ascend_l0a_2201_layout(buf, transpose=self.trans_A)
             return make_ascend_major_mn_layout(buf, k_align=k_align) if self.trans_A else make_ascend_major_k_layout(buf, k_align=k_align)
 
         def _b_layout(buf):

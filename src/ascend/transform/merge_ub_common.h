@@ -41,6 +41,7 @@
 
 #include "op/builtin.h"
 #include "runtime/thread_storage_scope.h"
+#include "storage_footprint.h"
 #include "support/check.h"
 #include "tir/transforms/ir_utils.h"
 
@@ -74,73 +75,11 @@ inline bool IsScopeMemory(tirx::Var buffer_var,
   return GetPtrStorageScope(std::move(buffer_var)) == target_scope;
 }
 
-inline int AscendScopeAlignBytes(const std::string &scope) {
-  if (scope == "shared.l0c" || scope == "shared.l0c.dyn")
-    return 1024;
-  if (scope == "shared.l1" || scope == "shared.l1.dyn" ||
-      scope == "shared.l0a" || scope == "shared.l0a.dyn" ||
-      scope == "shared.l0b" || scope == "shared.l0b.dyn")
-    return 512;
-  return 0;
-}
-
-inline int AscendScopeAlignBytes(const tirx::AllocBufferNode *alloc) {
-  if (alloc == nullptr)
-    return 0;
-  return AscendScopeAlignBytes(GetPtrStorageScope(alloc->buffer->data));
-}
-
-inline int64_t PackedBytesFromElems(int64_t elements, int elem_bits) {
-  return (elem_bits % 8 == 0) ? elements * (elem_bits / 8)
-                              : (elements * elem_bits + 7) / 8;
-}
-
-inline PrimExpr PackedBytesFromElems(PrimExpr elements, int elem_bits) {
-  if (elem_bits % 8 == 0)
-    return elements * tirx::make_const(elements.dtype(), elem_bits / 8);
-  return tirx::FloorDiv(elements *
-                                tirx::make_const(elements.dtype(), elem_bits) +
-                            tirx::make_const(elements.dtype(), 7),
-                        tirx::make_const(elements.dtype(), 8));
-}
-
-inline PrimExpr PackedElemsFromBytes(PrimExpr bytes, int elem_bits) {
-  return tirx::FloorDiv(bytes * tirx::make_const(bytes.dtype(), 8),
-                        tirx::make_const(bytes.dtype(), elem_bits));
-}
-
-inline PrimExpr AlignPrimExpr(const PrimExpr &value, int alignment) {
-  if (alignment <= 1)
-    return value;
-  DataType dtype = value.dtype();
-  ICHECK(dtype.is_int() || dtype.is_uint())
-      << "Expected integer dtype for alignment, but got " << dtype;
-  PrimExpr align_expr = tirx::make_const(dtype, alignment);
-  PrimExpr adjust = tirx::make_const(dtype, alignment - 1);
-  return indexdiv(value + adjust, align_expr) * align_expr;
-}
-
-inline PrimExpr GetBufferSizeBytes(const tirx::AllocBufferNode *alloc,
-                                   DataType result_dtype) {
-  DataType size_dtype = DataType::Int(32);
-  if (!alloc->buffer->shape.empty())
-    size_dtype = alloc->buffer->shape[0].dtype();
-  if (!size_dtype.is_int() && !size_dtype.is_uint())
-    size_dtype = DataType::Int(32);
-
-  PrimExpr total_elems = tirx::make_const(size_dtype, 1);
-  for (const PrimExpr &extent : alloc->buffer->shape) {
-    PrimExpr normalized_extent = extent;
-    if (normalized_extent.dtype() != size_dtype)
-      normalized_extent = cast(size_dtype, normalized_extent);
-    total_elems = total_elems * normalized_extent;
-  }
-  int elem_bits = alloc->buffer->dtype.bits() * alloc->buffer->dtype.lanes();
-  PrimExpr size_bytes = PackedBytesFromElems(total_elems, elem_bits);
-  if (size_bytes.dtype() != result_dtype)
-    size_bytes = cast(result_dtype, size_bytes);
-  return size_bytes;
-}
+using ascend::AlignPrimExpr;
+using ascend::AscendScopeAlignBytes;
+using ascend::GetBufferSizeBytes;
+using ascend::PackedBytesFromElems;
+using ascend::PackedElemsFromBytes;
 
 class AllocateCollector : public tirx::StmtExprVisitor {
 public:
