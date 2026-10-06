@@ -26,6 +26,7 @@
 #include "arith/ir_mutator_with_analyzer.h"
 #include "arith/ir_visitor_with_analyzer.h"
 #include "ascend/op/utils.h"
+#include "ascend/target_utils.h"
 #include "ascend/transform/vf_regions.h"
 #include "backend/common/target_utils.h"
 #include "config.h"
@@ -1619,20 +1620,26 @@ private:
 // Ascend variant of the parallel-loop fuser. SIMD_VF bodies are opaque scalar
 // CCE code, so fusion never descends into them; inside SIMT_VF a loop nest
 // feeding reducer_update keeps its shape so ReducerPlanAndMaterialize can
-// still recognize the per-axis reduction structure.
+// still recognize the per-axis reduction structure. The 2201 MemBase path
+// also keeps logical axes: its instruction lowering consumes row broadcasts
+// and column predicates before choosing contiguous vector instruction domains.
 class ParallelLoopFuserSkipSimdVF : public ParallelLoopFuser {
 public:
-  static Stmt Fuse(const Stmt &stmt) {
+  static Stmt Fuse(const Stmt &stmt, bool preserve_membase_axes) {
     arith::Analyzer analyzer;
-    ParallelLoopFuserSkipSimdVF substituter(&analyzer);
+    ParallelLoopFuserSkipSimdVF substituter(&analyzer, preserve_membase_axes);
     return substituter.VisitStmt(stmt);
   }
 
 private:
-  ParallelLoopFuserSkipSimdVF(arith::Analyzer *analyzer)
-      : ParallelLoopFuser(analyzer) {}
+  ParallelLoopFuserSkipSimdVF(arith::Analyzer *analyzer,
+                              bool preserve_membase_axes)
+      : ParallelLoopFuser(analyzer),
+        preserve_membase_axes_(preserve_membase_axes) {}
 
   bool PreserveParallelLoopNest(const ForNode *op) const final {
+    if (preserve_membase_axes_)
+      return true;
     if (!inside_simt_vf_) {
       return false;
     }
@@ -1658,6 +1665,7 @@ private:
     return result;
   }
 
+  bool preserve_membase_axes_;
   bool inside_simt_vf_{false};
 };
 
@@ -1686,7 +1694,13 @@ public:
   static PrimFunc Substitute(PrimFunc f) {
     arith::Analyzer analyzer;
     PrimFuncNode *fptr = f.CopyOnWrite();
-    fptr->body = ParallelLoopFuserSkipSimdVF::Fuse(f->body);
+    auto target = f->GetAttr<Target>(tvm::attr::kTarget);
+    ICHECK(target.defined()) << "AscendLayoutInference requires a bound target";
+    bool preserve_membase_axes =
+        GetAscendTargetInfo(target.value()).architecture ==
+        AscendArchitecture::kDav2201;
+    fptr->body =
+        ParallelLoopFuserSkipSimdVF::Fuse(f->body, preserve_membase_axes);
     BufferUseDefCollector collector;
     collector.Collect(f);
     auto result = collector.Run();

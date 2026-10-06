@@ -117,7 +117,7 @@ def test_misaligned_source_rows_are_diagnosed_without_overreading_padding():
     "kwargs, diagnostic",
     [
         ({"axis": 0}, "trailing axis"),
-        ({"kind": "sum", "dtype": "float16"}, "native float16 sum uses float16 intermediates"),
+        ({"kind": "sum", "dtype": "float16"}, "Low-precision sum output needs an explicit accumulator-precision contract"),
         ({"kind": "min"}, "only reduce_sum and reduce_max"),
         ({"count": 0}, "count zero must not issue"),
     ],

@@ -163,6 +163,44 @@ The count may have a static tail or a bounded dynamic extent, including zero;
 each physical UB operand origin must satisfy 32-byte instruction alignment.
 Multi-row DMA uses target-specific byte gaps on GM and 32-byte gaps on UB.
 
+For 2201, layout inference preserves the logical Parallel loop axes and
+validates their ordinary nest layout. Vector lowering chooses the contiguous
+instruction domain after consuming row broadcasts and column predicates.
+The 3510 fusion and VF layout contracts are unchanged. Independent dense
+assignments over a partitioned AIV's static private row domain can use one
+whole-tile count instruction, including consecutive assignments with their
+typed rounding boundaries. Logical and physical continuity, alignment and
+same-storage alias checks establish lane independence; unowned serial loops,
+cross-row dependencies, predicates and dynamic domains retain their controls.
+
+Static FP32 row broadcasts in ordinary `T.Parallel(R, 64)` assignments can
+use one native Brcb and one strided subtract, multiply or division operation.
+Brcb fetches eight compact FP32 row values per repeat and copies each payload
+into one 32-byte block. Compiler-owned private UB scratch has `R * 8` FP32
+elements (`32 * R` bytes); it is allocated before scheduling and has an ordinary
+buffer lifetime. Both row-factor operand orders retain their mathematical
+order, including `row / matrix`. Division uses the same native FP32 `vdiv`
+primitive as the existing count API and inherits its accuracy and special-value
+limitations; it does not insert a reciprocal algorithm.
+
+This path requires a proved static positive row count divisible by eight and
+at most 255, contiguous physical matrix rows of exactly 64 FP32 elements,
+compact row state, and 32-byte-aligned starts. Unconditional consecutive
+assignments can keep Exp and terminal casts at the whole-matrix count while
+preserving each expression node and assignment order. Row state must not alias
+matrix or output storage. Same-storage matrix operands require the identical
+typed physical start; shifted views, lane predicates, dynamic or empty row
+domains, and other widths retain the existing lowering. Partitioned mixed
+kernels use the same test on each AIV's actual private row domain.
+
+The IR retains FP32 `tl.access_ptr` read/write regions: Brcb reads `R` values
+and writes `R * 8`, and the strided binary reads a matrix of `R * 64` and the
+`R * 8` broadcast blocks while writing `R * 64`. Only native Brcb codegen
+reinterprets FP32 pointers as UInt32, matching the CANN 9.1 b32 interface.
+Every normal-mode instruction explicitly defines normal/full mask. These
+operations use PIPE_V and the shared RAW/WAR/WAW, version and completion
+analyses; no hidden event or composite softmax algorithm is introduced.
+
 Private UB copies and direct dense Parallel assignments preserve source bits.
 The 2201 count primitive uses UInt16 OR of the source with itself, including
 two UInt16 lanes per FP32 element. It keeps the typed regions and exact element
@@ -177,9 +215,31 @@ can remain consecutive. This rule is separate from 3510's VF execution path.
 
 Trailing-axis FP32 sum/max and FP16 max reductions use the installed native
 repeat interfaces with explicit partial-result scratch and completion before
-compact scalar output stores. FP16 sum and BF16 reductions currently require
-explicit FP32 promotion. Unsupported gathers, predicates, layouts and
-conversion modes have diagnostics at the relevant lowering boundary.
+compact scalar output stores. Sum with FP16 or BF16 input and FP32 output
+exposes an ordinary widening cast, then uses the same FP32 partial plan. Its
+`clear=False` combine is FP32. BF16 max widens, uses that plan, and narrows the
+selected result; `clear=False` remains a separate BF16 max node after narrowing.
+These composed paths use per-row aligned UB scratch allocated by the compiler;
+users need no auxiliary buffer or cast.
+FP16 max with `clear=False` also exposes its combine as an ordinary typed
+vector max over aligned scratch. Compact old-output reads and final stores
+remain scalar accesses; this avoids the unsupported 2201 scalar half max.
+
+For matching native dtypes, clear-true rank-two rows exactly one 256-byte VL
+wide can use one batched count instruction. Proven tight source rows and
+contiguous destination results retain exact typed effects. The destination
+base keeps the native alignment requirement; internally adjacent scalar
+results use stride one. This path needs no reduction scratch or per-row scalar
+readback. Dynamic rows, partial or strided layouts, other widths and clear-false
+reductions retain the ordinary row plan.
+
+Low-precision sum output remains diagnosed: FP32 accumulation followed by one
+narrowing does not preserve low-precision intermediate rounding. The promoted
+paths inherit the native FP32 reduction's ordering and special-value limits;
+`nan_propagate=True` remains unsupported. This does not establish NaN payload
+or propagation behavior, signed-zero tie selection, or subnormal preservation.
+Unsupported gathers, predicates, layouts and conversion modes have diagnostics
+at the relevant lowering boundary.
 
 ## Automatic pipelines and cost evidence
 

@@ -4,7 +4,7 @@
 /*!
  * \file lower_vector_tiles.cc
  * \brief Expose 2201 MemBase arithmetic, scratch, and memory effects before
- *        scheduling. Each intrinsic is one native count-mode vector operation.
+ *        scheduling. Each intrinsic is one native vector operation.
  */
 
 #include <tvm/arith/analyzer.h>
@@ -19,6 +19,7 @@
 
 #include <limits>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "ascend/op/copy.h"
@@ -73,6 +74,26 @@ REGISTER_MEMBASE_OP(mul_scalar, 4);
 REGISTER_MEMBASE_OP(max_scalar, 4);
 REGISTER_MEMBASE_OP(min_scalar, 4);
 #undef REGISTER_MEMBASE_OP
+
+// These operations retain typed FP32 regions. Only native code generation
+// bitcasts the single Brcb instruction's operands to uint32_t pointers.
+TVM_REGISTER_OP("tl.ascend_membase.brcb_f32")
+    .set_num_inputs(3)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+TVM_REGISTER_OP("tl.ascend_membase.sub_rows_f32")
+    .set_num_inputs(5)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+TVM_REGISTER_OP("tl.ascend_membase.mul_rows_f32")
+    .set_num_inputs(5)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
+TVM_REGISTER_OP("tl.ascend_membase.div_rows_f32")
+    .set_num_inputs(5)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
 
 TVM_REGISTER_OP("tl.ascend_membase.select_bits")
     .set_num_inputs(5)
@@ -241,9 +262,11 @@ private:
     }
   }
 
-  BufferLoad NewScratch(DataType dtype) {
+  BufferLoad NewScratch(DataType dtype, int64_t elements = -1) {
+    if (elements < 0)
+      elements = count_;
     PrimExpr bytes = ascend::PackedBytesFromElems(
-        make_const(DataType::Int(64), count_), dtype.bits() * dtype.lanes());
+        make_const(DataType::Int(64), elements), dtype.bits() * dtype.lanes());
     PrimExpr capacity = analyzer_.Simplify(ascend::PackedElemsFromBytes(
         ascend::AlignPrimExpr(bytes,
                               ascend::AscendScopeAlignBytes("shared.dyn")),
@@ -255,12 +278,14 @@ private:
     return BufferLoad(buffer, {make_const(DataType::Int(32), 0)});
   }
 
-  PrimExpr Ptr(const BufferLoad &load, int mask) {
+  PrimExpr Ptr(const BufferLoad &load, int mask,
+               Optional<PrimExpr> elements = std::nullopt) {
     return Call(DataType::Handle(), tl::access_ptr(),
-                {load, active_count_, make_const(DataType::Int(32), mask)});
+                {load, elements.has_value() ? elements.value() : active_count_,
+                 make_const(DataType::Int(32), mask)});
   }
 
-  void Emit(const char *name, Array<PrimExpr> args) {
+  void Emit(const char *name, Array<PrimExpr> args, bool append_count = true) {
     // Count-mode arithmetic permits exact in-place operands. A shifted
     // overlapping source is not an in-place operation and would introduce
     // instruction-order-dependent reads within the vector tile.
@@ -290,7 +315,8 @@ private:
               "shifted overlapping source/destination regions are "
               "unsupported; use a separate UB tile");
     }
-    args.push_back(cast(DataType::UInt(32), active_count_));
+    if (append_count)
+      args.push_back(cast(DataType::UInt(32), active_count_));
     emitted_.push_back(Evaluate(
         Call(DataType::Void(),
              Op::Get(std::string("tl.ascend_membase.") + name), args)));
@@ -342,7 +368,255 @@ private:
     return {dst, PrimExpr()};
   }
 
-  // Recognize an affine prefix interval on the one dense vector coordinate.
+  // Compact row state is proved against logical and physical storage.
+  bool IsAligned32(const BufferLoad &base) {
+    return analyzer_.CanProveEqual(
+        floormod(FlatOffset(base, true),
+                 make_const(FlatOffset(base, true).dtype(),
+                            32 / (base->buffer->dtype.bits() / 8))),
+        0);
+  }
+
+  bool IsRowBroadcast(const BufferLoad &load) {
+    if (batch_rows_ == 0 || load->buffer->dtype != DataType::Float(32))
+      return false;
+    PrimExpr row = batch_row_var_.value() - batch_row_min_;
+    PrimExpr logical = FlatOffset(load, false);
+    PrimExpr physical = FlatOffset(load, true);
+    return analyzer_.CanProveEqual(logical,
+                                   Substitute(logical, base_map_) + row) &&
+           analyzer_.CanProveEqual(physical,
+                                   Substitute(physical, base_map_) + row);
+  }
+
+  struct RowBinary {
+    BufferLoad matrix;
+    BufferLoad row;
+    const char *name;
+    bool row_lhs;
+  };
+
+  std::optional<RowBinary> MatchRowBinary(const PrimExpr &expr) {
+    if (batch_rows_ == 0 || expr.dtype() != DataType::Float(32))
+      return std::nullopt;
+    PrimExpr lhs, rhs;
+    const char *name;
+    if (const auto *sub = expr.as<SubNode>()) {
+      lhs = sub->a;
+      rhs = sub->b;
+      name = "sub_rows_f32";
+    } else if (const auto *mul = expr.as<MulNode>()) {
+      lhs = mul->a;
+      rhs = mul->b;
+      name = "mul_rows_f32";
+    } else if (const auto *div = expr.as<DivNode>()) {
+      lhs = div->a;
+      rhs = div->b;
+      name = "div_rows_f32";
+    } else {
+      return std::nullopt;
+    }
+    const auto *a = lhs.as<BufferLoadNode>();
+    const auto *b = rhs.as<BufferLoadNode>();
+    if (!a || !b || a->buffer->dtype != DataType::Float(32) ||
+        b->buffer->dtype != DataType::Float(32))
+      return std::nullopt;
+    BufferLoad aa = GetRef<BufferLoad>(a), bb = GetRef<BufferLoad>(b);
+    if (IsRowBroadcast(aa) && DenseOrScalar(bb, false))
+      return RowBinary{bb, aa, name, true};
+    if (IsRowBroadcast(bb) && DenseOrScalar(aa, false))
+      return RowBinary{aa, bb, name, false};
+    return std::nullopt;
+  }
+
+  Value LowerRowBinary(const RowBinary &binary, Optional<BufferLoad> output) {
+    BufferLoad matrix = Base(binary.matrix);
+    BufferLoad row = Base(binary.row);
+    auto found = row_blocks_.find(binary.row);
+    BufferLoad blocks;
+    PrimExpr rows = make_const(DataType::Int(32), batch_rows_);
+    PrimExpr block_elements = make_const(DataType::Int(32), batch_rows_ * 8);
+    if (found == row_blocks_.end()) {
+      blocks = NewScratch(DataType::Float(32), batch_rows_ * 8);
+      // One repeat reads eight compact FP32 values and writes eight 32B
+      // blocks. R is a multiple of eight; neither the read nor write is rounded
+      // beyond the declared regions. The ordinary V RAW dependency supplies
+      // completion before a row-binary consumer.
+      Emit("brcb_f32",
+           {Ptr(blocks, kAccessWrite, block_elements),
+            Ptr(row, kAccessRead, rows),
+            make_const(DataType::UInt(8), batch_rows_ / 8)},
+           false);
+      row_blocks_.emplace(binary.row, blocks);
+    } else {
+      blocks = found->second;
+    }
+    BufferLoad dst =
+        output.has_value() ? output.value() : NewScratch(DataType::Float(32));
+    PrimExpr matrix_ptr = Ptr(matrix, kAccessRead);
+    PrimExpr row_ptr = Ptr(blocks, kAccessRead, block_elements);
+    Emit(binary.name,
+         {Ptr(dst, kAccessWrite), binary.row_lhs ? row_ptr : matrix_ptr,
+          binary.row_lhs ? matrix_ptr : row_ptr,
+          make_const(DataType::UInt(8), batch_rows_),
+          make_const(DataType::Bool(), binary.row_lhs)},
+         false);
+    return {dst, PrimExpr()};
+  }
+
+  bool CollectRowAssignments(Stmt body, std::vector<BufferStore> *stores) {
+    while (const auto *realize = body.as<SBlockRealizeNode>()) {
+      if (!is_one(realize->predicate) || !realize->iter_values.empty() ||
+          !realize->block->alloc_buffers.empty() ||
+          !realize->block->match_buffers.empty() ||
+          !realize->block->annotations.empty() ||
+          realize->block->init.defined())
+        return false;
+      body = realize->block->body;
+    }
+    if (const auto *sequence = body.as<SeqStmtNode>()) {
+      for (const Stmt &statement : sequence->seq)
+        if (!CollectRowAssignments(statement, stores))
+          return false;
+      return true;
+    }
+    const auto *store = body.as<BufferStoreNode>();
+    if (!store ||
+        (store->predicate.has_value() && !is_one(store->predicate.value())))
+      return false;
+    stores->push_back(GetRef<BufferStore>(store));
+    return true;
+  }
+
+  std::optional<Stmt> TryCoalescedRows(const ForNode *op) {
+    // Mixed ownership turns its row Parallel into a private Serial loop. Only
+    // unconditional independent row/column assignments can be flattened here;
+    // arbitrary serial controls and cross-row state are never reordered.
+    if (mixed_cube_ && !row_partitioned_)
+      return std::nullopt;
+    if (op->kind != ForKind::kParallel &&
+        !(op->kind == ForKind::kSerial && row_partitioned_))
+      return std::nullopt;
+    const auto *column = op->body.as<ForNode>();
+    if (!column || column->kind != ForKind::kParallel)
+      return std::nullopt;
+    arith::ConstIntBound row_bound = analyzer_.const_int_bound(op->extent);
+    arith::ConstIntBound column_bound =
+        analyzer_.const_int_bound(column->extent);
+    int64_t rows = row_bound->min_value;
+    int64_t columns = column_bound->min_value;
+    if (rows <= 0 || rows != row_bound->max_value || columns <= 0 ||
+        columns != column_bound->max_value ||
+        rows > std::numeric_limits<int32_t>::max() / columns)
+      return std::nullopt;
+    Stmt body = column->body;
+    std::vector<BufferStore> stores;
+    if (!CollectRowAssignments(body, &stores) || stores.empty())
+      return std::nullopt;
+
+    analyzer_.Bind(column->loop_var,
+                   Range::FromMinExtent(column->min, column->extent));
+    Map<Var, PrimExpr> saved_base = base_map_;
+    PrimExpr saved_linear = linear_index_, saved_active = active_count_;
+    int64_t saved_count = count_, saved_rows = batch_rows_;
+    Optional<Var> saved_var = batch_row_var_;
+    PrimExpr saved_min = batch_row_min_;
+    auto restore = [&]() {
+      base_map_ = saved_base;
+      linear_index_ = saved_linear;
+      active_count_ = saved_active;
+      count_ = saved_count;
+      batch_rows_ = saved_rows;
+      batch_row_var_ = saved_var;
+      batch_row_min_ = saved_min;
+    };
+    base_map_.clear();
+    base_map_.Set(op->loop_var, op->min);
+    base_map_.Set(column->loop_var, column->min);
+    linear_index_ = (op->loop_var - op->min) * column->extent +
+                    (column->loop_var - column->min);
+    active_count_ = make_const(DataType::Int(32), rows * columns);
+    count_ = rows * columns;
+    // Dense independent assignments need only the ordinary count-mode
+    // contract. Compact row operands additionally require Brcb's exact
+    // eight-row input blocks and the normal binary's one-FP32-VL row shape.
+    batch_rows_ = columns == 64 && rows % 8 == 0 && rows <= 255 ? rows : 0;
+    batch_row_var_ = op->loop_var;
+    batch_row_min_ = op->min;
+
+    std::vector<BufferLoad> reads, writes;
+    std::unordered_set<const BufferLoadNode *> row_reads;
+    bool predicates = false;
+    for (const BufferStore &store : stores) {
+      writes.push_back(BufferLoad(store->buffer, store->indices));
+      PostOrderVisit(store->value, [&](const ObjectRef &node) {
+        if (const auto *load = node.as<BufferLoadNode>())
+          reads.push_back(GetRef<BufferLoad>(load));
+        if (const auto *expr = node.as<PrimExprNode>()) {
+          if (auto binary = MatchRowBinary(GetRef<PrimExpr>(expr)))
+            row_reads.insert(binary->row.get());
+        }
+        if (node.as<SelectNode>())
+          predicates = true;
+        if (const auto *call = node.as<CallNode>();
+            call && call->op.same_as(Op::Get("tirx.if_then_else")))
+          predicates = true;
+      });
+    }
+    bool valid = !predicates;
+    // Replacing per-lane statement order by whole-tile statement order is
+    // safe only for independent lanes. Same-storage matrix views therefore
+    // require identical typed physical starts; shifted/disjoint views fall
+    // back instead of adding another alias-range contract here.
+    auto exact_or_distinct = [&](const BufferLoad &a, const BufferLoad &b) {
+      return !a->buffer->data.same_as(b->buffer->data) ||
+             (a->buffer->dtype == b->buffer->dtype &&
+              analyzer_.CanProveEqual(FlatOffset(Base(a), true),
+                                      FlatOffset(Base(b), true)));
+    };
+    for (const BufferLoad &write : writes) {
+      valid &= DenseOrScalar(write, false) && IsAligned32(Base(write));
+      for (const BufferLoad &other : writes)
+        valid &= exact_or_distinct(write, other);
+    }
+    for (const BufferLoad &load : reads) {
+      if (IsRowBroadcast(load)) {
+        valid &= row_reads.count(load.get()) != 0 && IsAligned32(Base(load));
+        for (const BufferLoad &write : writes)
+          valid &= !load->buffer->data.same_as(write->buffer->data);
+        for (const BufferLoad &other : reads)
+          if (!IsRowBroadcast(other))
+            valid &= !load->buffer->data.same_as(other->buffer->data);
+      } else {
+        bool dense = DenseOrScalar(load, false);
+        valid &= dense || DenseOrScalar(load, true);
+        if (dense)
+          valid &= IsAligned32(Base(load));
+        for (const BufferLoad &write : writes) {
+          valid &= exact_or_distinct(load, write);
+          // A uniform scalar read cannot alias a matrix written by another
+          // lane or a preceding whole-tile assignment.
+          valid &= dense || !load->buffer->data.same_as(write->buffer->data);
+        }
+      }
+    }
+    if (!valid) {
+      restore();
+      return std::nullopt;
+    }
+    for (const BufferLoad &write : writes) {
+      CheckBuffer(write->buffer);
+      CheckInBounds(write);
+    }
+    for (const BufferLoad &load : reads) {
+      CheckBuffer(load->buffer);
+      CheckInBounds(load);
+    }
+    Stmt result = LowerBody(body);
+    restore();
+    return result;
+  }
+
   // Intersections/unions remain one scalar Min/Max cutoff, rather than a
   // per-lane condition tree. Other predicates have a single boundary
   // diagnostic.
@@ -661,6 +935,11 @@ private:
       if (found != values_.end())
         return found->second;
     }
+    if (auto binary = MatchRowBinary(expr)) {
+      Value result = LowerRowBinary(binary.value(), output);
+      values_.emplace(expr, result);
+      return result;
+    }
     if (const auto *load = expr.as<BufferLoadNode>()) {
       BufferLoad base = Base(GetRef<BufferLoad>(load));
       CheckAligned(base);
@@ -845,6 +1124,7 @@ private:
     output_dtype_ = store->buffer->dtype;
     emitted_.clear();
     values_.clear();
+    row_blocks_.clear();
     BufferLoad dst = Base(BufferLoad(store->buffer, store->indices));
     CheckAligned(dst);
     Value result = LowerExpr(store->value, dst);
@@ -880,7 +1160,7 @@ private:
               "UB copy region rank must match its buffer");
       for (size_t i = 0; i < ranges.size(); ++i) {
         Require(CanProveAscendRangeInBounds(ranges[i]->min, ranges[i]->extent,
-                                          buffer->shape[i], &analyzer_),
+                                            buffer->shape[i], &analyzer_),
                 "UB copy regions must lie within their private allocations; "
                 "clamp the valid region or fill padding explicitly");
       }
@@ -924,6 +1204,8 @@ private:
 
   Stmt VisitStmt_(const ForNode *op) final {
     analyzer_.Bind(op->loop_var, Range::FromMinExtent(op->min, op->extent));
+    if (auto batched = TryCoalescedRows(op))
+      return batched.value();
     if (op->kind != ForKind::kParallel)
       return StmtExprMutator::VisitStmt_(op);
     Require(!mixed_cube_ || row_partitioned_,
@@ -1084,6 +1366,10 @@ private:
   PrimExpr active_count_;
   DataType output_dtype_;
   ValueMap values_;
+  std::unordered_map<PrimExpr, BufferLoad, ValueHash, ValueEqual> row_blocks_;
+  int64_t batch_rows_{0};
+  Optional<Var> batch_row_var_;
+  PrimExpr batch_row_min_;
   int64_t count_{0};
   int next_temporary_{0};
 };

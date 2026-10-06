@@ -2039,6 +2039,61 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
   if (EmitAscendMemoryCall_(op)) {
     return;
   }
+  if (const auto *callee = op->op.as<OpNode>();
+      callee && callee->name == "tl.ascend_membase.brcb_f32") {
+    ICHECK(is_dav2201_) << "FP32 Brcb requires dav-2201";
+    ICHECK_EQ(op->args.size(), 3U);
+    // The IR operands remain FP32: vbrcb copies b32 payloads, including signed
+    // zero and NaN bits. The public C API only exposes uint32_t pointer types.
+    std::string dst = PrintExpr(op->args[0]);
+    std::string src = PrintExpr(op->args[1]);
+    std::string repeats = PrintExpr(op->args[2]);
+    PrintIndent();
+    stream << "asc_set_mask_norm();\n";
+    PrintIndent();
+    stream << "asc_set_vector_mask(~uint64_t(0), ~uint64_t(0));\n";
+    PrintIndent();
+    stream << "asc_brcb(reinterpret_cast<__ubuf__ uint32_t*>(" << dst
+           << "), reinterpret_cast<__ubuf__ uint32_t*>(" << src
+           << "), uint16_t(1), uint16_t(8), " << repeats << ");\n";
+    return;
+  }
+  if (const auto *callee = op->op.as<OpNode>();
+      callee && (callee->name == "tl.ascend_membase.sub_rows_f32" ||
+                 callee->name == "tl.ascend_membase.mul_rows_f32" ||
+                 callee->name == "tl.ascend_membase.div_rows_f32")) {
+    ICHECK(is_dav2201_) << "FP32 row binary requires dav-2201";
+    ICHECK_EQ(op->args.size(), 5U);
+    const auto *row_lhs = op->args[4].as<IntImmNode>();
+    ICHECK(row_lhs != nullptr);
+    std::string dst = PrintExpr(op->args[0]);
+    std::string lhs = PrintExpr(op->args[1]);
+    std::string rhs = PrintExpr(op->args[2]);
+    std::string repeats = PrintExpr(op->args[3]);
+    const char *name =
+        callee->name == "tl.ascend_membase.sub_rows_f32"   ? "asc_sub"
+        : callee->name == "tl.ascend_membase.mul_rows_f32" ? "asc_mul"
+                                                           : "asc_div";
+    // One full FP32 VL per row. A zero block stride reuses the same 32B
+    // broadcast block eight times; its repeat stride advances one row block.
+    PrintIndent();
+    stream << "asc_set_mask_norm();\n";
+    PrintIndent();
+    stream << "asc_set_vector_mask(~uint64_t(0), ~uint64_t(0));\n";
+    PrintIndent();
+    stream << name << "(" << dst << ", " << lhs << ", " << rhs << ", "
+           << repeats << ", uint8_t(1), uint8_t(" << (row_lhs->value ? 0 : 1)
+           << "), uint8_t(" << (row_lhs->value ? 1 : 0)
+           << "), uint8_t(8), uint8_t(" << (row_lhs->value ? 1 : 8)
+           << "), uint8_t(" << (row_lhs->value ? 8 : 1) << "));\n";
+    // Leave normal/full mask explicitly defined for a following normal-mode
+    // instruction. Count-mode consumers define their own count mask.
+    PrintIndent();
+    stream << "asc_set_mask_norm();\n";
+    PrintIndent();
+    stream << "asc_set_vector_mask(~uint64_t(0), ~uint64_t(0));\n";
+    return;
+  }
   if (op->op.same_as(builtin::reinterpret())) {
     SSAOperationScope ssa_scope(this);
     CodeGenC::VisitExpr_(op, os);

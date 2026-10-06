@@ -98,7 +98,7 @@ private:
     for (size_t i = 0; i < region->region.size(); ++i) {
       auto range = region->region[i];
       Require(CanProveAscendRangeInBounds(range->min, range->extent,
-                                        region->buffer->shape[i], &analyzer_),
+                                          region->buffer->shape[i], &analyzer_),
               "source and destination regions must lie within their UB "
               "buffers; clamp the domain or use a padded tile");
     }
@@ -117,12 +117,108 @@ private:
     int64_t block_elements = 32 / (dtype.bits() / 8);
     int64_t padded =
         (elements + block_elements - 1) / block_elements * block_elements;
+    Require(padded <= std::numeric_limits<int32_t>::max(),
+            "aligned reduction scratch exceeds the int32 metadata range");
     Buffer buffer =
         decl_buffer({make_const(DataType::Int(32), padded)}, dtype,
                     "membase_reduce_tmp_" + std::to_string(next_temporary_++),
                     "shared.dyn");
     scratch_.push_back(buffer);
     return BufferLoad(buffer, {make_const(DataType::Int(32), 0)});
+  }
+
+  BufferLoad CombineCompactMax(const BufferLoad &reduced,
+                               const BufferLoad &destination,
+                               Array<Stmt> *tasks) {
+    // Compact output rows are legal S accesses but need not be aligned V
+    // operands. Snapshot the old typed value into compiler-owned aligned UB,
+    // then expose the combine as an ordinary one-lane vector operation. In
+    // particular, dav-2201 has no scalar half max instruction.
+    DataType dtype = destination->buffer->dtype;
+    Var previous("membase_reduce_previous_" + std::to_string(next_temporary_++),
+                 dtype);
+    tasks->push_back(Bind(previous, destination));
+    BufferLoad old_output = NewScratch(1, dtype);
+    tasks->push_back(BufferStore(old_output->buffer, previous, {0}));
+    BufferLoad combined = NewScratch(1, dtype);
+    Var combine("membase_reduce_combine_" + std::to_string(next_temporary_++),
+                DataType::Int(32));
+    tasks->push_back(
+        For(combine, 0, 1, ForKind::kParallel,
+            BufferStore(combined->buffer,
+                        Max(BufferLoad(reduced->buffer, {combine}),
+                            BufferLoad(old_output->buffer, {combine})),
+                        {combine})));
+    return combined;
+  }
+
+  Optional<Stmt> TryBatchNativeRows(const ReduceOp &reduce,
+                                    const BufferLoad &src,
+                                    const BufferLoad &dst,
+                                    const std::vector<Var> &rows,
+                                    int64_t input_count) {
+    const auto *op = reduce.get();
+    const DataType dtype = op->src->dtype;
+    const int64_t vl = 256 / (dtype.bits() / 8);
+    if (!op->clear || rows.size() != 1 || input_count != vl ||
+        op->src->dtype != op->dst->dtype || op->src->shape.size() != 2 ||
+        !op->src->axis_separators.empty() || !op->dst->axis_separators.empty())
+      return std::nullopt;
+    PrimExpr row_extent = analyzer_.Simplify(op->srcRegion_->region[0]->extent);
+    const auto *row_count = row_extent.as<IntImmNode>();
+    // Counter mode ignores the uint8 repeat field; the native count is
+    // uint32. Retain the tighter existing int32 pointer-metadata contract.
+    if (!row_count || row_count->value <= 0 ||
+        row_count->value > std::numeric_limits<int32_t>::max() / vl)
+      return std::nullopt;
+
+    auto src_ranges = op->srcRegion_->region;
+    auto dst_ranges = op->dstRegion_->region;
+    // A flat access_ptr also describes a logical row-major run. Whole trailing
+    // dimensions keep that common effect faithful to the proved physical run;
+    // a layout-transposed partial column view needs the ordinary fallback.
+    if (!analyzer_.CanProveEqual(op->src->shape.back(), Integer(vl)) ||
+        !analyzer_.CanProveEqual(src_ranges.back()->min, Integer(0)) ||
+        op->dst->shape.size() != dst_ranges.size() ||
+        (dst_ranges.size() == 2 &&
+         (!analyzer_.CanProveEqual(op->dst->shape.back(), Integer(1)) ||
+          !analyzer_.CanProveEqual(dst_ranges.back()->min, Integer(0)))))
+      return std::nullopt;
+    if (auto layout = ascend::FindLayoutForBuffer(layouts_, op->dst);
+        layout.has_value() && layout.value()->InputDim() != dst->indices.size())
+      return std::nullopt;
+
+    Array<PrimExpr> src_indices, dst_indices;
+    for (const Range &range : src_ranges)
+      src_indices.push_back(range->min);
+    for (const Range &range : dst_ranges)
+      dst_indices.push_back(range->min);
+    BufferLoad src_base(op->src, src_indices), dst_base(op->dst, dst_indices);
+    PrimExpr src_offset = FlatOffset(src_base);
+    PrimExpr dst_offset = FlatOffset(dst_base);
+    int64_t dst_alignment = op->type->IsMax() ? 2 : 1;
+    if (!analyzer_.CanProveEqual(
+            FlatOffset(src),
+            src_offset + rows[0] * make_const(rows[0].dtype(), vl)) ||
+        !analyzer_.CanProveEqual(FlatOffset(dst), dst_offset + rows[0]) ||
+        !analyzer_.CanProveEqual(
+            floormod(src_offset, Integer(32 / (dtype.bits() / 8))),
+            Integer(0)) ||
+        !analyzer_.CanProveEqual(floormod(dst_offset, Integer(dst_alignment)),
+                                 Integer(0)))
+      return std::nullopt;
+
+    const int64_t count = row_count->value * vl;
+    const Op &intrinsic = Op::Get(
+        op->type->IsSum() ? "tl.ascend_membase.repeat_reduce_sum"
+                          : "tl.ascend_membase.repeat_reduce_max_only_value");
+    // Each 256B input repeat is one complete logical row. ONLY_VALUE dst
+    // stride=1 is in elements; the conservative C API alignment applies only
+    // to this call's base, not each internal result. No row scalar readback.
+    return Evaluate(Call(DataType::Void(), intrinsic,
+                         {Ptr(dst_base, row_count->value, kAccessWrite),
+                          Ptr(src_base, count, kAccessRead),
+                          make_const(DataType::UInt(32), count)}));
   }
 
   Stmt LowerReduce(const ReduceOp &reduce) {
@@ -133,15 +229,21 @@ private:
             "only reduce_sum and reduce_max are implemented");
     Require(!op->nan_propagate,
             "nan_propagate=True has no established native2201 contract");
-    Require(op->src->dtype == op->dst->dtype,
-            "source and destination dtypes must match");
     DataType dtype = op->src->dtype;
-    Require(dtype == DataType::Float(32) ||
-                (op->type->IsMax() && dtype == DataType::Float(16)),
-            "sum currently requires float32; native float16 sum uses float16 "
-            "intermediates with a distinct overflow contract, so promote "
-            "explicitly to float32. Max "
-            "supports float16/float32");
+    const bool low_input = dtype.is_float16() || dtype.is_bfloat16();
+    const bool promote_sum =
+        op->type->IsSum() && low_input && op->dst->dtype == DataType::Float(32);
+    const bool promote_max =
+        op->type->IsMax() && dtype.is_bfloat16() && op->dst->dtype == dtype;
+    const bool native =
+        op->dst->dtype == dtype && (dtype == DataType::Float(32) ||
+                                    (op->type->IsMax() && dtype.is_float16()));
+    Require(native || promote_sum || promote_max,
+            "sum supports float32 accumulation/output, including float16 or "
+            "bfloat16 input. Low-precision sum output needs an explicit "
+            "accumulator-precision contract; FP32 promotion cannot preserve "
+            "its typed intermediate rounding. Max supports matching "
+            "float16/bfloat16/float32 input/output");
     Require(!op->src->data.same_as(op->dst->data),
             "source/destination storage aliasing requires an explicit "
             "non-overlapping temporary");
@@ -207,6 +309,80 @@ private:
                                     offset + column),
             "the reduced row must be physically contiguous");
 
+    if (promote_sum || promote_max) {
+      // Widen input as ordinary typed Cast nodes. For sum the output dtype
+      // specifies FP32 accumulation; low-precision sum output is not silently
+      // assigned a different accumulator. BF16 max selects a represented
+      // value in the same established comparison domain as the FP32 route.
+      Require(task_depth_ == 0,
+              "this reduction expands to multiple dependency-bearing tasks; "
+              "use T.Stage rather than an opaque T.Task/PerCoreTask wrapper");
+      Array<Stmt> tasks;
+      BufferLoad wide_input = NewScratch(input_count, DataType::Float(32));
+      Var column("membase_reduce_promote_" + std::to_string(next_temporary_++),
+                 DataType::Int(32));
+      Array<PrimExpr> promoted_indices = src_indices;
+      promoted_indices.Set(rank - 1, promoted_indices.back() + column);
+      tasks.push_back(
+          For(column, 0, make_const(column.dtype(), input_count),
+              ForKind::kParallel,
+              BufferStore(wide_input->buffer,
+                          Cast(DataType::Float(32),
+                               BufferLoad(op->src, promoted_indices)),
+                          {column})));
+
+      BufferLoad wide_result = NewScratch(1, DataType::Float(32));
+      auto scratch_region = [&](const BufferLoad &base, int64_t count,
+                                int mask) {
+        return Call(DataType::Handle(), tl::region(),
+                    {base, make_const(DataType::Int(32), mask),
+                     make_const(DataType::Int(32), count)});
+      };
+      ReduceOp wide_reduce(
+          {scratch_region(wide_input, input_count, kAccessRead),
+           scratch_region(wide_result, 1, kAccessWrite),
+           StringImm(promote_sum ? "sum" : "max"),
+           make_const(DataType::Int(32), 0), const_true()});
+      tasks.push_back(LowerReduce(wide_reduce));
+
+      BufferLoad final_value = wide_result;
+      if (promote_max) {
+        // Narrow this reduction node before the separate clear=False Max
+        // node. Both remain ordinary typed operations for VectorTiles.
+        BufferLoad narrowed = NewScratch(1, dtype);
+        Var item("membase_reduce_narrow_" + std::to_string(next_temporary_++),
+                 DataType::Int(32));
+        tasks.push_back(For(
+            item, 0, 1, ForKind::kParallel,
+            BufferStore(narrowed->buffer,
+                        Cast(dtype, BufferLoad(wide_result->buffer, {item})),
+                        {item})));
+        final_value = narrowed;
+        if (!op->clear)
+          final_value = CombineCompactMax(narrowed, dst, &tasks);
+      }
+      Var result("membase_reduce_result_" + std::to_string(next_temporary_++),
+                 op->dst->dtype);
+      tasks.push_back(Bind(result, final_value));
+      PrimExpr value = result;
+      if (promote_sum && !op->clear) {
+        Var previous("membase_reduce_previous_" +
+                         std::to_string(next_temporary_++),
+                     DataType::Float(32));
+        tasks.push_back(Bind(previous, dst));
+        value = result + previous;
+      }
+      tasks.push_back(BufferStore(op->dst, value, dst_indices));
+      Stmt body = MakeSeq(tasks);
+      for (size_t i = rows.size(); i-- > 0;)
+        body = For(rows[i], make_zero(rows[i].dtype()), src_ranges[i]->extent,
+                   ForKind::kSerial, body);
+      return body;
+    }
+
+    if (auto batched = TryBatchNativeRows(reduce, src, dst, rows, input_count))
+      return batched.value();
+
     // Max needs twice the element alignment even in ONLY_VALUE mode. An
     // inferred padded output layout may satisfy that contract directly; a
     // compact multi-row output generally needs the explicit scalar path.
@@ -240,13 +416,19 @@ private:
     // Stable CANN max constrains its destination to 4 bytes (half) / 8 bytes
     // (float), with no only_value exception. Keep that operation on aligned
     // scratch, then expose the V->S readback and compact output store. For
-    // clear=False the old output is another explicit scalar read.
+    // clear=False the old output is another explicit scalar read. Half max
+    // combines in V: the corresponding scalar instruction is unavailable on
+    // dav-2201. Its scratch and typed Parallel are visible before scheduling.
     if (compact_store) {
+      bool vector_combine =
+          !op->clear && op->type->IsMax() && dtype.is_float16();
+      if (vector_combine)
+        current = CombineCompactMax(current, dst, &tasks);
       Var result("membase_reduce_result_" + std::to_string(next_temporary_++),
                  dtype);
       tasks.push_back(Bind(result, current));
       PrimExpr value = result;
-      if (!op->clear) {
+      if (!op->clear && !vector_combine) {
         Var previous("membase_reduce_previous_" +
                          std::to_string(next_temporary_++),
                      dtype);
