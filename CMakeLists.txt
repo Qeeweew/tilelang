@@ -178,11 +178,20 @@ endif()
 
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
 
+include(cmake/BackendOptions.cmake)
+
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.gitmodules" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
   find_package(Git QUIET)
   if(Git_FOUND)
+    # Ascend/CPU builds need TVM and its FFI dependencies, not CUDA's CUTLASS
+    # and FlashAttention trees. Keep the full upstream dependency set for CUDA.
+    if(USE_CUDA)
+      set(_tilelang_submodule_args --recursive)
+    else()
+      set(_tilelang_submodule_args 3rdparty/tvm)
+    endif()
     execute_process(
-      COMMAND ${GIT_EXECUTABLE} submodule update --init --recursive
+      COMMAND ${GIT_EXECUTABLE} submodule update --init ${_tilelang_submodule_args}
       WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
       RESULT_VARIABLE TILELANG_GIT_SUBMODULE_RESULT
     )
@@ -191,6 +200,13 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.gitmodules" AND EXISTS "${CMAKE_CURRENT_
         FATAL_ERROR
           "Failed to initialize git submodules. Please run "
           "`git submodule update --init --recursive` and re-run CMake."
+      )
+    endif()
+    if(NOT USE_CUDA)
+      execute_process(
+        COMMAND ${GIT_EXECUTABLE} submodule update --init --recursive 3rdparty/tvm-ffi
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/tvm
+        COMMAND_ERROR_IS_FATAL ANY
       )
     endif()
   else()
@@ -286,7 +302,6 @@ else()
 endif()
 
 # Configs
-include(cmake/BackendOptions.cmake)
 
 set(PREBUILD_CYTHON ON)
 
@@ -515,6 +530,11 @@ if(WIN32)
 else()
   add_library(tilelang SHARED $<TARGET_OBJECTS:tilelang_objs>)
   target_link_libraries(tilelang PUBLIC tvm_compiler)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    # Compiler/runtime symbols must resolve at build time. A missing builtin
+    # must not survive packaging and terminate a later lazy runtime lookup.
+    target_link_options(tilelang PRIVATE "-Wl,--no-undefined")
+  endif()
 
   # Place dev build outputs under build/lib for consistency
   set_target_properties(tilelang PROPERTIES
