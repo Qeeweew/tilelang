@@ -132,7 +132,7 @@ def test_invalid_input_contract_is_rejected_before_frontend_construction(example
         example.flash_attention_fwd(**arguments)
 
 
-def test_generic_and_pipeline_have_one_shared_step_and_differ_only_in_loop_intent(example):
+def test_variants_share_typed_math_and_pipeline_exposes_independent_rescale(example):
     from tilelang import tvm
     import tilelang
     from tvm import tirx
@@ -187,4 +187,27 @@ def test_generic_and_pipeline_have_one_shared_step_and_differ_only_in_loop_inten
     assert "tl.ascend_auto_pipeline" not in generic_loops[0].annotations
     assert bool(pipeline_loops[0].annotations["tl.ascend_auto_pipeline"])
     assert int(pipeline_loops[0].annotations["num_stages"]) == 3
-    tvm.ir.assert_structural_equal(generic_loops[0].body, pipeline_loops[0].body, map_free_vars=True)
+    def output_stores(stmt):
+        return [store for store in nodes(stmt, tirx.BufferStore) if store.buffer.name == "output"]
+
+    generic_body = list(generic_loops[0].body.seq)
+    pipeline_body = list(pipeline_loops[0].body.seq)
+    # The recurrence retains every shared operation and dtype. Only the
+    # output's FP32 multiply/add acquire separate dependency-bearing tasks.
+    shared = lambda body: tirx.SeqStmt([stmt for stmt in body if not output_stores(stmt)])
+    tvm.ir.assert_structural_equal(shared(generic_body), shared(pipeline_body), map_free_vars=True)
+    (combined,) = output_stores(generic_loops[0].body)
+    rescale, update = output_stores(pipeline_loops[0].body)
+    assert isinstance(combined.value, tirx.Add)
+    assert isinstance(combined.value.a, tirx.Mul)
+    assert isinstance(rescale.value, tirx.Mul)
+    assert isinstance(update.value, tirx.Add)
+    assert all(store.value.dtype == "float32" for store in (combined, rescale, update))
+    assert [load.buffer.name for load in nodes(rescale.value, tirx.BufferLoad)] == ["alpha", "output"]
+    assert [load.buffer.name for load in nodes(update.value, tirx.BufferLoad)] == ["output", "pv"]
+    rescale_index, update_index = [i for i, stmt in enumerate(pipeline_body) if output_stores(stmt)]
+    (p_export_index,) = [i for i, stmt in enumerate(pipeline_body)
+                        if any(call.args[0].args[0].buffer.name == "p" for call in calls(stmt, "tl.tileop.ascend_copy"))]
+    (pv_import_index,) = [i for i, stmt in enumerate(pipeline_body)
+                         if any(call.args[1].args[0].buffer.name == "pv" for call in calls(stmt, "tl.tileop.ascend_copy"))]
+    assert rescale_index < p_export_index < pv_import_index < update_index

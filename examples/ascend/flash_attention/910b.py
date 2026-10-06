@@ -60,7 +60,8 @@ def flash_attention_fwd(
     Consecutive groups of Hq/Hkv query heads share one KV head. A causal key
     is visible when its index <= query_start + query index. Accumulators and
     statistics are FP32; probabilities entering the second GEMM and output
-    are rounded to dtype. The variant changes scheduling intent only.
+    are rounded to dtype. Both variants retain the same typed math while
+    exposing different issue boundaries.
     """
     tiling = tiling or FwdTiling()
     scale = _contract(batch, query_heads, kv_heads, query_len, kv_len, head_dim, dtype, causal, query_start, softmax_scale, tiling)
@@ -104,13 +105,22 @@ def flash_attention_fwd(
         # This is a state copy with exact valid-row effects, not arithmetic.
         # Keep the same epoch-carried maximum buffer for the next KV block.
         T.copy(next_maximum[0:qrows], maximum[0:qrows])
+        if variant == "pipeline":
+            # Independent FP32 rescale: this task does not read the future PV.
+            # The same output epoch is completed by the later FP32 add.
+            for i, j in T.Parallel(block_q, head_dim):
+                output[i, j] = alpha[i] * output[i, j]
         # Unwritten Q-tail rows of P's L1 operand are initialized by the
         # compiler's physical bridge. V remains the ordinary [K,N] operand.
         T.copy(p[0:qrows, :], p_l1)
         T.gemm(p_l1, v_l1, pv_acc, transpose_B=False, clear_accum=True)
         T.copy(pv_acc[0:qrows, :], pv)
-        for i, j in T.Parallel(block_q, head_dim):
-            output[i, j] = alpha[i] * output[i, j] + pv[i, j]
+        if variant == "generic":
+            for i, j in T.Parallel(block_q, head_dim):
+                output[i, j] = alpha[i] * output[i, j] + pv[i, j]
+        else:
+            for i, j in T.Parallel(block_q, head_dim):
+                output[i, j] = output[i, j] + pv[i, j]
 
     @T.prim_func
     def main(
