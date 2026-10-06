@@ -86,12 +86,18 @@ def flash_attention_fwd(
         # read region supplies the one valid row domain to the GM bridge and
         # both AIV owners, including a tail with an empty second owner.
         T.copy(score_acc[0:qrows, :], scores)
-        for i, j in T.Parallel(block_q, block_kv):
-            scores[i, j] = T.if_then_else(
-                (key_base + j < kv_len) & ((not causal) | (key_base + j <= query_start + query_base + i)),
-                scores[i, j] * T.float32(scale),
-                -T.infinity("float32"),
-            )
+        if not causal and kv_len % block_kv == 0:
+            # Every key in each Python-selected tile belongs to the input.
+            # Keep this dense case free of a redundant per-lane predicate.
+            for i, j in T.Parallel(block_q, block_kv):
+                scores[i, j] = scores[i, j] * T.float32(scale)
+        else:
+            for i, j in T.Parallel(block_q, block_kv):
+                scores[i, j] = T.if_then_else(
+                    (key_base + j < kv_len) & ((not causal) | (key_base + j <= query_start + query_base + i)),
+                    scores[i, j] * T.float32(scale),
+                    -T.infinity("float32"),
+                )
         T.reduce_max(scores, next_maximum, dim=1, clear=True)
         for i in T.Parallel(block_q):
             next_maximum[i] = T.max(maximum[i], next_maximum[i])

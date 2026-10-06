@@ -132,13 +132,14 @@ def test_invalid_input_contract_is_rejected_before_frontend_construction(example
         example.flash_attention_fwd(**arguments)
 
 
-def test_variants_share_typed_math_and_pipeline_exposes_independent_rescale(example):
+@pytest.mark.parametrize("kv_len,causal", [(65, True), (64, False), (65, False), (64, True)])
+def test_variants_share_typed_math_and_pipeline_exposes_independent_rescale(example, kv_len, causal):
     from tilelang import tvm
     import tilelang
     from tvm import tirx
     from testing.ascend._ir import calls, nodes
 
-    arguments = dict(batch=1, query_heads=2, kv_heads=1, query_len=33, kv_len=65, head_dim=16, dtype="float16", causal=True, tiling=example.FwdTiling(32, 16, 3))
+    arguments = dict(batch=1, query_heads=2, kv_heads=1, query_len=33, kv_len=kv_len, head_dim=16, dtype="float16", causal=causal, tiling=example.FwdTiling(32, 16, 3))
     programs = {}
     for variant in ("generic", "pipeline"):
         program = example.flash_attention_fwd(**arguments, variant=variant)
@@ -149,6 +150,7 @@ def test_variants_share_typed_math_and_pipeline_exposes_independent_rescale(exam
         assert not [block for block in nodes(mod, tirx.SBlock) if block.name_hint in ("SIMD_VF", "SIMT_VF")]
         assert not [attr for attr in nodes(mod, tirx.AttrStmt) if attr.attr_key == "thread_extent" and attr.node.thread_tag == "cthread"]
         assert not [call for call in nodes(mod, tirx.Call) if isinstance(call.op, tvm.ir.Op) and "softmax" in call.op.name.lower()]
+        assert bool(calls(mod, "tirx.if_then_else")) == (causal or kv_len % 16 != 0)
         transfers = calls(mod, "tl.tileop.ascend_copy")
         logical_bridges = [call for call in transfers if call.args[0].args[0].buffer.scope() == "shared.l0c"]
         assert len(logical_bridges) == 2
