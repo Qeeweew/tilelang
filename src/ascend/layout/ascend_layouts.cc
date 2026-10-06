@@ -349,7 +349,11 @@ bool TryExtractAscendFractalLayout(const Layout &layout, const Buffer &buf,
   PrimExpr row_frac = I(16);
 
   auto ceildiv_expr = [](const PrimExpr &v, const PrimExpr &f) {
-    return FloorDiv(v + f - Integer(1), f);
+    // Canonical fractal factors are positive. Keep the shape's index dtype
+    // and avoid v+factor-1 overflowing before the division.
+    PrimExpr factor = cast(v.dtype(), f);
+    return FloorDiv(v, factor) +
+           cast(v.dtype(), FloorMod(v, factor) != make_zero(v.dtype()));
   };
   const auto *tagged = layout.as<AscendFractalLayoutNode>();
   ICHECK(tagged != nullptr)

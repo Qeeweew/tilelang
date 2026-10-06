@@ -147,13 +147,8 @@ BoundedDMACopyRanges ClampDMACopyTail(const AscendCopyNode &op,
   // compared with the request without overflow.
   auto wide = [](PrimExpr value) { return cast(DataType::Int(64), value); };
   auto end_is_in_bounds = [&](const Range &range, const PrimExpr &shape) {
-    PrimExpr origin = wide(range->min), extent = wide(range->extent);
-    PrimExpr capacity = wide(shape);
-    if (!analyzer->CanProve(origin >= 0 && extent >= 0 && origin <= capacity,
-                            arith::ProofStrength::kSymbolicBound))
-      return false;
-    return analyzer->CanProve(extent <= capacity - origin,
-                              arith::ProofStrength::kSymbolicBound);
+    return CanProveAscendRangeInBounds(range->min, range->extent, shape,
+                                      analyzer);
   };
   auto clamped_extent = [&](const Range &range, const PrimExpr &shape) {
     PrimExpr origin = wide(range->min);

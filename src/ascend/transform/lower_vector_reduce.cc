@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "ascend/op/oob_padding.h"
+#include "ascend/op/utils.h"
 #include "ascend/target_utils.h"
 #include "ascend/transform/attr.h"
 #include "op/builtin.h"
@@ -96,9 +97,8 @@ private:
   void CheckBounds(const BufferRegion &region) {
     for (size_t i = 0; i < region->region.size(); ++i) {
       auto range = region->region[i];
-      Require(analyzer_.CanProve(range->min >= 0) &&
-                  analyzer_.CanProve(range->min + range->extent <=
-                                     region->buffer->shape[i]),
+      Require(CanProveAscendRangeInBounds(range->min, range->extent,
+                                        region->buffer->shape[i], &analyzer_),
               "source and destination regions must lie within their UB "
               "buffers; clamp the domain or use a padded tile");
     }

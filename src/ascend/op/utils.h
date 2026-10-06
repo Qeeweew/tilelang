@@ -9,6 +9,7 @@
 #ifndef TVM_TL_ASCEND_OP_UTILS_H_
 #define TVM_TL_ASCEND_OP_UTILS_H_
 
+#include <tvm/arith/analyzer.h>
 #include <tvm/tirx/op.h>
 
 #include <algorithm>
@@ -20,6 +21,23 @@ namespace tl {
 
 constexpr const char *kL0SFBindings = "tl.l0_sf_bindings";
 using L0SFBindings = ffi::Map<tirx::Var, tirx::Var>;
+
+// Check a semantic region before any layout mapping or pointer arithmetic.
+// Widening an already formed min+extent cannot repair narrow overflow, and an
+// int64 endpoint addition can also overflow. Subtraction is representable once
+// the nonnegative origin is proved no larger than the allocation.
+inline bool CanProveAscendRangeInBounds(const PrimExpr &origin,
+                                       const PrimExpr &extent,
+                                       const PrimExpr &capacity,
+                                       arith::Analyzer *analyzer) {
+  PrimExpr start = cast(DataType::Int(64), origin);
+  PrimExpr count = cast(DataType::Int(64), extent);
+  PrimExpr size = cast(DataType::Int(64), capacity);
+  constexpr auto strength = arith::ProofStrength::kSymbolicBound;
+  if (!analyzer->CanProve(start >= 0 && count >= 0 && start <= size, strength))
+    return false;
+  return analyzer->CanProve(count <= size - start, strength);
+}
 
 // The annotation is emitted by alloc_l0*_sf, never inferred from consumers.
 L0SFBindings CollectL0SFBindings(const tirx::Stmt &body);

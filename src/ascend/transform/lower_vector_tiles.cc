@@ -23,6 +23,7 @@
 
 #include "ascend/op/copy.h"
 #include "ascend/op/oob_padding.h"
+#include "ascend/op/utils.h"
 #include "ascend/target_utils.h"
 #include "ascend/transform/storage_footprint.h"
 #include "layout/layout.h"
@@ -878,10 +879,8 @@ private:
       Require(ranges.size() == buffer->shape.size(),
               "UB copy region rank must match its buffer");
       for (size_t i = 0; i < ranges.size(); ++i) {
-        Require(analyzer_.CanProve(ranges[i]->min >= 0) &&
-                    analyzer_.CanProve(ranges[i]->extent >= 0) &&
-                    analyzer_.CanProve(ranges[i]->min + ranges[i]->extent <=
-                                       buffer->shape[i]),
+        Require(CanProveAscendRangeInBounds(ranges[i]->min, ranges[i]->extent,
+                                          buffer->shape[i], &analyzer_),
                 "UB copy regions must lie within their private allocations; "
                 "clamp the valid region or fill padding explicitly");
       }

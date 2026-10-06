@@ -75,6 +75,15 @@ void CollectFragmentLayouts(const PrimExpr &expr,
   });
 }
 
+// All callers use positive hardware units. Quotient/remainder rounding
+// preserves the index dtype without overflowing value+unit-1 first.
+PrimExpr CeilDivCopyCount(const PrimExpr &value, const PrimExpr &unit) {
+  PrimExpr factor = cast(value.dtype(), unit);
+  return FloorDiv(value, factor) +
+         cast(value.dtype(),
+              FloorMod(value, factor) != make_zero(value.dtype()));
+}
+
 PrimExpr Float4StorageBytes(const PrimExpr &elements, DataType dtype) {
   ICHECK(dtype.is_float4_e2m1fn());
   int element_bits = dtype.bits() * dtype.lanes();
@@ -304,10 +313,14 @@ Stmt LowerDMACopy(const AscendCopyNode &op, const LowerArgs &T,
       const bool load = dma_path == DMAPath::kGMToUB;
       PrimExpr ub_offset_bytes = AscendMTEBytesFromElements(
           load ? plan.dst_offset : plan.src_offset, elem_bits);
-      TVM_FFI_CHECK(analyzer->CanProveEqual(FloorMod(ub_offset_bytes, I(32)),
-                                           I(0)), ValueError)
+      TVM_FFI_CHECK(analyzer->CanProveEqual(
+                        FloorMod(ub_offset_bytes,
+                                 make_const(ub_offset_bytes.dtype(), 32)),
+                        make_zero(ub_offset_bytes.dtype())),
+                    ValueError)
           << "dav-2201 GM <-> UB copy requires a 32-byte-aligned UB origin, "
-             "got byte offset " << ub_offset_bytes;
+             "got byte offset "
+          << ub_offset_bytes;
       // One burst can carry a contiguous tile of any rank. Multiple native
       // bursts each advance the UB side by its rounded 32-byte footprint.
       const bool one_burst = analyzer->CanProveEqual(plan.n_rows, I(1)) ||
@@ -321,10 +334,15 @@ Stmt LowerDMACopy(const AscendCopyNode &op, const LowerArgs &T,
         PrimExpr padded_row_bytes = plan_row_bytes +
             I(load ? right_pad_elems * elem_bits / 8 : 0);
         PrimExpr ub_footprint =
-            ceildiv(padded_row_bytes, I(32)) * I(32);
-        TVM_FFI_CHECK(analyzer->CanProve(ub_pitch >= ub_footprint) &&
-                          analyzer->CanProveEqual(FloorMod(ub_pitch, I(32)),
-                                                  I(0)), ValueError)
+            CeilDivCopyCount(padded_row_bytes,
+                             make_const(padded_row_bytes.dtype(), 32)) *
+            make_const(padded_row_bytes.dtype(), 32);
+        TVM_FFI_CHECK(
+            analyzer->CanProve(ub_pitch >= ub_footprint) &&
+                analyzer->CanProveEqual(
+                    FloorMod(ub_pitch, make_const(ub_pitch.dtype(), 32)),
+                    make_zero(ub_pitch.dtype())),
+            ValueError)
             << "dav-2201 multi-row DMA requires a 32-byte-aligned UB row "
                "pitch covering the rounded burst footprint, got pitch "
             << ub_pitch << " and footprint " << ub_footprint;
@@ -551,7 +569,8 @@ Stmt LowerDMACopy(const AscendCopyNode &op, const LowerArgs &T,
         // to the proof so the runtime has_data guard is preserved below.
         With<arith::ConstraintContext> nonempty_copy(analyzer, has_data);
         ICHECK(analyzer->CanProveEqual(
-            FloorMod(value, make_const(value.dtype(), multiple)), 0))
+            FloorMod(value, make_const(value.dtype(), multiple)),
+            make_zero(value.dtype())))
             << "Ascend transposed L1->L0 copy of " << op.src->name << " ("
             << op.src->dtype << ") requires " << parameter
             << " to be divisible by " << multiple << ", got " << value
@@ -571,8 +590,10 @@ Stmt LowerDMACopy(const AscendCopyNode &op, const LowerArgs &T,
       // Transposition exchanges the source's row16 and C0 dimensions.
       // Compare physical regions, not logical extents or allocation bytes:
       // the declared destination also describes the copy's write effects.
-      PrimExpr written_outer0 = FloorDiv(m_step * 16, c0);
-      PrimExpr written_outer1 = FloorDiv(k_step * c0, 16);
+      PrimExpr written_outer0 =
+          FloorDiv(m_step * 16, make_const(m_step.dtype(), c0));
+      PrimExpr written_outer1 =
+          FloorDiv(k_step * c0, make_const(k_step.dtype(), 16));
       ICHECK(!analyzer->CanProve(written_outer0 > dst_region.outer0->extent) &&
              !analyzer->CanProve(written_outer1 > dst_region.outer1->extent))
           << "Ascend transposed L1->L0 copy writes " << written_outer0 << "x"
@@ -612,7 +633,10 @@ Stmt LowerDMACopy(const AscendCopyNode &op, const LowerArgs &T,
           !is_l0a && !needs_transpose &&
           analyzer->CanProveEqual(src_range[source_row_axis]->min, I(0)) &&
           analyzer->CanProveEqual(
-              FloorMod(src_range[source_c0_axis]->min, src_info.c0), I(0)) &&
+              FloorMod(
+                  src_range[source_c0_axis]->min,
+                  cast(src_range[source_c0_axis]->min.dtype(), src_info.c0)),
+              make_zero(src_range[source_c0_axis]->min.dtype())) &&
           analyzer->CanProveEqual(m_start, I(0)) &&
           analyzer->CanProveEqual(m_step, src_stride) &&
           analyzer->CanProveEqual(repeat, m_step) &&
@@ -625,7 +649,7 @@ Stmt LowerDMACopy(const AscendCopyNode &op, const LowerArgs &T,
                           {dst_ptr, src_base_ptr, k_start * src_stride,
                            merged_repeat, I(1), I(0), I(0)}));
       } else {
-        Var frac("l0_fractal", DataType::Int(32));
+        Var frac("l0_fractal", loop_count.dtype());
         // L0A is M-major ZA; L0B is K-major ZB. Select the source NZ fractal
         // sequence that becomes contiguous in that native destination order.
         PrimExpr start = k_start * src_stride + m_start +
@@ -635,11 +659,13 @@ Stmt LowerDMACopy(const AscendCopyNode &op, const LowerArgs &T,
         const LogicalAxis loop_axis =
             is_l0a ? dst_info.row16_axis : dst_info.c0_axis;
         size_t axis = chunk.size() - (loop_axis == LogicalAxis::kRow ? 2 : 1);
-        chunk.Set(axis, Range::FromMinExtent(frac * I(16), I(16)));
+        PrimExpr fractal_extent = make_const(frac.dtype(), 16);
+        chunk.Set(axis,
+                  Range::FromMinExtent(frac * fractal_extent, fractal_extent));
         PrimExpr chunk_dst =
             MakeAccessPtrFromRegion(BufferRegion(op.dst, chunk), 2);
         native_copy =
-            For(frac, I(0), loop_count, ForKind::kSerial,
+            For(frac, make_zero(frac.dtype()), loop_count, ForKind::kSerial,
                 Evaluate(Call(DataType::Void(), native,
                               {chunk_dst, src_base_ptr, start, repeat, stride,
                                I(0), I(needs_transpose ? 1 : 0)})));
@@ -772,13 +798,16 @@ Stmt LowerDMACopy(const AscendCopyNode &op, const LowerArgs &T,
     PrimExpr raw_total_bytes =
         AscendMTEBytesFromElements(src_layout.modes[0].size, elem_bits);
     TVM_FFI_CHECK(
-        analyzer->CanProveEqual(FloorMod(raw_total_bytes, I(32)), I(0)),
+        analyzer->CanProveEqual(
+            FloorMod(raw_total_bytes, make_const(raw_total_bytes.dtype(), 32)),
+            make_zero(raw_total_bytes.dtype())),
         ValueError)
         << "Ascend raw UB->L1 copy requires a payload that is a multiple of "
            "32 bytes, but got "
         << raw_total_bytes << " bytes from source buffer " << op.src->name
         << " ranges " << src_range << ".";
-    PrimExpr n_burst_val = raw_total_bytes / I(32);
+    PrimExpr n_burst_val =
+        raw_total_bytes / make_const(raw_total_bytes.dtype(), 32);
     call = Call(DataType::Void(), ascend_copy_ubuf_to_cbuf(),
                 {dst_ptr, src_ptr, zero, n_burst_val, I(1), zero, zero});
   } else if (dma_path == DMAPath::kL0CToGM) {
@@ -941,16 +970,21 @@ Stmt LowerMxSfLoad(const AscendCopyNode &op, const LowerArgs &T,
   PrimExpr sf_k_step = sf_region.outer1->extent;
   PrimExpr sf_src_stride = sf_info.outer1;
   PrimExpr sf_dst_stride =
-      FloorDiv(dst_range[ndim - 1]->extent + sf_info.c0 - 1, sf_info.c0);
+      CeilDivCopyCount(dst_range[ndim - 1]->extent, sf_info.c0);
   {
     With<arith::ConstraintContext> nonempty_copy(analyzer, has_data);
     size_t src_ndim = src_range.size();
     ICHECK(analyzer->CanProveEqual(
-               FloorMod(src_range[src_ndim - 2]->min, I(16)), 0) &&
+               FloorMod(src_range[src_ndim - 2]->min,
+                        make_const(src_range[src_ndim - 2]->min.dtype(), 16)),
+               make_zero(src_range[src_ndim - 2]->min.dtype())) &&
            analyzer->CanProveEqual(
-               FloorMod(src_range[src_ndim - 1]->min, sf_info.c0), 0))
+               FloorMod(src_range[src_ndim - 1]->min,
+                        cast(src_range[src_ndim - 1]->min.dtype(), sf_info.c0)),
+               make_zero(src_range[src_ndim - 1]->min.dtype())))
         << "L0 SF source origin must align to 16 MN rows and a scale pair";
-    ICHECK(analyzer->CanProveEqual(sf_m_step, FloorDiv(mn + 15, 16)) &&
+    ICHECK(analyzer->CanProveEqual(
+               sf_m_step, CeilDivCopyCount(mn, make_const(mn.dtype(), 16))) &&
            analyzer->CanProveEqual(sf_k_step, sf_dst_stride))
         << "L0 SF source and compact destination region must cover the same "
            "physical scale groups";
@@ -1131,20 +1165,19 @@ Normalize2201L1ToL0Footprint(const AscendCopyNode &op,
       src_ndim - (src_info.c0_axis == LogicalAxis::kRow ? 2 : 1);
   ICHECK(
       analyzer->CanProveEqual(
-          FloorMod(src_range[source_row_axis]->min, src_info.row_frac), I(0)) &&
+          FloorMod(
+              src_range[source_row_axis]->min,
+              cast(src_range[source_row_axis]->min.dtype(), src_info.row_frac)),
+          make_zero(src_range[source_row_axis]->min.dtype())) &&
       analyzer->CanProveEqual(
-          FloorMod(src_range[source_c0_axis]->min, src_info.c0), I(0)))
+          FloorMod(src_range[source_c0_axis]->min,
+                   cast(src_range[source_c0_axis]->min.dtype(), src_info.c0)),
+          make_zero(src_range[source_c0_axis]->min.dtype())))
       << "dav-2201 LoadData2D requires a row16/C0-aligned source origin; "
       << op.src->name << " has source region " << src_range;
   auto in_source_axis = [&](const PrimExpr &origin, const PrimExpr &extent,
                             const PrimExpr &capacity) {
-    PrimExpr wide_origin = cast(DataType::Int(64), origin);
-    PrimExpr wide_extent = cast(DataType::Int(64), extent);
-    PrimExpr wide_capacity = cast(DataType::Int(64), capacity);
-    if (!analyzer->CanProve(wide_origin >= 0 && wide_extent >= 0 &&
-                            wide_origin <= wide_capacity))
-      return false;
-    return analyzer->CanProve(wide_extent <= wide_capacity - wide_origin);
+    return CanProveAscendRangeInBounds(origin, extent, capacity, analyzer);
   };
   // Prove bounds before MapRegionBounds forms min+extent in the input dtype.
   // A wrapped narrow interval must never turn an out-of-allocation origin
