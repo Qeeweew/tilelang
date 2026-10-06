@@ -6,12 +6,15 @@ returned PrimFunc with target={"kind": "ascend", "arch": "dav-2201"}.
 """
 
 
-def gemm(m, n, k, *, dtype="bfloat16", transpose_b=True, tile_m=128, tile_n=128, tile_k=256):
+def gemm(m, n, k, *, dtype="bfloat16", transpose_b=True, tile_m=128, tile_n=128, tile_k=256, cache_a=False):
     """Build C=A@B.T or C=A@B, with FP32 accumulation and dtype output.
 
     A is [m,k]; B is [n,k] for transpose_b=True or [k,n] otherwise.
     Logical dimensions can have tails. Tile sizes are Python algorithm
     choices; the target's resource planner diagnoses a tile that cannot fit.
+    With cache_a=True, this output tile caches all of A's K dimension in
+    L1 before the K loop. Its capacity is rounded to tile_k; select tiles that
+    fit the target resource planner. The cache is private to each output tile.
     No manual stages, buffer versions or physical-device choice are required.
     """
     from tilelang.ascend import language as T
@@ -26,6 +29,9 @@ def gemm(m, n, k, *, dtype="bfloat16", transpose_b=True, tile_m=128, tile_n=128,
         raise ValueError("dav-2201 GEMM requires FP16 or BF16 operands")
     if not isinstance(transpose_b, bool):
         raise ValueError("transpose_b must be a bool")
+    if not isinstance(cache_a, bool):
+        raise ValueError("cache_a must be a bool")
+    a_k_extent = ((k + tile_k - 1) // tile_k) * tile_k if cache_a else tile_k
     b_shape = (n, k) if transpose_b else (k, n)
     n_tiles = (n + tile_n - 1) // tile_n
     grid = ((m + tile_m - 1) // tile_m) * n_tiles
@@ -35,16 +41,29 @@ def gemm(m, n, k, *, dtype="bfloat16", transpose_b=True, tile_m=128, tile_n=128,
         with T.Kernel(grid) as block:
             mi = block // n_tiles
             ni = block % n_tiles
-            a_l1 = T.alloc_l1((tile_m, tile_k), dtype)
+            a_l1 = T.alloc_l1((tile_m, a_k_extent), dtype)
             b_l1 = T.alloc_l1((tile_n, tile_k) if transpose_b else (tile_k, tile_n), dtype)
             accumulator = T.alloc_l0c((tile_m, tile_n), "float32")
+            if cache_a:
+                T.copy(A[mi * tile_m : (mi + 1) * tile_m, 0:a_k_extent], a_l1)
             for ki in T.Pipelined(T.ceildiv(k, tile_k)):
-                T.copy(A[mi * tile_m : (mi + 1) * tile_m, ki * tile_k : (ki + 1) * tile_k], a_l1)
+                if not cache_a:
+                    T.copy(A[mi * tile_m : (mi + 1) * tile_m, ki * tile_k : (ki + 1) * tile_k], a_l1)
                 if transpose_b:
                     T.copy(B[ni * tile_n : (ni + 1) * tile_n, ki * tile_k : (ki + 1) * tile_k], b_l1)
                 else:
                     T.copy(B[ki * tile_k : (ki + 1) * tile_k, ni * tile_n : (ni + 1) * tile_n], b_l1)
-                T.gemm(a_l1, b_l1, accumulator, transpose_B=transpose_b, clear_accum=ki == 0)
+                if cache_a:
+                    T.gemm(
+                        a_l1[:, ki * tile_k : (ki + 1) * tile_k],
+                        b_l1,
+                        accumulator,
+                        transpose_B=transpose_b,
+                        clear_accum=ki == 0,
+                    )
+                else:
+                    T.gemm(a_l1, b_l1, accumulator, transpose_B=transpose_b, clear_accum=ki == 0)
             T.copy(accumulator, C[mi * tile_m : (mi + 1) * tile_m, ni * tile_n : (ni + 1) * tile_n])
 
-    return main.with_attr("global_symbol", f"gemm_{m}_{n}_{k}_{dtype}")
+    suffix = "_cache_a" if cache_a else ""
+    return main.with_attr("global_symbol", f"gemm_{m}_{n}_{k}_{dtype}{suffix}")
