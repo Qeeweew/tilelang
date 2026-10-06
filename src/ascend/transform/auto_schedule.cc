@@ -167,6 +167,10 @@ public:
     storage_groups_ = std::move(groups);
   }
 
+  // Only 2201 has the non-pipe-selective collective wait contract used by
+  // this source-issue preference. No target timing calibration is implied.
+  void SetPreferHandoffIssue(bool value) { prefer_handoff_issue_ = value; }
+
   void SetMemoryLimit(const std::string &scope, int64_t bytes) {
     memory_limits_[scope] = bytes;
   }
@@ -247,6 +251,7 @@ private:
       selected_buffer_versions_.Set(member, num_versions);
   }
 
+  bool prefer_handoff_issue_{false};
   L0StorageGroups storage_groups_;
   ffi::Map<Var, PrimExpr> storage_slot_bytes_;
   CompilerWorkspaceStorageSet compiler_workspaces_;
@@ -338,6 +343,119 @@ bool HasResourceDependency(const IRStructure *a, const IRStructure *b,
   if (((a->GetPipeMask() & b->GetPipeMask()) & mask) != 0)
     return true;
   return (a->GetHbmMask() & b->GetHbmMask()) != 0;
+}
+
+// Derive an issue-quality preference from the shared leaf access facts. This
+// does not add, erase or redirect a completion dependency. A forward handoff is
+// a concrete-core writer -> other-core reader of the dependency storage. The
+// opposite read -> write slot-release edge remains a hard constraint, but is
+// not mistaken for a forward data consumer here.
+std::vector<std::pair<int64_t, int64_t>>
+CollectHandoffIssuePreferences(const std::vector<IRStructure *> &nodes,
+                               const std::vector<DepInfo> &deps) {
+  const size_t n = nodes.size();
+  std::unordered_map<IRStructure *, size_t> index;
+  std::vector<CoreMask> cores(n, kCoreUnassigned);
+  auto task_core = [](const TaskNode *task) {
+    CoreMask candidate = GetTaskCandidateCoreMask(task);
+    CoreMask lexical = task->GetCoreMask();
+    return lexical == kCoreUnassigned ? candidate : candidate & lexical;
+  };
+  for (size_t i = 0; i < n; ++i) {
+    index[nodes[i]] = i;
+    std::vector<TaskNode *> leaves;
+    CollectAllTaskNodes(nodes[i], leaves);
+    for (TaskNode *task : leaves) {
+      // Scalar bookkeeping with no memory or SPR effects is domain-neutral.
+      // Other leaves use the same hardware candidate facts as AssignCore,
+      // intersected with any existing lexical ownership metadata.
+      if (task->GetCoreMask() == kCoreUnassigned &&
+          task->UsesOnlyPipe(ResourcePipe::kScalar) &&
+          task->GetReadRegions().empty() && task->GetWriteRegions().empty() &&
+          task->GetSpecialWriteMask() == 0 &&
+          task->GetExplicitSpecialReadMask() == 0)
+        continue;
+      CoreMask core = task_core(task);
+      if (!IsConcreteCore(core)) {
+        cores[i] = kCoreBroadcast;
+        break;
+      }
+      cores[i] |= core;
+    }
+  }
+  std::vector<bool> handoff(n, false), blocking_consumer(n, false);
+  std::vector<std::vector<size_t>> predecessors(n), successors(n);
+  for (const DepInfo &dep : deps) {
+    if (dep.kind != DependencyKind::kData)
+      continue;
+    size_t i = index.at(dep.prod_node), j = index.at(dep.cons_node);
+    if (dep.distance == 0 && i != j) {
+      // A dependency through an ambiguous or other-core intermediate still
+      // excludes a producer from being independent of this consumer.
+      successors[i].push_back(j);
+      if (IsConcreteCore(cores[i]) && cores[i] == cores[j])
+        predecessors[j].push_back(i);
+    }
+    if (!dep.storage.has_value())
+      continue;
+    for (const auto &[producer, consumer] : dep.task_pairs) {
+      CoreMask pcore = task_core(producer);
+      CoreMask ccore = task_core(consumer);
+      if (!IsConcreteCore(pcore) || !IsConcreteCore(ccore) || pcore == ccore ||
+          cores[i] != pcore || cores[j] != ccore)
+        continue;
+      const Var &storage = dep.storage.value();
+      // Do not infer a unique forward role from an ambiguous read-modify-write
+      // pair. All of its original dependencies still go to Z3 and InsertSync.
+      if (!producer->WritesStorage(storage) ||
+          !consumer->ReadsStorage(storage) ||
+          (producer->ReadsStorage(storage) && consumer->WritesStorage(storage)))
+        continue;
+      handoff[i] = true;
+      blocking_consumer[j] = true;
+    }
+  }
+
+  std::vector<bool> productive(n, false);
+  for (size_t seed = 0; seed < n; ++seed) {
+    if (!handoff[seed])
+      continue;
+    std::vector<size_t> pending{seed};
+    std::vector<bool> seen(n, false);
+    while (!pending.empty()) {
+      size_t task = pending.back();
+      pending.pop_back();
+      if (seen[task] || blocking_consumer[task])
+        continue;
+      seen[task] = true;
+      productive[task] = true;
+      pending.insert(pending.end(), predecessors[task].begin(),
+                     predecessors[task].end());
+    }
+  }
+
+  std::vector<std::pair<int64_t, int64_t>> result;
+  for (size_t consumer = 0; consumer < n; ++consumer) {
+    if (!blocking_consumer[consumer])
+      continue;
+    std::vector<bool> depends_on_consumer(n, false);
+    std::vector<size_t> pending{consumer};
+    while (!pending.empty()) {
+      size_t task = pending.back();
+      pending.pop_back();
+      if (depends_on_consumer[task])
+        continue;
+      depends_on_consumer[task] = true;
+      pending.insert(pending.end(), successors[task].begin(),
+                     successors[task].end());
+    }
+    for (size_t producer = 0; producer < n; ++producer) {
+      if (productive[producer] && !depends_on_consumer[producer] &&
+          cores[producer] == cores[consumer])
+        result.emplace_back(producer, consumer);
+    }
+  }
+  return result;
 }
 
 ScheduleBuilder::LetDependencyClosure
@@ -1030,6 +1148,13 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
     }
   }
 
+  // This is a soft issue preference after the minimum-II solve. All directed,
+  // resource, owner, stage, version and SPR constraints remain hard. Compound
+  // units keep their existing boundaries; no wait is moved into lane guards.
+  std::vector<std::pair<int64_t, int64_t>> issue_priority_pairs;
+  if (prefer_handoff_issue_ && auto_pipeline && !manual_schedule)
+    issue_priority_pairs = CollectHandoffIssuePreferences(nodes, deps);
+
   // Stage-order constraints for copied Let variables.
   //
   // A Let task `a = buf[...]` only READS buffers (it writes a scalar var).
@@ -1079,6 +1204,7 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
   ffi::Array<ffi::Array<int64_t>> tvm_resource_deps;
   ffi::Array<ffi::Array<int64_t>> tvm_owner_exclusion_deps;
   ffi::Array<ffi::Array<int64_t>> tvm_pipe_order_deps;
+  ffi::Array<ffi::Array<int64_t>> tvm_issue_priority_pairs;
   ffi::Array<int64_t> tvm_storage_sizes;
   ffi::Array<int64_t> tvm_manual_stages;
 
@@ -1119,6 +1245,8 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
     pair.push_back(dep.second);
     tvm_pipe_order_deps.push_back(pair);
   }
+  for (const auto &[producer, consumer] : issue_priority_pairs)
+    tvm_issue_priority_pairs.push_back({producer, consumer});
   ffi::Array<ffi::Array<int64_t>> tvm_stage_order_deps;
   for (const auto &dep : stage_order_deps) {
     ffi::Array<int64_t> pair;
@@ -1160,7 +1288,7 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
                    tvm_data_deps, tvm_resource_deps, tvm_owner_exclusion_deps,
                    tvm_pipe_order_deps, tvm_storage_sizes, tvm_memory_groups,
                    tvm_stage_order_deps, enable_offset, tvm_manual_stages,
-                   manual_schedule, stage_horizon)
+                   manual_schedule, stage_horizon, tvm_issue_priority_pairs)
           .cast<ffi::Tuple<ffi::Array<int64_t>, ffi::Array<int>, int64_t>>();
 
   ffi::Array<int64_t> start_times = return_val.get<0>();
@@ -1395,6 +1523,8 @@ static void ScheduleSingleKernel(const Stmt &kernel_body, Target target,
   unit_builder.SetStorageSlotBytes(StorageFootprintCollector::SlotBytes(
       metadata.kernel_root, metadata.manual_buffer_versions));
   const AscendTargetInfo &target_info = GetAscendTargetInfo(target);
+  unit_builder.SetPreferHandoffIssue(target_info.architecture ==
+                                     AscendArchitecture::kDav2201);
   int64_t shared_mem_limit = GetSharedMemoryLimit(kernel_body, target_info);
   unit_builder.SetMemoryLimit("shared", shared_mem_limit);
   unit_builder.SetMemoryLimit("shared.l1", target_info.l1_bytes);

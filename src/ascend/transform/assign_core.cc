@@ -274,74 +274,9 @@ private:
     PropagateCandidateCapabilities();
   }
 
-  static CoreMask GetScalarMemoryMask(const TaskNode *task) {
-    bool touches_vector_memory = false;
-    bool touches_cube_memory = false;
-    auto scan = [&](const std::vector<BufferRegion> &regions) {
-      for (const BufferRegion &region : regions) {
-        if (IsSharedBuffer(region->buffer)) {
-          touches_vector_memory = true;
-        } else if (IsL1Buffer(region->buffer) || IsL0ABuffer(region->buffer) ||
-                   IsL0BBuffer(region->buffer) || IsL0CBuffer(region->buffer)) {
-          touches_cube_memory = true;
-        }
-      }
-    };
-    scan(task->GetReadRegions());
-    scan(task->GetWriteRegions());
-    if (touches_vector_memory && touches_cube_memory) {
-      LOG(FATAL) << "Cannot assign scalar task because it accesses "
-                    "incompatible core-local memories on both Vector (UB) "
-                    "and Cube (L1/L0) cores: "
-                 << task->stmt;
-    }
-    if (touches_vector_memory)
-      return kCoreVector;
-    if (touches_cube_memory)
-      return kCoreCube;
-    return kCoreBroadcast;
-  }
-
-  static CoreMask GetMte2Mask(const TaskNode *task) {
-    CoreMask result = kCoreUnassigned;
-    for (const BufferRegion &region : task->GetWriteRegions()) {
-      if (IsL1Buffer(region->buffer))
-        result |= kCoreCube;
-      else if (IsSharedBuffer(region->buffer))
-        result |= kCoreVector;
-    }
-    return result == kCoreUnassigned ? kCoreVector : result;
-  }
-
-  static CoreMask GetCandidateCoreMask(const TaskNode *task) {
-    uint16_t pipe_mask = task->GetPipeMask();
-    CoreMask result = kCoreUnassigned;
-    if (pipe_mask & static_cast<uint16_t>(ResourcePipe::kCube))
-      result |= kCoreCube;
-    if (pipe_mask & static_cast<uint16_t>(ResourcePipe::kVector))
-      result |= kCoreVector;
-    if (pipe_mask & static_cast<uint16_t>(ResourcePipe::kMTE1) ||
-        pipe_mask & static_cast<uint16_t>(ResourcePipe::kFixpipe)) {
-      result |= kCoreCube;
-    }
-    if (pipe_mask & static_cast<uint16_t>(ResourcePipe::kMTE3))
-      result |= kCoreVector;
-    if (pipe_mask & static_cast<uint16_t>(ResourcePipe::kMTE2))
-      result |= GetMte2Mask(task);
-
-    if (result == kCoreBroadcast) {
-      LOG(FATAL) << "Cannot assign one atomic task to incompatible Vector and "
-                    "Cube execution resources: "
-                 << task->stmt;
-    }
-    if (result != kCoreUnassigned)
-      return result;
-    return GetScalarMemoryMask(task);
-  }
-
   void AssignCandidateCoreMasks() {
     for (TaskNode *task : all_tasks_) {
-      CoreMask candidate = GetCandidateCoreMask(task);
+      CoreMask candidate = GetTaskCandidateCoreMask(task);
       if (task->GetCoreMask() != kCoreUnassigned)
         candidate &= task->GetCoreMask();
       ICHECK_NE(candidate, kCoreUnassigned)

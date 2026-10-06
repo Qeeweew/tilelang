@@ -266,6 +266,63 @@ def z3_schedule_ffi(
     return start_times
 
 
+def _refine_loop_issue_order(
+    ctx, assertions, model, k_vars, r_vars, buffer_vars, issue_priority_pairs,
+    *, buffer_counts=None, verbose=False,
+):
+    """Select a better physical issue order within an already feasible plan.
+
+    Keep the chosen stages, emitted version counts and every original assertion.
+    A preference counts the actual C++ source sort: smaller residue first,
+    larger stage first at equal residue, then original sibling order. It is a
+    structural quality heuristic; no value here represents measured wait time.
+    """
+    if not issue_priority_pairs:
+        return model
+    optimizer = z3.Optimize(ctx=ctx)
+    optimizer.set("rlimit", 100000)
+    optimizer.set("timeout", 100)  # One bounded refinement per automatic loop.
+    optimizer.add(*assertions)
+    for var in k_vars:
+        optimizer.add(var == model.eval(var, model_completion=True))
+    for i, var in enumerate(buffer_vars):
+        count = (buffer_counts[i] if buffer_counts is not None
+                 else model.eval(var, model_completion=True))
+        optimizer.add(var == count)
+
+    penalties = []
+    promoted = sorted({producer for producer, _ in issue_priority_pairs})
+    for producer, consumer in issue_priority_pairs:
+        equal_phase_before = z3.Or(
+            k_vars[producer] > k_vars[consumer],
+            z3.And(k_vars[producer] == k_vars[consumer],
+                   z3.BoolVal(producer < consumer, ctx)),
+        )
+        before = z3.Or(r_vars[producer] < r_vars[consumer],
+                       z3.And(r_vars[producer] == r_vars[consumer], equal_phase_before))
+        penalties.append(z3.If(before, 0, 1))
+    objectives = [z3.Sum(penalties), z3.Sum([r_vars[i] for i in promoted])]
+    for objective in objectives:
+        optimizer.minimize(objective)
+    status = optimizer.check()
+    if status != z3.sat:
+        if verbose:
+            reason = optimizer.reason_unknown() if status == z3.unknown else str(status)
+            print(f"[Python Z3 Loop] Issue refinement {status} ({reason}); retain feasible plan")
+        return model
+    candidate = optimizer.model()
+    def cost(selected):
+        return tuple(selected.eval(value, model_completion=True).as_long()
+                     for value in objectives)
+    # Resource-limited optimization may yield only a feasible incumbent. Never
+    # accept a modeled preference regression relative to the original plan.
+    if cost(candidate) > cost(model):
+        return model
+    if verbose:
+        print(f"[Python Z3 Loop] Issue preference cost: {cost(model)} -> {cost(candidate)}")
+    return candidate
+
+
 def z3_schedule_loop_python(
     num_stages: int,
     latencies: list[int],
@@ -285,6 +342,7 @@ def z3_schedule_loop_python(
     seed: int | None = 42,
     verbose: bool = False,
     stage_horizon: int | None = None,
+    issue_priority_pairs: list[tuple[int, int]] | None = None,
 ) -> tuple[list[int], list[int], int]:
     """Schedule a loop body with modulo, stage, and storage constraints.
 
@@ -297,6 +355,10 @@ def z3_schedule_loop_python(
     ----------
     num_stages : int
         Maximum number of physical versions available to automatic buffers.
+    issue_priority_pairs : list[tuple[int, int]] | None
+        Soft physical-source-order preferences derived from forward cross-core
+        RAW handoffs. Applied only after the minimum-II solve, with its selected
+        stages and emitted version counts fixed. They never replace dependencies.
     stage_horizon : int | None
         Optional maximum number of task stages for automatic Ascend pipelines.
         Bounds the same joint solve that selects order and physical versions;
@@ -362,6 +424,8 @@ def z3_schedule_loop_python(
     if stage_horizon is not None and stage_horizon < 1:
         raise ValueError("Automatic pipeline stage_horizon must be positive")
 
+    if issue_priority_pairs is None:
+        issue_priority_pairs = []
     if stage_order_deps is None:
         stage_order_deps = []
     if pipe_order_deps is None:
@@ -534,6 +598,8 @@ def z3_schedule_loop_python(
             best_start_vars = start_vars
             best_k_vars = k_vars
             best_buffer_vars = buffer_vars
+            best_r_vars = r_vars
+            best_assertions = solver.assertions()
             # Try smaller II
             ii_upper = ii_mid
         else:
@@ -590,6 +656,18 @@ def z3_schedule_loop_python(
                 buffer_var = best_model.eval(best_buffer_vars[i]).as_long()
                 buffer_versions.append(buffer_var)
 
+        if issue_priority_pairs and not manual_schedule:
+            # Fix the actual emitted counts, including the existing minimum-
+            # version recalculation, rather than a larger slack solver bound.
+            best_model = _refine_loop_issue_order(
+                ctx, best_assertions, best_model, best_k_vars, best_r_vars,
+                best_buffer_vars, issue_priority_pairs,
+                buffer_counts=buffer_versions, verbose=verbose,
+            )
+            # Stages and version counts stay unchanged; only residues may move.
+            start_times = [best_model.eval(best_start_vars[i]).as_long() - offset * best_ii
+                           for i in range(n)]
+
     # Sort tasks by start time (and by index as tie-breaker)
     task_indices = list(range(n))
     task_indices.sort(key=lambda idx: (start_times[idx], idx))
@@ -627,6 +705,7 @@ def z3_schedule_loop_python(
                 "data_dependencies": data_deps,
                 "resource_dependencies": resource_deps,
                 "owner_exclusions": owner_exclusion_deps,
+                "issue_priority_pairs": issue_priority_pairs,
                 "manual_schedule": manual_schedule,
                 "manual_stages": manual_stages,
                 "start_times": start_times,
@@ -809,6 +888,7 @@ def z3_schedule_loop_ffi(
     manual_stages=None,
     manual_schedule=False,
     stage_horizon=0,
+    issue_priority_pairs=None,
 ):
     """FFI wrapper for z3_schedule_loop_python.
 
@@ -840,6 +920,7 @@ def z3_schedule_loop_ffi(
 
     pipe_order_deps_list = _convert_int_tuples(pipe_order_deps, 2)
     owner_exclusion_deps_list = _convert_int_tuples(owner_exclusion_deps, 4)
+    issue_priority_pairs_list = _convert_int_tuples(issue_priority_pairs, 2)
 
     # Call the actual scheduler (Z3 is not thread-safe, serialize access)
     with _z3_lock:
@@ -860,6 +941,7 @@ def z3_schedule_loop_ffi(
             manual_schedule=bool(manual_schedule),
             seed=42,
             stage_horizon=int(stage_horizon) if stage_horizon else None,
+            issue_priority_pairs=issue_priority_pairs_list,
         )
 
     # Return start_times and buffer_versions as separate arrays for easier FFI handling

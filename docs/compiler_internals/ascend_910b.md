@@ -254,6 +254,22 @@ Plain serial loops and explicit `num_stages=0` without an offset request keep
 all tasks at stage zero. They do not search arbitrary cross-pipe epoch offsets.
 Explicit positive version bounds retain their existing scheduling policy.
 
+For ordinary automatic 2201 mixed loops, shared memory effects identify forward
+cross-core writer-to-reader handoffs separately from reverse slot-release
+dependencies. The issue-quality heuristic prefers an independent handoff
+producer and its same-core ancestors before an unrelated blocking reader.
+Hard same-iteration reachability excludes that reader's own descendants even
+through an ambiguous-core intermediate. Native task candidates use the same
+instruction and memory capability function as AssignCore, intersected with
+lexical ownership; ambiguous placement remains conservative.
+
+After the minimum-II solve and version recalculation, one bounded refinement
+can select different issue residues with stages, emitted version counts and
+all original constraints fixed. An unavailable or worse result retains the
+feasible plan; verbose diagnostics report the solver status and unknown reason.
+These structural preferences do not estimate wait duration and do not establish
+optimal overlap. Manual schedules and 3510 retain their existing policy.
+
 Native sub-K loops created by L1 GEMM lowering inherit the enclosing automatic
 pipeline intent and optimization bound. Their L0 copies and MADs participate in
 the same dependency, resource and version solver. An explicit pipeline setting
