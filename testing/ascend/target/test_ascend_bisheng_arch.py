@@ -20,7 +20,9 @@ def test_target_npu_arch_priority(monkeypatch):
 
     target = Target({"kind": "ascend", "mcpu": "dav-mcpu"})
     assert bisheng.get_target_npu_arch(target) == "dav-mcpu"
-    assert bisheng.get_target_npu_arch(Target("ascend")) == "dav-env"
+    # Unnormalized targets preserve the native default; environment defaults
+    # are fixed into the target by the frontend, never re-read by Bisheng.
+    assert bisheng.get_target_npu_arch(Target("ascend")) == "dav-3510"
 
     monkeypatch.delenv("ASCEND_NPU_ARCH")
     assert bisheng.get_target_npu_arch(Target("ascend")) == "dav-3510"

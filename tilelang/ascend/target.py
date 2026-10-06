@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from tvm.target import Target
 
 from tilelang.backend.target import TargetLike, register_target_detector, register_target_normalizer
@@ -14,6 +16,8 @@ def _target_ffi_api():
 def _make_ascend_target(target_dict: dict | None = None) -> Target:
     target_dict = dict(target_dict or {})
     target_dict["kind"] = "ascend"
+    if "arch" not in target_dict and "mcpu" not in target_dict:
+        target_dict["arch"] = os.environ.get("ASCEND_NPU_ARCH", "dav-3510")
     return Target(target_dict)
 
 
@@ -56,13 +60,27 @@ def _detect_ascend_target() -> Target | None:
 
 
 def normalize_ascend_target(target: TargetLike) -> Target | None:
-    if not isinstance(target, str) or target.strip() != "ascend":
-        return None
+    """Freeze architecture selection before lowering and binary caching.
 
-    try:
-        return _make_ascend_target()
-    except Exception:
-        return None
+    The environment supplies a default only. An explicit target always wins,
+    and the resulting Target carries the selection across all compiler stages.
+    """
+    if isinstance(target, Target):
+        if target.kind.name != "ascend":
+            return None
+        config = dict(target.export())
+        if "arch" in target.attrs or "mcpu" in target.attrs:
+            return target
+        return _make_ascend_target(config)
+    if isinstance(target, dict):
+        if target.get("kind") != "ascend":
+            return None
+        return _make_ascend_target(target)
+    if isinstance(target, str):
+        value = target.strip()
+        if value == "ascend":
+            return _make_ascend_target()
+    return None
 
 
 def normalize_pto_target(target: TargetLike) -> Target | None:

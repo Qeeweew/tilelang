@@ -95,11 +95,13 @@ def get_npu_arch(npu_arch: str | None = None) -> str:
 
 def get_target_npu_arch(target: Target) -> str:
     """Resolve the Bisheng NPU architecture from an Ascend target."""
+    # The compiler target is authoritative after normalization. In particular,
+    # changing ASCEND_NPU_ARCH after lowering cannot retarget the binary.
     for attr_name in ("arch", "mcpu"):
         value = target.attrs.get(attr_name)
         if value is not None:
             return get_npu_arch(str(value))
-    return get_npu_arch()
+    return "dav-3510"
 
 
 def get_bisheng_compile_options(
