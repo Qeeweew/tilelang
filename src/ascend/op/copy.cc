@@ -616,11 +616,6 @@ Stmt LowerDMACopy(const AscendCopyNode &op, const LowerArgs &T,
       PrimExpr loop_count =
           is_l0a ? dst_region.outer1->extent : dst_region.outer0->extent;
       const bool loop_source_rows = is_l0a != needs_transpose;
-      size_t src_ndim = src_range.size();
-      size_t source_row_axis =
-          src_ndim - (src_info.row16_axis == LogicalAxis::kRow ? 2 : 1);
-      size_t source_c0_axis =
-          src_ndim - (src_info.c0_axis == LogicalAxis::kRow ? 2 : 1);
       auto native =
           is_l0a ? ascend_load_cbuf_to_ca_2d() : ascend_load_cbuf_to_cb_2d();
       // Without a fractal transpose, a full physical N slice of L1 NZ is
@@ -630,18 +625,8 @@ Stmt LowerDMACopy(const AscendCopyNode &op, const LowerArgs &T,
       PrimExpr merged_repeat =
           cast(DataType::Int(64), loop_count) * cast(DataType::Int(64), repeat);
       bool merge_b =
-          !is_l0a && !needs_transpose &&
-          analyzer->CanProveEqual(src_range[source_row_axis]->min, I(0)) &&
-          analyzer->CanProveEqual(
-              FloorMod(
-                  src_range[source_c0_axis]->min,
-                  cast(src_range[source_c0_axis]->min.dtype(), src_info.c0)),
-              make_zero(src_range[source_c0_axis]->min.dtype())) &&
-          analyzer->CanProveEqual(m_start, I(0)) &&
-          analyzer->CanProveEqual(m_step, src_stride) &&
-          analyzer->CanProveEqual(repeat, m_step) &&
-          analyzer->CanProveEqual(loop_count, k_step) &&
-          analyzer->CanProve(merged_repeat <= I(255));
+          !is_l0a && CanMerge2201L0BLoad(src_range, src_info, src_region,
+                                         dst_region, needs_transpose, analyzer);
       Stmt native_copy;
       if (merge_b) {
         native_copy =
@@ -1127,6 +1112,34 @@ struct AscendCopyImpl {
     return LowerAscendNormalCopy(op, T, analyzer);
   }
 };
+
+bool CanMerge2201L0BLoad(const Array<Range> &source,
+                         const AscendFractalLayoutInfo &source_layout,
+                         const AscendFractalRegionInfo &source_region,
+                         const AscendFractalRegionInfo &destination_region,
+                         bool needs_transpose, arith::Analyzer *analyzer) {
+  if (needs_transpose || source.size() < 2)
+    return false;
+  size_t row_axis =
+      source.size() - (source_layout.row16_axis == LogicalAxis::kRow ? 2 : 1);
+  size_t c0_axis =
+      source.size() - (source_layout.c0_axis == LogicalAxis::kRow ? 2 : 1);
+  PrimExpr repeat = destination_region.outer1->extent;
+  PrimExpr loop_count = destination_region.outer0->extent;
+  PrimExpr merged_repeat =
+      cast(DataType::Int(64), loop_count) * cast(DataType::Int(64), repeat);
+  return analyzer->CanProveEqual(source[row_axis]->min, 0) &&
+         analyzer->CanProveEqual(
+             FloorMod(source[c0_axis]->min,
+                      cast(source[c0_axis]->min.dtype(), source_layout.c0)),
+             make_zero(source[c0_axis]->min.dtype())) &&
+         analyzer->CanProveEqual(source_region.outer1->min, 0) &&
+         analyzer->CanProveEqual(source_region.outer1->extent,
+                                 source_layout.outer1) &&
+         analyzer->CanProveEqual(repeat, source_region.outer1->extent) &&
+         analyzer->CanProveEqual(loop_count, source_region.outer0->extent) &&
+         analyzer->CanProve(merged_repeat <= 255);
+}
 
 // The public helper is shared by early IR normalization and late emission.
 std::pair<Array<Range>, Array<Range>>

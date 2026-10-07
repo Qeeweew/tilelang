@@ -294,16 +294,40 @@ or sum separate allocations. Fixed version counts are checked before byte
 multiplication, and whole-byte slot strides are computed without an
 intermediate conversion to bits that could overflow.
 
-The initial 2201 cost model uses one **dimensionless ordering weight** per
-leaf operation. Its function attribute is
-`tl.ascend.cost_model = "dav-2201.ordinal.uncalibrated"`. These weights do not
-represent cycles, measured bandwidth, latency or competitive performance.
-3510 cycle estimates and INI rate fields are never used as measured 2201 costs.
-Calibration requires separately identified target, units, workloads and
-measurement evidence before replacing these weights.
+The 2201 cost model uses **dimensionless service/order weights**. Its function
+attribute is
+`tl.ascend.cost_model = "dav-2201.service_weights.estimated.v1"`. The objective
+compares relative resource pressure and buffer choices in an ordinary automatic
+pipeline; it predicts neither asynchronous completion latency nor kernel time.
+3510 cycle estimates and INI rate fields do not supply measured 2201 costs.
+
+The initial native FP16 reference is a 128×128×128 FP16-to-FP32 MMAD, a full-M
+128×128 A Load3Dv2 and a full-physical-N merged 128×128 B LoadData2D, with NZ
+L1 input and independent two-slot destinations. Current CANN 9.1/dav-2201
+measurements cover one AIC and a 20-AIC grid. Counter windows use raw SYS_CNT
+ticks and explicit target-pipe completion events. Loaded-chip profiler frequency
+is reported separately; no SYS_CNT period or AIC-cycle conversion is inferred.
+Raw measurements, binary identities, frequency records and residuals remain in
+external experiment artifacts.
+
+The coarse reference weights are MMAD:A3D:B2D = **4:1:2**. This rounded,
+measurement-informed ratio is an estimated scheduling heuristic, not the raw
+timer coefficients or an exact measured latency. MMAD scales by physical
+16-element-fractal M×N×K work; these native loads scale by their actual padded
+destination payload. Source dependency bounding regions and allocation-wide
+K-cache pitches do not represent transferred bytes. The estimator and native
+copy lowering share the merged-B2D descriptor predicate. Other geometries are
+extrapolated estimates. BF16 and other precision paths, segmented/unidentified
+copies, dynamic work and all other unknown leaves retain uncalibrated ordinal
+one; one never means one cycle/tick. See
+[the service-weight definition](../ascend/2201_service_weights.md).
+
 Task cost overrides, debug output and scheduling plots use the same model
-units. A measured cycle override cannot be mixed with the uncalibrated 2201
-weights; calibration must first establish a consistent model for that target.
+units. The existing fields named latency and II carry abstract scheduling
+distances on 2201; a measured cycle/tick override cannot be mixed into these
+weights. Typed dependencies, versions and native synchronization still establish
+actual completion and safe reuse independently of this objective. Automatic
+buffer selection and competitive kernel performance require separate acceptance.
 
 ## Build and runtime
 

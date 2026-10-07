@@ -23,6 +23,7 @@
  */
 
 #include <algorithm>
+#include <initializer_list>
 #include <limits>
 #include <memory>
 #include <unordered_map>
@@ -47,10 +48,12 @@
 #include "./auto_schedule/task_analysis.h"
 #include "./auto_schedule/task_annotations.h"
 #include "./estimate_latency.h"
+#include "ascend/layout/ascend_layouts.h"
 #include "ascend/op/ascend_mte_plan.h"
 #include "ascend/op/builtin.h"
 #include "ascend/op/copy.h"
 #include "ascend/op/cube_load.h"
+#include "ascend/op/oob_padding.h"
 #include "ascend/op/utils.h"
 #include "ascend/target_utils.h"
 #include "ascend/transform/attr.h"
@@ -266,12 +269,135 @@ struct TaskCostFeatures {
   std::vector<CopyInfo> copy_infos;
 };
 
+// dav-2201 uses dimensionless service/order weights, never cycles. The
+// reference FP16 128^3 MAD : 128x128 A3D : merged B2D ratio is 4:1:2.
+// Scaling other physical work/payload is an estimate; unknown leaves retain
+// ordinal one. These are scheduler preferences, not completion-time bounds.
+class Dav2201ServiceWeights {
+public:
+  Dav2201ServiceWeights(const LayoutMap &layouts, arith::Analyzer *analyzer)
+      : layouts_(layouts), analyzer_(analyzer) {}
+
+  int64_t Estimate(const Stmt &stmt) {
+    const auto *evaluate = stmt.as<EvaluateNode>();
+    const auto *call = evaluate ? evaluate->value.as<CallNode>() : nullptr;
+    if (!call)
+      return 1;
+    if (call->op.same_as(Op::Get("tl.tileop.gemm"))) {
+      Gemm gemm(call->args, call->annotations);
+      if (!IsL0ABuffer(gemm->a_) || !IsL0BBuffer(gemm->b_) ||
+          !gemm->a_->dtype.is_float16() || !gemm->b_->dtype.is_float16() ||
+          gemm->c_->dtype != DataType::Float(32) ||
+          gemm->a_->dtype.lanes() != 1 || gemm->b_->dtype.lanes() != 1 ||
+          gemm->c_->dtype.lanes() != 1)
+        return 1; // BF16 MAD and other precision paths are uncalibrated.
+      const auto &c = gemm->cRegion_->region;
+      const auto &a = gemm->aRegion_->region;
+      int64_t m = FractalExtent(c[c.size() - 2]->extent);
+      int64_t n = FractalExtent(c[c.size() - 1]->extent);
+      int64_t k = FractalExtent(a[a.size() - (gemm->transA_ ? 2 : 1)]->extent);
+      return Scale({m, n, k}, 4, 128 * 128 * 128);
+    }
+    if (call->op.same_as(AscendCubeLoad3D::Get())) {
+      AscendCubeLoad3D load(call->args, call->annotations);
+      if (!load->src->buffer->dtype.is_float16() ||
+          !load->dst->buffer->dtype.is_float16())
+        return 1;
+      // The selected native op's destination is the exact padded transfer.
+      // Its source region may conservatively span NZ gaps: never charge it
+      // as payload or use the allocation-wide cached K extent.
+      return Payload(load->dst, 1);
+    }
+    if (IsAscendCopyCall(call)) {
+      AscendCopy copy(call->args, call->annotations);
+      if (IsMergedB2D(*copy.get()))
+        return Payload(BufferRegion(copy->dst, copy->dst_range), 2);
+    }
+    return 1;
+  }
+
+private:
+  int64_t Constant(const PrimExpr &expr) const {
+    PrimExpr simplified = analyzer_->Simplify(expr);
+    const auto *value = simplified.as<IntImmNode>();
+    return value && value->value > 0 ? value->value : 0;
+  }
+  int64_t FractalExtent(const PrimExpr &expr) const {
+    int64_t value = Constant(expr);
+    if (!value || value > std::numeric_limits<int64_t>::max() - 15)
+      return 0;
+    return (value + 15) / 16 * 16;
+  }
+  static int64_t Scale(std::initializer_list<int64_t> factors, int64_t weight,
+                       int64_t reference) {
+    int64_t product = weight;
+    for (int64_t value : factors) {
+      if (value <= 0 || product > std::numeric_limits<int64_t>::max() / value)
+        return 1; // Unknown or unrepresentable work is not a measured cost.
+      product *= value;
+    }
+    return std::max<int64_t>(1,
+                             product / reference + (product % reference != 0));
+  }
+  bool LeadingUnit(const BufferRegion &region) const {
+    if (region->region.size() < 2)
+      return false;
+    for (size_t i = 0; i + 2 < region->region.size(); ++i)
+      if (!analyzer_->CanProveEqual(region->region[i]->extent, 1))
+        return false;
+    return true;
+  }
+  int64_t Payload(const BufferRegion &dst, int64_t weight) const {
+    if (!LeadingUnit(dst))
+      return 1;
+    const auto &r = dst->region;
+    return Scale({Constant(r[r.size() - 2]->extent),
+                  Constant(r[r.size() - 1]->extent), 2},
+                 weight, 32768);
+  }
+  bool IsMergedB2D(const AscendCopyNode &copy) const {
+    if (!IsL1Buffer(copy.src) || !IsL0BBuffer(copy.dst) ||
+        !copy.src->dtype.is_float16() || !copy.dst->dtype.is_float16() ||
+        copy.src->dtype.lanes() != 1 || copy.dst->dtype.lanes() != 1 ||
+        !copy.annotations.empty() || copy.transpose != 0 ||
+        !LeadingUnit(BufferRegion(copy.src, copy.src_range)) ||
+        !LeadingUnit(BufferRegion(copy.dst, copy.dst_range)))
+      return false;
+    auto sl = FindLayoutForBuffer(layouts_, copy.src);
+    auto dl = FindLayoutForBuffer(layouts_, copy.dst);
+    AscendFractalLayoutInfo si, di;
+    if (!sl.defined() || !dl.defined() || !IsAscendFractalLayout(sl.value()) ||
+        !IsAscendFractalLayout(dl.value()) ||
+        !TryExtractAscendFractalLayout(sl.value(), copy.src, &si) ||
+        !TryExtractAscendFractalLayout(dl.value(), copy.dst, &di) ||
+        si.kind != AscendFractalKind::kMajorK ||
+        di.kind != AscendFractalKind::kMajorK)
+      return false;
+    // The native 2D emitter owns the full-N merge predicate. Reuse exactly
+    // that selection result, rather than inferring traffic from source hulls.
+    AscendFractalRegionInfo source, destination;
+    if (!TryExtractAscendFractalRegion(sl.value(), copy.src_range, &source) ||
+        !TryExtractAscendFractalRegion(dl.value(), copy.dst_range,
+                                       &destination))
+      return false;
+    bool needs_transpose = (copy.transpose != 0) != (si.c0_axis != di.c0_axis);
+    return CanMerge2201L0BLoad(copy.src_range, si, source, destination,
+                               needs_transpose, analyzer_);
+  }
+
+  const LayoutMap &layouts_;
+  arith::Analyzer *analyzer_;
+};
+
 // Internal cost model for Ascend AutoSchedule tasks. The public transform pass
 // is implemented separately in estimate_latency.cc.
 class TaskCostEstimator {
 public:
-  explicit TaskCostEstimator(Hf32ModeMap hf32_modes, bool ordinal_costs)
-      : hf32_modes_(std::move(hf32_modes)), ordinal_costs_(ordinal_costs) {}
+  explicit TaskCostEstimator(Hf32ModeMap hf32_modes, bool dimensionless_costs,
+                             LayoutMap layouts)
+      : hf32_modes_(std::move(hf32_modes)),
+        dimensionless_costs_(dimensionless_costs),
+        layouts_(std::move(layouts)) {}
 
   // Estimate latency and initiation interval for one Ascend task.
   void Estimate(TaskNode *task);
@@ -323,9 +449,10 @@ private:
 
   AscendLatencyParams params_;
   Hf32ModeMap hf32_modes_;
-  // 2201 has no calibrated timing model yet. A unit per leaf operation is a
-  // dimensionless ordering weight, never a cycle estimate or a bandwidth.
-  bool ordinal_costs_;
+  // 2201 uses dimensionless relative service/order weights. Other targets
+  // retain their timing model; unknown 2201 leaves use uncalibrated ordinal 1.
+  bool dimensionless_costs_;
+  LayoutMap layouts_;
 
   // ====================================================================
   // Every divisor is guarded so an unknown bandwidth/throughput contributes
@@ -1918,13 +2045,17 @@ bool IsComposedLatencyStmt(const Stmt &stmt) {
 
 void TaskCostEstimator::Estimate(TaskNode *task) {
   ICHECK(task != nullptr);
-  if (ordinal_costs_) {
-    task->SetLatency(1);
-    task->SetII(1);
-    return;
-  }
   arith::Analyzer analyzer;
   task->outer_ctx.Populate(analyzer);
+  if (dimensionless_costs_) {
+    int64_t weight =
+        Dav2201ServiceWeights(layouts_, &analyzer).Estimate(task->stmt);
+    // The existing fields are abstract scheduling distances on 2201. Neither
+    // this weight nor II is a measured asynchronous completion latency.
+    task->SetLatency(weight);
+    task->SetII(weight);
+    return;
+  }
   TaskCostFeatures cost_features =
       CostFeatureAnalyzer::Analyze(task->stmt, &analyzer, hf32_modes_);
   EstimateAscend(task, cost_features, &analyzer);
@@ -2066,16 +2197,18 @@ using TaskCostMap =
 class TaskCostCollector : public TaskAwareConstrVisitor {
 public:
   static TaskCostMap Collect(const Stmt &body, const ConstrSet &outer_ctx,
-                             bool ordinal_costs) {
-    TaskCostCollector collector(body, outer_ctx, ordinal_costs);
+                             bool dimensionless_costs, LayoutMap layouts) {
+    TaskCostCollector collector(body, outer_ctx, dimensionless_costs,
+                                std::move(layouts));
     collector(body);
     return std::move(collector.costs_);
   }
 
 private:
   TaskCostCollector(const Stmt &body, const ConstrSet &outer_ctx,
-                    bool ordinal_costs)
-      : estimator_(Hf32ModeAnalyzer::Analyze(body), ordinal_costs) {
+                    bool dimensionless_costs, LayoutMap layouts)
+      : estimator_(Hf32ModeAnalyzer::Analyze(body), dimensionless_costs,
+                   std::move(layouts)) {
     constr_stack_ = outer_ctx.constrs_;
   }
 
@@ -2257,8 +2390,9 @@ private:
 };
 
 Stmt RunEstimateLatency(const Stmt &body, const ConstrSet &outer_ctx,
-                         bool ordinal_costs) {
-  TaskCostMap costs = TaskCostCollector::Collect(body, outer_ctx, ordinal_costs);
+                        bool dimensionless_costs, LayoutMap layouts) {
+  TaskCostMap costs = TaskCostCollector::Collect(
+      body, outer_ctx, dimensionless_costs, std::move(layouts));
   ICHECK(!costs.empty()) << "EstimateLatency found no schedulable tasks inside "
                             "tilelang_root";
   TaskAnnotationRewriter rewriter(costs);
@@ -2270,18 +2404,48 @@ Stmt RunEstimateLatency(const Stmt &body, const ConstrSet &outer_ctx,
 tvm::transform::Pass EstimateLatency() {
   auto pass_func = [](PrimFunc func, const IRModule &, const PassContext &) {
     const auto target = func->GetAttr<Target>(tvm::attr::kTarget);
-    const bool ordinal_costs =
+    const bool dimensionless_costs =
         GetAscendTargetInfo(target.value_or(Target::Current())).architecture ==
         AscendArchitecture::kDav2201;
     func = WithAttr(std::move(func), "tl.ascend.cost_model",
-                    ffi::String(ordinal_costs ? "dav-2201.ordinal.uncalibrated"
-                                              : "dav-3510.cycles"));
+                    ffi::String(dimensionless_costs
+                                    ? "dav-2201.service_weights.estimated.v1"
+                                    : "dav-3510.cycles"));
     return RewriteTilelangKernels(
         std::move(func), "EstimateLatency",
-        [ordinal_costs](const TilelangKernelContext &context) {
+        [dimensionless_costs](const TilelangKernelContext &context) {
           SBlock root = context.root;
+          LayoutMap layouts;
+          if (dimensionless_costs) {
+            PostOrderVisit(root, [&](const ObjectRef &node) {
+              if (const auto *block = node.as<SBlockNode>()) {
+                if (auto value = block->annotations.Get(attr::kLayoutMap)) {
+                  // Standalone scheduling also accepts frontend IR with
+                  // Var-keyed layouts. Native load classification requires
+                  // layout inference's Buffer-keyed contract; leave those
+                  // pre-inference loads uncalibrated rather than guessing a
+                  // conversion. Cube work does not depend on this map.
+                  for (const auto &[key, layout] :
+                       value.value().cast<ffi::Map<ObjectRef, Layout>>()) {
+                    const auto *node = key.as<BufferNode>();
+                    ICHECK(node || key.as<VarNode>())
+                        << "Ascend layout_map keys must be Buffers or Vars";
+                    if (!node)
+                      continue;
+                    Buffer buffer = GetRef<Buffer>(node);
+                    if (auto previous = layouts.Get(buffer))
+                      ICHECK(previous.value()->IsEqual(layout.get()))
+                          << "Conflicting layouts for cost-model buffer "
+                          << buffer->name;
+                    layouts.Set(buffer, layout);
+                  }
+                }
+              }
+            });
+          }
           root.CopyOnWrite()->body =
-              RunEstimateLatency(root->body, context.outer_ctx, ordinal_costs);
+              RunEstimateLatency(root->body, context.outer_ctx,
+                                 dimensionless_costs, std::move(layouts));
           return root;
         },
         /*require_kernel=*/false);

@@ -19,6 +19,9 @@
 namespace tvm {
 namespace tl {
 
+struct AscendFractalLayoutInfo;
+struct AscendFractalRegionInfo;
+
 /*!
  * \brief Typed Ascend view of a tile copy.
  *
@@ -109,6 +112,15 @@ public:
 bool IsAscendCopyCall(const tirx::CallNode *call);
 
 namespace ascend {
+// Whether this already normalized L1->L0B transfer emits one contiguous 2D
+// descriptor. Shared by native lowering and dimensionless service weighting;
+// regions/layouts remain the source of geometry, not dependency bounding bytes.
+bool CanMerge2201L0BLoad(const Array<Range> &source,
+                         const AscendFractalLayoutInfo &source_layout,
+                         const AscendFractalRegionInfo &source_region,
+                         const AscendFractalRegionInfo &destination_region,
+                         bool needs_transpose, arith::Analyzer *analyzer);
+
 // Prove native dav-2201 LoadData2D legality and return its exact whole-fractal
 // source/destination regions. Buffers must already have normalized storage;
 // leading/version axes and empty-copy predicates retain their semantics.

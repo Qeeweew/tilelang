@@ -50,7 +50,7 @@ def test_2201_costs_do_not_inherit_3510_timing():
         mod = tilelang.transform.MaterializeKernelLaunch()(mod)
         mod = tilelang.transform.Simplify()(mod)
         mod = ascend_transform.EstimateLatency()(_materialize_schedule_units(mod))
-        assert str(mod["main"].attrs["tl.ascend.cost_model"]) == "dav-2201.ordinal.uncalibrated"
+        assert str(mod["main"].attrs["tl.ascend.cost_model"]) == "dav-2201.service_weights.estimated.v1"
         metadata = _collect_task_metadata(mod)
         assert (metadata["latency"][-1], metadata["ii"][-1]) == (1, 1)
 
