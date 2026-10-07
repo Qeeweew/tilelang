@@ -19,6 +19,7 @@ def persistent_attention_fwd(
     block_kv=128,
     head_dim=64,
     row_block=64,
+    pv_chunk=None,
     dtype="float16",
 ):
     """Build dense MHA with explicit group-private workspace arguments.
@@ -34,6 +35,13 @@ def persistent_attention_fwd(
     row_block divides block_q, and groups divides B*H*query_pairs. This
     factory has no causal mask, GQA, dropout, or sequence tails. Resource
     feasibility is checked by the target compiler, not by these shape rules.
+
+    By default V is staged with QK and PV consumes a complete logical KV tile.
+    An explicit positive, 16-aligned pv_chunk dividing block_kv instead stages
+    V during PV, once per chunk for both query owners. Each owner accumulates
+    all chunks in its own FP32 L0C region before one final PV export. Softmax
+    and P rounding still cover the full logical block_kv; pv_chunk controls
+    L1 staging rather than native Cube K tiling. row_block remains explicit.
     """
     values = (batch, heads, query_pairs, kv_tiles, groups,
               block_q, block_kv, head_dim, row_block)
@@ -43,6 +51,10 @@ def persistent_attention_fwd(
         raise ValueError("Persistent attention supports FP16/BF16 operands")
     if any(x % 16 for x in (block_q, block_kv, head_dim, row_block)) or block_q % row_block:
         raise ValueError("Aligned dense tiles and complete UB row subtiles are required")
+    if pv_chunk is not None and (not isinstance(pv_chunk, int) or isinstance(pv_chunk, bool) or pv_chunk <= 0):
+        raise ValueError("pv_chunk must be a positive integer or None")
+    if pv_chunk is not None and (pv_chunk % 16 or block_kv % pv_chunk):
+        raise ValueError("pv_chunk must be 16-aligned and divide block_kv into complete PV chunks")
     total_pairs = batch * heads * query_pairs
     if total_pairs % groups:
         raise ValueError(
@@ -55,6 +67,10 @@ def persistent_attention_fwd(
     pairs_per_group = total_pairs // groups
     tasks = pairs_per_group * kv_tiles
     sequence_k = kv_tiles * block_kv
+    chunked_pv = pv_chunk is not None
+    pv_extent = pv_chunk if chunked_pv else block_kv
+    pv_chunks = block_kv // pv_extent
+    pv_acc_shape = (2, block_q, head_dim) if chunked_pv else (block_q, head_dim)
     scale = head_dim ** -0.5
 
     @T.prim_func
@@ -71,10 +87,10 @@ def persistent_attention_fwd(
         with T.MixedKernel(groups, sids=2) as (group, sid):
             q_l1 = T.alloc_l1((2, block_q, head_dim), dtype)
             k_l1 = T.alloc_l1((block_kv, head_dim), dtype)
-            v_l1 = T.alloc_l1((2, block_kv, head_dim), dtype)
-            p_l1 = T.alloc_l1((block_q, block_kv), dtype)
+            v_l1 = T.alloc_l1((2, pv_extent, head_dim), dtype)
+            p_l1 = T.alloc_l1((block_q, pv_extent), dtype)
             score_acc = T.alloc_l0c((block_q, block_kv), "float32")
-            pv_acc = T.alloc_l0c((block_q, head_dim), "float32")
+            pv_acc = T.alloc_l0c(pv_acc_shape, "float32")
 
             scores = T.alloc_shared((row_block, block_kv), "float32")
             probabilities = T.alloc_shared((row_block, block_kv), dtype)
@@ -122,9 +138,10 @@ def persistent_attention_fwd(
                                            q_l1[owner, :, :])
                             T.copy(K[batch_index, head_index,
                                      kv * block_kv:(kv + 1) * block_kv, :], k_l1)
-                            T.copy(V[batch_index, head_index,
-                                     kv * block_kv:(kv + 1) * block_kv, :],
-                                   v_l1[task_slot, :, :])
+                            if not chunked_pv:
+                                T.copy(V[batch_index, head_index,
+                                         kv * block_kv:(kv + 1) * block_kv, :],
+                                       v_l1[task_slot, :, :])
                             for owner in T.serial(2):
                                 T.gemm(q_l1[owner, :, :], k_l1, score_acc,
                                        transpose_B=True, clear_accum=True)
@@ -162,12 +179,42 @@ def persistent_attention_fwd(
                 with T.Stage(0):
                     if 1 <= e and e < tasks + 1:
                         with T.Cube():
-                            task_slot_pv = (e - 1) % 2
-                            for owner in T.serial(2):
-                                T.copy(P[group, owner, task_slot_pv, :, :], p_l1)
-                                T.gemm(p_l1, v_l1[task_slot_pv, :, :], pv_acc,
-                                       transpose_B=False, clear_accum=True)
-                                T.copy(pv_acc, PV[group, owner, task_slot_pv, :, :])
+                            if chunked_pv:
+                                t_pv = e - 1
+                                local_pair_pv = t_pv // kv_tiles
+                                flat_pair_pv = group + local_pair_pv * groups
+                                batch_index_pv = flat_pair_pv // (heads * query_pairs)
+                                head_index_pv = (flat_pair_pv // query_pairs) % heads
+                                kv_pv = t_pv % kv_tiles
+                                task_slot_pv = t_pv % 2
+                                # A V chunk is loaded once and read by both owners.
+                                # PV accumulators have an actual owner axis; their
+                                # compiler version count stays one across chunks.
+                                for chunk in T.serial(pv_chunks):
+                                    chunk_begin = chunk * pv_chunk
+                                    chunk_end = (chunk + 1) * pv_chunk
+                                    v_slot = chunk % 2
+                                    T.copy(V[batch_index_pv, head_index_pv,
+                                             kv_pv * block_kv + chunk_begin:
+                                             kv_pv * block_kv + chunk_end, :],
+                                           v_l1[v_slot, :, :])
+                                    for owner in T.serial(2):
+                                        T.copy(P[group, owner, task_slot_pv, :,
+                                                 chunk_begin:chunk_end], p_l1)
+                                        T.gemm(p_l1, v_l1[v_slot, :, :],
+                                               pv_acc[owner, :, :],
+                                               transpose_B=False,
+                                               clear_accum=(chunk == 0))
+                                for owner in T.serial(2):
+                                    T.copy(pv_acc[owner, :, :],
+                                           PV[group, owner, task_slot_pv, :, :])
+                            else:
+                                task_slot_pv = (e - 1) % 2
+                                for owner in T.serial(2):
+                                    T.copy(P[group, owner, task_slot_pv, :, :], p_l1)
+                                    T.gemm(p_l1, v_l1[task_slot_pv, :, :], pv_acc,
+                                           transpose_B=False, clear_accum=True)
+                                    T.copy(pv_acc, PV[group, owner, task_slot_pv, :, :])
 
                 with T.Stage(0):
                     if 2 <= e:
@@ -199,4 +246,4 @@ def persistent_attention_fwd(
                                 T.copy(output_cast, O[batch_index_vec2, head_index_vec2, query_pair_vec2,
                                                       sid, row:row + row_block, :])
 
-    return main.with_attr("global_symbol", "parallel_fa_" + dtype)
+    return main.with_attr("global_symbol", ("chunked_fa_" if chunked_pv else "parallel_fa_") + dtype)

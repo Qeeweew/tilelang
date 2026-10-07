@@ -56,25 +56,25 @@ def _integer(expr, values, definitions):
     return int(operators[type(expr)](_integer(expr.a, values, definitions), _integer(expr.b, values, definitions)))
 
 
-def _copy_sites(stmt, loops=(), guards=(), cube=False):
+def _tile_sites(stmt, loops=(), guards=(), cube=False, operation="tl.tileop.ascend_copy"):
     if isinstance(stmt, tirx.SeqStmt):
         for child in stmt.seq:
-            yield from _copy_sites(child, loops, guards, cube)
+            yield from _tile_sites(child, loops, guards, cube, operation)
     elif isinstance(stmt, tirx.For):
-        yield from _copy_sites(stmt.body, (*loops, stmt), guards, cube)
+        yield from _tile_sites(stmt.body, (*loops, stmt), guards, cube, operation)
     elif isinstance(stmt, tirx.IfThenElse):
-        yield from _copy_sites(stmt.then_case, loops, (*guards, (stmt.condition, True)), cube)
+        yield from _tile_sites(stmt.then_case, loops, (*guards, (stmt.condition, True)), cube, operation)
         if stmt.else_case is not None:
-            yield from _copy_sites(stmt.else_case, loops, (*guards, (stmt.condition, False)), cube)
+            yield from _tile_sites(stmt.else_case, loops, (*guards, (stmt.condition, False)), cube, operation)
     elif isinstance(stmt, tirx.SBlockRealize):
-        yield from _copy_sites(stmt.block, loops, (*guards, (stmt.predicate, True)), cube)
+        yield from _tile_sites(stmt.block, loops, (*guards, (stmt.predicate, True)), cube, operation)
     elif isinstance(stmt, tirx.SBlock):
-        yield from _copy_sites(stmt.body, loops, guards, cube or stmt.name_hint == "CUBE")
+        yield from _tile_sites(stmt.body, loops, guards, cube or stmt.name_hint == "CUBE", operation)
     elif isinstance(stmt, tirx.AttrStmt):
-        yield from _copy_sites(stmt.body, loops, guards, cube)
+        yield from _tile_sites(stmt.body, loops, guards, cube, operation)
     elif isinstance(stmt, tirx.Evaluate):
         call = stmt.value
-        if isinstance(call, tirx.Call) and isinstance(call.op, tvm.ir.Op) and call.op.name == "tl.tileop.ascend_copy":
+        if isinstance(call, tirx.Call) and isinstance(call.op, tvm.ir.Op) and (operation is None or call.op.name == operation):
             yield call, loops, guards, cube
     else:
         assert isinstance(stmt, (tirx.Bind, tirx.BufferStore)), ("Unsupported frontend statement", stmt)
@@ -104,7 +104,7 @@ def _gm_transfers(program, groups):
     trips = 12 // groups * 3 + 2
     (epoch,) = [loop for loop in nodes(program, tirx.For) if loop.kind == tirx.ForKind.SERIAL and int(loop.extent) == trips]
     actual = collections.Counter()
-    for call, loops, guards, cube in _copy_sites(program.body):
+    for call, loops, guards, cube in _tile_sites(program.body):
         for values in _loop_values(loops, definitions):
             # A frontend CUBE scope is one AIC task, although it is lexically
             # inside the mixed kernel's two-SID launch loop.
@@ -127,7 +127,7 @@ def _gm_transfers(program, groups):
     return actual, buffers
 
 
-def _expected_transfers(groups):
+def _expected_transfers(groups, block_kv=16, pv_chunk=None):
     expected = collections.Counter()
 
     def add(name, writing, group, epoch, origin, shape):
@@ -143,12 +143,16 @@ def _expected_transfers(groups):
                 for owner in range(2):
                     if kv == 0:
                         add("Q", False, group, task, (batch, head, query, owner, 0, 0), (1, 1, 1, 1, 32, 16))
-                    add("Score", True, group, task, (group, owner, task % 2, 0, 0), (1, 1, 1, 32, 16))
-                    add("P", False, group, task + 1, (group, owner, task % 2, 0, 0), (1, 1, 1, 32, 16))
+                    add("Score", True, group, task, (group, owner, task % 2, 0, 0), (1, 1, 1, 32, block_kv))
+                    if pv_chunk is None:
+                        add("P", False, group, task + 1, (group, owner, task % 2, 0, 0), (1, 1, 1, 32, block_kv))
+                    else:
+                        for column in range(0, block_kv, pv_chunk):
+                            add("P", False, group, task + 1, (group, owner, task % 2, 0, column), (1, 1, 1, 32, pv_chunk))
                     add("PV", True, group, task + 1, (group, owner, task % 2, 0, 0), (1, 1, 1, 32, 16))
                     for row in (0, 16):
                         for name, writing in (("Score", False), ("P", True)):
-                            add(name, writing, group, task + 1, (group, owner, task % 2, row, 0), (1, 1, 1, 16, 16))
+                            add(name, writing, group, task + 1, (group, owner, task % 2, row, 0), (1, 1, 1, 16, block_kv))
                         add("PV", False, group, task + 2, (group, owner, task % 2, row, 0), (1, 1, 1, 16, 16))
                         # With even group counts, flattened-pair parity is
                         # constant per group. Query state must still alternate.
@@ -159,8 +163,12 @@ def _expected_transfers(groups):
                             add("OState", True, group, task + 2, state, (1, 1, 1, 16, 16))
                         else:
                             add("O", True, group, task + 2, (batch, head, query, owner, row, 0), (1, 1, 1, 1, 16, 16))
-                for name in ("K", "V"):
-                    add(name, False, group, task, (batch, head, kv * 16, 0), (1, 1, 16, 16))
+                add("K", False, group, task, (batch, head, kv * block_kv, 0), (1, 1, block_kv, 16))
+                if pv_chunk is None:
+                    add("V", False, group, task, (batch, head, kv * block_kv, 0), (1, 1, block_kv, 16))
+                else:
+                    for column in range(0, block_kv, pv_chunk):
+                        add("V", False, group, task + 1, (batch, head, kv * block_kv + column, 0), (1, 1, pv_chunk, 16))
     return expected
 
 
@@ -188,12 +196,85 @@ def test_real_frontend_keeps_query_ownership_and_group_private_rings(example, dt
                                          for batch, head, query, owner, row in itertools.product(range(2), range(2), range(3), range(2), (0, 16)))
 
 
+@pytest.mark.parametrize("dtype,groups,block_kv,pv_chunk", [
+    ("float16", 2, 32, 32),
+    ("float16", 2, 64, 32),
+    ("bfloat16", 4, 64, 16),
+])
+def test_chunked_frontend_shares_v_and_keeps_owner_accumulators_until_final_export(
+        example, dtype, groups, block_kv, pv_chunk):
+    program = example.persistent_attention_fwd(
+        batch=2, heads=2, query_pairs=3, kv_tiles=3, groups=groups,
+        block_q=32, block_kv=block_kv, head_dim=16, row_block=16,
+        pv_chunk=pv_chunk, dtype=dtype)
+    assert str(program.attrs["global_symbol"]) == "chunked_fa_" + dtype
+    actual, buffers = _gm_transfers(program, groups)
+    assert actual == _expected_transfers(groups, block_kv, pv_chunk)
+    assert not buffers["P"].strides or int(buffers["P"].strides[-2]) == block_kv
+
+    # Inspect actual typed operands and loop ancestry, not a Python copy of
+    # the factory's chunk/owner address expressions.
+    sites = list(_tile_sites(program.body, operation=None))
+    pv_gemms = [site for site in sites if site[0].op.name == "tl.tileop.gemm" and not int(site[0].args[4])]
+    (gemm, loops, guards, cube), = pv_gemms
+    assert cube
+    p_region, v_region, c_region = gemm.args[:3]
+    p_l1, v_l1, accumulator = [region.args[0].buffer for region in (p_region, v_region, c_region)]
+    assert tuple(map(int, p_l1.shape)) == (32, pv_chunk)
+    assert tuple(map(int, v_l1.shape)) == (2, pv_chunk, 16)
+    assert tuple(map(int, accumulator.shape)) == (2, 32, 16)
+    assert tuple(map(int, c_region.args[2:])) == (1, 32, 16)
+    assert all(int(value) == 0 for value in c_region.args[0].indices[1:])
+    assert int(c_region.args[1]) == 3  # The first-chunk predicate is not a static write-only claim.
+    (root,) = [block for block in nodes(program, tirx.SBlock) if "tl.buffer_versions_map" in block.annotations]
+    assert int(root.annotations["tl.buffer_versions_map"][accumulator.data]) == 1
+    assert int(root.annotations["tl.buffer_versions_map"][p_l1.data]) == 1
+    assert int(root.annotations["tl.manual_multi_buffer"][v_l1.data]) == 2
+
+    (chunk_var,) = nodes(gemm.args[9], tirx.Var)
+    (chunk_loop,) = [loop for loop in loops if loop.loop_var.same_as(chunk_var)]
+    owner_var = c_region.args[0].indices[0]
+    (owner_loop,) = [loop for loop in loops if loop.loop_var.same_as(owner_var)]
+    assert int(chunk_loop.extent) == block_kv // pv_chunk and int(owner_loop.extent) == 2
+    (v_copy,) = [site for site in sites if site[0].op.name == "tl.tileop.ascend_copy"
+                and site[0].args[0].args[0].buffer.data.same_as(buffers["V"].data)]
+    assert v_copy[0].args[1].args[0].buffer.data.same_as(v_l1.data)
+    assert any(loop.same_as(chunk_loop) for loop in v_copy[1])
+    assert not any(loop.same_as(owner_loop) for loop in v_copy[1])
+    (export,) = [site for site in sites if site[0].op.name == "tl.tileop.ascend_copy"
+                and site[0].args[1].args[0].buffer.data.same_as(buffers["PV"].data)]
+    assert export[0].args[0].args[0].buffer.data.same_as(accumulator.data)
+    assert not any(loop.same_as(chunk_loop) for loop in export[1])
+    assert next(i for i, site in enumerate(sites) if site is export) > next(
+        i for i, site in enumerate(sites) if site is pv_gemms[0])
+
+    definitions = {binding.var: binding.value for binding in nodes(program, tirx.Bind)}
+    launch = {loop.thread_binding.thread_tag: loop for loop in loops if loop.thread_binding is not None}
+    group, sid = launch["blockIdx.x"].loop_var, launch["cthread"].loop_var
+    (epoch,) = [loop for loop in loops if loop.kind == tirx.ForKind.SERIAL and int(loop.extent) == 12 // groups * 3 + 2]
+    accumulation = collections.defaultdict(list)
+    for values in _loop_values(loops, definitions):
+        if values[sid] or not all(bool(_integer(guard, values, definitions)) == expected for guard, expected in guards):
+            continue
+        chunk = values[chunk_var]
+        assert _integer(v_region.args[0].indices[0], values, definitions) == chunk % 2
+        accumulation[values[group], values[epoch.loop_var], values[owner_var]].append(
+            (chunk, bool(_integer(gemm.args[9], values, definitions))))
+    expected = {(group, epoch, owner): [(chunk, chunk == 0) for chunk in range(block_kv // pv_chunk)]
+                for group in range(groups) for epoch in range(1, 12 // groups * 3 + 1) for owner in range(2)}
+    assert dict(accumulation) == expected
+
+
 @pytest.mark.parametrize("changes,message", [
     ({"batch": True}, "positive integers"),
     ({"groups": 5}, "divide evenly"),
     ({"block_q": 24}, "Aligned dense tiles"),
     ({"row_block": 48}, "complete UB row subtiles"),
     ({"dtype": "float32"}, "FP16/BF16"),
+    ({"pv_chunk": True}, "pv_chunk must be a positive integer"),
+    ({"pv_chunk": 0}, "pv_chunk must be a positive integer"),
+    ({"pv_chunk": 8}, "pv_chunk must be 16-aligned"),
+    ({"block_kv": 48, "pv_chunk": 32}, "divide block_kv"),
 ])
 def test_invalid_contract_is_rejected_before_frontend_construction(example, changes, message):
     options = dict(batch=2, heads=2, query_pairs=3, kv_tiles=3, groups=2,
