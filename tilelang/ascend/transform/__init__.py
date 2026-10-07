@@ -272,9 +272,10 @@ def RewriteFlagToBuf():
 
 
 def AscendLowerL1Gemm():
-    """Expose dav-2201 L1-to-L0 copies, operand buffers, and sub-K MADs.
+    """Expose dav-2201 physical GEMM tiles, L0 buffers and sub-K MADs.
 
-    Runs before layout inference and scheduling. A bounded serial sub-K loop
+    Runs before layout inference and scheduling. An oversized full-clear GEMM
+    and its complete GM export can become compact M/N tiles. A bounded sub-K loop
     and at most one static tail preserve the logical regions and accumulator
     semantics without expanding the K trip count into the compiler IR.
     """

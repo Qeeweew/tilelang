@@ -155,8 +155,10 @@ def test_unsupported_l1_layout_routes_have_an_explicit_diagnostic(transpose_a, t
         transform.AscendLowerL1Gemm()(_program(64, 64, 128, transpose_a=transpose_a, transpose_b=transpose_b))
 
 
-def test_a_single_native_fractal_must_fit_target_l0_capacity():
-    with pytest.raises(ValueError, match="cannot fit a 16-element sub-K tile"):
+def test_oversized_unpaired_accumulator_is_diagnosed_before_native_expansion():
+    # This accumulator exceeds L0C as well as the minimum L0A fractal.
+    # The paired M/N boundary cannot remove a live C without its full export.
+    with pytest.raises(ValueError, match="physical M/N GEMM requires adjacent full-clear L1 GEMM"):
         transform.AscendLowerL1Gemm()(_program(32769, 16, 16))
 
 

@@ -1,4 +1,4 @@
-"""Automatic L0A/B rings fit the complete kernel's physical bank budget.
+"""Automatic L0A/B/C rings fit the complete kernel's physical bank budget.
 
 The ordinary DSL cases run complete CPU lowering without CANN compilation or
 device launches. Small explicitly scheduled inputs isolate reservation across
@@ -280,6 +280,40 @@ def test_root_reservation_rejects_a_minimum_that_only_fits_the_child_alone(scope
     current = _storage("current", 32 * 1024, scope)
     fixed = _storage("fixed", 48 * 1024, scope)
     out = tirx.decl_buffer((1,), "float16", name="out")
+    module = _module(_owner(current, "epoch", out), [current, fixed], out)
+    with pytest.raises(tvm.error.InternalError, match="insufficient for minimum buffer usage"):
+        _capture_reservations(module)
+
+
+def _l0c_storage(name, size_bytes):
+    return tirx.decl_buffer((size_bytes // 4,), "float32", name=name, scope="shared.l0c")
+
+
+def test_l0c_fixed_root_allocation_is_reserved_before_selecting_another_ring():
+    current = _l0c_storage("current", 64 * 1024)
+    fixed = _l0c_storage("fixed", 64 * 1024)
+    out = tirx.decl_buffer((1,), "float32", name="out")
+    _, queries = _capture_reservations(_module(_owner(current, "epoch", out), [current, fixed], out))
+    assert len(queries) == 1 and queries[0]["sizes"] == [64 * 1024]
+    assert _variable_capacity(queries[0]) == 64 * 1024
+
+
+def test_l0c_previous_owner_width_is_a_minimum_and_a_foreign_reservation():
+    shared_ring = _l0c_storage("shared_ring", 32 * 1024)
+    other = _l0c_storage("other", 64 * 1024)
+    out = tirx.decl_buffer((1,), "float32", name="out")
+    body = seq(_owner(shared_ring, "first", out), _owner(shared_ring, "second", out),
+               _owner(other, "other_epoch", out))
+    after, queries = _capture_reservations(_module(body, [shared_ring, other], out), first_versions=2)
+    assert [query["minimum"] for query in queries] == [[1], [2], [1]]
+    assert _variable_capacity(queries[2]) == 64 * 1024
+    assert int(_root(after).annotations["tl.buffer_versions_map"][shared_ring.data]) == 2
+
+
+def test_l0c_minimum_cannot_use_another_roots_reserved_capacity():
+    current = _l0c_storage("current", 64 * 1024)
+    fixed = _l0c_storage("fixed", 96 * 1024)
+    out = tirx.decl_buffer((1,), "float32", name="out")
     module = _module(_owner(current, "epoch", out), [current, fixed], out)
     with pytest.raises(tvm.error.InternalError, match="insufficient for minimum buffer usage"):
         _capture_reservations(module)

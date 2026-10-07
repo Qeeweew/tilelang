@@ -22,6 +22,8 @@
 #include "op/gemm.h"
 #include "op/utils.h"
 
+#include "lower_l1_gemm_mn.h"
+
 namespace tvm {
 namespace tl {
 
@@ -328,8 +330,10 @@ tvm::transform::Pass AscendLowerL1Gemm() {
     const AscendTargetInfo &info = GetAscendTargetInfo(target.value());
     if (info.architecture != AscendArchitecture::kDav2201)
       return func;
+    ascend::l1_gemm_mn_detail::PhysicalMNGemmLowerer physical_tiles(info);
+    Stmt body = physical_tiles(func->body);
     L1GemmLowerer lowerer(info);
-    func.CopyOnWrite()->body = lowerer(func->body);
+    func.CopyOnWrite()->body = lowerer(body);
     return func;
   };
   return CreatePrimFuncPass(pass_func, 0, "tl.AscendLowerL1Gemm", {});

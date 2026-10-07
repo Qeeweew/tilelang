@@ -46,6 +46,14 @@ read/write regions. No private template mutex or hidden allocation participates
 in this path. The L1 precision path uses matching FP16/BF16 NN or NT operands
 and FP32 accumulation; transposed A remains unsupported.
 
+When one logical accumulator exceeds L0C capacity, the same boundary can pair
+its full-clear GEMM with its adjacent complete GM export. It replaces that
+pair with ordinary M/N loops, a compact single-version L0C accumulator, and
+subtile exports into the original GM region. K lowering then operates on each
+physical tile. The whole GM reader remains outside these loops. See
+[physical GEMM tiles](ascend_2201_physical_tiles.md) for admission and completion
+contracts; this does not imply that the logical L1 or UB allocations fit.
+
 Native LoadData2D consumes complete source fractals. Its lowering boundary
 checks row16/C0-aligned origins, matching physical source/destination tiles,
 allocation bounds and leading version indices. A larger L0 destination cannot
@@ -373,7 +381,7 @@ at a nested loop forms its own boundary; an explicit zero disables inheritance
 within that loop. Clear-accumulator and final-completion expressions keep the
 logical loop epoch when tasks receive a stage offset.
 
-For automatic 2201 loops, L0A/B version admission reserves every other root
+For automatic 2201 loops, L0A/B/C version admission reserves every other root
 storage allocation before solving the current owner. The existing physical
 slot footprint includes layout and alignment; aliases with the same storage
 Var are charged once. Previously selected shared rings retain their maximum
@@ -383,10 +391,12 @@ are reserved before that owner is visited. A manually versioned allocation
 already includes its physical version axis and is charged once.
 
 This whole-kernel reservation is conservative: different storage Vars remain
-reserved even if a later lifetime proof could reuse their allocations. It can
+reserved even if a later lifetime proof could reuse their allocations. L0C
+coalescing runs before admission, so proven common storage identity is already
+reflected in this accounting. The remaining conservative reservation can
 reject such a reuse plan and does not claim optimal allocation. This admission
-boundary covers automatic L0A/B selection; it is not a complete bank validator
-for manual kernels or kernels without an automatic loop. UB, L1, L0C and 3510
+boundary covers automatic L0A/B/C selection; it is not a complete bank validator
+for manual kernels or kernels without an automatic loop. UB, L1 and 3510
 retain their existing policies. Final physical allocations and native
 completion still need their own validation.
 

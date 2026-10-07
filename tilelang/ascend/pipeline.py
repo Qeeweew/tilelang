@@ -95,7 +95,7 @@ def _AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     mod = ascend_transform.UnrollLoopSkipVF()(mod)
     mod = tilelang.transform.Simplify()(mod)
 
-    # Expose 2201's sub-K loads, L0 scratch and MAD tasks before layout and
+    # Expose 2201's physical M/N tiles, sub-K loads and MAD tasks before layout and
     # scheduling. The 3510 path retains its existing fused L1 GEMM lowering.
     mod = ascend_transform.AscendLowerL1Gemm()(mod)
     # Reuse cthread and ordinary buffers/regions for two private AIV owners.

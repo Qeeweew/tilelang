@@ -175,7 +175,7 @@ public:
   // Structural GM prefetch preference for ordinary dav-2201 auto pipelines.
   void SetPreferPrefetchIssue(bool value) { prefer_prefetch_issue_ = value; }
 
-  // Conservative whole-kernel L0A/B admission for dav-2201 automatic loops.
+  // Conservative whole-kernel L0 admission for dav-2201 automatic loops.
   // Physical reuse is a later decision, so it cannot increase this budget.
   void SetReserveL0Storage(bool value) { reserve_l0_storage_ = value; }
 
@@ -247,7 +247,7 @@ private:
     if (existing != selected_buffer_versions_.end()) {
       // Disjoint owners are scheduled independently but share one physical
       // storage ring, so keep enough versions for every owner. Automatic
-      // dav-2201 L0A/B queries reserve other root allocations and carry this
+      // dav-2201 L0 queries reserve other root allocations and carry this
       // existing count as a hard lower bound before selecting again. Other
       // scopes and manual schedules retain their existing per-owner policy.
       num_versions = std::max((*existing).second, num_versions);
@@ -1037,6 +1037,8 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
       return "shared.l0a";
     if (scope == "shared.l0b" || scope == "shared.l0b.dyn")
       return "shared.l0b";
+    if (scope == "shared.l0c" || scope == "shared.l0c.dyn")
+      return "shared.l0c";
     return "";
   };
   auto reserved_versions = [&](const Var &storage) -> int {
@@ -1131,7 +1133,8 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
   if (reserve_l0) {
     // Every root allocation remains reserved until a later physical reuse
     // proof. This deliberately may reject a downstream alias/reuse plan; it
-    // is a safe L0A/B bound, not a lifetime-optimal allocation model.
+    // is a safe L0 bound, not a lifetime-optimal allocation model. L0C
+    // coalescing has already established any proven shared storage identity.
     for (const auto &[storage, _] : storage_slot_bytes_) {
       std::string scope = l0_scope(storage);
       if (scope.empty())
@@ -1156,7 +1159,7 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
   }
 
   // Validate buffer capacities upfront: every eligible buffer needs at least
-  // one version, or the existing shared ring count for automatic 2201 L0A/B.
+  // one version, or the existing shared ring count for automatic 2201 L0.
   // If that minimum exceeds the remaining capacity, Z3 cannot be feasible.
   for (size_t g = 0; g < group_capacities.size(); ++g) {
     int64_t capacity = group_capacities[g];

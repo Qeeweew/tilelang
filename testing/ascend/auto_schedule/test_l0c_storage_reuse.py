@@ -255,13 +255,23 @@ def test_three_member_group_checks_overlap_against_every_accepted_member():
 
 
 def test_sequential_distinct_unique_loop_owners_keep_independent_storage():
-    before, first, second = _fixture(kind="different-owners")
+    before, first, second = _fixture(kind="different-owners", width=128)
     after, plans = _scheduled(before)
     assert len(plans) == 2
     assert {buffer.data for buffer in _l0c_allocations(after)} == {first.data, second.data}
     assert [set(loop.annotations["multi_buffer_eligible"]) for loop in nodes(after, tirx.For)] == [
         {first.data}, {second.data}
     ]
+
+
+def test_distinct_loop_owners_cannot_borrow_each_others_l0c_capacity():
+    before, _, _ = _fixture(kind="different-owners")
+    snapshot = tvm.ir.save_json(before)
+    # Independent 128KiB and 32KiB allocations coexist at the root. No
+    # cross-owner reuse proof licenses admitting either owner in isolation.
+    with pytest.raises(tvm.error.InternalError, match="shared.l0c.*insufficient for minimum buffer usage"):
+        _scheduled(before)
+    assert tvm.ir.save_json(before) == snapshot
 
 
 @pytest.mark.parametrize("nested", [False, True])
