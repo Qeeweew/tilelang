@@ -33,6 +33,58 @@ namespace {
 constexpr const char *kModeMerging = "MODE_MERGING";
 constexpr const char *kSimdOpPrefix = "tl.simd.";
 
+bool HasMaskSafeArguments(const PrimExpr &expr) {
+  static const Op type_annotation = Op::Get("tirx.type_annotation");
+  bool safe = true;
+  tirx::PostOrderVisit(expr, [&](const ffi::ObjectRef &node) {
+    if (const auto *call = node.as<CallNode>()) {
+      safe &= call->op.same_as(builtin::tvm_access_ptr()) ||
+              call->op.same_as(builtin::address_of()) ||
+              call->op.same_as(builtin::reinterpret()) ||
+              call->op.same_as(type_annotation) ||
+              call->op.same_as(builtin::bitwise_and()) ||
+              call->op.same_as(builtin::bitwise_or()) ||
+              call->op.same_as(builtin::bitwise_xor()) ||
+              call->op.same_as(builtin::bitwise_not()) ||
+              call->op.same_as(builtin::shift_left()) ||
+              call->op.same_as(builtin::shift_right());
+    }
+  });
+  return safe;
+}
+
+// These exact 2201 C API overloads leave normal/full mask state unchanged.
+// Restrict the run to direct statements with side-effect-free arguments.
+bool IsNormalFullMaskCall(const CallNode *call) {
+  const auto *callee = call->op.as<OpNode>();
+  if (!callee ||
+      (callee->name != "tl.ascend_membase.brcb_f32" &&
+       callee->name != "tl.ascend_membase.sub_rows_f32" &&
+       callee->name != "tl.ascend_membase.mul_rows_f32" &&
+       callee->name != "tl.ascend_membase.div_rows_f32" &&
+       callee->name != "tl.ascend_membase.repeat_reduce_sum_rows_f32" &&
+       callee->name != "tl.ascend_membase.repeat_reduce_max_rows_f32")) {
+    return false;
+  }
+  if (callee->name == "tl.ascend_membase.repeat_reduce_sum_rows_f32" ||
+      callee->name == "tl.ascend_membase.repeat_reduce_max_rows_f32") {
+    if (call->args.size() != 5 || !is_const_int(call->args[4], 64))
+      return false;
+  }
+  return std::all_of(call->args.begin(), call->args.end(),
+                     HasMaskSafeArguments);
+}
+
+bool IsVectorPipeBarrier(const CallNode *call) {
+  const auto *callee = call->op.as<OpNode>();
+  if (!callee || callee->name != "tl.ascend_pipe_barrier" ||
+      call->args.size() != 1) {
+    return false;
+  }
+  const auto *pipe = call->args[0].as<StringImmNode>();
+  return pipe && pipe->value == "PIPE_V";
+}
+
 // LowerScheduledTIR can clone a cthread binding into several core regions.
 // These bind the same immutable hardware SID, rather than defining new SSA
 // values. Collect them within one emitted function so their declarations
@@ -587,10 +639,11 @@ void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
   ICHECK(IsOutsideVF())
       << "Ascend VF mode leaked across PrimFunc code generation";
   this->InitFuncState(f);
-  Target target = f->GetAttr<Target>(tvm::attr::kTarget)
-                      .value_or(Target("ascend"));
+  Target target =
+      f->GetAttr<Target>(tvm::attr::kTarget).value_or(Target("ascend"));
   is_dav2201_ = tl::GetAscendTargetInfo(target).architecture ==
-               tl::AscendArchitecture::kDav2201;
+                tl::AscendArchitecture::kDav2201;
+  reuse_normal_full_mask_ = false;
   has_gemm_l0_ = false;
   has_gemm_l1_ = false;
   unroll_factor_.clear();
@@ -2027,6 +2080,28 @@ bool CodeGenTileLangAscend::EmitAscendMemoryCall_(const CallNode *op) {
   return true;
 }
 
+void CodeGenTileLangAscend::EmitNormalFullMask_() {
+  if (!reuse_normal_full_mask_) {
+    PrintIndent();
+    stream << "asc_set_mask_norm();\n";
+    PrintIndent();
+    stream << "asc_set_vector_mask(~uint64_t(0), ~uint64_t(0));\n";
+  }
+}
+
+std::string CodeGenTileLangAscend::PrintMaskArgument_(const PrimExpr &arg) {
+  std::string value = PrintExpr(arg);
+  if (HasMaskSafeArguments(arg))
+    return value;
+  // PrintExpr normally leaves calls inline. Materialize a possibly clobbering
+  // argument before establishing this operation's mask, exactly once. `auto`
+  // preserves a pointer's address space as well as scalar argument types.
+  std::string temporary = name_supply_->FreshName("mask_arg_");
+  PrintIndent();
+  stream << "auto " << temporary << " = " << value << ";\n";
+  return temporary;
+}
+
 void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
   std::string simd_op_name;
   if (IsSimdOp(op, &simd_op_name)) {
@@ -2053,27 +2128,35 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
       (callee->name == "tl.ascend_membase.repeat_reduce_sum_rows_f32" ||
        callee->name == "tl.ascend_membase.repeat_reduce_max_rows_f32")) {
     ICHECK(is_dav2201_) << "FP32 strided row reduce requires dav-2201";
-    ICHECK_EQ(op->args.size(), 4U);
+    ICHECK_EQ(op->args.size(), 5U);
     const auto *rows = op->args[2].as<IntImmNode>();
     const auto *stride = op->args[3].as<IntImmNode>();
-    ICHECK(rows && rows->value > 0 && rows->value <= 255 && stride &&
-           stride->value > 8 && stride->value <= 65535 &&
-           stride->value % 8 == 0);
+    const auto *lanes = op->args[4].as<IntImmNode>();
+    ICHECK(rows && rows->value > 0 && rows->value <= 255 && stride && lanes &&
+           lanes->value >= 8 && lanes->value <= 64 && lanes->value % 8 == 0 &&
+           stride->value >= lanes->value / 8 && stride->value <= 65535 &&
+           (lanes->value == 64 ? stride->value % 8 == 0
+                               : stride->value == lanes->value / 8));
     const char *name =
         callee->name == "tl.ascend_membase.repeat_reduce_sum_rows_f32"
             ? "asc_repeat_reduce_sum"
             : "asc_repeat_reduce_max_only_value";
-    std::string dst = PrintExpr(op->args[0]);
-    std::string src = PrintExpr(op->args[1]);
-    std::string repeats = PrintExpr(op->args[2]);
-    std::string row_stride = PrintExpr(op->args[3]);
-    // The six-argument overload performs one complete FP32 VL per repeat.
+    std::string dst = PrintMaskArgument_(op->args[0]);
+    std::string src = PrintMaskArgument_(op->args[1]);
+    std::string repeats = PrintMaskArgument_(op->args[2]);
+    std::string row_stride = PrintMaskArgument_(op->args[3]);
+    // The six-argument overload reduces the explicitly active lanes per row.
     // Its destination repeat stride is in elements; source strides are 32B
     // blocks. Count-mode predecessors do not restore a full normal mask.
-    PrintIndent();
-    stream << "asc_set_mask_norm();\n";
-    PrintIndent();
-    stream << "asc_set_vector_mask(~uint64_t(0), ~uint64_t(0));\n";
+    if (lanes->value == 64) {
+      EmitNormalFullMask_();
+    } else {
+      PrintIndent();
+      stream << "asc_set_mask_norm();\n";
+      PrintIndent();
+      stream << "asc_set_vector_mask(uint64_t(0), uint64_t("
+             << ((uint64_t(1) << lanes->value) - 1) << "));\n";
+    }
     PrintIndent();
     stream << name << "(" << dst << ", " << src << ", " << repeats
            << ", uint16_t(1), uint16_t(1), " << row_stride << ");\n";
@@ -2085,13 +2168,10 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     ICHECK_EQ(op->args.size(), 3U);
     // The IR operands remain FP32: vbrcb copies b32 payloads, including signed
     // zero and NaN bits. The public C API only exposes uint32_t pointer types.
-    std::string dst = PrintExpr(op->args[0]);
-    std::string src = PrintExpr(op->args[1]);
-    std::string repeats = PrintExpr(op->args[2]);
-    PrintIndent();
-    stream << "asc_set_mask_norm();\n";
-    PrintIndent();
-    stream << "asc_set_vector_mask(~uint64_t(0), ~uint64_t(0));\n";
+    std::string dst = PrintMaskArgument_(op->args[0]);
+    std::string src = PrintMaskArgument_(op->args[1]);
+    std::string repeats = PrintMaskArgument_(op->args[2]);
+    EmitNormalFullMask_();
     PrintIndent();
     stream << "asc_brcb(reinterpret_cast<__ubuf__ uint32_t*>(" << dst
            << "), reinterpret_cast<__ubuf__ uint32_t*>(" << src
@@ -2108,10 +2188,10 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     const auto *stride = op->args[5].as<IntImmNode>();
     ICHECK(row_lhs && stride && stride->value > 0 && stride->value <= 255 &&
            stride->value % 8 == 0);
-    std::string dst = PrintExpr(op->args[0]);
-    std::string lhs = PrintExpr(op->args[1]);
-    std::string rhs = PrintExpr(op->args[2]);
-    std::string repeats = PrintExpr(op->args[3]);
+    std::string dst = PrintMaskArgument_(op->args[0]);
+    std::string lhs = PrintMaskArgument_(op->args[1]);
+    std::string rhs = PrintMaskArgument_(op->args[2]);
+    std::string repeats = PrintMaskArgument_(op->args[3]);
     const char *name =
         callee->name == "tl.ascend_membase.sub_rows_f32"   ? "asc_sub"
         : callee->name == "tl.ascend_membase.mul_rows_f32" ? "asc_mul"
@@ -2120,10 +2200,7 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     // broadcast block eight times; its repeat stride advances one row block.
     // CANN 9.1's strided vsub/vmul/vdiv overloads do not change mask state,
     // so the entry setters also guarantee normal/full mask on return.
-    PrintIndent();
-    stream << "asc_set_mask_norm();\n";
-    PrintIndent();
-    stream << "asc_set_vector_mask(~uint64_t(0), ~uint64_t(0));\n";
+    EmitNormalFullMask_();
     PrintIndent();
     stream << name << "(" << dst << ", " << lhs << ", " << rhs << ", "
            << repeats << ", uint8_t(1), uint8_t(" << (row_lhs->value ? 0 : 1)
@@ -3311,6 +3388,26 @@ void CodeGenTileLangAscend::VisitExpr_(const ShuffleNode *op,
     PrintVecElemStore(result, op->dtype, i, output_lanes[i]);
   }
   os << result;
+}
+
+void CodeGenTileLangAscend::VisitStmt_(const SeqStmtNode *op) {
+  if (!is_dav2201_) {
+    CodeGenC::VisitStmt_(op);
+    return;
+  }
+  bool normal_full = false;
+  for (const Stmt &stmt : op->seq) {
+    const auto *evaluate = stmt.as<EvaluateNode>();
+    const auto *call = evaluate ? evaluate->value.as<CallNode>() : nullptr;
+    const bool native = call && IsNormalFullMaskCall(call);
+    const bool barrier = call && IsVectorPipeBarrier(call);
+    reuse_normal_full_mask_ = normal_full && native;
+    PrintStmt(stmt);
+    reuse_normal_full_mask_ = false;
+    // Setters precede the native call unconditionally, including a zero or
+    // dynamic repeat count. Never export an inner branch/loop's mask state.
+    normal_full = native || (normal_full && barrier);
+  }
 }
 
 void CodeGenTileLangAscend::VisitStmt_(const ForNode *op) {

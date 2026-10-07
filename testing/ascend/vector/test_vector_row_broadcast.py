@@ -88,6 +88,36 @@ def _source(program):
     return tilelang.lower(program, target=TARGET, enable_host_codegen=False, enable_device_compile=False).kernel_source
 
 
+def _assert_normal_full_mask_entry(source, expected):
+    """Check mask state at native entries, allowing one straight-line run.
+
+    These fixtures emit direct C API statements. Only the six normal-mode
+    families and a PIPE_V barrier preserve this fact; count/cast wrappers and
+    every other call require a new entry before the next native operation.
+    """
+    families = {
+        "asc_brcb", "asc_sub", "asc_mul", "asc_div",
+        "asc_repeat_reduce_sum", "asc_repeat_reduce_max_only_value",
+    }
+    assert not re.search(r"\b(?:if|for|while)\s*\(", source), source
+    normal = full = False
+    actual = []
+    for match in re.finditer(r"\b(asc_\w+)\(([^;\n]*)\);", source):
+        name, arguments = match.groups()
+        if name == "asc_set_mask_norm":
+            normal = True
+        elif name == "asc_set_vector_mask":
+            full = arguments.replace(" ", "") == "~uint64_t(0),~uint64_t(0)"
+        elif name in families and (name == "asc_brcb" or "(uint8_t)" in arguments):
+            assert normal and full, source[match.start():match.end()]
+            actual.append(name)
+        elif name == "asc_sync_pipe" and arguments.strip() == "PIPE_V":
+            pass
+        else:
+            normal = full = False
+    assert actual == expected, (actual, expected, source)
+
+
 @pytest.mark.parametrize("rows", [8, 16, 248])
 @pytest.mark.parametrize("operation", ["sub", "rsub", "mul", "rmul", "div", "rdiv"])
 def test_static_full_vl_broadcast_exposes_exact_f32_regions(rows, operation):
@@ -210,6 +240,7 @@ def test_full_frontend_codegen_has_native_brcb_and_whole_tile_exp_cast(dtype):
     assert re.search(r"asc_exp\([^;]+\(uint32_t\)1024\)", source)
     cast = "asc_float2half_rn" if dtype == "float16" else "asc_float2bfloat16_rn"
     assert re.search(cast + r"\([^;]+\(uint32_t\)1024\)", source)
+    _assert_normal_full_mask_entry(source, ["asc_brcb", "asc_sub"])
     # The shared native V dependency must survive the complete compiler:
     # Brcb -> Sub -> Exp -> narrowing. No per-row S snapshot is introduced.
     brcb_end = source.index(";", source.index("asc_brcb("))
@@ -238,6 +269,7 @@ def test_mul_and_add_remain_separate_rounding_nodes():
     source = _source(main)
     assert "asc_mul(" in source and "asc_add(" in source
     assert "vmadd" not in source and "membase_scalar_" not in source
+    _assert_normal_full_mask_entry(source, ["asc_brcb", "asc_mul"])
 
 
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
@@ -269,6 +301,7 @@ def test_ordinary_fa_two_assignments_preserve_whole_tile_node_order(dtype):
     assert "membase_scalar_" not in source
     positions = [source.index(name) for name in ("asc_brcb(", "asc_sub(", "asc_exp(", "asc_" + cast + "(")]
     assert positions == sorted(positions)
+    _assert_normal_full_mask_entry(source, ["asc_brcb", "asc_sub"])
     for before, after in zip(positions, positions[1:]):
         assert "asc_sync_pipe(PIPE_V)" in source[source.index(";", before):after]
 
@@ -332,11 +365,9 @@ def test_row_division_codegen_uses_native_normal_repeat_and_exact_cast(operation
     line = next(line for line in source.splitlines() if "asc_div(" in line)
     strides = "uint8_t(1), uint8_t(0), uint8_t(1), uint8_t(8), uint8_t(1), uint8_t(8)" if operation == "rdiv" else "uint8_t(1), uint8_t(1), uint8_t(0), uint8_t(8), uint8_t(8), uint8_t(1)"
     assert strides in line and "(uint8_t)16" in line
-    # The count wrapper ends in normal mode but leaves count mask bits.
-    # Each new normal binary explicitly establishes all 64 FP32 lanes.
-    prefix = source[:division_start]
-    assert prefix.rfind("asc_set_mask_norm();") > prefix.rfind("asc_brcb(")
-    assert prefix.rfind("asc_set_vector_mask(~uint64_t(0), ~uint64_t(0));") > prefix.rfind("asc_brcb(")
+    # Brcb and division may share one normal/full entry across PIPE_V.
+    # A count/cast wrapper would invalidate that state before another row op.
+    _assert_normal_full_mask_entry(source, ["asc_brcb", "asc_div"])
     assert "asc_sync_pipe(PIPE_V)" in source[source.index(";", source.index("asc_brcb(")):division_start]
     assert "membase_scalar_" not in source and "asc_reciprocal" not in source
     if output_dtype != "float32":

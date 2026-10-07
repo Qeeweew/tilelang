@@ -1234,20 +1234,30 @@ private:
     return IRMutatorWithAnalyzer::VisitStmt_(lowered.get());
   }
 
-  // A strided WholeReduce reads one 64-element chunk of each physical row.
+  // A strided WholeReduce reads one exact lane interval of each physical row.
   // Keep that exact rectangle through dependency/version planning; only this
   // late mechanical conversion needs a pointer span covering the row gaps.
   Stmt LowerRowReduceRegions(const EvaluateNode *op, const CallNode *call) {
-    ICHECK_EQ(call->args.size(), 4U);
+    ICHECK_EQ(call->args.size(), 5U) << "FP32 row reduce expects five operands";
     const auto *rows = call->args[2].as<IntImmNode>();
     const auto *stride = call->args[3].as<IntImmNode>();
+    const auto *lanes = call->args[4].as<IntImmNode>();
     ICHECK(rows && rows->value > 0 && rows->value <= 255 &&
-           call->args[2].dtype() == DataType::UInt(8) && stride &&
-           stride->value > 8 && stride->value <= 65535 &&
-           stride->value % 8 == 0 &&
+           call->args[2].dtype() == DataType::UInt(8))
+        << "FP32 row reduce requires static uint8 rows in [1, 255]";
+    ICHECK(lanes && lanes->value >= 8 && lanes->value <= 64 &&
+           lanes->value % 8 == 0 && call->args[4].dtype() == DataType::UInt(8))
+        << "FP32 row reduce requires static uint8 valid lanes in [8, 64], "
+           "in multiples of eight";
+    ICHECK(stride && stride->value >= lanes->value / 8 &&
+           stride->value <= 65535 &&
            call->args[3].dtype() == DataType::UInt(16))
-        << "FP32 row reduce requires positive uint8 rows and a uint16 "
-           "whole-VL source row stride";
+        << "FP32 row reduce requires a uint16 source row stride in "
+           "[valid_lanes / 8, 65535]";
+    ICHECK(lanes->value == 64 ? stride->value % 8 == 0
+                              : stride->value == lanes->value / 8)
+        << "FP32 row reduce requires a whole-VL stride for 64 lanes or "
+           "a compact source row stride for partial lanes";
     Array<PrimExpr> args = call->args;
     for (size_t i = 0; i < 2; ++i) {
       const auto *region = call->args[i].as<CallNode>();
@@ -1255,49 +1265,67 @@ private:
           << "FP32 row reduce requires exact typed tl.region operands";
       BufferRegion access = NormalizeToBufferRegion(call->args[i]);
       const int mask = i == 0 ? kAccessWrite : kAccessRead;
-      ICHECK(is_const_int(region->args[1], mask));
+      ICHECK(is_const_int(region->args[1], mask))
+          << "FP32 row reduce region access mask differs from its operand";
       ICHECK(access->buffer->dtype == DataType::Float(32) &&
-             IsSharedBuffer(access->buffer));
+             IsSharedBuffer(access->buffer))
+          << "FP32 row reduce operands require FP32 UB storage";
       const size_t rank = access->region.size();
-      const size_t trailing = i == 0 ? 1 : 2;
-      ICHECK_GE(rank, trailing);
+      ICHECK_GE(rank, i == 0 ? 1U : 2U);
+      // A retained reduction axis is a physical trailing unit dimension;
+      // version/owner axes before the actual rows still select one plane.
+      const bool retained_axis = i == 0 && rank >= 2 &&
+                                 is_one(access->buffer->shape.back()) &&
+                                 is_one(access->region.back()->extent) &&
+                                 is_zero(access->region.back()->min);
+      const size_t row_axis = rank - (i == 1 || retained_axis ? 2 : 1);
       for (size_t axis = 0; axis < rank; ++axis)
         ICHECK(CanProveAscendRangeInBounds(
             access->region[axis]->min, access->region[axis]->extent,
             access->buffer->shape[axis], analyzer_))
             << "FP32 row reduce region must lie inside its backing";
-      for (size_t axis = 0; axis + trailing < rank; ++axis)
+      for (size_t axis = 0; axis < row_axis; ++axis)
         ICHECK(is_one(access->region[axis]->extent))
             << "FP32 row reduce leading/version axes must be singleton";
       if (!access->buffer->strides.empty()) {
         ICHECK(is_one(access->buffer->strides.back()))
             << "FP32 row reduce requires contiguous input/output elements";
-        if (i == 1)
+        if (i == 1 || retained_axis)
           ICHECK(analyzer_->CanProveEqual(
-              access->buffer->strides[rank - 2],
-              make_const(access->buffer->strides[rank - 2].dtype(),
-                         stride->value * 8)))
-              << "FP32 row reduce source pitch differs from its stride";
+              access->buffer->strides[row_axis],
+              make_const(access->buffer->strides[row_axis].dtype(),
+                         i == 1 ? stride->value * 8 : 1)))
+              << "FP32 row reduce physical row pitch differs from its "
+                 "compact output or source stride";
       }
       PrimExpr span;
       if (i == 0) {
-        ICHECK(is_const_int(access->region.back()->extent, rows->value));
-        span = access->region.back()->extent;
+        ICHECK(is_const_int(access->region[row_axis]->extent, rows->value))
+            << "FP32 row reduce destination must contain exactly rows "
+               "compact elements";
+        span = access->region[row_axis]->extent;
       } else {
-        ICHECK(is_const_int(access->region[rank - 2]->extent, rows->value) &&
-               is_const_int(access->region.back()->extent, 64) &&
+        ICHECK(is_const_int(access->region[row_axis]->extent, rows->value) &&
+               is_const_int(access->region.back()->extent, lanes->value) &&
                is_const_int(access->buffer->shape.back(), stride->value * 8))
-            << "FP32 row reduce source must be an exact [rows, 64] chunk "
+            << "FP32 row reduce source must be an exact [rows, valid_lanes] "
+               "chunk "
                "of its physical row width";
-        ICHECK(analyzer_->CanProveEqual(
-            floormod(access->region.back()->min,
-                     make_const(access->region.back()->min.dtype(), 64)),
-            make_zero(access->region.back()->min.dtype())))
-            << "FP32 row reduce source column must start at a whole VL";
-        DataType dtype = access->region[rank - 2]->extent.dtype();
-        span = (access->region[rank - 2]->extent - make_const(dtype, 1)) *
+        if (lanes->value == 64) {
+          ICHECK(analyzer_->CanProveEqual(
+              floormod(access->region.back()->min,
+                       make_const(access->region.back()->min.dtype(), 64)),
+              make_zero(access->region.back()->min.dtype())))
+              << "FP32 row reduce source column must start at a whole VL";
+        } else {
+          ICHECK(is_zero(access->region.back()->min))
+              << "FP32 row reduce partial lanes must start at source column "
+                 "zero";
+        }
+        DataType dtype = access->region[row_axis]->extent.dtype();
+        span = (access->region[row_axis]->extent - make_const(dtype, 1)) *
                    make_const(dtype, stride->value * 8) +
-               make_const(dtype, 64);
+               make_const(dtype, lanes->value);
       }
       Array<PrimExpr> indices;
       for (const Range &range : access->region)

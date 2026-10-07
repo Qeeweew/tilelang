@@ -1,7 +1,5 @@
 """Wide private row broadcasts retain exact chunk regions before scheduling."""
 
-import re
-
 import pytest
 import tilelang
 from tilelang import tvm
@@ -11,7 +9,7 @@ from tvm import tirx
 from testing.ascend._ir import calls, kernel, nodes, seq
 from testing.ascend.auto_schedule._scheduled_ir import unit
 from testing.ascend.vector.test_vector_row_broadcast import (
-    TARGET, _lower, _native, _program, _ptrs, _regions, _source,
+    TARGET, _assert_normal_full_mask_entry, _lower, _native, _program, _ptrs, _regions, _source,
 )
 
 
@@ -134,11 +132,9 @@ def test_wide_fa_store_boundaries_keep_whole_tile_exp_and_terminal_cast(dtype):
     assert "membase_scalar_" not in source
     lines = [line for line in source.splitlines() if "asc_sub(" in line]
     assert all("uint8_t(1), uint8_t(1), uint8_t(0), uint8_t(16), uint8_t(16), uint8_t(1)" in line for line in lines)
-    # Each normal-mode chunk establishes a full mask. The common V completion
-    # protects Brcb -> both chunks -> whole-tile Exp -> narrowing.
-    for match in re.finditer(r"asc_sub\(", source):
-        before = source[:match.start()]
-        assert before.rfind("asc_set_vector_mask(~uint64_t(0), ~uint64_t(0));") > before.rfind("asc_brcb(")
+    # Both normal chunks execute with a full mask, possibly inherited from
+    # Brcb. Count-mode Exp and narrowing retain their separate call contract.
+    _assert_normal_full_mask_entry(source, ["asc_brcb", "asc_sub", "asc_sub"])
     brcb_end = source.index(";", source.index("asc_brcb("))
     assert "asc_sync_pipe(PIPE_V)" in source[brcb_end:source.index("asc_sub(")]
     sub_end = source.index(";", source.rindex("asc_sub("))

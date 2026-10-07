@@ -1,4 +1,4 @@
-"""Static FP32 multi-VL rows expose strided native chunks and typed combines."""
+"""Static FP32 row plans expose native levels, exact effects and UB scratch."""
 
 import importlib.util
 from pathlib import Path
@@ -96,8 +96,8 @@ def test_each_chunk_has_exact_regions_aligned_partials_and_no_row_readback(kind,
     assert int(partials.shape[-1]) * 4 % 32 == 0
     assert any(partials.same_as(buffer) for buffer in after["main"].body.block.alloc_buffers)
     for chunk, call in enumerate(native):
-        assert [str(arg.dtype) for arg in call.args[2:]] == ["uint8", "uint16"]
-        assert [int(arg) for arg in call.args[2:]] == [rows, columns // 8]
+        assert [str(arg.dtype) for arg in call.args[2:]] == ["uint8", "uint16", "uint8"]
+        assert [int(arg) for arg in call.args[2:]] == [rows, columns // 8, 64]
         target, origin = call.args[:2]
         assert target.op.name == origin.op.name == "tl.region"
         assert [int(target.args[1]), int(origin.args[1])] == [2, 1]
@@ -236,12 +236,12 @@ def test_dav3510_reduction_is_not_rewritten_by_the_2201_plan():
 
 
 def test_larger_expansion_keeps_the_short_existing_row_tree():
-    # 4096/64 chunks would create 127 operations, while two independent rows
-    # need only four count-mode reductions. No thousand-node shape expansion.
-    before, _, _ = _program(rows=2, columns=4096)
+    # Outside the bounded two-level domain, 8192/64 chunks would create 255
+    # operations while two rows need only six count-mode reductions.
+    before, _, _ = _program(rows=2, columns=8192)
     after = _lower(before)
     assert not _strided(after)
-    assert [int(call.args[-1]) for call in calls(after, PREFIX + "sum")] == [4096, 64]
+    assert [int(call.args[-1]) for call in calls(after, PREFIX + "sum")] == [8192, 128, 2]
 
 
 @pytest.mark.parametrize("kind", ["sum", "max"])
@@ -347,7 +347,24 @@ def test_layout_compactness_cannot_override_the_native_raw_row_stride_boundary()
     assert [int(call.args[-1]) for call in calls(after, PREFIX + "sum")] == [128, 2]
 
 
-@pytest.mark.parametrize("bad", ["rows", "stride", "width", "pitch", "alignment", "leading"])
+def test_two_level_layout_cannot_override_the_native_raw_destination_stride():
+    before, source, _ = _program(columns=1024)
+    destination = tirx.decl_buffer((3,), "float32", "raw_strided_destination",
+                                   scope="shared.dyn", strides=[2])
+    original = calls(before, "tl.tileop.reduce")[0]
+    args = list(original.args)
+    args[1] = region(destination, 2)
+    mod = kernel(tirx.Evaluate(tirx.Call("handle", original.op, args)),
+                 buffers=[source, destination], annotations={
+                     "layout_map": {destination: Layout([3], lambda i: [i])},
+                 })
+    mod["main"] = mod["main"].with_attr("target", tvm.target.Target(TARGET))
+    after = _lower(mod)
+    assert not _strided(after)
+    assert [int(call.args[-1]) for call in calls(after, PREFIX + "sum")] == [1024, 16]
+
+
+@pytest.mark.parametrize("bad", ["rows", "stride", "lanes", "width", "pitch", "alignment", "leading"])
 def test_late_native_boundary_rejects_inconsistent_encoded_regions(bad):
     before, source, _ = _program()
     (native, _) = _strided(_lower(before))
@@ -357,7 +374,9 @@ def test_late_native_boundary_rejects_inconsistent_encoded_regions(bad):
     if bad == "rows":
         args[2] = tirx.IntImm("uint8", 0)
     elif bad == "stride":
-        args[3] = tirx.IntImm("uint16", 8)
+        args[3] = tirx.IntImm("uint16", 0)
+    elif bad == "lanes":
+        args[4] = tirx.IntImm("uint8", 65)
     elif bad in ["width", "pitch"]:
         operand = list(args[1].args)
         if bad == "width":
@@ -400,15 +419,128 @@ def test_ordinary_dsl_source_establishes_masks_and_vector_completion(kind):
     symbol = "asc_repeat_reduce_sum" if kind == "sum" else "asc_repeat_reduce_max_only_value"
     positions = [match.start() for match in re.finditer(symbol + r"\(", source)]
     assert len(positions) == 2
-    for position in positions:
-        assert re.search(r"asc_set_mask_norm\(\);\s*asc_set_vector_mask\(~uint64_t\(0\), ~uint64_t\(0\)\);\s*$",
-                         source[:position])
+    # Establishment may be shared by an adjacent native run. Verify the
+    # effective mode/mask at each call instead of requiring duplicate setters.
+    normal, full = False, False
+    checked = 0
+    for line in source.splitlines():
+        if "asc_set_mask_norm();" in line:
+            normal = True
+        elif "asc_set_mask_count" in line:
+            normal = False
+        elif "asc_set_vector_mask(" in line:
+            full = "~uint64_t(0), ~uint64_t(0)" in line
+        elif symbol + "(" in line:
+            assert normal and full
+            checked += 1
+    assert checked == len(positions)
     native_lines = [line for line in source.splitlines() if symbol + "(" in line]
     assert all("(uint8_t)3, uint16_t(1), uint16_t(1), (uint16_t)16" in line for line in native_lines)
     combine = source.index("asc_add(" if kind == "sum" else "asc_max(")
     assert source.rfind("asc_sync_pipe(PIPE_V);", 0, combine) > max(positions)
     assert "membase_reduce_result" not in source
     assert "asc_repeat_reduce_sum_sync" not in source and artifact.host_mod
+
+
+@pytest.mark.parametrize("kind", ["sum", "max"])
+@pytest.mark.parametrize("rows,columns", [(1, 512), (16, 1024), (3, 1536), (2, 4096)])
+def test_compact_wide_rows_have_two_native_levels_and_no_combine_tree(kind, rows, columns):
+    before, source, destination = _program(kind=kind, rows=rows, columns=columns)
+    after = _lower(before, vector=True)
+    count_name = PREFIX + ("sum" if kind == "sum" else "max_only_value")
+    (first,) = calls(after, count_name)
+    (second,) = _strided(after, kind)
+    target, origin = first.args[:2]
+    assert target.op.name == origin.op.name == "tl.access_ptr"
+    partials = target.args[0].buffer
+    _equal(partials.shape, [rows, columns // 64])
+    _equal(target.args[0].indices, [0, 0])
+    _equal([target.args[1], origin.args[1], first.args[2]],
+           [rows * (columns // 64), rows * columns, rows * columns])
+    assert [int(target.args[2]), int(origin.args[2])] == [2, 1]
+    assert origin.args[0].buffer.same_as(source)
+    _equal(origin.args[0].indices, [0, 0])
+    output, inputs = second.args[:2]
+    assert output.op.name == inputs.op.name == "tl.region"
+    assert output.args[0].buffer.same_as(destination)
+    assert inputs.args[0].buffer.same_as(partials)
+    _equal(output.args[2:], [rows])
+    _equal(inputs.args[2:], [rows, columns // 64])
+    assert [str(arg.dtype) for arg in second.args[2:]] == ["uint8", "uint16", "uint8"]
+    assert [int(arg) for arg in second.args[2:]] == [rows, columns // 512, columns // 64]
+    assert len(after["main"].body.block.alloc_buffers) == 3
+    assert not nodes(after, tirx.Bind) and not nodes(after, tirx.For)
+    assert not calls(after, "tl.ascend_membase.add")
+    assert not calls(after, "tl.ascend_membase.max")
+    units = transform.MaterializeScheduleUnits()(after)
+    tasks = [task for task in nodes(units, tirx.AttrStmt) if task.attr_key == "tl.ascend_task"]
+    assert len(tasks) == 2
+    assert len(calls(tasks[0], count_name)) == 1 and len(_strided(tasks[1], kind)) == 1
+
+
+@pytest.mark.parametrize("kind", ["sum", "max"])
+@pytest.mark.parametrize("retain_axis", [False, True])
+def test_two_level_plan_keeps_nonzero_origins_and_retained_output_axis(kind, retain_axis):
+    before, source, destination = _program(
+        kind=kind, rows=3, columns=1024, source_row=2, output_row=8,
+        retain_axis=retain_axis, index_dtype="int64")
+    after = _lower(before)
+    (first,) = calls(after, PREFIX + ("sum" if kind == "sum" else "max_only_value"))
+    (second,) = _strided(after, kind)
+    _equal(first.args[1].args[0].indices, [2, 0])
+    _equal(second.args[0].args[0].indices, [8, 0] if retain_axis else [8])
+    _equal(second.args[0].args[2:], [3, 1] if retain_axis else [3])
+    target = tvm.target.Target(TARGET)
+    with target:
+        pointers = tilelang.transform.LowerAccessPtr()(transform.AscendLowerTileOp()(after))
+    (lowered_first,) = calls(pointers, first.op.name)
+    (lowered_second,) = _strided(pointers, kind)
+    _equal([lowered_first.args[1].args[2], lowered_first.args[1].args[3]], [2048, 3072])
+    _equal([lowered_second.args[0].args[2], lowered_second.args[0].args[3]], [8, 3])
+    _equal([lowered_second.args[1].args[2], lowered_second.args[1].args[3]], [0, 48])
+    assert lowered_second.args[0].args[1].same_as(destination.data)
+
+
+@pytest.mark.parametrize("options", [
+    {"clear": False}, {"pitch": 1032}, {"output_row": 1},
+    {"source_column": 64, "pitch": 1088}, {"rows": 0}, {"rows": 256},
+])
+def test_two_level_plan_preserves_count_fallback_domains(options):
+    before, _, _ = _program(columns=1024, **options)
+    after = _lower(before)
+    assert not _strided(after)
+    assert calls(after, PREFIX + "sum")
+
+
+def test_non_block_aligned_partials_keep_the_existing_chunk_tree():
+    before, _, _ = _program(rows=16, columns=768)
+    after = _lower(before)
+    assert len(_strided(after)) == 12
+    assert all(int(call.args[4]) == 64 for call in _strided(after))
+    assert not calls(after, PREFIX + "sum")
+
+
+def test_two_level_plan_cannot_be_hidden_in_an_atomic_task():
+    before, _, _ = _program(columns=1024, task=True)
+    with pytest.raises(ValueError, match="multiple dependency-bearing tasks"):
+        _lower(before)
+
+
+def test_two_level_scratch_is_charged_across_consecutive_reductions():
+    before, source, destination = _program(columns=1024)
+    second_output = tirx.decl_buffer((3,), "float32", "second_output", scope="shared.dyn")
+    original = calls(before, "tl.tileop.reduce")[0]
+    args = list(original.args)
+    args[1] = region(second_output, 2)
+    body = seq(tirx.Evaluate(original), tirx.Evaluate(tirx.Call("handle", original.op, args)))
+    # Each two-level plan needs 192B. Leave room for one and 160B more,
+    # which admits the established <=64B row fallback for the second reduce.
+    owner_bytes = 3 * 1024 * 4 + 2 * 32
+    filler = tirx.decl_buffer(((196608 - owner_bytes - 352) // 4,),
+                              "float32", "filler", scope="shared.dyn")
+    after = _lower(_root_program(before, extra_buffers=[second_output, filler], body=body))
+    assert len(_strided(after)) == 1
+    assert [int(call.args[-1]) for call in calls(after, PREFIX + "sum")] == [3072, 1024, 16]
 
 
 @pytest.mark.parametrize("variant", ["generic", "pipeline"])

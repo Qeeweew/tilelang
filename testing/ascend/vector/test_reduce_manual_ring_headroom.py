@@ -105,42 +105,83 @@ def test_flat_manual_owner_aliases_are_charged_once_at_their_maximum_footprint(p
 
 
 @pytest.mark.parametrize("operand", ["source", "output"])
-def test_manual_native_operand_keeps_existing_plan_until_its_layout_is_known(operand):
+@pytest.mark.parametrize("columns", [128, 1024])
+def test_manual_native_operand_keeps_existing_plan_until_its_layout_is_known(operand, columns):
     # A leading version axis may acquire a different row stride later. In
     # particular output[2] needs 32B per result when it is a two-slot ring.
-    before, _ = _program(rows=2, versioned_operand=operand)
+    before, _ = _program(rows=2, columns=columns, versioned_operand=operand)
     after = transform.AscendLowerVectorReduce()(before)
     assert not _strided(after)
-    assert [int(call.args[-1]) for call in _count(after)] == [128, 2]
+    assert [int(call.args[-1]) for call in _count(after)] == [columns, columns // 64]
 
 
-def test_automatic_future_versions_remain_conservative_even_for_another_owner():
-    before, _ = _program(automatic=True)
+@pytest.mark.parametrize("columns", [128, 1024])
+def test_automatic_future_versions_remain_conservative_even_for_another_owner(columns):
+    before, _ = _program(columns=columns, automatic=True)
     after = transform.AscendLowerVectorReduce()(before)
     assert not _strided(after)
-    assert [int(call.args[-1]) for call in _count(after)] == [128, 2]
+    assert [int(call.args[-1]) for call in _count(after)] == [columns, columns // 64]
 
 
-def test_unknown_manual_owner_footprint_keeps_existing_plan():
+@pytest.mark.parametrize("columns", [128, 1024])
+def test_unknown_manual_owner_footprint_keeps_existing_plan(columns):
     capacity = tirx.Var("capacity", "int32")
-    before, _ = _program(ring_extent=capacity)
+    before, _ = _program(columns=columns, ring_extent=capacity)
     after = transform.AscendLowerVectorReduce()(before)
     assert not _strided(after)
-    assert [int(call.args[-1]) for call in _count(after)] == [128, 2]
+    assert [int(call.args[-1]) for call in _count(after)] == [columns, columns // 64]
 
 
 @pytest.mark.parametrize("kind", ["sum", "max"])
-def test_new_partials_and_vector_combine_keep_validated_private_ownership(kind):
-    before, owners = _program(kind=kind, columns=192, private=True)
+@pytest.mark.parametrize("columns", [192, 1024])
+def test_new_partials_and_vector_combine_keep_validated_private_ownership(kind, columns):
+    before, owners = _program(kind=kind, columns=columns, private=True)
     reduced = transform.AscendLowerVectorReduce()(before)
-    assert len(_strided(reduced, kind)) == 3
-    partials = _strided(reduced, kind)[0].args[0].args[0].buffer
-    assert tuple(int(extent) for extent in partials.shape) == (3, 8)
+    two_level = columns == 1024
+    assert len(_strided(reduced, kind)) == (1 if two_level else 3)
+    partials = _strided(reduced, kind)[0].args[1 if two_level else 0].args[0].buffer
+    assert tuple(int(extent) for extent in partials.shape) == ((3, 16) if two_level else (3, 8))
     lowered = transform.AscendLowerVectorTiles()(reduced)
-    assert len(_strided(lowered, kind)) == 3
-    assert len(calls(lowered, "tl.ascend_membase." + ("add" if kind == "sum" else "max"))) == 2
+    assert len(_strided(lowered, kind)) == (1 if two_level else 3)
+    assert len(_count(lowered, kind)) == (1 if two_level else 0)
+    assert len(calls(lowered, "tl.ascend_membase." + ("add" if kind == "sum" else "max"))) == (0 if two_level else 2)
     members = lowered["main"].body.block.annotations[PRIVATE]
     assert all(any(member.same_as(buffer.data) for member in members)
                for buffer in lowered["main"].body.block.alloc_buffers)
     assert len(before["main"].body.block.annotations[PRIVATE]) == len(owners)
     assert not nodes(lowered, tirx.Bind)
+
+
+@pytest.mark.parametrize("kind", ["sum", "max"])
+@pytest.mark.parametrize("fits", [False, True])
+def test_two_level_partials_and_manual_slot_padding_are_charged_exactly(kind, fits):
+    # The row-major partials need 3*16*4=192B and no binary-combine reserve.
+    # The unrelated two-slot ring still occupies two aligned 32B slots.
+    owner_bytes, ring_bytes, partial_bytes = 3 * 1024 * 4 + 32, 64, 192
+    filler_bytes = 196608 - owner_bytes - ring_bytes - partial_bytes
+    if not fits:
+        filler_bytes += 32
+    before, owners = _program(kind=kind, columns=1024, ring_shape=(2, 1),
+                              filler_bytes=filler_bytes)
+    after = transform.AscendLowerVectorReduce()(before)
+    assert len(_strided(after, kind)) == (1 if fits else 0)
+    assert [int(call.args[-1]) for call in _count(after, kind)] == ([3072] if fits else [1024, 16])
+    assert int(after["main"].body.block.annotations["tl.manual_multi_buffer"][owners[2].data]) == 2
+
+
+@pytest.mark.parametrize("padded_alias", [False, True])
+def test_two_level_partials_keep_the_shared_manual_owner_maximum_footprint(padded_alias):
+    filler_bytes = 196608 - (3 * 1024 * 4 + 32 + 64) - 192
+    before, owners = _program(columns=1024, ring_shape=(16,), filler_bytes=filler_bytes)
+    ring = owners[2]
+    alias = tirx.decl_buffer((16,), "float32", "ring_alias", scope="shared.dyn", data=ring.data)
+    annotations = dict(before["main"].body.block.annotations.items())
+    annotations["layout_map"] = {
+        ring: Layout([16], lambda i: [i]),
+        alias: Layout([16], lambda i: [i + (8 if padded_alias else 0)]),
+    }
+    mod = kernel(before["main"].body.block.body, buffers=owners, annotations=annotations)
+    mod["main"] = mod["main"].with_attr("target", tvm.target.Target(TARGET))
+    after = transform.AscendLowerVectorReduce()(mod)
+    assert len(_strided(after)) == (0 if padded_alias else 1)
+    assert [int(call.args[-1]) for call in _count(after)] == ([1024, 16] if padded_alias else [3072])

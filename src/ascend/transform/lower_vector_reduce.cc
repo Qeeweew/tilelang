@@ -53,14 +53,15 @@ TVM_REGISTER_OP("tl.ascend_membase.repeat_reduce_max_only_value")
     .set_attr<TGlobalSymbol>("TGlobalSymbol",
                              "asc_repeat_reduce_max_only_value");
 
-// Normal-mask repeats retain exact [rows, 64] source regions. Unlike the
-// count overload, their source row stride is independently represented.
+// Normal-mask repeats retain exact [rows, valid_lanes] source regions.
+// Unlike the count overload, the physical row stride and active lanes are
+// independently represented. No inactive lane is part of the memory effect.
 TVM_REGISTER_OP("tl.ascend_membase.repeat_reduce_sum_rows_f32")
-    .set_num_inputs(4)
+    .set_num_inputs(5)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 TVM_REGISTER_OP("tl.ascend_membase.repeat_reduce_max_rows_f32")
-    .set_num_inputs(4)
+    .set_num_inputs(5)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
@@ -272,18 +273,6 @@ private:
              make_const(op->src->strides[0].dtype(), input_count))))
       return std::nullopt;
 
-    const int64_t chunks = input_count / 64;
-    int64_t levels = 0, remaining = input_count;
-    do {
-      remaining = (remaining + 63) / 64;
-      ++levels;
-    } while (remaining > 1);
-    // Bound expansion by the ordinary row plan's native instruction count.
-    // This is a structural selection heuristic, not a measured time model:
-    // e.g. one wide row should keep its short two-level reduction tree.
-    if (2 * chunks - 1 > row_count->value * levels)
-      return std::nullopt;
-
     Array<PrimExpr> src_indices, dst_indices;
     for (const Range &range : src_ranges)
       src_indices.push_back(range->min);
@@ -310,6 +299,78 @@ private:
       return std::nullopt;
 
     const int64_t count = row_count->value;
+    const int64_t chunks = input_count / 64;
+    const Op &intrinsic = Op::Get(
+        op->type->IsSum() ? "tl.ascend_membase.repeat_reduce_sum_rows_f32"
+                          : "tl.ascend_membase.repeat_reduce_max_rows_f32");
+    // This plan writes the user's destination through the native row op,
+    // unlike the chunk tree's ordinary vector combine. Its raw Buffer must
+    // satisfy the same compact/aligned contract as its mapped layout.
+    auto raw_dst_base = op->dst->ElemOffset(dst_indices);
+    auto raw_dst_row = op->dst->ElemOffset(dst->indices);
+    bool native_dst_compact =
+        raw_dst_base.size() == 1 && raw_dst_row.size() == 1 &&
+        (op->dst->strides.empty() || (is_one(op->dst->strides.front()) &&
+                                      is_one(op->dst->strides.back()))) &&
+        analyzer_.CanProveEqual(raw_dst_row[0], raw_dst_base[0] + rows[0]) &&
+        analyzer_.CanProveEqual(
+            floormod(raw_dst_base[0], make_const(raw_dst_base[0].dtype(), 8)),
+            make_zero(raw_dst_base[0].dtype()));
+    // The count overload writes one compact partial per contiguous 64 input
+    // elements. Complete rows therefore produce [rows, chunks] without
+    // crossing a logical row. A second normal-mask instruction can reduce
+    // those rows directly when their pitch is a whole 32B block and at most
+    // one VL. Keep all other widths on the established plan below.
+    if (input_count >= 512 && input_count <= 4096 && input_count % 512 == 0 &&
+        native_dst_compact &&
+        HasMultiVLHeadroom(op->src, op->dst, count * chunks * 4)) {
+      Require(task_depth_ == 0,
+              "this reduction expands to multiple dependency-bearing tasks; "
+              "use T.Stage rather than an opaque T.Task/PerCoreTask wrapper");
+      Buffer partials = decl_buffer({make_const(DataType::Int(32), count),
+                                     make_const(DataType::Int(32), chunks)},
+                                    DataType::Float(32),
+                                    "membase_reduce_partials_" +
+                                        std::to_string(next_temporary_++),
+                                    "shared.dyn");
+      scratch_.push_back(partials);
+      BufferLoad partial_base(partials, {0, 0});
+      const Op &count_intrinsic = Op::Get(
+          op->type->IsSum() ? "tl.ascend_membase.repeat_reduce_sum"
+                            : "tl.ascend_membase.repeat_reduce_max_only_value");
+      Stmt first =
+          Evaluate(Call(DataType::Void(), count_intrinsic,
+                        {Ptr(partial_base, count * chunks, kAccessWrite),
+                         Ptr(src_base, count * input_count, kAccessRead),
+                         make_const(DataType::UInt(32), count * input_count)}));
+      PrimExpr partial_region =
+          Call(DataType::Handle(), tl::region(),
+               {partial_base, make_const(DataType::Int(32), kAccessRead),
+                make_const(DataType::Int(32), count),
+                make_const(DataType::Int(32), chunks)});
+      Array<PrimExpr> destination_args{
+          dst_base, make_const(DataType::Int(32), kAccessWrite)};
+      for (const Range &range : dst_ranges)
+        destination_args.push_back(range->extent);
+      Stmt second = Evaluate(
+          Call(DataType::Void(), intrinsic,
+               {Call(DataType::Handle(), tl::region(), destination_args),
+                partial_region, make_const(DataType::UInt(8), count),
+                make_const(DataType::UInt(16), chunks / 8),
+                make_const(DataType::UInt(8), chunks)}));
+      return SeqStmt({first, second});
+    }
+
+    int64_t levels = 0, remaining = input_count;
+    do {
+      remaining = (remaining + 63) / 64;
+      ++levels;
+    } while (remaining > 1);
+    // Bound expansion by the ordinary row plan's native instruction count.
+    // This is a structural selection heuristic, not a measured time model.
+    if (2 * chunks - 1 > count * levels)
+      return std::nullopt;
+
     PrimExpr aligned_row_bytes = analyzer_.Simplify(ascend::AlignPrimExpr(
         ascend::PackedBytesFromElems(make_const(DataType::Int(64), count), 32),
         ascend::AscendScopeAlignBytes("shared.dyn")));
@@ -335,9 +396,6 @@ private:
                                   "shared.dyn");
     scratch_.push_back(partials);
     future_combine_bytes_ += combine_bytes;
-    const Op &intrinsic = Op::Get(
-        op->type->IsSum() ? "tl.ascend_membase.repeat_reduce_sum_rows_f32"
-                          : "tl.ascend_membase.repeat_reduce_max_rows_f32");
     Array<Stmt> tasks;
     for (int64_t chunk = 0; chunk < chunks; ++chunk) {
       Array<PrimExpr> source = src_indices;
@@ -358,7 +416,8 @@ private:
           Evaluate(Call(DataType::Void(), intrinsic,
                         {destination_region, source_region,
                          make_const(DataType::UInt(8), count),
-                         make_const(DataType::UInt(16), input_count / 8)})));
+                         make_const(DataType::UInt(16), input_count / 8),
+                         make_const(DataType::UInt(8), 64)})));
     }
 
     // Each chunk performs the native 64-lane tree. Combine compact row

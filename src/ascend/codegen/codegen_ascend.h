@@ -21,6 +21,7 @@ public:
   void PrintType(DataType t, std::ostream &os) final; // NOLINT(*)
   void PrintCCEVectorSuffix(DataType t, std::ostream &os);
   void VisitStmt_(const SBlockNode *op) final;
+  void VisitStmt_(const SeqStmtNode *op) final;
   void VisitStmt_(const ForNode *op) final;
   void VisitStmt_(const WhileNode *op) final;
   void VisitStmt_(const AttrStmtNode *op) final;
@@ -136,6 +137,8 @@ private:
   void PrintSimdCall_(const Call &call, size_t num_expr_args, std::ostream &os);
   void EmitCApiCall_(const std::string &function_name,
                      std::initializer_list<CApiArgument> arguments);
+  void EmitNormalFullMask_();
+  std::string PrintMaskArgument_(const PrimExpr &arg);
   bool EmitAscendMemoryCall_(const CallNode *op);
   void EmitPipeBarrier_(const CallNode *op);
   void EmitHardEventSync_(const CallNode *op, bool notify);
@@ -167,6 +170,9 @@ private:
   int mix_aiv_count_{2};
   bool enable_fast_math_{false};
   bool is_dav2201_{false};
+  // Permission for one direct native call, never a fact propagated through
+  // expression or control-flow emission. SeqStmt owns the bounded run state.
+  bool reuse_normal_full_mask_{false};
 
   // Accumulates constraints along the traversal
   arith::Analyzer analyzer_;
