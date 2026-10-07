@@ -808,8 +808,16 @@ Stmt LowerDMACopy(const AscendCopyNode &op, const LowerArgs &T,
     AscendFractalRegionInfo compact_src_region;
     PrimExpr loop_src_stride = src_row.size;
 
-    CheckCompactL0Region(op.src, src_range, analyzer,
-                         "Ascend L0C->GM compact source");
+    // AscendLowerTileOp validates aligned full-M N-column regions against
+    // their actual canonical backing allocation. Their ordinary access_ptr
+    // is remapped once to NZ; FIX keeps the allocation's padded M pitch.
+    const bool column_region =
+        GetAscendTargetInfo(T.target).architecture ==
+            AscendArchitecture::kDav2201 &&
+        !analyzer->CanProveEqual(src_range.back()->min, 0);
+    if (!column_region)
+      CheckCompactL0Region(op.src, src_range, analyzer,
+                           "Ascend L0C->GM compact source");
     Optional<Layout> compact_src_layout =
         FindLayoutForBuffer(T.layout_map, op.src);
     ICHECK(compact_src_layout.defined() &&

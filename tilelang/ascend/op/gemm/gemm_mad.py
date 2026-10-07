@@ -169,7 +169,7 @@ class GemmMAD(GemmBase):
         if self._is_l1_input():
             assert not self.trans_A and self.trans_B, "Ascend L1 GEMM currently only supports trans_A=False, trans_B=True (NT)."
             return self._lower_l1()
-        return self._lower_l0()
+        return self._lower_l0(target)
 
     def _is_l1_input(self):
         return self.A.scope() == "shared.l1" and self.B.scope() == "shared.l1"
@@ -177,7 +177,7 @@ class GemmMAD(GemmBase):
     def _is_l0_input(self):
         return self.A.scope() == "shared.l0a" and self.B.scope() == "shared.l0b"
 
-    def _l0_operation_extents(self):
+    def _l0_operation_extents(self, target: Target | None = None):
         """Return the logical MAD M/N/K carried by the three L0 regions."""
         analyzer = arith.Analyzer()
 
@@ -194,7 +194,20 @@ class GemmMAD(GemmBase):
 
         require_zero_origin("A", self.ARegion)
         require_zero_origin("B", self.BRegion)
-        require_zero_origin("C", self.CRegion)
+        c_cols = self.CRegion.region[-1]
+        if prove_equal(c_cols.min, tirx.const(0, c_cols.min.dtype)):
+            require_zero_origin("C", self.CRegion)
+        else:
+            # AscendLowerTileOp has validated the actual allocation identity,
+            # exact canonical NZ layout, full aligned M/N-column encoding and
+            # loop-aware bounds before invoking this callback. Its subsequent
+            # pointer remap converts logical [0, n0] to physical n0 * M. Keep
+            # that contract shared with FIX exports rather than duplicating
+            # it in this fresh analyzer, which has no enclosing owner domain.
+            info = tvm_ffi.get_global_func("tl.GetAscendTargetInfo")(target) if target is not None else None
+            assert not self.is_blockscaled and info is not None and str(info["arch"]) == "dav-2201", (
+                "Ascend nonzero L0C N-column regions require regular dav-2201 MAD"
+            )
 
         m = self.CRegion.region[-2].extent
         n = self.CRegion.region[-1].extent
@@ -229,8 +242,8 @@ class GemmMAD(GemmBase):
         assert tile_k_sub > 0 and self.K % tile_k_sub == 0, f"K ({self.K}) is not divisible by any valid TILE_K_SUB <= {max_k}"
         return tile_k_sub
 
-    def _lower_l0(self):
-        m, n, k = self._l0_operation_extents()
+    def _lower_l0(self, target: Target):
+        m, n, k = self._l0_operation_extents(target)
         c_ptr = _make_access_ptr(self.CRegion.buffer, self.CRegion, 2)
         a_ptr = _make_access_ptr(self.ARegion.buffer, self.ARegion, 1)
         b_ptr = _make_access_ptr(self.BRegion.buffer, self.BRegion, 1)

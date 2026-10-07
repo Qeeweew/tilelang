@@ -17,8 +17,10 @@
 #include <unordered_map>
 #include <vector>
 
+#include "ascend/layout/ascend_layouts.h"
 #include "ascend/op/copy.h"
 #include "ascend/op/utils.h"
+#include "ascend/target_utils.h"
 #include "cuda/op/builtin.h"
 #include "layout/layout.h"
 #include "layout/utils.h"
@@ -1407,6 +1409,69 @@ private:
     return IRMutatorWithAnalyzer::VisitStmt_(op);
   }
 
+  // MAD and FIX consume the same column-region contract. Validate it before
+  // flattening pointers, while this boundary owns loop domains, allocation
+  // identities and canonical logical layouts.
+  void ValidateL0CColumnRegion(const Buffer &buffer,
+                               const Array<Range> &region) const {
+    if (GetAscendTargetInfo(target_).architecture !=
+            AscendArchitecture::kDav2201 ||
+        !IsL0CBuffer(buffer))
+      return;
+    if (region.empty() || analyzer_->CanProveEqual(region.back()->min, 0))
+      return;
+    TVM_FFI_CHECK(region.size() == buffer->shape.size() && region.size() >= 2,
+                  ValueError)
+        << "Ascend dav-2201 L0C column region requires rank-matched geometry";
+    auto backing = buffer_map_.find(buffer->data);
+    TVM_FFI_CHECK(backing != buffer_map_.end() &&
+                      backing->second.same_as(buffer),
+                  ValueError)
+        << "Ascend dav-2201 L0C column region requires the actual backing "
+           "allocation buffer, rather than an aliased view";
+    for (size_t axis = 0; axis < region.size(); ++axis) {
+      const Range &range = region[axis];
+      TVM_FFI_CHECK(CanProveAscendRangeInBounds(
+                        range->min, range->extent, buffer->shape[axis],
+                        analyzer_) &&
+                        analyzer_->CanProve(range->extent > 0) &&
+                        (axis + 2 >= region.size() ||
+                         analyzer_->CanProveEqual(range->extent, 1)),
+                    ValueError)
+          << "Ascend dav-2201 L0C column region must be provably in bounds "
+             "with singleton leading axes; axis "
+          << axis << " has origin " << range->min << ", extent "
+          << range->extent << ", capacity " << buffer->shape[axis];
+    }
+    auto layout = layout_map_.Get(buffer);
+    AscendFractalLayoutInfo info;
+    TVM_FFI_CHECK(layout.has_value() &&
+                      TryExtractAscendFractalLayout(layout.value(), buffer,
+                                                    &info) &&
+                      info.kind == AscendFractalKind::kL0C &&
+                      layout.value()->IsEqual(MakeAscendL0CLayout(buffer).get()),
+                  ValueError)
+        << "Ascend dav-2201 L0C column region requires the canonical L0C NZ "
+           "layout on the actual backing buffer";
+    TVM_FFI_CHECK(buffer->strides.empty() && buffer->axis_separators.empty() &&
+                      analyzer_->CanProveEqual(buffer->elem_offset, 0),
+                  ValueError)
+        << "Ascend dav-2201 L0C column region requires compact backing storage";
+    size_t rank = region.size();
+    TVM_FFI_CHECK(analyzer_->CanProveEqual(region[rank - 2]->min, 0) &&
+                      analyzer_->CanProveEqual(region[rank - 2]->extent,
+                                               buffer->shape[rank - 2]),
+                  ValueError)
+        << "Ascend dav-2201 L0C column region requires zero-origin full M rows";
+    for (const PrimExpr &value : {buffer->shape[rank - 2], buffer->shape.back(),
+                                 region.back()->min, region.back()->extent}) {
+      TVM_FFI_CHECK(analyzer_->CanProveEqual(floormod(value, 16), 0), ValueError)
+          << "Ascend dav-2201 L0C column region requires 16-fractal-aligned "
+             "backing M/N, N origin and N extent; got "
+          << value;
+    }
+  }
+
   Stmt VisitStmt_(const EvaluateNode *op) final {
     const CallNode *call = op->value.as<CallNode>();
     if (call) {
@@ -1432,6 +1497,15 @@ private:
     auto tile_op = ParseOperator(GetRef<Stmt>(op), block_annotations_);
     if (!tile_op.defined())
       return IRMutatorWithAnalyzer::VisitStmt_(op);
+
+    if (call && call->op.same_as(Gemm::Get())) {
+      const auto *gemm = tile_op.as<GemmNode>();
+      if (IsL0ABuffer(gemm->a_) && IsL0BBuffer(gemm->b_))
+        ValidateL0CColumnRegion(gemm->c_, gemm->cRegion_->region);
+    }
+    if (const auto *copy = tile_op.as<CopyNode>();
+        copy && IsL0CBuffer(copy->src) && IsGlobalBuffer(copy->dst))
+      ValidateL0CColumnRegion(copy->src, copy->src_range);
 
     if (tile_op.as<GemmBlockScaledNode>()) {
       ValidateL0SFGemm(Downcast<GemmBlockScaled>(tile_op), mx_sf_bindings_,

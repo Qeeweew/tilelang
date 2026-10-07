@@ -88,6 +88,31 @@ Dependency and synchronization lowering consume these ordinary effects:
 Loop completion projection belongs to `InsertSync`; code generation does not
 invent event numbers or shift pointers to repair the rewrite.
 
+## Explicit shared C column regions
+
+Regular 2201 L0 MAD also accepts an aligned N-column region of a compact,
+canonical NZ L0C allocation. For backing shape `[M, N]`, the destination
+`C[0:M, n0:n0+n]` occupies the consecutive native elements
+`[n0*M, (n0+n)*M)`. Backing M/N, n0 and n must be multiples of 16. The region
+must cover every M row; a partial M region would require a different native
+C pitch. Leading version axes select single planes. A/B regions retain their
+existing zero-origin contract.
+
+The loop-aware tile lowering boundary validates the same compact canonical
+encoding for MAD and L0C-to-GM export, and proves every region axis is positive
+and inside its backing allocation before flattening the pointer. Native
+lowering consumes that contract. The common layout remapper computes the NZ address, while native
+MAD M/N/K come from the operation regions rather than the backing allocation.
+Custom layouts, noncompact storage and 3510 column regions are diagnosed.
+The destination and layout key must identify the actual backing Buffer;
+matching names or aliased Buffer views do not establish its native encoding.
+
+This allows ordinary DSL kernels to share one explicitly allocated C bank
+between a wide QK tile and narrower PV column regions. Their ordinary typed
+read/write effects must still establish each FIX completion before an
+overlapping MAD overwrite. Admitting a region neither inserts a separate
+synchronization mechanism nor chooses this storage policy automatically.
+
 ## Supported boundary
 
 The rewrite targets 2201 FP16/BF16 L1 inputs, FP32 accumulation and FP32 GM
