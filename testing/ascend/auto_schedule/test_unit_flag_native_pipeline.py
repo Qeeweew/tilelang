@@ -443,3 +443,169 @@ def test_single_trip_shifted_control_retains_its_unproved_operand_lifetime_diagn
     with pytest.raises(tvm.error.InternalError, match="no reverse completion path for MTE1->M"):
         _insert(prepared)
     assert tvm.ir.save_json(before) == original
+
+
+def _shifted_m64_inputs(*, dtype="float16", load_stage=1, mad_stage=2, rejection=None):
+    # Two K256 chunks keep the finite trace small while retaining the actual
+    # M64/N64 native operands, private C pitch64, and P0/load1/MAD2 offsets.
+    from tilelang.ascend import language as T
+    from tilelang.layout import (
+        make_ascend_l0a_2201_layout, make_ascend_l0c_layout,
+        make_ascend_major_mn_layout,
+    )
+
+    epoch, owner, result, chunk = [tirx.Var(name, "int32") for name in
+                                  ("m64_epoch", "m64_owner", "m64_result", "m64_chunk")]
+    epochs, owners, results, chunks = 2, 2, 2, 2
+    p_gm = tirx.decl_buffer((epochs, owners, results, chunks, 64, 256), dtype, name="P")
+    v_gm = tirx.decl_buffer((epochs, chunks * 256, 64), dtype, name="V")
+    output = tirx.decl_buffer((epochs, owners, results, 64, 64), "float32", name="M64Output")
+    p = tirx.decl_buffer((64, 256), dtype, name="m64_p", scope="shared.l1")
+    v = tirx.decl_buffer((chunks * 256, 64), dtype, name="m64_v", scope="shared.l1")
+    a = tirx.decl_buffer((64, 256), dtype, name="m64_a", scope="shared.l0a")
+    b = tirx.decl_buffer((256, 64), dtype, name="m64_b", scope="shared.l0b")
+    c = tirx.decl_buffer((64, 64), "float32", name="m64_c", scope="shared.l0c")
+    feedback = tirx.decl_buffer((64, 64), "float32", name="m64_feedback", scope="shared.l1")
+    fill = unit(copy(p_gm, p, src_indices=[epoch, owner, result, chunk, 0, 0],
+                     src_shape=[1, 1, 1, 1, 64, 256]), core=2)
+    load_a = unit(copy(p, a), core=2, stage=load_stage,
+                  guard=chunk < chunks if rejection == "own-DMA-guard" else None)
+    load_b = unit(copy(v, b, src_indices=[chunk * 256, 0], src_shape=[256, 64]),
+                  core=2, stage=load_stage)
+    mad = unit(tirx.Evaluate(T.gemm(a, b, c, clear_accum=chunk == 0)), core=2, stage=mad_stage)
+    annotations = {"num_stages": 3, "multi_buffer_eligible": [p.data, a.data, b.data]}
+    if rejection == "invalid-parent-bound":
+        annotations["num_stages"] = 1
+    elif rejection == "parent-offset-disabled":
+        annotations["enable_offset"] = False
+    elif rejection == "parent-unconsumed-auto":
+        annotations["tl.ascend_auto_pipeline"] = True
+    children = [mad, load_b, load_a, fill]
+    direct = []
+    extra_allocations, extra_layouts = [], {}
+    if rejection == "direct-result-DMA":
+        direct = [unit(copy(v_gm, v, src_indices=[epoch, 0, 0],
+                            src_shape=[1, chunks * 256, 64]), core=2, stage=1)]
+    if rejection == "sibling-shift-multiple-MADs":
+        # A shifted DMA-only sibling must impose the single-MAD-task limit,
+        # even when the two real accumulating MAD tasks themselves stay at0.
+        extra = unit(tirx.Evaluate(T.gemm(a, b, c, clear_accum=False)), core=2)
+        sibling = tirx.Var("m64_dma_sibling", "int32")
+        # This sibling has its own single-slot input. It must not access P/A
+        # outside their annotated chunk owner, which Prepare rightly rejects.
+        sibling_input = tirx.decl_buffer((64, 256), dtype, name="m64_sibling_input", scope="shared.l1")
+        extra_allocations = [sibling_input]
+        extra_layouts = {sibling_input: make_ascend_nz_layout(sibling_input)}
+        sibling_copy = copy(p_gm, sibling_input, src_indices=[epoch, owner, result, 0, 0, 0],
+                            src_shape=[1, 1, 1, 1, 64, 256])
+        dma = unit(tirx.For(sibling, 0, 2, tirx.ForKind.SERIAL,
+                            seq(unit(sibling_copy, core=2), unit(sibling_copy, core=2, stage=1)),
+                            annotations={"num_stages": 2}), core=None)
+        children = [fill, load_b, load_a, mad, extra]
+        direct = [dma]
+    body = unit(tirx.For(chunk, 0, chunks, tirx.ForKind.SERIAL, seq(*children),
+                         annotations=annotations), core=None)
+    export = unit(copy(c, output, dst_indices=[epoch, owner, result, 0, 0],
+                       dst_shape=[1, 1, 1, 64, 64],
+                       annotations={"tl.ascend.root_fixpipe_config": tirx.IntImm("int32", 1)}), core=2)
+    body = unit(tirx.For(result, 0, results, tirx.ForKind.SERIAL,
+                         seq(*direct, body, export)), core=None)
+    body = unit(tirx.For(owner, 0, owners, tirx.ForKind.SERIAL, body), core=None)
+    v_fill = unit(copy(v_gm, v, src_indices=[epoch, 0, 0], src_shape=[1, chunks * 256, 64]), core=2)
+    body = unit(tirx.For(epoch, 0, epochs, tirx.ForKind.SERIAL, seq(v_fill, body)), core=None)
+    read_epoch, read_owner, read_result = [tirx.Var(name, "int32") for name in
+                                         ("m64_read_epoch", "m64_read_owner", "m64_read_result")]
+    readback = unit(copy(output, feedback, src_indices=[read_epoch, read_owner, read_result, 0, 0],
+                         src_shape=[1, 1, 1, 64, 64]), core=2)
+    for var, extent in ((read_result, results), (read_owner, owners), (read_epoch, epochs)):
+        readback = unit(tirx.For(var, 0, extent, tirx.ForKind.SERIAL, readback), core=None)
+    setup = unit(tirx.Evaluate(tirx.Call("void", tvm.ir.Op.get("tl.ascend_set_fixpipe_config"), [])), core=2)
+    layouts = {p: make_ascend_nz_layout(p), v: make_ascend_nz_layout(v),
+               a: make_ascend_l0a_2201_layout(a), b: make_ascend_major_mn_layout(b),
+               c: make_ascend_l0c_layout(c), feedback: make_ascend_nz_layout(feedback), **extra_layouts}
+    before = kernel(seq(setup, body, readback), buffers=[p, v, a, b, c, feedback, *extra_allocations],
+                    params=[p_gm, v_gm, output], annotations={"layout_map": layouts,
+                    "tl.buffer_versions_map": {p.data: 2, a.data: 2, b.data: 2}})
+    before["main"] = before["main"].with_attr(
+        "target", tvm.target.Target({"kind": "ascend", "arch": "dav-2201"}))
+    return before, {"epoch": epoch, "owner": owner, "result": result, "chunk": chunk,
+                    "c": c, "p": p, "a": a, "b": b, "output": output}
+
+
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+def test_shifted_m64_input_dma_preserves_physical_offsets_and_closed_stream(dtype):
+    before, facts = _shifted_m64_inputs(dtype=dtype)
+    original = tvm.ir.save_json(before)
+    _, synced, materialized, after = _lower(before)
+    assert tvm.ir.save_json(before) == original
+    assert calls(synced, _DIRECTION), "The P0/load1/MAD2 stream fell back"
+    for storage, shape in ((facts["p"], (2, 64, 256)), (facts["a"], (2, 64, 256)),
+                           (facts["b"], (2, 256, 64)), (facts["c"], (64, 64))):
+        allocation = next(buffer for buffer in materialized["main"].body.block.alloc_buffers
+                          if buffer.data.same_as(storage.data))
+        assert tuple(int(extent) for extent in allocation.shape) == shape
+    facts = _physical_loop_facts(after, facts, ("epoch", "owner", "result", "chunk"))
+    records = _trace(after)
+    activations, transactions = {}, {}
+    for index, (call, env, _) in enumerate(records):
+        if facts["epoch"] in env and facts["owner"] in env:
+            activation = (_value(facts["epoch"], env), _value(facts["owner"], env))
+            activations.setdefault(activation, []).append(index)
+        if _name(call) == _GEMM or _is_export(call, facts):
+            key = (*activation, _value(facts["result"], env))
+            transactions.setdefault(key, []).append((call, env))
+    assert set(transactions) == {(e, owner, part) for e in range(2) for owner in range(2) for part in range(2)}
+    for transaction in transactions.values():
+        mads, export = transaction[:-1], transaction[-1]
+        assert len(mads) == 2
+        assert [_value(facts["chunk"], env) for _, env in mads] == [2, 3]
+        assert [_value(call.args[9], env) for call, env in mads] == [1, 0]
+        assert [_value(call.annotations["unit_flag_ctrl"], env) for call, env in mads] == [2, 3]
+        assert [_value(call.args[index], env) for call, env in mads for index in (5, 6, 7)] == [64, 64, 256] * 2
+        for call, env in mads:
+            for operand in (0, 1):
+                assert _value(call.args[operand].args[0].indices[0], env) == (_value(facts["chunk"], env) - 2) % 2
+        assert _is_export(export[0], facts) and _value(export[0].annotations["unit_flag_ctrl"], export[1]) == 3
+    loads, fills = [], []
+    for call, env, _ in records:
+        if _name(call) != _COPY:
+            continue
+        dst = call.args[1].args[0]
+        if dst.buffer.data.same_as(facts["a"].data) or dst.buffer.data.same_as(facts["b"].data):
+            loads.append((call, env))
+            assert _value(facts["chunk"], env) in (1, 2)
+            assert _value(dst.indices[0], env) == (_value(facts["chunk"], env) - 1) % 2
+            if dst.buffer.data.same_as(facts["a"].data):
+                assert _value(call.args[0].args[0].indices[0], env) == (_value(facts["chunk"], env) - 1) % 2
+            else:
+                assert _value(call.args[0].args[0].indices[0], env) == (_value(facts["chunk"], env) - 1) * 256
+        elif dst.buffer.data.same_as(facts["p"].data):
+            fills.append((call, env))
+            assert _value(facts["chunk"], env) in (0, 1)
+            assert _value(dst.indices[0], env) == _value(facts["chunk"], env) % 2
+    assert len(loads) == 32 and len(fills) == 16
+    _check_brackets(records, facts, activations)
+
+
+@pytest.mark.parametrize("rejection", ["own-DMA-guard", "direct-result-DMA", "invalid-parent-bound",
+                                       "parent-offset-disabled", "parent-unconsumed-auto",
+                                       "sibling-shift-multiple-MADs"])
+def test_unproved_shifted_dma_cannot_claim_a_unit_stream(rejection):
+    # Isolate DMA-stage validation from positive MAD-stage validation.
+    before, _ = _shifted_m64_inputs(load_stage=0 if rejection in (
+        "direct-result-DMA", "sibling-shift-multiple-MADs") else 1,
+        mad_stage=0 if rejection != "own-DMA-guard" else 2, rejection=rejection)
+    original = tvm.ir.save_json(before)
+    prepared = transform.PrepareMultiBuffer()(before)
+    after = _insert(prepared)
+    assert tvm.ir.save_json(before) == original
+    assert not calls(after, _DIRECTION)
+    assert all("unit_flag_ctrl" not in call.annotations for call in calls(after, _GEMM))
+    assert any(call.args[0].value == "M_FIX" for call in calls(after, _SET))
+
+
+def test_guarded_stage_zero_dma_keeps_its_existing_unit_stream():
+    before, _ = _shifted_m64_inputs(load_stage=0, mad_stage=1, rejection="own-DMA-guard")
+    prepared = transform.PrepareMultiBuffer()(before)
+    after = _insert(prepared)
+    assert calls(after, _DIRECTION), "The unchanged stage0 guarded-DMA contract fell back"

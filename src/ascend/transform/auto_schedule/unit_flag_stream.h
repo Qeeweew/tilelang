@@ -444,8 +444,10 @@ inline bool InputCounterCommit(const TaskNode *task,
 // This walk accepts input DMA followed by a finite native-K chain and one
 // complete export. It does not infer a protocol from arbitrary C accesses.
 inline bool Collect(ControlNode *result, std::vector<Mad> *mads,
-                    TaskNode **fix, std::optional<AscendCopy> *copy) {
+                    TaskNode **fix, std::optional<AscendCopy> *copy,
+                    bool *has_shifted_descendant) {
   bool valid = true;
+  *has_shifted_descendant = false;
   std::vector<Buffer> result_counters;
   if (!AddInputCounters(result, &result_counters))
     return false;
@@ -467,6 +469,7 @@ inline bool Collect(ControlNode *result, std::vector<Mad> *mads,
             valid = false;
             return;
           }
+          *has_shifted_descendant |= control->GetStage() != 0;
           loops.push_back(control);
           for (const auto &child : control->children)
             walk(child.get(), loops, counters);
@@ -480,6 +483,7 @@ inline bool Collect(ControlNode *result, std::vector<Mad> *mads,
           valid = false;
           return;
         }
+        *has_shifted_descendant |= task->GetStage() != 0;
         const Call &call = operation.value();
         if (call->op.same_as(Gemm::Get())) {
           Gemm gemm(call->args, call->annotations);
@@ -545,7 +549,11 @@ inline bool Collect(ControlNode *result, std::vector<Mad> *mads,
             return;
           }
         }
-        if (task->GetStage() != 0) {
+        // A shifted input is admitted only inside the validated static nest
+        // (Operation rejects a shifted direct result child). Its own guard
+        // must not remove a producer occurrence. Keep the existing guarded
+        // zero-stage DMA contract unchanged.
+        if (task->GetStage() != 0 && task->HasConditions()) {
           valid = false;
           return;
         }
@@ -579,20 +587,15 @@ inline std::vector<UnitFlagStreamPlan> AnalyzeUnitFlagStreams(
     std::vector<Mad> mads;
     TaskNode *fix = nullptr;
     std::optional<AscendCopy> copy;
+    bool has_shifted_descendant = false;
     bool selected = StaticResultLoop(result, &result_count) &&
-                    Collect(result, &mads, &fix, &copy);
+                    Collect(result, &mads, &fix, &copy,
+                            &has_shifted_descendant);
     // The existing zero-stage contract can contain several explicit MAD
     // tasks. For any shifted descendant task or control, one task repeated
     // over a static K nest preserves logical K order without a new physical
     // trace planner.
-    if (selected && mads.size() != 1 &&
-        std::any_of(mads.begin(), mads.end(), [](const Mad &mad) {
-          return mad.task->GetStage() != 0 ||
-                 std::any_of(mad.loops.begin(), mad.loops.end(),
-                             [](const ControlNode *loop) {
-                               return loop->GetStage() != 0;
-                             });
-        }))
+    if (selected && has_shifted_descendant && mads.size() != 1)
       selected = false;
     if (selected) {
       Buffer c = mads.front().gemm->c_;
