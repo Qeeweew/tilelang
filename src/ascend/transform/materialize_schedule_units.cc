@@ -495,8 +495,10 @@ ValidatedTask ValidateTask(const AttrStmtNode *op, bool inside_per_core_task) {
   Stmt task = GetRef<Stmt>(op);
   TaskResourceUsage resource_usage = AnalyzeTaskResourceUsage(task);
   uint16_t issue_pipe_mask = resource_usage.pipe_mask;
-  // FIX copies and native predicate selection configure/consume their SPR
-  // inside one atomic data operation. Independent SPR writers still add S.
+  // Local FIX copies and predicate selection configure/consume their SPR
+  // inside one atomic data operation. The explicit root FIX setter is itself
+  // classified as Scalar; it must remain a standalone S task. Other independent
+  // SPR writers add S to the operation's issue pipe.
   if ((AnalyzeSpecialRegisterWrites(task) &
        ~(static_cast<uint16_t>(SpecialRegister::kFixpipeNz2Nd) |
          static_cast<uint16_t>(SpecialRegister::kCmpMask))) != 0)

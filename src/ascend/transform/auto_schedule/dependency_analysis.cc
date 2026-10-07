@@ -446,39 +446,53 @@ AnalyzeDependencies(std::vector<IRStructure *> nodes, ControlNode *loop,
       }
     }
   }
-  // A selected Load3D kernel owns one invariant root configuration. Its
-  // completion is not a buffer hazard and must not be buffer-versioned.
-  // Record the same precise leaf-task RAW edges for AutoSchedule/InsertSync.
-  constexpr uint16_t kRootConfig =
-      static_cast<uint16_t>(SpecialRegister::kLoad3DConfig);
-  std::vector<std::vector<TaskNode *>> state_reads(n);
-  TaskNode *initializer = nullptr;
-  size_t initializer_node = n;
-  for (size_t i = 0; i < n; ++i) {
-    std::vector<TaskNode *> tasks;
-    CollectAllTaskNodes(nodes[i], tasks);
-    for (TaskNode *task : tasks) {
-      if (task->GetSpecialWriteMask() & kRootConfig) {
+  // Invariant root SPR state is not a buffer hazard and cannot be versioned.
+  // Both scheduling and synchronization consume these storage-free leaf RAW
+  // edges. Only explicitly selected FIX readers opt into this contract; the
+  // established per-copy configuration path retains its ordinary SPR ordering.
+  for (auto [root_config, name] :
+       {std::pair{SpecialRegister::kLoad3DConfig, "Load3D"},
+        std::pair{SpecialRegister::kFixpipeNz2Nd, "Fixpipe"}}) {
+    uint16_t mask = static_cast<uint16_t>(root_config);
+    std::vector<std::vector<TaskNode *>> state_reads(n);
+    std::vector<std::vector<TaskNode *>> tasks_by_node(n);
+    bool has_explicit_read = false;
+    for (size_t i = 0; i < n; ++i) {
+      CollectAllTaskNodes(nodes[i], tasks_by_node[i]);
+      for (TaskNode *task : tasks_by_node[i]) {
+        if (task->GetExplicitSpecialReadMask() & mask) {
+          state_reads[i].push_back(task);
+          has_explicit_read = true;
+        }
+      }
+    }
+    if (root_config == SpecialRegister::kFixpipeNz2Nd && !has_explicit_read)
+      continue;
+    TaskNode *initializer = nullptr;
+    size_t initializer_node = n;
+    for (size_t i = 0; i < n; ++i) {
+      for (TaskNode *task : tasks_by_node[i]) {
+        if (!(task->GetSpecialWriteMask() & mask))
+          continue;
         ICHECK(loop == nullptr && nodes[i] == task &&
                !task->HasConditions() && initializer == nullptr)
-            << "Load3D configuration requires exactly one unconditional "
-               "kernel-root S task; repeated configuration is unsupported";
+            << name << " configuration requires exactly one unconditional "
+                       "kernel-root S task; repeated configuration is unsupported";
         ICHECK_EQ(task->GetPipeMask(), PipeMask(ResourcePipe::kScalar));
         ICHECK_EQ(task->GetCoreMask(), kCoreCube)
-            << "Load3D configuration must be owned by the AIC";
+            << name << " configuration must be owned by the AIC";
         initializer = task;
         initializer_node = i;
       }
-      if (task->GetExplicitSpecialReadMask() & kRootConfig)
-        state_reads[i].push_back(task);
     }
-  }
-  if (loop == nullptr) {
+    if (loop != nullptr)
+      continue;
     for (size_t i = 0; i < n; ++i) {
       if (state_reads[i].empty())
         continue;
       ICHECK(initializer != nullptr && initializer_node < i)
-          << "Selected Load3D requires a preceding kernel-root configuration";
+          << "Selected " << name
+          << " requires a preceding kernel-root configuration";
       std::vector<DependencyTaskPair> pairs;
       for (TaskNode *reader : state_reads[i])
         pairs.emplace_back(initializer, reader);

@@ -54,11 +54,11 @@ AttrStmt RequireSemanticTaskMarker(const Stmt &stmt, const char *context) {
 }
 
 // InsertSync migrates a PerCoreTask's completion into each buffer-bearing
-// candidate. A single root Load3D configuration produces one completion edge,
+// candidate. A single root SPR configuration produces one completion edge,
 // so accepting compound/repeated candidates here could consume that edge more
 // than once. Keep this first slice to one flat leaf; outer scheduled controls
 // remain supported and retain their normal lexical-site projection.
-void ValidateLoad3DPerCoreLeaf(const AttrStmt &group) {
+void ValidateRootConfigPerCoreLeaf(const AttrStmt &group, bool fixpipe) {
   Stmt leaf = group->body;
   bool has_task = false;
   while (const auto *wrapper = leaf.as<AttrStmtNode>()) {
@@ -71,12 +71,17 @@ void ValidateLoad3DPerCoreLeaf(const AttrStmt &group) {
   }
   const auto *evaluate = leaf.as<EvaluateNode>();
   const auto *call = evaluate ? evaluate->value.as<CallNode>() : nullptr;
-  ICHECK(has_task && call &&
-         (call->op.same_as(AscendCubeLoad3D::Get()) ||
-          call->op.same_as(tl::ascend_load_cbuf_to_ca_3d())))
-      << "Load3D T.PerCoreTask requires one flat T.Task leaf; compound or "
+  bool valid = call &&
+      (fixpipe ? ((IsAscendCopyCall(call) ||
+                   call->op.same_as(tl::ascend_copy_matrix_cc_to_gm())) &&
+                  UsesRootFixpipeConfig(call->annotations))
+               : (call->op.same_as(AscendCubeLoad3D::Get()) ||
+                  call->op.same_as(tl::ascend_load_cbuf_to_ca_3d())));
+  ICHECK(has_task && valid)
+      << (fixpipe ? "Fixpipe" : "Load3D")
+      << " T.PerCoreTask requires one flat T.Task leaf; compound or "
          "internally repeated/conditional candidates are unsupported. Place "
-         "the control outside T.PerCoreTask or retain the 2D path. Got "
+         "the control outside T.PerCoreTask or retain local configuration. Got "
       << group->body;
 }
 
@@ -334,7 +339,10 @@ private:
     if (semantic_task->attr_key == attr::kAscendPerCoreTask) {
       if (task->GetExplicitSpecialReadMask() &
           static_cast<uint16_t>(SpecialRegister::kLoad3DConfig))
-        ValidateLoad3DPerCoreLeaf(semantic_task);
+        ValidateRootConfigPerCoreLeaf(semantic_task, false);
+      if (task->GetExplicitSpecialReadMask() &
+          static_cast<uint16_t>(SpecialRegister::kFixpipeNz2Nd))
+        ValidateRootConfigPerCoreLeaf(semantic_task, true);
       ICHECK_NE(pipe_mask, 0)
           << "Cannot recover the pipe of a scheduled T.PerCoreTask";
       task->MarkPerCoreTask();

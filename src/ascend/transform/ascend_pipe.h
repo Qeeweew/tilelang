@@ -287,6 +287,7 @@ inline uint16_t GetAscendCallPipeMask(const Call &call) {
 
   if (op.same_as(ascend_set_copy_pad_value()) ||
       op.same_as(ascend_set_load3d_config()) ||
+      op.same_as(ascend_set_fixpipe_config()) ||
       op.same_as(ascend_threadfence()) || op.same_as(ascend_set_hf32_mode()) ||
       op.same_as(ascend_set_mmad_direction()) ||
       op.same_as(ascend_set_atomic()) || op.same_as(ascend_set_atomic_none()) ||

@@ -37,6 +37,9 @@ public:
   int dual_dst_ctl{0}; // "dual_dst_ctl": L0C->UB dual-destination mode
   int transpose{0};    // "transpose": GM->L1 dn2nz / L1->L0 transpose request
   int data_select{0};  // "data_select": GM->UB hardware right-padding
+  // Internal selection fact: this copy consumes the invariant ND_PARA=1
+  // established by an explicit kernel-root S task. Never a frontend hint.
+  bool root_fixpipe_config{false};
   // Canonical allocation buffer selected from alloc_l0*_sf's IR binding.
   // Leading indices already include any materialized physical versions.
   Optional<Buffer> mx_sf_data;
@@ -112,6 +115,14 @@ public:
 bool IsAscendCopyCall(const tirx::CallNode *call);
 
 namespace ascend {
+inline constexpr const char *kRootFixpipeConfig =
+    "tl.ascend.root_fixpipe_config";
+
+bool UsesRootFixpipeConfig(const Map<String, ObjectRef> &annotations);
+// Validate each kernel independently, including direct LowerTileOp/codegen
+// entry: a durable selected-copy annotation cannot authorize missing state.
+void ValidateRootFixpipeConfig(const Stmt &body);
+
 // Whether this already normalized L1->L0B transfer emits one contiguous 2D
 // descriptor. Shared by native lowering and dimensionless service weighting;
 // regions/layouts remain the source of geometry, not dependency bounding bytes.

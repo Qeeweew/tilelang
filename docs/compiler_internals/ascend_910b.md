@@ -138,10 +138,21 @@ facts. They do not permit an empty AIV owner to skip collective completion.
 `asc_set_l0c_copy_params(1, 0, 0)` before issuing the transfer. The installed
 `asc_copy_l0c2gm` implementation issues the copy without configuring this
 register; a native instruction in generated code alone is insufficient.
-The single-matrix configuration and `PIPE_FIX` barrier follow CANN's
-`dav_c220` Basic Fixpipe implementation and remain inside the atomic FIX task.
-The scheduler preserves program order between these register writers and FIX
-consumers through the shared Fixpipe NZ-to-ND special-register dependency.
+On 2201 this setter completely defines `ND_PARA=1`: one ND matrix with zero
+source/destination inter-matrix strides. Row pitch, conversion and valid M/N
+remain per-transfer arguments. Before task materialization,
+`AscendSelectFixpipeConfig` can establish this invariant once in an explicit
+kernel-root AIC/S task. Selected copies only read the shared register;
+AutoSchedule and InsertSync share a storage-free root-to-consumer RAW edge
+with finite completion and an empty-loop drain. Existing proven pipe paths
+can cover that completion; a nonempty loop may wait only on its first epoch.
+L0C readiness/reuse and GM handoff completion still come from buffer regions.
+Unknown external calls, existing raw FIX operations, conditional copies and
+explicit atomic copy tasks retain the per-copy setter and `PIPE_FIX` barrier
+sequence from CANN's `dav_c220` Basic Fixpipe implementation. The internal
+selected-copy marker is rejected without a preceding unconditional root
+initializer. Disabling automatic scheduling retains this established local
+configuration path; 3510 keeps its own setter contract.
 L0C reads and GM writes retain the original explicit buffer regions. See the
 [2201 configuration API](https://asc.gitcode.com/api/SIMD-API/c_api/cube_datamove/asc_set_l0c_copy_params.html).
 The source stride uses the canonical allocation's padded M extent even when

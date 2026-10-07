@@ -257,6 +257,8 @@ TVM_DLL const Op &ascend_load_cbuf_to_cb_2d();
 TVM_DLL const Op &ascend_load_cbuf_to_ca_3d();
 // One kernel-root AIC/S initialization of the four Load3D configuration SPRs.
 TVM_DLL const Op &ascend_set_load3d_config();
+// One kernel-root AIC/S initialization of ND_PARA to one ND matrix.
+TVM_DLL const Op &ascend_set_fixpipe_config();
 
 /*!
  * \brief Ascend load from CBuf (L1) to CB (L0B).

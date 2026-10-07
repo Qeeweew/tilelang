@@ -863,7 +863,10 @@ Stmt LowerDMACopy(const AscendCopyNode &op, const LowerArgs &T,
               zero,   // [21] C0_pad_en
               zero,   // [22] wino_post_en
               zero,   // [23] broadcast_en
-              zero}); // [24] NZ2DN_en
+              zero},  // [24] NZ2DN_en
+             op.root_fixpipe_config
+                 ? Map<String, ObjectRef>{{kRootFixpipeConfig, Integer(1)}}
+                 : Map<String, ObjectRef>{});
   } else {
     LOG(FATAL) << "Unknown Ascend DMA path";
   }
@@ -1315,6 +1318,8 @@ void DecodeAscendCopyAnnotations(AscendCopyNode *node) {
   node->dual_dst_ctl = int_or("dual_dst_ctl", 0);
   node->transpose = int_or("transpose", 0);
   node->data_select = int_or("data_select", 0);
+  node->root_fixpipe_config =
+      ascend::UsesRootFixpipeConfig(node->annotations);
   node->mx_sf_data = std::nullopt;
   node->l2_cache_ctrl = std::nullopt;
   if (auto val = node->annotations.Get("l2_cache_ctrl")) {

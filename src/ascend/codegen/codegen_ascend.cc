@@ -19,6 +19,7 @@
 #include "arith/pattern_match.h"
 
 #include "ascend/op/builtin.h"
+#include "ascend/op/copy.h"
 #include "ascend/target_utils.h"
 #include "backend/common/target_utils.h"
 #include "transform/common/attr.h"
@@ -582,6 +583,7 @@ void CodeGenTileLangAscend::PrintType(DataType t, std::ostream &os) {
 }
 
 void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
+  tl::ascend::ValidateRootFixpipeConfig(f->body);
   ICHECK(IsOutsideVF())
       << "Ascend VF mode leaked across PrimFunc code generation";
   this->InitFuncState(f);
@@ -1652,13 +1654,15 @@ void CodeGenTileLangAscend::EmitL0cToGmCopy_(const CallNode *op) {
   if (is_dav2201_) {
     // Native 2201 Fixpipe supports NZ->ND directly; its signature does not
     // contain the 3510 loop enhancement or NZ->DN controls.
-    // The C API copy only issues FIX and does not initialize ND_PARA. Match
-    // dav_c220 Basic Fixpipe: one matrix, then drain FIX before using this
-    // configuration. Keep configuration and transfer in the same FIX task.
-    PrintIndent();
-    stream << "asc_set_l0c_copy_params(1, 0, 0);\n";
-    PrintIndent();
-    stream << "asc_sync_pipe(PIPE_FIX);\n";
+    // The C API copy does not initialize ND_PARA. Unselected copies retain
+    // dav_c220 Basic Fixpipe's atomic setup/barrier/transfer. Selected copies
+    // consume the explicit root S configuration and its IR completion edge.
+    if (!tl::ascend::UsesRootFixpipeConfig(op->annotations)) {
+      PrintIndent();
+      stream << "asc_set_l0c_copy_params(1, 0, 0);\n";
+      PrintIndent();
+      stream << "asc_sync_pipe(PIPE_FIX);\n";
+    }
     EmitCApiCall_("asc_copy_l0c2gm",
                   {{op->args[0]},
                    {op->args[1]},
@@ -1990,6 +1994,11 @@ bool CodeGenTileLangAscend::EmitAscendMemoryCall_(const CallNode *op) {
     EmitL1ToL0Copy2D_(op, op->op.same_as(tl::ascend_load_cbuf_to_ca_2d()));
   } else if (op->op.same_as(tl::ascend_set_load3d_config())) {
     EmitLoad3DConfig_(op);
+  } else if (op->op.same_as(tl::ascend_set_fixpipe_config())) {
+    ICHECK(is_dav2201_ && op->args.empty())
+        << "Root Fixpipe configuration requires dav-2201";
+    PrintIndent();
+    stream << "asc_set_l0c_copy_params(1, 0, 0);\n";
   } else if (op->op.same_as(tl::ascend_load_cbuf_to_ca_3d())) {
     EmitL1ToL0Copy3D_(op);
   } else if (op->op.same_as(tl::ascend_load_ca_sf()) ||

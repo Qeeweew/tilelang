@@ -366,6 +366,11 @@ TIR_DEFINE_TL_BUILTIN(ascend_set_load3d_config)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
+TIR_DEFINE_TL_BUILTIN(ascend_set_fixpipe_config)
+    .set_num_inputs(0)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
 TIR_DEFINE_TL_BUILTIN(ascend_load_cbuf_to_ca_3d)
     .set_num_inputs(7)
     .set_attr<TCallEffectKind>("TCallEffectKind",

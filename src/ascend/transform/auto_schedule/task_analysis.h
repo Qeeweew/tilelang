@@ -346,14 +346,17 @@ private:
       Add(SpecialRegister::kAtomicMode);
     } else if (op->op.same_as(tl::ascend_set_load3d_config())) {
       Add(SpecialRegister::kLoad3DConfig);
+    } else if (op->op.same_as(tl::ascend_set_fixpipe_config())) {
+      Add(SpecialRegister::kFixpipeNz2Nd);
     } else if (IsAscendCopyCall(op)) {
       AscendCopy copy(op->args, op->annotations);
-      if (IsL0CBuffer(copy->src) &&
+      if (!copy->root_fixpipe_config && IsL0CBuffer(copy->src) &&
           (IsGlobalBuffer(copy->dst) || IsSharedBuffer(copy->dst)))
         Add(SpecialRegister::kFixpipeNz2Nd);
     } else if (op->op.same_as(tl::ascend_copy_matrix_cc_to_gm()) ||
                op->op.same_as(tl::ascend_copy_matrix_cc_to_ub())) {
-      Add(SpecialRegister::kFixpipeNz2Nd);
+      if (!UsesRootFixpipeConfig(op->annotations))
+        Add(SpecialRegister::kFixpipeNz2Nd);
     } else if (const auto *callee = op->op.as<OpNode>();
                callee && callee->name == "tl.ascend_membase.select_bits") {
       Add(SpecialRegister::kCmpMask);
@@ -383,6 +386,8 @@ private:
     if (op->op.same_as(AscendCubeLoad3D::Get()) ||
         op->op.same_as(tl::ascend_load_cbuf_to_ca_3d()))
       mask_ |= static_cast<uint16_t>(SpecialRegister::kLoad3DConfig);
+    if (UsesRootFixpipeConfig(op->annotations))
+      mask_ |= static_cast<uint16_t>(SpecialRegister::kFixpipeNz2Nd);
     StmtExprVisitor::VisitExpr_(op);
   }
   uint16_t mask_{0};

@@ -137,6 +137,7 @@ def _AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     tilelang.ascend.analysis.VFChecker()(mod)
 
     if auto_schedule_enabled:
+        mod = ascend_transform.AscendSelectFixpipeConfig()(mod)
         mod = ascend_transform.NormalizeControlFlowForSchedule()(mod)
         mod = ascend_transform.NormalizeConflictHints()(mod)
         mod = ascend_transform.MaterializeScheduleUnits()(mod)

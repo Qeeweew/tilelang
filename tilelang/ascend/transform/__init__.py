@@ -286,8 +286,14 @@ def AscendSelectCubeLoads():
     return _ffi_api.AscendSelectCubeLoads()  # type: ignore
 
 
+def AscendSelectFixpipeConfig():
+    """Select one invariant 2201 ND_PARA configuration before scheduling."""
+    return _ffi_api.AscendSelectFixpipeConfig()  # type: ignore
+
+
 __all__ = [
     "AscendSelectCubeLoads",
+    "AscendSelectFixpipeConfig",
     "AscendLowerL1Gemm",
     "AscendValidateTarget",
     "NormalizeAscendFractalStorage",

@@ -200,6 +200,7 @@ private:
 class LowerTileOpPass : arith::IRMutatorWithAnalyzer {
 public:
   static PrimFunc Substitute(PrimFunc f) {
+    ValidateRootFixpipeConfig(f->body);
     arith::Analyzer analyzer;
     LowerTileOpPass substituter(&analyzer);
     // Trace the buffer map for tvm_access_ptr

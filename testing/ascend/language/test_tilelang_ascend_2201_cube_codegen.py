@@ -70,7 +70,9 @@ def test_automatic_pipeline_emits_native_cube_dma_signatures(dtype, transpose_b)
         assert len(transpose_args) == 9 and transpose_args[7] == "1", source
     assert len(_call_arguments(source, "asc_copy_l0c2gm")) == 11, source
     assert _call_arguments(source, "asc_set_l0c_copy_params") == ["1", "0", "0"], source
-    assert source.index("asc_set_l0c_copy_params(") < source.index("asc_sync_pipe(PIPE_FIX)") < source.index("asc_copy_l0c2gm(")
+    ordered = ["asc_set_l0c_copy_params(", "asc_sync_notify(PIPE_S, PIPE_FIX,",
+               "asc_sync_wait(PIPE_S, PIPE_FIX,", "asc_copy_l0c2gm("]
+    assert [source.index(item) for item in ordered] == sorted(source.index(item) for item in ordered), source
     assert "asc_mmad(" in source
     assert "asc_set_gm2l1_nz_para(" not in source
     assert "asc_set_l0c_copy_nz_para(" not in source
