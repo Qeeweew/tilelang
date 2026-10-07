@@ -25,6 +25,7 @@
 #include "ascend/op/copy.h"
 #include "ascend/op/utils.h"
 #include "op/builtin.h"
+#include "op/gemm.h"
 #include "op/utils.h"
 #include "support/check.h"
 #include "transform/common/attr.h"
@@ -917,6 +918,35 @@ private:
 
     if (op->op.same_as(tl::loop_break()))
       has_loop_break_ = true;
+
+    if (mode_ == AccessMode::kPhysical && op->op.same_as(Gemm::Get())) {
+      // The serialized C region may still carry an RW mask after clear is
+      // simplified, or a W mask before an accumulating clear is introduced.
+      // Use the typed operation's may-access contract, not that redundant
+      // mask: a literal clear writes C; any other clear may also read it.
+      Gemm gemm(op->args, op->annotations);
+      AccessRegions accesses = gemm->GetAccessRegions();
+      for (const BufferRegion &read : accesses.reads)
+        RecordBufferRegion(read, true);
+      for (const BufferRegion &write : accesses.writes)
+        RecordBufferRegion(write, false);
+      // Region BufferLoads identify operands rather than scalar reads. Keep
+      // their index/extent expressions and every remaining scalar argument,
+      // including an actual old-C load inside the clear expression.
+      for (const BufferRegion &operand :
+           {gemm->aRegion_, gemm->bRegion_, gemm->cRegion_}) {
+        for (const Range &range : operand->region) {
+          VisitExpr(range->min);
+          VisitExpr(range->extent);
+        }
+      }
+      for (size_t i = 3; i < op->args.size(); ++i)
+        VisitExpr(op->args[i]);
+      for (const auto &[_, value] : op->annotations)
+        if (auto expression = value.as<PrimExpr>())
+          VisitExpr(expression.value());
+      return;
+    }
 
     if (mode_ == AccessMode::kPhysical && IsAscendCopyCall(op)) {
       // Visit the original operands first so symbolic indices and the logical
