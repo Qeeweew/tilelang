@@ -316,7 +316,7 @@ def test_nn_tail_preserves_k_n_regions_and_compact_padded_storage():
 
 
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
-def test_automatic_l1_nn_pipeline_emits_classic_transposed_b16_load(dtype):
+def test_automatic_l1_nn_pipeline_emits_full_n_b_load3dv2(dtype):
     import tilelang
 
     m, n, total_k, tile_k = 128, 96, 768, 384
@@ -334,7 +334,10 @@ def test_automatic_l1_nn_pipeline_emits_classic_transposed_b16_load(dtype):
             T.copy(c_l0, C)
 
     source = tilelang.lower(main, target={"kind": "ascend", "arch": "dav-2201"}).kernel_source
-    assert "load_cbuf_to_cb(" in source
+    assert "asc_set_l13d_fmatrix_b(" in source
+    assert "asc_copy_l12l0b(" in source
+    assert "96, 128, 0, (gemm_sub_k_0 * 128), 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 96)" in source
+    assert "load_cbuf_to_cb(" not in source
     assert "asc_copy_l12l0b_transpose(" not in source
     assert "tl::ascend_gemm_l1" not in source
     assert "asc_mmad(" in source

@@ -369,7 +369,7 @@ def _assert_root_fixpipe_completion(before, after, expected_consumers):
             pipe = "S"
             if name == CONFIG:
                 root.append(index)
-        elif name in ("tl.tileop.ascend_load_cbuf_to_ca_3d", "tl.ascend_load_cbuf_to_ca_3d"):
+        elif name in ("tl.tileop.ascend_cube_load3d", "tl.ascend_load_cbuf_to_ca_3d", "tl.ascend_load_cbuf_to_cb_3d"):
             pipe = "MTE1"
         elif name in ("tl.tileop.gemm", "tl.ascend_mad"):
             pipe = "M"

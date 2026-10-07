@@ -1852,16 +1852,24 @@ void CodeGenTileLangAscend::EmitL1ToL0Copy2D_(const CallNode *op, bool is_l0a) {
 
 void CodeGenTileLangAscend::EmitLoad3DConfig_(const CallNode *op) {
   ICHECK(is_dav2201_);
-  ICHECK_EQ(op->args.size(), 1U);
-  std::string fmatrix = name_supply_->FreshName("load3d_fmatrix");
+  ICHECK_EQ(op->args.size(), 2U);
+  std::string fmatrix_a = name_supply_->FreshName("load3d_fmatrix_a");
+  std::string fmatrix_b = name_supply_->FreshName("load3d_fmatrix_b");
   std::string repeat = name_supply_->FreshName("load3d_repeat");
   PrintIndent();
   // Installed dav_c220 Load3DSetFMatrixCal packs WIDTH low, HEIGHT high.
   // The C API union's named fields disagree; set the proven raw word.
-  stream << "asc_l13d_fmatrix_config " << fmatrix << " = { .config = uint64_t("
-         << PrintExpr(op->args[0]) << ") | (uint64_t(1) << 16) };\n";
+  stream << "asc_l13d_fmatrix_config " << fmatrix_a
+         << " = { .config = uint64_t(" << PrintExpr(op->args[0])
+         << ") | (uint64_t(1) << 16) };\n";
   PrintIndent();
-  stream << "asc_set_l13d_fmatrix(" << fmatrix << ");\n";
+  stream << "asc_set_l13d_fmatrix(" << fmatrix_a << ");\n";
+  PrintIndent();
+  stream << "asc_l13d_fmatrix_config " << fmatrix_b
+         << " = { .config = uint64_t(" << PrintExpr(op->args[1])
+         << ") | (uint64_t(1) << 16) };\n";
+  PrintIndent();
+  stream << "asc_set_l13d_fmatrix_b(" << fmatrix_b << ");\n";
   PrintIndent();
   stream << "asc_load3d_v2_config " << repeat
          << " = { .config = uint64_t(1) << 16 };\n";
@@ -1873,29 +1881,33 @@ void CodeGenTileLangAscend::EmitLoad3DConfig_(const CallNode *op) {
   stream << "asc_set_l13d_size(uint64_t(0));\n";
 }
 
-void CodeGenTileLangAscend::EmitL1ToL0Copy3D_(const CallNode *op) {
+void CodeGenTileLangAscend::EmitL1ToL0Copy3D_(const CallNode *op, bool is_l0a) {
   ICHECK(is_dav2201_);
   ICHECK_EQ(op->args.size(), 7U);
   auto I = [](int value) { return IntImm(DataType::Int(32), value); };
   // Basic dav_c220's BF16 specialization reinterprets storage as half for
   // img2colv2. Follow that actual recipe; this is a bit view only.
-  EmitCApiCall_("asc_copy_l12l0a", {{op->args[0], "(__ca__ half*)(", ")"},
-                                    {op->args[1], "(__cbuf__ half*)(", ")"},
-                                    {op->args[5]},
-                                    {op->args[4]},
-                                    {op->args[6]},
-                                    {I(0)},
-                                    {I(1)},
-                                    {I(1)},
-                                    {I(1)},
-                                    {I(1)},
-                                    {I(1)},
-                                    {I(1)},
-                                    {I(0)},
-                                    {I(0)},
-                                    {I(0)},
-                                    {I(0)},
-                                    {op->args[3]}});
+  // The NN B recipe views source (K,N) as load3D (M,K)=(K,N).
+  // FMATRIX_B supplies source K pitch, selected by f_matrix_ctrl=1.
+  EmitCApiCall_(
+      is_l0a ? "asc_copy_l12l0a" : "asc_copy_l12l0b",
+      {{op->args[0], is_l0a ? "(__ca__ half*)(" : "(__cb__ half*)(", ")"},
+       {op->args[1], "(__cbuf__ half*)(", ")"},
+       {op->args[5]},
+       {op->args[4]},
+       {is_l0a ? op->args[6] : I(0)},
+       {is_l0a ? I(0) : op->args[6]},
+       {I(1)},
+       {I(1)},
+       {I(1)},
+       {I(1)},
+       {I(1)},
+       {I(1)},
+       {I(0)},
+       {I(0)},
+       {I(0)},
+       {I(is_l0a ? 0 : 1)},
+       {op->args[3]}});
 }
 
 void CodeGenTileLangAscend::EmitUbufToL1Copy_(const CallNode *op) {
@@ -2052,8 +2064,9 @@ bool CodeGenTileLangAscend::EmitAscendMemoryCall_(const CallNode *op) {
         << "Root Fixpipe configuration requires dav-2201";
     PrintIndent();
     stream << "asc_set_l0c_copy_params(1, 0, 0);\n";
-  } else if (op->op.same_as(tl::ascend_load_cbuf_to_ca_3d())) {
-    EmitL1ToL0Copy3D_(op);
+  } else if (op->op.same_as(tl::ascend_load_cbuf_to_ca_3d()) ||
+             op->op.same_as(tl::ascend_load_cbuf_to_cb_3d())) {
+    EmitL1ToL0Copy3D_(op, op->op.same_as(tl::ascend_load_cbuf_to_ca_3d()));
   } else if (op->op.same_as(tl::ascend_load_ca_sf()) ||
              op->op.same_as(tl::ascend_load_cb_sf())) {
     EmitMxSfLoad_(op, op->op.same_as(tl::ascend_load_ca_sf()));

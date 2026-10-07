@@ -65,6 +65,7 @@
 #include "./auto_schedule/task_annotations.h"
 #include "./auto_schedule/unit_flag_stream.h"
 #include "ascend/op/builtin.h"
+#include "ascend/op/cube_load.h"
 #include "ascend/target_utils.h"
 #include "ascend/transform/attr.h"
 #include "buffer_alias.h"
@@ -2816,6 +2817,83 @@ std::shared_ptr<TaskNode> MakeSyncTaskNode(const Stmt &body, CoreMask core_mask,
   return task;
 }
 
+// Retire invariant scalar Load3D initialization once on the AIC MTE1 queue.
+// Later MTE1 descriptors inherit this readiness through issue order, even
+// when their data loops skip iterations. The site has no buffer access and
+// does not claim completion of any earlier MTE1 data operation.
+void InsertRootLoad3DInitMarker(
+    std::vector<std::shared_ptr<IRStructure>> &root, const Stmt &kernel_body) {
+  constexpr uint16_t mask =
+      static_cast<uint16_t>(SpecialRegister::kLoad3DConfig);
+  std::vector<std::pair<size_t, TaskNode *>> writers;
+  std::vector<std::pair<size_t, TaskNode *>> readers;
+  for (size_t i = 0; i < root.size(); ++i) {
+    std::vector<TaskNode *> tasks;
+    CollectAllTaskNodes(root[i].get(), tasks);
+    for (TaskNode *task : tasks) {
+      if (task->GetSpecialWriteMask() & mask)
+        writers.emplace_back(i, task);
+      // Only actual typed or late Load3D instructions request this marker;
+      // an empty task or unrelated explicit SPR bit cannot create it.
+      if (AnalyzeSpecialRegisterReads(task->stmt) & mask)
+        readers.emplace_back(i, task);
+    }
+  }
+  if (readers.empty())
+    return;
+
+  TaskNode *initializer = nullptr;
+  size_t initializer_index = root.size();
+  for (const auto &[index, writer] : writers) {
+    const auto *task_marker = writer->stmt.as<AttrStmtNode>();
+    const auto *evaluate = task_marker &&
+                                  task_marker->attr_key == attr::kAscendTask
+                              ? task_marker->body.as<EvaluateNode>()
+                              : nullptr;
+    const auto *call = evaluate ? evaluate->value.as<CallNode>() : nullptr;
+    ICHECK(root[index].get() == writer && !writer->HasGuards() &&
+           initializer == nullptr && call &&
+           call->op.same_as(ascend_set_load3d_config()))
+        << "Load3D configuration requires exactly one unconditional "
+           "kernel-root S task; repeated configuration is unsupported";
+    ICHECK_EQ(writer->GetPipeMask(), PipeMask(ResourcePipe::kScalar));
+    ICHECK_EQ(writer->GetCoreMask(), kCoreCube)
+        << "Load3D configuration must be owned by the AIC";
+    ICHECK_EQ(writer->GetStage(), 0)
+        << "Load3D root configuration must have stage zero";
+    initializer = writer;
+    initializer_index = index;
+  }
+  for (const auto &[index, reader] : readers) {
+    ICHECK(initializer != nullptr && initializer_index < index)
+        << "Selected Load3D requires a preceding kernel-root configuration";
+    ICHECK_EQ(reader->GetCoreMask(), kCoreCube)
+        << "Selected Load3D must be owned by the AIC";
+    ICHECK(reader->UsesOnlyPipe(ResourcePipe::kMTE1))
+        << "Selected Load3D must issue only on MTE1";
+  }
+  // Inspect the complete input, including control expressions: a raw setter
+  // hidden in an opaque call cannot be assumed to preserve the root SPR state.
+  PostOrderVisit(kernel_body, [&](const ffi::ObjectRef &node) {
+    if (const auto *call = node.as<CallNode>()) {
+      ICHECK(ascend::PreservesLoad3DConfig(call))
+          << "Load3D configuration cannot cross an external or opaque "
+             "operation without a modeled register-preservation contract: "
+          << call->op;
+    }
+  });
+
+  auto marker = MakeSyncTaskNode(Evaluate(0), kCoreCube, 0);
+  marker->SetPipeMask(PipeMask(ResourcePipe::kMTE1));
+  marker->SetSpecialReadMask(mask);
+  marker->outer_ctx = initializer->outer_ctx;
+  root.insert(root.begin() + initializer_index + 1, std::move(marker));
+  for (size_t i = 0; i < root.size(); ++i) {
+    root[i]->SetIndex(i);
+    root[i]->SetParent(nullptr);
+  }
+}
+
 class PerCoreTaskSyncMigrator : public StmtMutator {
 public:
   PerCoreTaskSyncMigrator(std::vector<Stmt> before, std::vector<Stmt> after,
@@ -3422,6 +3500,11 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
       InsertUnitFlagBoundaries(root, nullptr, unit_streams, &unit_boundaries);
     }
   }
+  // Keep this after the original unit-fallback snapshot. A recursive retry
+  // rebuilds one marker from the unmodified tree; owner-analysis retries below
+  // reuse this tree without inserting another initialization consumer.
+  if (target_info.architecture == AscendArchitecture::kDav2201)
+    InsertRootLoad3DInitMarker(root, kernel_body);
   std::vector<TaskNode *> tasks;
   CollectAllTaskNodes(root, tasks);
   for (TaskNode *task : tasks) {

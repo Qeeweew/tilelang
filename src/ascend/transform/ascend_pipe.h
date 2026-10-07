@@ -236,6 +236,7 @@ inline uint16_t GetAscendCallPipeMask(const Call &call) {
   }
   if (op.same_as(AscendCubeLoad3D::Get()) ||
       op.same_as(ascend_load_cbuf_to_ca_3d()) ||
+      op.same_as(ascend_load_cbuf_to_cb_3d()) ||
       op.same_as(ascend_load_cbuf_to_ca()) ||
       op.same_as(ascend_load_cbuf_to_ca_2d()) ||
       op.same_as(ascend_load_cbuf_to_cb_2d()) ||

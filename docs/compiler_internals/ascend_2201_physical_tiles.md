@@ -88,6 +88,37 @@ Dependency and synchronization lowering consume these ordinary effects:
 Loop completion projection belongs to `InsertSync`; code generation does not
 invent event numbers or shift pointers to repair the rewrite.
 
+## Native 2201 operand loads
+
+After storage normalization and padding, native selection can replace an
+ordinary FP16/BF16 NZ-to-L0 copy with one Load3Dv2 descriptor. The typed
+`ascend_cube_load3d` retains the actual source and destination regions for
+dependency, allocation and synchronization analysis. Late pointer lowering
+keeps leading physical versions in the base address and the selected K origin
+in the descriptor; it never counts that origin twice.
+
+A loads cover the complete padded source M and a compact K interval into ZA.
+NN B loads cover the complete source N and an aligned K-row interval into the
+native B layout. For B, the 3D descriptor's M axis is logical K, its K axis is
+logical N, and FMATRIX_B width is the backing K extent. This mapping is
+different from the old 2D transpose bit. Partial M for A, partial N for B,
+unproved bounds, unsupported layouts and annotated copies keep their existing
+copy path. These recipes are specific to 2201.
+
+FMATRIX_A and FMATRIX_B have independent invariant widths. A kernel with
+inconsistent widths for either register keeps its ordinary loads. One root
+AIC scalar task sets both registers and the shared repeat, padding and size
+state. `InsertSync` acquires that initialization once through a real root
+S-to-MTE1 event, before every data control. Later descriptors inherit readiness
+through MTE1 issue order even when earlier readers are skipped or their loops
+are empty. The private empty insertion site has no memory access, buffer
+version or completion claim for earlier MTE1 data operations. All operand
+readiness and reuse dependencies remain ordinary memory effects.
+
+The existing service evidence covers A3D and merged B2D. B3D retains ordinal
+weight one until it has its own measurements; sharing a load interface does
+not establish the same bandwidth, latency or scheduler cost.
+
 ## Explicit shared C column regions
 
 Regular 2201 L0 MAD also accepts an aligned N-column region of a compact,

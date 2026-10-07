@@ -255,7 +255,11 @@ TVM_DLL const Op &ascend_load_cbuf_to_cb_2d();
 // Late pointer form of selected 2201 A 3Dv2: dst, src-leading-base,
 // physical L1 M/K, loaded M/K, source K origin (all sizes in elements).
 TVM_DLL const Op &ascend_load_cbuf_to_ca_3d();
-// One kernel-root AIC/S initialization of the four Load3D configuration SPRs.
+// Late pointer form of selected 2201 NN B 3Dv2: dst, src-leading-base,
+// physical L1 K/N, loaded K/N, source K origin (all sizes in elements).
+TVM_DLL const Op &ascend_load_cbuf_to_cb_3d();
+// One kernel-root AIC/S initialization: FMATRIX_A/B widths (height1),
+// shared repeat1, padding0 and boundary0. An unused side has constant width1.
 TVM_DLL const Op &ascend_set_load3d_config();
 // One kernel-root AIC/S initialization of ND_PARA to one ND matrix.
 TVM_DLL const Op &ascend_set_fixpipe_config();

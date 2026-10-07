@@ -13,12 +13,18 @@
 namespace tvm {
 namespace tl {
 
+namespace ascend {
+// Shared invariant-state admission for native selection and synchronization.
+// Even a pure external call has no verified Load3D SPR preservation contract.
+bool PreservesLoad3DConfig(const tirx::CallNode *call);
+} // namespace ascend
+
 // Created only after layout normalization and OOB padding. The regions cover
 // the actual padded hardware transfer; the GEMM keeps its effective domain.
 class AscendCubeLoad3DNode : public TileOperatorNode {
 public:
   tirx::BufferRegion src, dst;
-  PrimExpr physical_m, physical_k;
+  PrimExpr physical_rows, physical_cols;
 
   tirx::Stmt Lower(const LowerArgs &args,
                    arith::Analyzer *analyzer) const final;
@@ -33,8 +39,8 @@ public:
     ffi::reflection::ObjectDef<AscendCubeLoad3DNode>()
         .def_ro("src", &AscendCubeLoad3DNode::src)
         .def_ro("dst", &AscendCubeLoad3DNode::dst)
-        .def_ro("physical_m", &AscendCubeLoad3DNode::physical_m)
-        .def_ro("physical_k", &AscendCubeLoad3DNode::physical_k);
+        .def_ro("physical_rows", &AscendCubeLoad3DNode::physical_rows)
+        .def_ro("physical_cols", &AscendCubeLoad3DNode::physical_cols);
   }
 };
 

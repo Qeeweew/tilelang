@@ -1,4 +1,4 @@
-"""Native A selection preserves truthful padded effects and 2D fallback."""
+"""Native A/B selection preserves truthful effects and one-shot root state."""
 
 from unittest.mock import patch
 
@@ -6,7 +6,11 @@ import pytest
 import tilelang
 from tilelang import tvm
 from tilelang.ascend import language as T, transform
-from tilelang.layout import make_ascend_l0a_2201_layout, make_ascend_major_k_layout
+from tilelang.layout import (
+    make_ascend_l0a_2201_layout,
+    make_ascend_major_k_layout,
+    make_ascend_major_mn_layout,
+)
 from tvm import tirx
 
 from testing.ascend._ir import calls, copy, kernel, nodes, region, seq
@@ -14,7 +18,7 @@ from testing.ascend.auto_schedule._scheduled_ir import unit
 from tilelang.ascend.transform import z3_scheduler
 
 
-NATIVE = "tl.tileop.ascend_load_cbuf_to_ca_3d"
+NATIVE = "tl.tileop.ascend_cube_load3d"
 
 
 def _fixture(dtype="float16", m=127, cache_k=256, load_k=128,
@@ -436,7 +440,7 @@ def test_explicit_atomic_copy_retains_2d_path():
     assert not calls(selected, CFG)
 
 
-def test_conditionally_repeated_load_keeps_2d_without_a_root_event():
+def test_conditionally_repeated_load_selects_with_root_state():
     original = _fixture()
     root = original["main"].body.block
     i = tirx.Var("i", "int32")
@@ -444,9 +448,11 @@ def test_conditionally_repeated_load_keeps_2d_without_a_root_event():
                    tirx.IfThenElse(i % 2 == 0, root.body, None))
     mod = kernel(body, buffers=root.alloc_buffers, annotations=root.annotations)
     selected = _select(mod)
-    assert calls(selected, "tl.tileop.ascend_copy")
-    assert not calls(selected, NATIVE)
-    assert not calls(selected, CFG)
+    assert not calls(selected, "tl.tileop.ascend_copy")
+    assert len(calls(selected, NATIVE)) == len(calls(selected, CFG)) == 1
+    (loop,) = nodes(selected, tirx.For)
+    assert calls(loop.body, NATIVE)
+    assert not calls(loop.body, CFG)
 
 
 def test_gm_valid_read_and_padding_producer_survive_native_selection():
@@ -547,3 +553,130 @@ def test_repeated_configuration_inside_loop_is_diagnosed():
     replacement["main"] = replacement["main"].with_attr("target", mod["main"].attrs["target"])
     with pytest.raises(tvm.error.InternalError, match="unconditional kernel-root S task"):
         transform.InsertSync()(replacement)
+
+
+
+def _b_fixture(dtype="float16", *, leading=False, cache_k=1024, n=64,
+               load_k=128, k_start=384, n_start=0, load_n=None):
+    prefix = (2,) if leading else ()
+    load_n = n if load_n is None else load_n
+    src = tirx.decl_buffer((*prefix, cache_k, n), dtype, name="b_l1", scope="shared.l1")
+    dst = tirx.decl_buffer((*prefix, load_k, load_n), dtype, name="b_l0", scope="shared.l0b")
+    origins, extents = ([1], [1]) if leading else ([], [])
+    return kernel(copy(src, dst, src_indices=[*origins, k_start, n_start],
+                       dst_indices=[*origins, 0, 0], src_shape=[*extents, load_k, load_n],
+                       dst_shape=[*extents, load_k, load_n]), buffers=[src, dst],
+                  annotations={"layout_map": {src: make_ascend_major_k_layout(src),
+                                               dst: make_ascend_major_mn_layout(dst)}})
+
+
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+@pytest.mark.parametrize("leading", [False, True])
+def test_full_n_b_native_load_retains_row_origin_and_version_pitch(dtype, leading):
+    selected = _select(_b_fixture(dtype, leading=leading))
+    (native,) = calls(selected, NATIVE)
+    read, write = native.args[:2]
+    _equal(read.args[0].indices, [1, 384, 0] if leading else [384, 0])
+    _equal(read.args[2:], [1, 128, 64] if leading else [128, 64])
+    _equal(write.args[0].indices, [1, 0, 0] if leading else [0, 0])
+    _equal(native.args[2:], [1024, 64])
+    _equal(calls(selected, CFG)[0].args, [1, 1024])
+    with selected["main"].attrs["target"]:
+        lowered = transform.AscendLowerTileOp()(selected)
+    (load,) = calls(lowered, "tl.ascend_load_cbuf_to_cb_3d")
+    assert not calls(lowered, NATIVE)
+    _equal(load.args[2:], [1024, 64, 128, 64, 384])
+    _equal([load.args[0].args[2], load.args[1].args[2]],
+           [128 * 64, 1024 * 64] if leading else [0, 0])
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"k_start": 1},
+    {"k_start": 912},
+    {"n_start": 16, "load_n": 32},
+    {"load_n": 32},
+    {"cache_k": 32768},
+])
+def test_b_unproved_geometry_keeps_existing_copy(kwargs):
+    selected = _select(_b_fixture(**kwargs), normalize_footprint=False)
+    assert not calls(selected, NATIVE)
+    assert not calls(selected, CFG)
+    assert calls(selected, "tl.tileop.ascend_copy")
+
+
+def test_a_and_b_configure_independent_fmatrix_widths():
+    roots = [x["main"].body.block for x in (_fixture(m=128), _b_fixture())]
+    combined = kernel(seq(*(root.body for root in roots)),
+                      buffers=[b for root in roots for b in root.alloc_buffers],
+                      annotations={"layout_map": {b: layout for root in roots
+                                                 for b, layout in root.annotations["layout_map"].items()}})
+    selected = _select(combined)
+    assert len(calls(selected, NATIVE)) == 2
+    (config,) = calls(selected, CFG)
+    _equal(config.args, [128, 1024])
+
+
+@pytest.mark.parametrize("activation", ["periodic", "late", "runtime"])
+def test_conditional_native_readers_acquire_root_state_once_before_all_controls(activation):
+    original = _state_fixture(nested=False, consumers=2)
+    root = original["main"].body.block
+    setup, first, second = root.body.seq
+    loop = first.body
+    (load,) = calls(loop.body, NATIVE)
+    enabled = tirx.Var("enabled", "bool")
+    guard = (loop.loop_var % 2 == 0 if activation == "periodic" else
+             loop.loop_var >= 2 if activation == "late" else enabled)
+    guarded = unit(tirx.For(loop.loop_var, loop.min, loop.extent, loop.kind,
+                           unit(tirx.Evaluate(load), core=2, cost=(1, 1), guard=guard)), core=None)
+    before = kernel(seq(setup, guarded, second), buffers=root.alloc_buffers,
+                    params=[enabled] if activation == "runtime" else [])
+    before["main"] = before["main"].with_attr("target", original["main"].attrs["target"])
+    after = _sync_state(before)
+    _assert_one_shot_s_mte1_events(after)
+    sets = [c for c in calls(after, "tl.ascend_set_flag") if c.args[0].value == "S_MTE1"]
+    waits = [c for c in calls(after, "tl.ascend_wait_flag") if c.args[0].value == "S_MTE1"]
+    assert len(sets) == len(waits) == 1
+    assert sum(isinstance(stmt.value, tirx.Call) and isinstance(stmt.value.op, tvm.ir.Op)
+               and stmt.value.op.name == NATIVE for stmt in nodes(after, tirx.Evaluate)) == 2
+    # The acquire executes even when the first reader's activation is empty.
+    # Its root wait precedes both loops, so all later MTE1 descriptors inherit
+    # initialized state by issue order without claiming old data completed.
+    top = list(after["main"].body.block.body.seq)
+    first_control = next(i for i, stmt in enumerate(top) if nodes(stmt, tirx.For))
+    prefix = seq(*top[:first_control])
+    assert len(calls(prefix, CFG)) == 1
+    assert any(c.args[0].value == "S_MTE1" for c in calls(prefix, "tl.ascend_wait_flag"))
+    for control in [stmt for stmt in top if nodes(stmt, tirx.For)]:
+        assert not [c for c in calls(control, "tl.ascend_wait_flag") if c.args[0].value == "S_MTE1"]
+
+
+
+@pytest.mark.parametrize("factory", [_fixture, _b_fixture], ids=["A", "B"])
+@pytest.mark.parametrize("kind", ["extern", "pure_extern", "opaque_gemm"])
+def test_unknown_native_state_keeps_ordinary_copy(factory, kind):
+    original = factory()
+    root = original["main"].body.block
+    call = (tirx.Call("void", tvm.ir.Op.get("tl.ascend_gemm_l1"), [0] * 11)
+            if kind == "opaque_gemm" else
+            tirx.call_pure_extern("int32", "set_fmatrix_b", 0) if kind == "pure_extern" else
+            tirx.call_extern("int32", "set_fmatrix", 0))
+    before = kernel(seq(tirx.Evaluate(call), root.body), buffers=root.alloc_buffers,
+                    annotations=root.annotations)
+    after = _select(before)
+    assert not calls(after, NATIVE)
+    assert not calls(after, CFG)
+    assert len(calls(after, "tl.tileop.ascend_copy")) == 1
+
+
+@pytest.mark.parametrize("kind", ["extern", "pure_extern"])
+def test_already_selected_load_rejects_unverified_native_state(kind):
+    original = _state_fixture(nested=False)
+    root = original["main"].body.block
+    call = (tirx.call_pure_extern("int32", "set_fmatrix_b", 0) if kind == "pure_extern" else
+            tirx.call_extern("int32", "set_fmatrix", 0))
+    setup, loop = root.body.seq
+    before = kernel(seq(setup, unit(tirx.Evaluate(call), core=2, cost=(1, 1)), loop),
+                    buffers=root.alloc_buffers)
+    before["main"] = before["main"].with_attr("target", original["main"].attrs["target"])
+    with before["main"].attrs["target"], pytest.raises(tvm.error.InternalError, match="Load3D configuration cannot cross an external or opaque"):
+        transform.InsertSync()(before)

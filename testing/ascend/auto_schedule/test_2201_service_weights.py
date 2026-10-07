@@ -67,7 +67,7 @@ def _load(which, *, n=128, k=128, cache_k=256, source_n=None,
     source = region(src, 1, [*index, 0, cache_k - k], [*extent, n, k])
     destination = region(dst, 2, [*index, 0, 0], [*extent, n, k])
     if which == "a3d":
-        body = tirx.Evaluate(tirx.Call("void", tvm.ir.Op.get("tl.tileop.ascend_load_cbuf_to_ca_3d"),
+        body = tirx.Evaluate(tirx.Call("void", tvm.ir.Op.get("tl.tileop.ascend_cube_load3d"),
                                     [source, destination, n, cache_k]))
     else:
         body = copy(src, dst, src_indices=[*index, 0, cache_k - k],
@@ -179,3 +179,14 @@ def test_ordinary_auto_gemm_selects_two_a_and_b_slots_with_service_weights(n, dt
         operands = [buffer for buffer in root.alloc_buffers if buffer.scope() == scope]
         assert operands, snapshots[-1].script()
         assert all(int(counts[buffer.data]) == 2 for buffer in operands), snapshots[-1].script()
+
+
+
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+def test_new_b3d_path_keeps_uncalibrated_ordinal_weight(dtype):
+    from testing.ascend.transform.test_ascend_select_cube_loads import _b_fixture, _select
+
+    # A large legal B descriptor would get a scaled A3D value if the measured
+    # A-path ratio were accidentally reused. B3D needs its own evidence.
+    selected = _select(_b_fixture(dtype, load_k=512, k_start=0))
+    assert _estimate(selected)[-1] == (1, 1)

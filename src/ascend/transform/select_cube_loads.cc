@@ -17,6 +17,7 @@
 #include "ascend/op/oob_padding.h"
 #include "ascend/op/utils.h"
 #include "ascend/target_utils.h"
+#include "ascend/transform/ascend_pipe.h"
 #include "ascend/transform/attr.h"
 #include "ascend/transform/auto_schedule/kernel_rewriter.h"
 #include "ascend/transform/auto_schedule/scheduled_tir.h"
@@ -37,21 +38,27 @@ public:
 
   SBlock Rewrite(const SBlock &root) {
     bool existing_state = false;
+    bool unknown_state = false;
     PostOrderVisit(root->body, [&](const ffi::ObjectRef &node) {
-      if (const auto *call = node.as<CallNode>())
+      if (const auto *call = node.as<CallNode>()) {
         existing_state |= call->op.same_as(ascend_set_load3d_config()) ||
                           call->op.same_as(AscendCubeLoad3D::Get()) ||
-                          call->op.same_as(ascend_load_cbuf_to_ca_3d());
+                          call->op.same_as(ascend_load_cbuf_to_ca_3d()) ||
+                          call->op.same_as(ascend_load_cbuf_to_cb_3d());
+        unknown_state |= !ascend::PreservesLoad3DConfig(call);
+      }
     });
-    if (existing_state)
+    if (existing_state || unknown_state)
       return root;
     SBlock rewritten = Downcast<SBlock>(operator()(root));
-    if (different_configurations_ || !physical_m_.defined())
+    if (different_configurations_ ||
+        (!fmatrix_a_width_.defined() && !fmatrix_b_width_.defined()))
       return root;
     ascend::TaskMetadata ownership;
     ownership.core_mask = kCoreCube;
     Stmt setup = Evaluate(Call(DataType::Void(), ascend_set_load3d_config(),
-                               {physical_m_.value()}));
+                               {fmatrix_a_width_.value_or(Integer(1)),
+                                fmatrix_b_width_.value_or(Integer(1))}));
     setup = AttrStmt(ascend::MergeTaskMetadata(ownership, Integer(0)),
                      attr::kAscendTask, Integer(1), setup);
     rewritten.CopyOnWrite()->body = SeqStmt({setup, rewritten->body});
@@ -67,16 +74,6 @@ private:
     atomic_depth_ += atomic;
     Stmt result = Parent::VisitStmt_(op);
     atomic_depth_ -= atomic;
-    return result;
-  }
-
-  Stmt VisitStmt_(const IfThenElseNode *op) final {
-    // A one-shot root event must not be consumed by a condition that becomes
-    // true on multiple iterations. Keep conditional copies on the established
-    // 2D path until their first-consumer protocol is explicitly represented.
-    ++conditional_depth_;
-    Stmt result = Parent::VisitStmt_(op);
-    --conditional_depth_;
     return result;
   }
 
@@ -126,7 +123,7 @@ private:
 
   Stmt VisitStmt_(const EvaluateNode *op) final {
     const auto *call = op->value.as<CallNode>();
-    if (atomic_depth_ || conditional_depth_ || !IsAscendCopyCall(call))
+    if (atomic_depth_ || !IsAscendCopyCall(call))
       return Parent::VisitStmt_(op);
     // The selected recipe implements ordinary copy only. Keep every annotated
     // copy on its established path: hardware controls, layout hints and
@@ -134,7 +131,8 @@ private:
     if (!call->annotations.empty())
       return Parent::VisitStmt_(op);
     AscendCopy copy(call->args, call->annotations);
-    if (!IsL1Buffer(copy->src) || !IsL0ABuffer(copy->dst) ||
+    const bool is_l0a = IsL0ABuffer(copy->dst);
+    if (!IsL1Buffer(copy->src) || (!is_l0a && !IsL0BBuffer(copy->dst)) ||
         copy->transpose != 0 || copy->src->dtype != copy->dst->dtype ||
         copy->src->dtype.lanes() != 1 ||
         !(copy->src->dtype.is_float16() || copy->src->dtype.is_bfloat16()) ||
@@ -155,62 +153,71 @@ private:
         !TryExtractAscendFractalLayout(dst_layout.value(), copy->dst,
                                        &dst_info) ||
         src_info.kind != AscendFractalKind::kMajorK ||
-        dst_info.kind != AscendFractalKind::kL0AMajorK)
+        dst_info.kind != (is_l0a ? AscendFractalKind::kL0AMajorK
+                                 : AscendFractalKind::kMajorMN))
       return Parent::VisitStmt_(op);
 
     size_t sn = copy->src_range.size(), dn = copy->dst_range.size();
-    const Range &sm = copy->src_range[sn - 2];
-    const Range &sk = copy->src_range[sn - 1];
-    const Range &dm = copy->dst_range[dn - 2];
-    const Range &dk = copy->dst_range[dn - 1];
-    PrimExpr physical_m = copy->src->shape[sn - 2];
-    PrimExpr physical_k = copy->src->shape[sn - 1];
-    PrimExpr loaded_m = copy->dst->shape[dn - 2];
-    PrimExpr loaded_k = copy->dst->shape[dn - 1];
-    // This narrow recipe selects one compact A tile, covering the source's
-    // complete padded M. Sizes are elements, not 2D fractal counts. Unknown
-    // bounds, partial M, transpose and noncompact destinations keep 2D.
-    if (!Equal(sm->min, 0) || !Equal(dm->min, 0) || !Equal(dk->min, 0) ||
-        !Equal(floormod(sk->min, 16), 0) || !Equal(loaded_m, physical_m) ||
-        !Equal(src_info.outer1 * src_info.row_frac, physical_m) ||
-        !Equal(src_info.outer0 * src_info.c0, physical_k) ||
-        !Equal(dst_info.outer1 * dst_info.row_frac, loaded_m) ||
-        !Equal(dst_info.outer0 * dst_info.c0, loaded_k) ||
-        !Equal(sm->extent, loaded_m) || !Equal(dm->extent, loaded_m) ||
-        !Equal(sk->extent, loaded_k) || !Equal(dk->extent, loaded_k) ||
-        !Equal(floormod(physical_m, 16), 0) ||
-        !Equal(floormod(physical_k, 16), 0) ||
-        !Equal(floormod(loaded_k, 16), 0) ||
-        !InBounds(sk->min, loaded_k, physical_k) ||
-        !Prove(sm->extent > 0 && sk->extent > 0 && dm->extent > 0 &&
-               dk->extent > 0 && physical_m > 0 && physical_m <= 32767 &&
-               physical_k > 0 && physical_k <= 65535 && loaded_k > 0 &&
-               loaded_k <= 65535))
+    const Range &sr = copy->src_range[sn - 2];
+    const Range &sc = copy->src_range[sn - 1];
+    const Range &dr = copy->dst_range[dn - 2];
+    const Range &dc = copy->dst_range[dn - 1];
+    PrimExpr physical_rows = copy->src->shape[sn - 2];
+    PrimExpr physical_cols = copy->src->shape[sn - 1];
+    PrimExpr loaded_rows = copy->dst->shape[dn - 2];
+    PrimExpr loaded_cols = copy->dst->shape[dn - 1];
+    // A uses (rows,cols)=(M,K), NN B uses (K,N). Both recipes copy one
+    // complete compact destination tile. A covers the source's full padded M;
+    // B covers its full padded N and materializes the native ZN order. Sizes
+    // and origins are elements, never classic Load2D fractal counts.
+    if (!Equal(dr->min, 0) || !Equal(dc->min, 0) ||
+        !Equal(src_info.outer1 * src_info.row_frac, physical_rows) ||
+        !Equal(src_info.outer0 * src_info.c0, physical_cols) ||
+        !Equal(dst_info.outer1 * dst_info.row_frac,
+               is_l0a ? loaded_rows : loaded_cols) ||
+        !Equal(dst_info.outer0 * dst_info.c0,
+               is_l0a ? loaded_cols : loaded_rows) ||
+        !Equal(sr->extent, loaded_rows) || !Equal(dr->extent, loaded_rows) ||
+        !Equal(sc->extent, loaded_cols) || !Equal(dc->extent, loaded_cols) ||
+        !Equal(floormod(physical_rows, 16), 0) ||
+        !Equal(floormod(physical_cols, 16), 0) ||
+        !Equal(floormod(loaded_rows, 16), 0) ||
+        !Equal(floormod(loaded_cols, 16), 0) ||
+        !Prove(physical_rows > 0 && physical_rows <= 32767 &&
+               physical_cols > 0 && physical_cols <= 65535 && loaded_rows > 0 &&
+               loaded_rows <= 65535 && loaded_cols > 0 && loaded_cols <= 65535))
+      return Parent::VisitStmt_(op);
+    if (is_l0a ? (!Equal(sr->min, 0) || !Equal(loaded_rows, physical_rows) ||
+                  !Equal(floormod(sc->min, 16), 0) ||
+                  !InBounds(sc->min, loaded_cols, physical_cols))
+               : (!Equal(sc->min, 0) || !Equal(loaded_cols, physical_cols) ||
+                  !Equal(floormod(sr->min, 16), 0) ||
+                  !InBounds(sr->min, loaded_rows, physical_rows)))
       return Parent::VisitStmt_(op);
 
-    PrimExpr configured_m = analyzer_->Simplify(physical_m);
-    if (!configured_m.as<IntImmNode>())
+    PrimExpr configured_width = analyzer_->Simplify(physical_rows);
+    if (!configured_width.as<IntImmNode>())
       return Parent::VisitStmt_(op);
-    if (physical_m_.defined() && !Equal(physical_m_.value(), configured_m))
+    auto &side_width = is_l0a ? fmatrix_a_width_ : fmatrix_b_width_;
+    if (side_width.defined() && !Equal(side_width.value(), configured_width))
       different_configurations_ = true;
-    physical_m_ = configured_m;
+    side_width = configured_width;
 
     Array<Range> reads = copy->src_range, writes = copy->dst_range;
     // Consume the shared NormalizeCubeCopyFootprints contract verbatim.
     // Selection never invents or enlarges a hardware read/write region.
-    return Evaluate(
-        Call(DataType::Void(), AscendCubeLoad3D::Get(),
-             {Region(copy->src, reads, kAccessRead),
-              Region(copy->dst, writes, kAccessWrite), physical_m, physical_k},
-             call->annotations),
-        op->span);
+    return Evaluate(Call(DataType::Void(), AscendCubeLoad3D::Get(),
+                         {Region(copy->src, reads, kAccessRead),
+                          Region(copy->dst, writes, kAccessWrite),
+                          physical_rows, physical_cols},
+                         call->annotations),
+                    op->span);
   }
 
   LayoutMap layouts_;
-  Optional<PrimExpr> physical_m_;
+  Optional<PrimExpr> fmatrix_a_width_, fmatrix_b_width_;
   bool different_configurations_{false};
   int atomic_depth_{0};
-  int conditional_depth_{0};
 };
 } // namespace
 

@@ -300,7 +300,11 @@ public:
     }
     if (call->op.same_as(AscendCubeLoad3D::Get())) {
       AscendCubeLoad3D load(call->args, call->annotations);
-      if (!CalibratedOperands(load->src->buffer->dtype,
+      // The measured reference covers A3D only. A B3D descriptor has the
+      // same transfer API but a different data path; retain ordinal one
+      // until that path has its own service evidence.
+      if (!IsL0ABuffer(load->dst->buffer) ||
+          !CalibratedOperands(load->src->buffer->dtype,
                               load->dst->buffer->dtype))
         return 1;
       // The selected native op's destination is the exact padded transfer.

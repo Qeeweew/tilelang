@@ -384,7 +384,8 @@ public:
 private:
   void VisitExpr_(const CallNode *op) final {
     if (op->op.same_as(AscendCubeLoad3D::Get()) ||
-        op->op.same_as(tl::ascend_load_cbuf_to_ca_3d()))
+        op->op.same_as(tl::ascend_load_cbuf_to_ca_3d()) ||
+        op->op.same_as(tl::ascend_load_cbuf_to_cb_3d()))
       mask_ |= static_cast<uint16_t>(SpecialRegister::kLoad3DConfig);
     if (UsesRootFixpipeConfig(op->annotations))
       mask_ |= static_cast<uint16_t>(SpecialRegister::kFixpipeNz2Nd);

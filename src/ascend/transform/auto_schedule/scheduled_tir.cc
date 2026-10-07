@@ -76,7 +76,8 @@ void ValidateRootConfigPerCoreLeaf(const AttrStmt &group, bool fixpipe) {
                    call->op.same_as(tl::ascend_copy_matrix_cc_to_gm())) &&
                   UsesRootFixpipeConfig(call->annotations))
                : (call->op.same_as(AscendCubeLoad3D::Get()) ||
-                  call->op.same_as(tl::ascend_load_cbuf_to_ca_3d())));
+                  call->op.same_as(tl::ascend_load_cbuf_to_ca_3d()) ||
+                  call->op.same_as(tl::ascend_load_cbuf_to_cb_3d())));
   ICHECK(has_task && valid)
       << (fixpipe ? "Fixpipe" : "Load3D")
       << " T.PerCoreTask requires one flat T.Task leaf; compound or "

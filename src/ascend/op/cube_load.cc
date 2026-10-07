@@ -13,23 +13,54 @@
 #include "ascend/op/builtin.h"
 #include "ascend/op/utils.h"
 #include "ascend/target_utils.h"
+#include "ascend/transform/ascend_pipe.h"
+#include "op/builtin.h"
 #include "op/utils.h"
 
 namespace tvm {
 namespace tl {
 using namespace tirx;
 
+namespace ascend {
+// A kernel-root configuration remains invariant only across registered native
+// operations with known hardware roles and pure IR metadata. A pure external
+// call still has no verified register contract. Opaque library GEMMs may issue
+// their own Basic LoadData setup and cannot share this root configuration.
+bool PreservesLoad3DConfig(const CallNode *call) {
+  if (call->op.same_as(builtin::call_extern()) ||
+      call->op.same_as(builtin::call_pure_extern()))
+    return false;
+  const auto callee = call->op.as<Op>();
+  if (!callee)
+    return false;
+  if (call->op.same_as(ascend_gemm_l1()) ||
+      call->op.same_as(ascend_blockscaled_gemm_l1()))
+    return false;
+  if (call->op.same_as(region()) || call->op.same_as(access_ptr()) ||
+      call->op.same_as(builtin::tvm_access_ptr()) ||
+      call->op.same_as(builtin::assume()))
+    return true;
+  if (GetAscendCallPipeMask(GetRef<Call>(call)) != 0)
+    return true;
+  static auto effects = Op::GetAttrMap<TCallEffectKind>("TCallEffectKind");
+  return effects.count(callee.value()) &&
+         effects[callee.value()]->value <=
+             static_cast<int>(CallEffectKind::kPure);
+}
+
+} // namespace ascend
+
 AscendCubeLoad3D::AscendCubeLoad3D(
     ffi::Array<PrimExpr> args,
     ffi::Map<ffi::String, ffi::ObjectRef> annotations) {
   ICHECK_EQ(args.size(), 4U);
   ICHECK(annotations.empty())
-      << "Selected 2201 A Load3Dv2 does not accept copy annotations";
+      << "Selected 2201 Load3Dv2 does not accept copy annotations";
   auto node = ffi::make_object<AscendCubeLoad3DNode>();
   node->src = NormalizeToBufferRegion(args[0]);
   node->dst = NormalizeToBufferRegion(args[1]);
-  node->physical_m = args[2];
-  node->physical_k = args[3];
+  node->physical_rows = args[2];
+  node->physical_cols = args[3];
   node->SetAccessRegions({{node->src, kAccessRead}, {node->dst, kAccessWrite}});
   data_ = std::move(node);
 }
@@ -44,19 +75,23 @@ Stmt AscendCubeLoad3DNode::Lower(const LowerArgs &args,
          AscendArchitecture::kDav2201);
   ICHECK_GE(src->region.size(), 2U);
   ICHECK_GE(dst->region.size(), 2U);
-  const auto &m = src->region[src->region.size() - 2];
-  const auto &k = src->region[src->region.size() - 1];
-  // Native selection already established the source NZ and destination ZA
-  // contract. Materialized versions alter only leading indices. These late
+  const bool is_l0a = IsL0ABuffer(dst->buffer);
+  ICHECK(is_l0a || IsL0BBuffer(dst->buffer));
+  const auto &rows = src->region[src->region.size() - 2];
+  const auto &cols = src->region[src->region.size() - 1];
+  // Native selection already established source NZ and destination ZA/ZN
+  // contracts. Materialized versions alter only leading indices. These late
   // flat pointers are addresses, never the pre-schedule memory-effect facts.
   PrimExpr dst_ptr = MakeAccessPtrFromRegion(dst, kAccessWrite);
   PrimExpr src_base = MakeAscendLeadingDimAccessPtr(src, kAccessRead);
-  return Evaluate(Call(DataType::Void(), ascend_load_cbuf_to_ca_3d(),
-                       {dst_ptr, src_base, physical_m, physical_k, m->extent,
-                        k->extent, k->min}));
+  return Evaluate(
+      Call(DataType::Void(),
+           is_l0a ? ascend_load_cbuf_to_ca_3d() : ascend_load_cbuf_to_cb_3d(),
+           {dst_ptr, src_base, physical_rows, physical_cols, rows->extent,
+            cols->extent, is_l0a ? cols->min : rows->min}));
 }
 
-TIR_REGISTER_TL_TILE_OP(AscendCubeLoad3D, ascend_load_cbuf_to_ca_3d)
+TIR_REGISTER_TL_TILE_OP(AscendCubeLoad3D, ascend_cube_load3d)
     .set_num_inputs(4)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));

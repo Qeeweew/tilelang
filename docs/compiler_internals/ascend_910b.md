@@ -69,27 +69,33 @@ storage reuse therefore participate in RAW/WAR dependencies. The GEMM keeps
 its effective logical M/N/K. The late emitter consumes the same footprint
 helper; it does not infer a separate set of allowed reads.
 
-After this normalization, native Cube instruction selection may replace a
-2201 nontransposed A copy with Load3Dv2. The selection requires canonical
-FP16/BF16 L1 NZ and L0A ZA layouts, one complete physical M tile, a compact
-aligned sub-K tile and proven allocation bounds. Its typed operation retains
-the established physical read/write regions through scheduling and versioning.
-Only late lowering turns them into pointers and native element descriptors.
-Annotated, conditional or explicitly atomic copies, incompatible layouts and
-unsupported geometry retain the 2D path.
+After this normalization, native Cube instruction selection may replace
+2201 FP16/BF16 copies with Load3Dv2. A requires canonical L1 NZ and L0A ZA,
+full padded M and a compact aligned K interval. NN B requires canonical L1 NZ,
+its native B layout, full padded N and an aligned K-row interval. Proven
+allocation bounds and actual regions remain shared scheduling/versioning
+facts; only late lowering emits pointers and native element descriptors.
+Annotated or explicitly atomic copies, incompatible layouts and unsupported
+geometry retain the established copy path.
 
-Selected loads in one kernel must share one static FMATRIX configuration.
-An explicit root AIC/PIPE_S task initializes FMATRIX, repeat, padding and
-boundary registers once. The loads read that register group. Shared dependency
-analysis supplies storage-free RAW edges to the concrete MTE1 consumers;
-InsertSync owns the S-to-MTE1 completion events and lexical first-use sites.
-The configuration receives no buffer version or hidden event number. Different
-FMATRIX tuples retain 2D for the kernel; live reconfiguration is unsupported.
+Selected loads share invariant but independent FMATRIX_A/B widths in each
+kernel. One root AIC/PIPE_S task initializes both widths and the shared repeat,
+padding and boundary state. Shared dependency analysis supplies storage-free
+RAW edges; InsertSync emits one real root S-to-MTE1 acquire before all data
+controls. Conditional and empty readers therefore inherit initialization
+without repeatedly consuming a one-shot event. This readiness protocol adds
+no buffer version, hidden event number or whole-MTE1 data completion. Different
+widths on the same side retain ordinary loads; live reconfiguration is
+unsupported. External and unmodeled opaque calls prevent selection, and an
+already selected kernel diagnoses them at synchronization lowering because
+they could overwrite the invariant state.
+
 The selected path requires synchronization lowering and is disabled when
 automatic scheduling is disabled. A hand-created PerCore reader must have one
-flat Task load leaf; compound, repeated or conditional readers have a diagnostic
-because their completion cannot consume a one-shot root event repeatedly.
-Descriptor count reduction alone is not evidence of lower execution time.
+flat Task load leaf; internally compound, repeated or conditional groups
+retain their existing diagnostic. Descriptor count reduction alone is not
+evidence of lower execution time. See the native operand-load contract in
+[2201 physical tiles](ascend_2201_physical_tiles.md).
 
 Logical L0C-to-UB and UB-to-L1 transitions become ordinary copies through
 compiler-owned GM workspace before layout or ownership is assigned. Each
