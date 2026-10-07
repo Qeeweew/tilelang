@@ -5,6 +5,15 @@ domains, and the established buffer plan. Local event IDs are synchronization
 resources; their count is not the physical buffer version count or the number
 of compiler stages.
 
+A carried dependency belongs to the loop whose children are being analyzed.
+Its ordinary region comparison holds ancestor coordinates and definitions
+fixed, while instantiating this loop and its descendants independently.
+For example, an outer even-epoch spill and odd-epoch reload cannot create an
+inner-loop carried edge. The parent analysis must retain their real boundary
+hazard. A matching leaf task pair in a child dependency does not by itself
+prove completion across the parent's iteration boundary. Independent storage
+owners retain their separate epoch comparison.
+
 ## dav-2201 hardware contract
 
 Local SetFlag writes a binary flag to one after the source pipe's preceding
@@ -57,11 +66,20 @@ merely because their data regions are disjoint.
 
 Shifted carried local events use an unconditional outermost lexical loop with
 immutable bounds, a positive step, signed iteration/trip-count types, and no
-break. Their source and destination
-must use that loop's active epoch sequence. The plan records the edge distance
-and total trip count; materialization applies the distinct set/wait phases and
-seed/drain residues. Shifted and finite no-reuse channels have exclusive
-event allocations because
+break. Their flag clock must equal the loop's lexical iteration ordinal.
+Source and destination must use the same active epoch sequence: either the
+whole loop or one exactly proven contiguous interval with static cut points.
+The proof expands established condition definitions and checks equivalence
+on actual loop iterations, including nonzero origins and positive steps.
+Periodic, gapped, or unknown active sequences are diagnosed.
+
+For an active ordinal interval `[L,U)`, the event clock is rebased to `i-L`
+and its trip count is `max(U-L,0)`. Physical buffer indexing and task guards
+are retained. The same distance, seed and drain formulas then apply to these
+active epochs, including an empty interval. Span expressions used by kernel
+seeds and drains are simplified with the loop's outer context; loop-entry
+facts cannot remove empty-interval protection from these hoisted expressions.
+Shifted and finite no-reuse channels have exclusive event allocations because
 the older sharing proof assumes equal phases and complete seed rings.
 
 Classic nested and counter-clock protocols remain supported when their

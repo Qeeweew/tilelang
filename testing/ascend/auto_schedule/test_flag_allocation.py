@@ -10,7 +10,8 @@ import tilelang.testing
 from tilelang import tvm
 from tilelang.ascend import transform as ascend_transform
 from tvm import tirx
-from testing.ascend._ir import calls, schedule, statements
+from testing.ascend._ir import calls, nodes, schedule, statements
+from testing.ascend.auto_schedule.test_sync_binary_flags import _completion_trace, _prove_binary_protocol
 
 
 def _make_cross_iter_reuse_program():
@@ -312,6 +313,39 @@ def _event_ranges(mod, operation, hard_event):
     return sorted(ranges)
 
 
+def _assert_materialized_release_protocol(mod, versions, stores, *, loads=None):
+    """Check the real slots and completion fences, leaving VF math opaque."""
+    lowered = ascend_transform.LowerScheduledTIR()(ascend_transform.MaterializeMultiBuffer()(mod))
+    shared = [buffer for block in nodes(lowered, tirx.SBlock) for buffer in block.alloc_buffers
+              if buffer.scope() == "shared.dyn"]
+    assert len(shared) == 1 and tuple(map(int, shared[0].shape)) == (versions, 64)
+
+    def opaque_vf(node):
+        if isinstance(node, tirx.SBlock) and node.name_hint == "SIMD_VF":
+            return tirx.Evaluate(0)
+
+    # The VF's surrounding hard events retain their completion semantics.
+    # Removing its opaque body adds no edge to the finite flag/DMA graph and
+    # makes no claim about the VF's internal instruction timing or math.
+    function = lowered["main"]
+    view = tvm.IRModule({"main": function.with_body(
+        tirx.stmt_functor.ir_transform(function.body, None, opaque_vf))})
+    trace = _completion_trace(view)
+    precedes = _prove_binary_protocol(trace)
+    assert sum(node.kind == "produce" for node in trace) == (stores if loads is None else loads)
+    assert sum(node.kind == "consume" for node in trace) == stores
+    last_write, last_read = {}, {}
+    for index, node in enumerate(trace):
+        if node.kind == "produce":
+            if node.slot in last_read:
+                assert precedes(last_read[node.slot], index), "UB overwritten before the previous GM store completes"
+            last_write[node.slot] = index
+        elif node.kind == "consume":
+            assert node.slot in last_write
+            assert precedes(last_write[node.slot], index), "GM store lacks the current UB load's completion"
+            last_read[node.slot] = index
+
+
 @pytest.mark.parametrize("count", [5, 9], ids=["fits", "requires-reuse"])
 def test_serial_protocols_fit_hardware_flag_budget(count):
     mod = _insert_sync(_make_serial_protocols(count))
@@ -331,7 +365,10 @@ def test_sibling_counter_owners_share_one_release_ring():
         assert len(dynamic) == 4
         for expr in dynamic[1:]:
             tvm.ir.assert_structural_equal(expr, dynamic[0])
-        assert len(_constant_ids(mod, operation, "MTE3_MTE2")) == 2
+    # Conservative parent boundaries may add separate constant channels;
+    # they must not change the shared two-slot data clock or lose completion.
+    assert _constant_ids(mod, "set", "MTE3_MTE2") == _constant_ids(mod, "wait", "MTE3_MTE2")
+    _assert_materialized_release_protocol(mod, versions=2, stores=64)
 
 
 def test_distinct_counter_channels_keep_exclusive_rings_and_spill():
@@ -405,10 +442,10 @@ def test_single_iteration_needs_no_reverse_flag(extent):
 def test_extent_one_child_uses_only_its_owner_versions(eligible):
     program = (_make_single_iteration_nested_loop_program if eligible else _make_noneligible_single_iteration_nested_loop_program)()
     mod = _insert_sync(program)
-    # The outer owner has three versions. The extent-one child must neither
-    # lose that ring nor create another outer ring for an unclaimed buffer.
-    for operation in ("set", "wait"):
-        assert len(_constant_ids(mod, operation, "MTE3_MTE2")) == 3
+    # The three physical slots must survive even when a stronger parent
+    # completion edge covers their release with one serial event channel.
+    assert _constant_ids(mod, "set", "MTE3_MTE2") == _constant_ids(mod, "wait", "MTE3_MTE2")
+    _assert_materialized_release_protocol(mod, versions=3, stores=8, loads=8 if eligible else 16)
 
 
 if __name__ == "__main__":

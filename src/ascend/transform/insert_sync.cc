@@ -31,6 +31,7 @@
 #include <memory>
 #include <optional>
 #include <set>
+#include <sstream>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -39,6 +40,7 @@
 #include <vector>
 
 #include <tvm/arith/analyzer.h>
+#include <tvm/arith/pattern.h>
 #include <tvm/ffi/container/array.h>
 #include <tvm/ffi/extra/structural_equal.h>
 #include <tvm/ffi/reflection/registry.h>
@@ -315,6 +317,11 @@ using CounterChannelKey = std::pair<CounterSyncSignature, int>;
 // A finite non-reusing clock instead reserves one ID per real/initial epoch.
 struct LocalBinaryFlagPlan {
   int distance;
+  PrimExpr trip_count;
+};
+
+struct LocalBinaryEpochSpan {
+  PrimExpr first;
   PrimExpr trip_count;
 };
 
@@ -1042,6 +1049,71 @@ private:
     return closure.MinDistance(src, dst, !HasImplicitCompletionOrder(src, dst));
   }
 
+  std::optional<LocalBinaryEpochSpan>
+  LocalBinaryActiveSpan(const SyncPoint &sync_point, ControlNode *loop,
+                        const PrimExpr &trip_count,
+                        const PrimExpr &step) const {
+    arith::Analyzer guard_analyzer;
+    loop->GetLoopBodyContext().Populate(guard_analyzer);
+    PrimExpr source_guard = guard_analyzer.Simplify(
+        site_registry_.Domain(site_registry_.Src(sync_point)).active_guard);
+    PrimExpr destination_guard = guard_analyzer.Simplify(
+        site_registry_.Domain(site_registry_.Dst(sync_point)).active_guard);
+    if (!guard_analyzer.CanProve(source_guard == destination_guard))
+      return std::nullopt;
+    PrimExpr zero = make_zero(trip_count.dtype());
+    if (is_one(source_guard))
+      return LocalBinaryEpochSpan{zero, trip_count};
+    if (is_zero(source_guard))
+      return LocalBinaryEpochSpan{zero, zero};
+
+    // Accept one interval in the lexical coordinate, never a gapped active
+    // sequence. Static cut points keep root seed/drain expressions independent
+    // of condition snapshots or other values defined inside this loop.
+    const ForNode *for_node = loop->control.get();
+    Array<PrimExpr> bounds =
+        arith::DetectClipBound(source_guard, {for_node->loop_var});
+    if (bounds.size() != 2)
+      return std::nullopt;
+    for (const PrimExpr &bound : bounds) {
+      if (bound.defined() && !bound.as<IntImmNode>())
+        return std::nullopt;
+    }
+    PrimExpr first = zero;
+    PrimExpr last = trip_count;
+    if (bounds[0].defined()) {
+      first =
+          max(zero, min(trip_count, ceildiv(bounds[0] - for_node->min, step)));
+    }
+    if (bounds[1].defined()) {
+      last = max(
+          zero, min(trip_count, indexdiv(bounds[1] - for_node->min, step) + 1));
+    }
+    // The span also controls kernel-root drain operations, including when
+    // this loop never enters. Its expressions may use only outer facts;
+    // the body's extent > 0 premise must not remove empty-span protection.
+    arith::Analyzer boundary_analyzer;
+    loop->task->outer_ctx.Populate(boundary_analyzer);
+    first = boundary_analyzer.Simplify(first);
+    last = boundary_analyzer.Simplify(last);
+
+    // Check exact equivalence on actual loop iterations, including a nonzero
+    // origin or positive step. Inferring a bound from a guard is not enough:
+    // holes or an unmodeled predicate must not silently drop flag operations.
+    Var epoch("local_binary_active_epoch", trip_count.dtype());
+    PrimExpr at_epoch = Substitute(
+        source_guard, {{for_node->loop_var, for_node->min + epoch * step}});
+    arith::Analyzer proof;
+    loop->task->outer_ctx.Populate(proof);
+    auto exit = proof.EnterConstraint(zero <= epoch && epoch < trip_count);
+    bool exact = proof.CanProve(at_epoch == (first <= epoch && epoch < last));
+    exit();
+    if (!exact)
+      return std::nullopt;
+    return LocalBinaryEpochSpan{
+        first, boundary_analyzer.Simplify(max(last - first, zero))};
+  }
+
   std::optional<int> FiniteLocalBinaryWidth(ControlNode *loop,
                                             const PrimExpr &trip_count,
                                             int distance) const {
@@ -1397,7 +1469,11 @@ private:
 
       int distance = dep.distance;
       int num_versions = 1;
-      ControlNode *flag_loop = nullptr;
+      // A boundary outside every storage owner uses the analysis loop's
+      // lexical clock. Storage identity alone cannot assign a descendant
+      // owner's counter to this parent epoch; within-owner edges override
+      // this default with their actual storage-local clock below.
+      ControlNode *flag_loop = loop;
       const MultiBufferInfo *counter_info = nullptr;
       const MultiBufferOwnerInfo *counter_owner = nullptr;
 
@@ -1453,10 +1529,6 @@ private:
                   domains_.DomainForStorage(counter_info->storage,
                                             counter_owner->loop));
       }
-      if (info == nullptr && !manual_versions && loop != nullptr) {
-        flag_loop = loop;
-      }
-
       for (const auto &[producer, consumer] : dep.task_pairs) {
         int pair_domain_id =
             dependency_domain_id.has_value()
@@ -1678,6 +1750,34 @@ private:
               ? MinCompletionDistance(closure, sync_point.edge.dst,
                                       sync_point.edge.src)
               : closure.MinDistance(sync_point.edge.dst, sync_point.edge.src);
+      auto binary_context = [&]() {
+        std::ostringstream detail;
+        detail << " [pipe=" << src.pipe << "->" << dst.pipe
+               << ", distance=" << sync_point.edge.distance
+               << ", reverse_completion="
+               << (min_distance == std::numeric_limits<int>::max()
+                       ? "unproved"
+                       : std::to_string(min_distance))
+               << ", width=" << sync_point.num_versions << ", analysis_loop="
+               << (loop ? loop->control->loop_var->name_hint : String("<none>"))
+               << ", flag_loop="
+               << (sync_point.flag_loop
+                       ? sync_point.flag_loop->control->loop_var->name_hint
+                       : String("<none>"))
+               << ", clock=" << sync_point.flag_iteration
+               << ", counter_group=" << sync_point.counter_group_id
+               << ", source=" << src.path_begin->GetIndex() << ":"
+               << src.path_end->GetIndex()
+               << ", destination=" << dst.path_begin->GetIndex() << ":"
+               << dst.path_end->GetIndex()
+               << ", source_guard=" << src.GetGuard()
+               << ", destination_guard=" << dst.GetGuard()
+               << ", source_domain=" << src.EpochDomainId() << ":"
+               << site_registry_.Domain(src).active_guard
+               << ", destination_domain=" << dst.EpochDomainId() << ":"
+               << site_registry_.Domain(dst).active_guard << "]";
+        return detail.str();
+      };
 
       if (local_binary && sync_point.edge.distance > 0) {
         // Weak MTE/FIX issue edges alone do not establish that a previous
@@ -1689,19 +1789,16 @@ private:
         if (reverse_completion == 0 && distance == innermost_num_versions)
           continue;
 
-        // A shifted lexical phase currently has a single, unconditional root
-        // clock. Re-seeding an inner loop at each entry is unsafe: a local
-        // drain only blocks its destination pipe, not the next source seed.
+        // A shifted lexical phase has one root clock, with at most one
+        // contiguous active interval. Re-seeding an inner loop at each entry
+        // is unsafe: a local drain only blocks its destination pipe, not the
+        // next source seed.
         ICHECK(is_innermost && sync_point.counter_group_id == 0 &&
                loop != nullptr && loop->GetParentControl() == nullptr &&
                !loop->HasConditions() && !loop->BodyHasLoopBreak())
             << "dav-2201 local binary flag: shifted carried events require "
-               "an unconditional outermost lexical loop";
-        const ConstrSet &loop_context = loop->GetLoopBodyContext();
-        ICHECK(loop_context.CanProve(site_registry_.Domain(src).active_guard) &&
-               loop_context.CanProve(site_registry_.Domain(dst).active_guard))
-            << "dav-2201 local binary flag: shifted carried events require "
-               "an unconditional active-epoch sequence";
+               "an unconditional outermost lexical loop"
+            << binary_context();
         const ForNode *for_node = loop->control.get();
         PrimExpr step = for_node->step.has_value()
                             ? for_node->step.value()
@@ -1718,6 +1815,22 @@ private:
                trip_count.dtype().is_int())
             << "dav-2201 local binary flag: shifted epoch clocks require "
                "signed integer iteration and trip-count types";
+        PrimExpr lexical_ordinal =
+            indexdiv(for_node->loop_var - for_node->min, step);
+        ICHECK(loop->GetLoopBodyContext().CanProve(sync_point.flag_iteration ==
+                                                   lexical_ordinal))
+            << "dav-2201 local binary flag: shifted epoch clock must equal "
+               "the root lexical iteration ordinal"
+            << binary_context();
+        std::optional<LocalBinaryEpochSpan> active_span =
+            LocalBinaryActiveSpan(sync_point, loop, trip_count, step);
+        ICHECK(active_span.has_value())
+            << "dav-2201 local binary flag: shifted carried events require "
+               "one exact contiguous active-epoch interval with static cut "
+               "points"
+            << binary_context();
+        sync_point.flag_iteration = lexical_ordinal - active_span->first;
+        trip_count = active_span->trip_count;
         if (reverse_completion == std::numeric_limits<int>::max()) {
           std::optional<int> finite_width =
               FiniteLocalBinaryWidth(loop, trip_count, distance);

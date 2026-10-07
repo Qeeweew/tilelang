@@ -66,7 +66,8 @@ struct DepInfo {
   // Cross-iteration distance of this dependency:
   //   0   : same-iteration dependency.
   //   -1  : unresolved cross-iteration dependency. A versioned storage may
-  //         resolve it to its ring width; otherwise it means one iteration.
+  //         resolve it to its ring width; otherwise it means one iteration
+  //         of the loop whose child list is being analyzed.
   //   >=1 : dependency on a manually multi-buffered buffer, at the physical
   //         iteration distance solved per access pair.
   // kOwnerExclusion leaves this as zero during shared analysis. InsertSync
@@ -88,8 +89,9 @@ using ConflictHintList = ffi::Array<ffi::Any>;
 // child list is copied and stable-sorted by stage before dependency directions
 // are derived; the kernel root list keeps its original order. `loop` identifies
 // the ControlNode whose ordered children are being analyzed; null means the
-// kernel root list. Its parent chain supplies the complete enclosing serial
-// loop nest for cross-iteration analysis.
+// kernel root list. Ordinary carried dependencies compare different iterations
+// of this loop with ancestor coordinates fixed and descendant coordinates
+// independent. Parent analysis establishes outer-boundary hazards.
 // `manual_buffer_versions` maps user-declared manual multi-buffer data Vars to
 // their version count; empty means no manual buffers.
 // `multi_buffer_owners` maps each storage treated as automatic multi-buffered
@@ -97,9 +99,9 @@ using ConflictHintList = ffi::Array<ffi::Any>;
 // owners are returned as kOwnerExclusion; physical ring size is handled by the
 // owner-local protocol.
 // `dependency_cache` is shared for one scheduling or synchronization phase and
-// is keyed by `loop`. An `i == j` control-node self-dependency whose
-// producer→consumer pairs are already established anywhere inside that node's
-// own subtree is dropped.
+// is keyed by `loop`. An `i == j` control-node self-dependency is retained even
+// if the same leaf pair occurs in a descendant dependency: the descendant
+// relation does not establish completion across this parent loop's boundary.
 std::vector<DepInfo>
 AnalyzeDependencies(std::vector<IRStructure *> nodes,
                     ControlNode *loop = nullptr,
@@ -112,13 +114,13 @@ AnalyzeDependencies(std::vector<IRStructure *> nodes,
 // contexts. `offset == 0` compares accesses in the same iteration. A positive
 // offset constrains the current consumer loop coordinate to equal the producer
 // coordinate plus that offset. A negative offset denotes an automatic
-// cross-iteration check. Normally it renames the loop suffix below the nearest
-// ancestor with another access to the storage and requires at least one
-// coordinate to differ. Only a multi-owner physical ring at one of its owner
-// loops renames the complete enclosing loop nest and permits equal coordinates:
-// an identically-shaped iteration in another owner can still be a distinct
-// epoch. Shared by scheduling-time IRStructure analysis and the scheduled-TIR
-// synchronization pass.
+// cross-iteration check. It renames the current loop and descendant definitions
+// and requires this loop's coordinate to differ; ancestor coordinates and their
+// definitions remain shared. Only a multi-owner physical ring at one of its
+// owner loops renames the complete enclosing loop nest and permits equal
+// coordinates: an identically-shaped iteration in another owner can still be a
+// distinct epoch. Shared by scheduling-time IRStructure analysis and the
+// scheduled-TIR synchronization pass.
 bool RegionsMayConflict(const ConstrSet &a_ctx, const BufferRegion &a_region,
                         const ConstrSet &b_ctx, const BufferRegion &b_region,
                         ControlNode *loop, int offset,

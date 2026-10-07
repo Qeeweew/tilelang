@@ -25,10 +25,8 @@
 #include "./dependency_analysis.h"
 
 #include <algorithm>
-#include <functional>
 #include <iterator>
 #include <set>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -47,11 +45,6 @@ namespace tl {
 namespace ascend {
 
 using namespace tirx;
-
-// An undefined storage key groups explicit conflicts between distinct storage.
-using CoveredDependencyMap =
-    std::unordered_map<ffi::Optional<Var>, std::set<DependencyTaskPair>,
-                       ffi::ObjectPtrHash, ffi::ObjectPtrEqual>;
 
 // A bare buffer hint matches every region using its storage. A region hint
 // matches only the same logical buffer and exact footprint.
@@ -79,37 +72,6 @@ static bool IsConflictHint(const Array<Any> &hint) {
   ICHECK(is_conflict != nullptr && is_conflict->dtype.is_bool())
       << "conflict_hint annotation expects a constant boolean polarity";
   return is_conflict->value;
-}
-
-// Return the suffix of the enclosing loop nest that forms one storage-local
-// iteration space. Walk outward from `loop` until the parent contains another
-// access to `storage` outside the child on this path. That parent is the scope
-// where separate access sequences meet, so only its child-to-`loop` suffix is
-// renamed when comparing two iterations. If no such parent exists, use the
-// complete enclosing loop nest.
-std::vector<const ControlNode *> StorageIterationNest(ControlNode *loop,
-                                                      const Var &storage) {
-  std::vector<const ControlNode *> controls = loop->GetAncestorControls();
-  size_t first = 0;
-  for (size_t i = controls.size(); i > 1; --i) {
-    const ControlNode *parent = controls[i - 2];
-    const IRStructure *path_child = controls[i - 1];
-    ICHECK_EQ(path_child->GetParent(), parent);
-
-    bool has_external_access =
-        parent->task && parent->task->TouchesStorage(storage);
-    for (const auto &child : parent->children) {
-      if (child.get() != path_child && child->TouchesStorage(storage)) {
-        has_external_access = true;
-        break;
-      }
-    }
-    if (has_external_access) {
-      first = i - 1;
-      break;
-    }
-  }
-  return {controls.begin() + first, controls.end()};
 }
 
 bool RegionsMayConflict(const ConstrSet &a_ctx, const BufferRegion &a_region,
@@ -164,9 +126,9 @@ bool RegionsMayConflict(const ConstrSet &a_ctx, const BufferRegion &a_region,
   ConstrSet loop_ctx;
   // Scheduled tasks can define condition snapshots outside the constraint
   // visitor's Bind stack. Rename all variables written in the compared
-  // iteration scope, including these otherwise-free predicates. Sharing one
-  // predicate between producer and consumer would incorrectly make opposite
-  // branches mutually exclusive across different iterations.
+  // iteration scope, including these otherwise-free predicates. Ancestor
+  // definitions stay shared: opposite branches selected by one outer epoch
+  // are still exclusive when comparing iterations of an inner loop.
   auto seed_iteration_vars = [&](const ControlNode *scope) {
     for (const Var &var : scope->GetWriteVars()) {
       if (!a_sub.count(var))
@@ -176,34 +138,27 @@ bool RegionsMayConflict(const ConstrSet &a_ctx, const BufferRegion &a_region,
     }
   };
   if (cross) {
-    if (offset < 0) {
-      std::vector<const ControlNode *> iteration_nest =
-          num_storage_owners > 1
-              ? loop->GetAncestorControls()
-              : StorageIterationNest(loop, a_region->buffer->data);
-      ICHECK(!iteration_nest.empty());
-      seed_iteration_vars(iteration_nest.front());
-      Var pivot_lv = iteration_nest.front()->control->loop_var;
-      a_local_ctx = a_local_ctx.RenameFrom("_p", a_sub, pivot_lv);
-      b_local_ctx = b_local_ctx.RenameFrom("_c", b_sub, pivot_lv);
-      if (num_storage_owners <= 1) {
-        PrimExpr different_iteration = Bool(false);
-        for (const ControlNode *control : iteration_nest) {
-          Var iteration = control->control->loop_var;
-          PrimExpr p = Substitute(iteration, a_sub);
-          PrimExpr c = Substitute(iteration, b_sub);
-          different_iteration = different_iteration || (p != c);
-        }
-        loop_ctx.AddConstr(different_iteration);
-      }
-    } else {
-      seed_iteration_vars(loop);
-      Var iteration = loop->control->loop_var;
-      a_local_ctx = a_local_ctx.RenameFrom("_p", a_sub, iteration);
-      b_local_ctx = b_local_ctx.RenameFrom("_c", b_sub, iteration);
-      PrimExpr p = Substitute(iteration, a_sub);
-      PrimExpr c = Substitute(iteration, b_sub);
+    // A carried edge belongs to the loop being analyzed, not to any differing
+    // coordinate in its enclosing nest. Keep ancestors fixed and instantiate
+    // this loop and its descendants independently. Parent analysis retains
+    // hazards that cross the outer boundary of this sequence.
+    const ControlNode *rename_scope = loop;
+    if (offset < 0 && num_storage_owners > 1) {
+      // Distinct storage owners have independent epochs even when their
+      // enclosing coordinates happen to coincide.
+      rename_scope = loop->GetAncestorControls().front();
+    }
+    seed_iteration_vars(rename_scope);
+    Var pivot = rename_scope->control->loop_var;
+    a_local_ctx = a_local_ctx.RenameFrom("_p", a_sub, pivot);
+    b_local_ctx = b_local_ctx.RenameFrom("_c", b_sub, pivot);
+    Var iteration = loop->control->loop_var;
+    PrimExpr p = Substitute(iteration, a_sub);
+    PrimExpr c = Substitute(iteration, b_sub);
+    if (offset > 0) {
       loop_ctx.AddConstr(c == p + IntImm(iteration.dtype(), offset));
+    } else if (num_storage_owners <= 1) {
+      loop_ctx.AddConstr(p != c);
     }
   }
   loop_ctx.Merge(a_local_ctx).Merge(b_local_ctx).Populate(ana);
@@ -271,30 +226,6 @@ AnalyzeDependencies(std::vector<IRStructure *> nodes, ControlNode *loop,
         accesses[i].writes.push_back({task, region});
     }
   }
-
-  std::function<void(IRStructure *, CoveredDependencyMap &)>
-      collect_subtree_deps = [&](IRStructure *node, CoveredDependencyMap &out) {
-        if (!node || !node->IsControl())
-          return;
-        auto *ctrl = static_cast<ControlNode *>(node);
-        std::vector<IRStructure *> children;
-        for (const auto &child : ctrl->children)
-          children.push_back(child.get());
-        auto child_deps =
-            AnalyzeDependencies(children, ctrl, manual_buffer_versions,
-                                multi_buffer_owners, &cache, root_conflicts);
-        for (const auto &cdep : child_deps) {
-          auto &covered_pairs = out[cdep.storage];
-          covered_pairs.insert(cdep.task_pairs.begin(), cdep.task_pairs.end());
-        }
-        for (auto *child : children)
-          collect_subtree_deps(child, out);
-      };
-  auto subtree_covered = [&](IRStructure *node) {
-    CoveredDependencyMap covered;
-    collect_subtree_deps(node, covered);
-    return covered;
-  };
 
   auto get_manual_versions = [&](const ffi::Optional<Var> &storage) {
     if (!storage.has_value())
@@ -420,22 +351,9 @@ AnalyzeDependencies(std::vector<IRStructure *> nodes, ControlNode *loop,
       consider(accesses[i].writes, accesses[j].writes);
       consider(accesses[i].reads, accesses[j].writes);
 
-      if (i == j && nodes[i]->IsControl()) {
-        CoveredDependencyMap covered = subtree_covered(nodes[i]);
-        for (PendingDependency &dep : pending) {
-          auto covered_it = covered.find(dep.storage);
-          if (covered_it == covered.end())
-            continue;
-          for (auto it = dep.task_pairs.begin(); it != dep.task_pairs.end();) {
-            if (covered_it->second.count(*it)) {
-              it = dep.task_pairs.erase(it);
-            } else {
-              ++it;
-            }
-          }
-        }
-      }
-
+      // A control-node self edge crosses iterations of this parent loop.
+      // The same leaf pair in a descendant dependency compares a different
+      // coordinate/domain and does not discharge this boundary hazard.
       for (PendingDependency &dep : pending) {
         if (dep.task_pairs.empty())
           continue;
