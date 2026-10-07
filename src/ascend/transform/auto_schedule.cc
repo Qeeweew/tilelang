@@ -58,6 +58,7 @@
 #include "./auto_schedule/dependency_analysis.h"
 #include "./auto_schedule/ir_structure.h"
 #include "./auto_schedule/kernel_rewriter.h"
+#include "./auto_schedule/l0c_storage_reuse.h"
 #include "./auto_schedule/multi_buffer.h"
 #include "./auto_schedule/scheduled_tir.h"
 #include "./auto_schedule/task_analysis.h"
@@ -1654,9 +1655,18 @@ tvm::transform::Pass AutoSchedule() {
         [&](const TilelangKernelContext &context) {
           ScheduledTIR scheduled_tir = DecodeScheduledTIR(
               context.root, context.outer_ctx, MakeAutoScheduleExtraInfo);
+          SBlock root =
+              TryCoalesceL0CStorage(scheduled_tir, GetAscendTargetInfo(target));
+          if (!root.same_as(context.root)) {
+            // A capacity repair changes physical storage identity. Decode the
+            // changed shell once so every task/owner/dependency consumes those
+            // facts, rather than retaining a parallel alias side table.
+            scheduled_tir = DecodeScheduledTIR(
+                root, context.outer_ctx, MakeAutoScheduleExtraInfo);
+          }
           BufferVersionMap buffer_version_overrides =
               scheduled_tir.metadata.buffer_versions;
-          ScheduleSingleKernel(context.root->body, target, &scheduled_tir);
+          ScheduleSingleKernel(root->body, target, &scheduled_tir);
           WarnOnUnappliedBufferVersionOverrides(
               buffer_version_overrides, scheduled_tir.metadata.buffer_versions);
           return EncodeScheduledTIR(std::move(scheduled_tir));
