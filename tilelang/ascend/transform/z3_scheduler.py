@@ -453,9 +453,83 @@ def _loop_issue_before(ctx, k_vars, r_vars, producer, consumer):
     )
 
 
+def _loop_buffer_versions(start_times, data_deps, ii, lower_bounds):
+    """Exact ring widths, retaining one physical slot and supplied bounds."""
+    versions = [max(1, count) for count in lower_bounds]
+    for u, v, distance, latency in data_deps:
+        if distance < 0:
+            buffer = -distance - 1
+            required = (latency + start_times[u] - start_times[v] + ii - 1) // ii
+            versions[buffer] = max(versions[buffer], required)
+    return versions
+
+
+def _improve_loop_prefetch_witness(
+    ctx, assertions, model, k_vars, r_vars, buffer_vars,
+    prefetch_priority_pairs, buffer_sizes, *, data_deps, ii, verbose=False,
+):
+    """Try one earlier producer stage per preference without another solve.
+
+    Residues and resource choices stay fixed. A candidate may grow storage to
+    satisfy every buffer-distance edge, but must witness all original hard
+    assertions and strictly improve the same prefetch score. Scan once only;
+    this does not search other stages, orders or combinations of rejected moves.
+    """
+    if ii <= 0 or not prefetch_priority_pairs:
+        return model
+    values = [[model.eval(var, model_completion=False) for var in variables]
+              for variables in (k_vars, r_vars, buffer_vars)]
+    if any(not z3.is_int_value(value) for group in values for value in group):
+        return model
+    # Loop scheduling uses scalar constants. Do not silently drop a function
+    # interpretation if a different model is supplied to this optional helper.
+    if any(declaration.arity() != 0 for declaration in model.decls()):
+        return model
+    stages, residues, counts = [[value.as_long() for value in group] for group in values]
+
+    def cost(selected_stages, selected_counts):
+        unmet = sum(not (selected_stages[consumer] >= selected_stages[producer] + 1
+                         and residues[producer] < residues[consumer])
+                    for producer, consumer in prefetch_priority_pairs)
+        return (unmet, sum(count * size for count, size in zip(selected_counts, buffer_sizes)),
+                max(selected_stages) - min(selected_stages))
+
+    selected, selected_cost = model, cost(stages, counts)
+    attempted, accepted = 0, 0
+    for producer, consumer in prefetch_priority_pairs:
+        earlier = stages[consumer] - 1
+        # With a positive stage lead, equal residues issue the consumer first.
+        # Moving a stage cannot repair a producer that already issues later.
+        if earlier < 0 or earlier >= stages[producer] or residues[producer] >= residues[consumer]:
+            continue
+        attempted += 1
+        candidate_stages = list(stages)
+        candidate_stages[producer] = earlier
+        starts = [stage * ii + residue for stage, residue in zip(candidate_stages, residues)]
+        candidate_counts = _loop_buffer_versions(starts, data_deps, ii, counts)
+        candidate_cost = cost(candidate_stages, candidate_counts)
+        if candidate_cost >= selected_cost:
+            continue
+        # update_value is public, and a new Model owns independent
+        # interpretations; never mutate the trusted feasible baseline.
+        candidate = z3.Model(ctx=ctx)
+        for declaration in selected.decls():
+            candidate.update_value(declaration, selected[declaration])
+        candidate.update_value(k_vars[producer], z3.IntVal(earlier, ctx))
+        for variable, count in zip(buffer_vars, candidate_counts):
+            candidate.update_value(variable, z3.IntVal(count, ctx))
+        if all(z3.is_true(candidate.eval(assertion, model_completion=False)) for assertion in assertions):
+            selected, selected_cost = candidate, candidate_cost
+            stages, counts = candidate_stages, candidate_counts
+            accepted += 1
+    if verbose:
+        print(f"[Python Z3 Loop] Local prefetch witnesses: {accepted}/{attempted} accepted")
+    return selected
+
+
 def _refine_loop_prefetch(
     ctx, assertions, model, k_vars, r_vars, buffer_vars,
-    prefetch_priority_pairs, buffer_sizes, *, verbose=False,
+    prefetch_priority_pairs, buffer_sizes, *, data_deps=None, ii=None, verbose=False,
 ):
     """Jointly prefer a useful one-epoch load lead at the already chosen II.
 
@@ -466,6 +540,12 @@ def _refine_loop_prefetch(
     """
     if not prefetch_priority_pairs:
         return model
+    if data_deps is not None and ii is not None:
+        model = _improve_loop_prefetch_witness(
+            ctx, assertions, model, k_vars, r_vars, buffer_vars,
+            prefetch_priority_pairs, buffer_sizes, data_deps=data_deps, ii=ii,
+            verbose=verbose,
+        )
     optimizer = z3.Optimize(ctx=ctx)
     optimizer.set("rlimit", 100000)
     optimizer.set("timeout", 100)
@@ -1018,7 +1098,7 @@ def z3_schedule_loop_python(
             best_model = _refine_loop_prefetch(
                 ctx, best_assertions, best_model, best_k_vars, best_r_vars,
                 best_buffer_vars, prefetch_priority_pairs, buffer_sizes,
-                verbose=verbose,
+                data_deps=data_deps, ii=best_ii, verbose=verbose,
             )
 
         # Extract start times from best model. Normalize by the smallest k so the
@@ -1033,15 +1113,9 @@ def z3_schedule_loop_python(
         # Extract buffer versions from best model
         if recalculate_buffer_versions:
             # if recalculation is true, we recalculate based on the schedule and dependencies
-            buffer_versions = len(buffer_sizes) * [1]
-            for u, v, distance, latency in data_deps:
-                if distance < 0:
-                    buffer_var_id = -distance - 1
-                    from math import ceil
-
-                    buffer_versions[buffer_var_id] = max(
-                        buffer_versions[buffer_var_id], ceil((latency + start_times[u] - start_times[v]) / best_ii)
-                    )
+            buffer_versions = _loop_buffer_versions(
+                start_times, data_deps, best_ii, [1] * len(buffer_sizes),
+            )
         else:
             buffer_versions = []
             for i in range(len(buffer_sizes)):

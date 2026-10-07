@@ -324,9 +324,18 @@ with producer-first physical issue, then fewer allocated bytes and a smaller
 stage span. Physical issue follows residue, descending stage at equal residue,
 then source index; a stage lead alone is insufficient. Only a strictly better,
 independently validated feasible model is accepted. Unknown or unsat retains
-the original model. Start normalization and emitted counts are recomputed from
+the selected feasible incumbent. Start normalization and emitted counts are recomputed from
 the selected plan. These are structural preferences in the existing cost
 model, not measured load latency or proof of a performance improvement.
+
+Before the solver-based prefetch refinement, one bounded scan can try moving
+each qualifying producer to the stage immediately before its consumer while
+keeping all issue residues and resource-order choices. Buffer-distance edges
+determine any additional versions using exact integer arithmetic, shared with
+the final emitted-version calculation. A candidate must strictly improve the
+same preference objective and evaluate every original hard assertion to true
+without model completion. An incomplete or unsupported model is retained.
+This scan adds no solver query and does not change the optimization budgets.
 
 For ordinary automatic 2201 mixed loops, shared memory effects identify forward
 cross-core writer-to-reader handoffs separately from reverse slot-release
