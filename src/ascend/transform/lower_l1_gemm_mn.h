@@ -56,6 +56,11 @@ using namespace tirx;
 using StorageSet =
     std::unordered_set<Var, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>;
 
+// Pass-local facts keyed by freshly generated loop Vars. They are consumed by
+// L1-to-L0 lowering in this pass, never accepted as user-authored annotations.
+using PhysicalMNLoops =
+    std::unordered_map<Var, int64_t, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>;
+
 // Decode only the explicit typed transport, never a scalar BufferLoad or an
 // opaque pointer. The ordinary operator constructors consume the same region.
 inline std::optional<AccessRegion> TypedRegion(const PrimExpr &expression) {
@@ -413,10 +418,11 @@ inline std::vector<int64_t> AlignedDivisors(int64_t extent) {
 class PairRewriter : public arith::IRMutatorWithAnalyzer {
 public:
   PairRewriter(arith::Analyzer *analyzer, const KernelFacts &facts,
-               Buffer accumulator, int64_t budget, uint64_t suffix)
+               Buffer accumulator, int64_t budget, uint64_t suffix,
+               PhysicalMNLoops *physical_mn_loops)
       : IRMutatorWithAnalyzer(analyzer), facts_(facts),
-        accumulator_(std::move(accumulator)), budget_(budget), suffix_(suffix) {
-  }
+        accumulator_(std::move(accumulator)), budget_(budget), suffix_(suffix),
+        physical_mn_loops_(physical_mn_loops) {}
 
   Buffer scratch;
   int scratch_versions{1};
@@ -549,6 +555,10 @@ private:
     DataType index_type = DataType::Int(
         tile_count <= std::numeric_limits<int32_t>::max() ? 32 : 64);
     Var tile("gemm_tile_" + suffix, index_type);
+    // The closed pair has no intervening L1 write. Its fresh loop Var cannot
+    // occur in the input: A changes only with floor(tile / n_tiles), while B
+    // changes with tile % n_tiles. Preserve this fact for native A reuse.
+    physical_mn_loops_->emplace(tile, n_tiles);
     PrimExpr mi = indexdiv(tile, make_const(index_type, n_tiles));
     PrimExpr ni = indexmod(tile, make_const(index_type, n_tiles));
     Array<Range> c;
@@ -647,6 +657,7 @@ private:
   Buffer accumulator_;
   int64_t budget_;
   uint64_t suffix_;
+  PhysicalMNLoops *physical_mn_loops_;
   int blocked_{0};
 };
 
@@ -684,7 +695,7 @@ private:
 };
 
 inline SBlock RewriteRoot(const SBlock &root, const AscendTargetInfo &target,
-                          uint64_t suffix) {
+                          uint64_t suffix, PhysicalMNLoops *physical_mn_loops) {
   arith::Analyzer analyzer;
   Buffer oversized;
   for (const Buffer &buffer : root->alloc_buffers) {
@@ -738,7 +749,8 @@ inline SBlock RewriteRoot(const SBlock &root, const AscendTargetInfo &target,
            "reserving other root allocations";
     budget -= bytes * count;
   }
-  PairRewriter rewriter(&analyzer, facts, oversized, budget, suffix);
+  PairRewriter rewriter(&analyzer, facts, oversized, budget, suffix,
+                        physical_mn_loops);
   Stmt body = rewriter(root->body);
   TVM_FFI_CHECK(rewriter.scratch.defined(), ValueError)
       << "Ascend dav-2201 physical M/N GEMM requires adjacent full-clear "
@@ -785,14 +797,20 @@ public:
   explicit PhysicalMNGemmLowerer(const AscendTargetInfo &target)
       : target_(target) {}
 
+  const PhysicalMNLoops &physical_mn_loops() const {
+    return physical_mn_loops_;
+  }
+
 private:
   Stmt VisitStmt_(const SBlockNode *op) final {
     if (op->name_hint == "tilelang_root")
-      return RewriteRoot(ffi::GetRef<SBlock>(op), target_, next_root_++);
+      return RewriteRoot(ffi::GetRef<SBlock>(op), target_, next_root_++,
+                         &physical_mn_loops_);
     return StmtMutator::VisitStmt_(op);
   }
   const AscendTargetInfo &target_;
   uint64_t next_root_{0};
+  PhysicalMNLoops physical_mn_loops_;
 };
 
 } // namespace l1_gemm_mn_detail

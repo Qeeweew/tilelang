@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -66,11 +67,24 @@ Array<Range> SubKSource(const BufferRegion &region, PrimExpr k_start,
 
 class L1GemmLowerer : public StmtMutator {
 public:
-  explicit L1GemmLowerer(const AscendTargetInfo &target) : target_(target) {}
+  L1GemmLowerer(
+      const AscendTargetInfo &target,
+      const ascend::l1_gemm_mn_detail::PhysicalMNLoops &physical_mn_loops)
+      : target_(target), physical_mn_loops_(physical_mn_loops) {}
 
 private:
+  struct PhysicalMNContext {
+    Var tile;
+    int64_t n_tiles;
+  };
+
   Stmt VisitStmt_(const ForNode *op) final {
     Optional<PrimExpr> previous = auto_pipeline_bound_;
+    auto previous_mn = physical_mn_;
+    physical_mn_.reset();
+    auto mn = physical_mn_loops_.find(op->loop_var);
+    if (mn != physical_mn_loops_.end() && mn->second > 1)
+      physical_mn_ = PhysicalMNContext{op->loop_var, mn->second};
     if (auto intent = op->annotations.Get("tl.ascend_auto_pipeline")) {
       auto_pipeline_bound_ = std::nullopt;
       if (intent.value().cast<bool>()) {
@@ -86,6 +100,7 @@ private:
     }
     Stmt rewritten = StmtMutator::VisitStmt_(op);
     auto_pipeline_bound_ = previous;
+    physical_mn_ = previous_mn;
     return rewritten;
   }
 
@@ -93,11 +108,21 @@ private:
     if (op->name_hint != "tilelang_root")
       return StmtMutator::VisitStmt_(op);
     pending_allocations_.emplace_back();
+    pending_single_versions_.emplace_back();
     SBlock rewritten = Downcast<SBlock>(StmtMutator::VisitStmt_(op));
     std::vector<Buffer> pending = std::move(pending_allocations_.back());
     pending_allocations_.pop_back();
     for (const Buffer &buffer : pending)
       rewritten.CopyOnWrite()->alloc_buffers.push_back(buffer);
+    if (!pending_single_versions_.back().empty()) {
+      BufferVersionMap versions;
+      if (auto value = rewritten->annotations.Get(kBufferVersionsMap))
+        versions = value.value().cast<BufferVersionMap>();
+      for (const Var &storage : pending_single_versions_.back())
+        versions.Set(storage, 1);
+      rewritten.CopyOnWrite()->annotations.Set(kBufferVersionsMap, versions);
+    }
+    pending_single_versions_.pop_back();
     return rewritten;
   }
 
@@ -166,7 +191,8 @@ private:
 
   Stmt MakeChunk(const Call &original, const Gemm &gemm, const Buffer &a_l0,
                  const Buffer &b_l0, PrimExpr k_start, int64_t k_extent,
-                 PrimExpr clear_accum, bool is_last) {
+                 PrimExpr clear_accum, bool is_last,
+                 Optional<PrimExpr> a_load_guard = std::nullopt) {
     const auto &a = gemm->aRegion_->region;
     const auto &b = gemm->bRegion_->region;
     PrimExpr chunk_k = make_const(DataType::Int(32), k_extent);
@@ -180,6 +206,8 @@ private:
                     kAccessRead),
          RegionCall(a_l0, a_dst, kAccessWrite)},
         {}, original->span));
+    if (a_load_guard.has_value())
+      a_copy = IfThenElse(a_load_guard.value(), a_copy);
     Stmt b_copy =
         Evaluate(Call(DataType::Handle(), AscendCopy::Get(),
                       {RegionCall(gemm->b_,
@@ -241,11 +269,23 @@ private:
 
     int64_t full_chunks = gemm->k_ / tile_k;
     int64_t tail = gemm->k_ % tile_k;
+    Optional<PrimExpr> a_load_guard;
+    if (physical_mn_.has_value() && full_chunks + (tail != 0) == 1) {
+      const PhysicalMNContext &mn = physical_mn_.value();
+      a_load_guard =
+          indexmod(mn.tile, make_const(mn.tile.dtype(), mn.n_tiles)) == 0;
+      // This physical A persists across all N readers of one M tile. A
+      // per-tile version selector would read uninitialized slots on N > 0.
+      // Common typed-region dependency analysis retains the final reader's
+      // WAR before the next M/owner/epoch overwrites this single allocation.
+      pending_single_versions_.back().push_back(a_l0->data);
+    }
     Array<Stmt> sequence;
     if (full_chunks > 0) {
       if (full_chunks == 1) {
         sequence.push_back(MakeChunk(original, gemm, a_l0, b_l0, 0, tile_k,
-                                     gemm->clearAccum_, tail == 0));
+                                     gemm->clearAccum_, tail == 0,
+                                     a_load_guard));
       } else {
         Var sub_k("gemm_sub_k_" + suffix, DataType::Int(32));
         Stmt body = MakeChunk(original, gemm, a_l0, b_l0,
@@ -304,10 +344,11 @@ private:
         pending_allocations_.back().push_back(tail_a);
         pending_allocations_.back().push_back(tail_b);
       }
-      sequence.push_back(MakeChunk(
-          original, gemm, tail_a, tail_b,
-          make_const(DataType::Int(32), full_chunks * tile_k), tail,
-          full_chunks == 0 ? gemm->clearAccum_ : const_false(), true));
+      sequence.push_back(
+          MakeChunk(original, gemm, tail_a, tail_b,
+                    make_const(DataType::Int(32), full_chunks * tile_k), tail,
+                    full_chunks == 0 ? gemm->clearAccum_ : const_false(), true,
+                    a_load_guard));
     }
     return SeqStmt::Flatten(sequence);
   }
@@ -315,7 +356,10 @@ private:
   const AscendTargetInfo &target_;
   arith::Analyzer analyzer_;
   Optional<PrimExpr> auto_pipeline_bound_;
+  const ascend::l1_gemm_mn_detail::PhysicalMNLoops &physical_mn_loops_;
+  std::optional<PhysicalMNContext> physical_mn_;
   std::vector<std::vector<Buffer>> pending_allocations_;
+  std::vector<std::vector<Var>> pending_single_versions_;
   uint64_t next_gemm_{0};
 };
 
@@ -332,7 +376,7 @@ tvm::transform::Pass AscendLowerL1Gemm() {
       return func;
     ascend::l1_gemm_mn_detail::PhysicalMNGemmLowerer physical_tiles(info);
     Stmt body = physical_tiles(func->body);
-    L1GemmLowerer lowerer(info);
+    L1GemmLowerer lowerer(info, physical_tiles.physical_mn_loops());
     func.CopyOnWrite()->body = lowerer(body);
     return func;
   };

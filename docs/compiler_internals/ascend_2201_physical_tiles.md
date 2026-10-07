@@ -38,6 +38,17 @@ static serial loop supplies the physical tile ordinal, including across M/N
 boundaries; enclosing automatic pipeline intent remains visible to the existing
 scheduling path.
 
+When a physical GEMM needs only one native K chunk, native lowering loads A
+on the first N tile of each M tile and reuses that L0A data for the remaining
+N tiles. The generating pass carries the M/N geometry through fresh loop
+identities within the pass; user annotations do not authorize this reuse.
+The closed producer/export loop has no intervening L1 writer. A keeps one
+fixed physical version so later N readers address the initialized slot.
+Its typed regions retain first-load RAW and last-reader WAR across M tiles,
+owners and enclosing epochs. Multiple K chunks retain their ordinary loads
+because one L0A tile cannot cache all of K. This reduces repeated movement
+without adding L0 capacity or changing GEMM accumulation or export order.
+
 An adjacent producer/export pair may occur inside a shared conditional branch,
 an Ascend Stage, or a transparent CUBE core block. The replacement stays inside
 that same scope: its guard, stage and owner loop still dominate every physical
