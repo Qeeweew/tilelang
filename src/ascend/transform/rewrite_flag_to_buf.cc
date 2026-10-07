@@ -7,8 +7,9 @@
  * A set_flag/wait_flag event-pair (hard_event) owns only 8 event_id slots. A
  * sparse layout may use at most 8 slots while still containing an out-of-range
  * id, so every such layout is compacted into [0,8). When a hard_event's sync
- * points need more than 8 slots in total, some must spill to the shared 32-slot
- * asc_lock/asc_unlock mutex pool. To waste as few flag slots as possible, we
+ * points need more than 8 slots in total, dav-3510 can spill to the shared
+ * 32-slot asc_lock/asc_unlock mutex pool; dav-2201 must reject the overflow.
+ * To waste as few flag slots as possible, we
  * treat each sync point as an indivisible block (a contiguous event_id range of
  * size = its version count, since a dynamic event_id = iter%nv + base cannot be
  * split across the 8-boundary at runtime) and run a 0/1 knapsack (capacity 8)
@@ -48,6 +49,7 @@
 #include <vector>
 
 #include "ascend/op/builtin.h"
+#include "ascend/target_utils.h"
 #include "transform/common/constr_visitor.h"
 
 namespace tvm {
@@ -313,6 +315,15 @@ PrimFunc RewriteFlagToBufFn(PrimFunc f) {
   if (collector.order.empty())
     return f;
 
+  // CANN 9.1 c_api/sync/sync.h declares ascMutexExecuteMode and
+  // asc_lock/asc_unlock only under __NPU_ARCH__ == 3510. Sparse compaction is
+  // legal on both targets, but dav-2201 cannot lower a true flag overflow to
+  // mutexes. Unbound single-pass inputs retain the upstream dav-3510 default.
+  auto target = f->GetAttr<Target>(tvm::attr::kTarget);
+  bool supports_mutex_spill =
+      !target.has_value() || GetAscendTargetInfo(target.value()).architecture ==
+                                 AscendArchitecture::kDav3510;
+
   std::unordered_map<std::string, std::vector<BlockAssign>> assign;
   // Start spilled buf_id allocation past the slots gemm_l1 already reserves.
   int mutex_running = static_cast<int>(collector.reserved_hwm);
@@ -328,6 +339,20 @@ PrimFunc RewriteFlagToBufFn(PrimFunc f) {
     }
     if (total <= kFlagSlotsPerPair && already_legal)
       continue; // Already fits in the physical flag namespace.
+
+    if (total > kFlagSlotsPerPair && !supports_mutex_spill) {
+      std::ostringstream ranges;
+      for (size_t i = 0; i < blocks.size(); ++i) {
+        if (i != 0)
+          ranges << ", ";
+        ranges << "[" << blocks[i].lo << ".." << blocks[i].hi << "]";
+      }
+      TVM_FFI_THROW(ValueError)
+          << "RewriteFlagToBuf: dav-2201 hard_event '" << he << "' requires "
+          << total << " local event slots from ranges " << ranges.str()
+          << "; limit is " << kFlagSlotsPerPair
+          << ". Mutex spill requires dav-3510 asc_lock/asc_unlock support.";
+    }
 
     // A sparse out-of-range layout that still fits in 8 slots only needs
     // compaction. Use knapsack selection only when capacity is truly exceeded.

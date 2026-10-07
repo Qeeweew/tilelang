@@ -31,6 +31,13 @@ Cross-core counters have a different contract. Their collective participants,
 ID allocation and finite completion protocol are handled separately. This
 local event rule does not change dav-3510 synchronization.
 
+Each local hard-event namespace has eight IDs. The late flag normalization
+pass can compact sparse numbering into that namespace. CANN 9.1 exposes
+`asc_lock`/`asc_unlock` only for dav-3510; dav-2201 cannot spill excess local
+flags into that mutex pool. A 2201 layout requiring more than eight actual
+slots is diagnosed with its hard event and ID ranges before native code is
+emitted. Changing stage or buffer counts does not change this hardware limit.
+
 ## A carried edge
 
 Let `src(i) -> dst(i+d)` be a dependency in one epoch domain. If the completion
@@ -72,6 +79,17 @@ whole loop or one exactly proven contiguous interval with static cut points.
 The proof expands established condition definitions and checks equivalence
 on actual loop iterations, including nonzero origins and positive steps.
 Periodic, gapped, or unknown active sequences are diagnosed.
+
+Before rebasing active spans, a carried local protocol can be removed when a
+wider protocol already covers it at exactly the same physical source and
+destination insertion positions. Both must use the same loop's raw lexical
+ordinal and positive distance, with lexical domains owned by that loop.
+The narrower source and destination guards must separately imply the wider
+guards using only the loop context. Counter clocks, cross-core completion and
+different physical endpoints are excluded. The compiler retains the wider
+protocol's complete seed/set/wait/drain lifecycle; it does not assign the two
+protocols one shared binary ID. Carried dependency projection into different
+active sequences remains subject to its existing stricter checks.
 
 For an active ordinal interval `[L,U)`, the event clock is rebased to `i-L`
 and its trip count is `max(U-L,0)`. Physical buffer indexing and task guards

@@ -1711,9 +1711,84 @@ private:
         });
   }
 
+  bool CoversLocalProtocol(const SyncPoint &wide, const SyncPoint &narrow,
+                           ControlNode *loop) const {
+    if (architecture_ != AscendArchitecture::kDav2201 || loop == nullptr ||
+        wide.counter_group_id != 0 || narrow.counter_group_id != 0 ||
+        wide.flag_loop != loop || narrow.flag_loop != loop ||
+        wide.edge.distance <= 0 || wide.edge.distance != narrow.edge.distance ||
+        site_registry_.IsCrossCore(wide) ||
+        site_registry_.IsCrossCore(narrow) || !site_registry_.UsesFlag(wide) ||
+        !site_registry_.HasSameFlagKind(wide, narrow)) {
+      return false;
+    }
+    const SyncInsertionSite &wide_src = site_registry_.Src(wide);
+    const SyncInsertionSite &wide_dst = site_registry_.Dst(wide);
+    const SyncInsertionSite &narrow_src = site_registry_.Src(narrow);
+    const SyncInsertionSite &narrow_dst = site_registry_.Dst(narrow);
+    if (!wide_src.HasSamePhysicalPosition(narrow_src) ||
+        !wide_dst.HasSamePhysicalPosition(narrow_dst)) {
+      return false;
+    }
+    for (const SyncInsertionSite *site :
+         {&wide_src, &wide_dst, &narrow_src, &narrow_dst}) {
+      const EpochDomain &domain = site_registry_.Domain(*site);
+      if (domain.IsCounter() || domain.owner != loop)
+        return false;
+    }
+
+    // This runs before active-span normalization. Equal raw lexical clocks
+    // and distances preserve src(e)->dst(e+d), even when one domain skips
+    // leading/trailing epochs. Do not project a carried closure edge into a
+    // different active sequence or share its binary IDs: discard the whole
+    // covered protocol, including its eventual seed and drain instead.
+    const ConstrSet &context = loop->GetLoopBodyContext();
+    arith::Analyzer analyzer;
+    context.Populate(analyzer);
+    PrimExpr lexical_iteration = CalculateIterationCount(loop);
+    if (!analyzer.CanProve(wide.flag_iteration == lexical_iteration) ||
+        !analyzer.CanProve(narrow.flag_iteration == lexical_iteration)) {
+      return false;
+    }
+    // The context contains only the enclosing loop facts, never either
+    // endpoint's activation guard. Implication is proved separately at the
+    // identical physical source and destination positions.
+    return GuardImplies(narrow_src.GetGuard(), wide_src.GetGuard(), context) &&
+           GuardImplies(narrow_dst.GetGuard(), wide_dst.GetGuard(), context);
+  }
+
+  void RemoveCoveredLocalProtocols(std::vector<SyncPoint> &sync_points,
+                                   ControlNode *loop) const {
+    std::vector<bool> covered(sync_points.size(), false);
+    for (size_t narrow = 0; narrow < sync_points.size(); ++narrow) {
+      for (size_t wide = 0; wide < sync_points.size(); ++wide) {
+        if (wide == narrow || covered[wide] ||
+            !CoversLocalProtocol(sync_points[wide], sync_points[narrow],
+                                 loop)) {
+          continue;
+        }
+        // Equivalent protocols keep their first representative. Strict guard
+        // inclusion instead keeps the wider protocol regardless of ordering.
+        if (wide < narrow || !CoversLocalProtocol(sync_points[narrow],
+                                                  sync_points[wide], loop)) {
+          covered[narrow] = true;
+          break;
+        }
+      }
+    }
+    std::vector<SyncPoint> retained;
+    retained.reserve(sync_points.size());
+    for (size_t i = 0; i < sync_points.size(); ++i) {
+      if (!covered[i])
+        retained.push_back(std::move(sync_points[i]));
+    }
+    sync_points = std::move(retained);
+  }
+
   void OptimizeSyncPoints(std::vector<SyncPoint> &sync_points,
                           DepClosure &closure, int max_distance,
                           ControlNode *projection_scope) const {
+    RemoveCoveredLocalProtocols(sync_points, projection_scope);
     std::stable_sort(sync_points.begin(), sync_points.end());
     std::vector<SyncPoint> emit;
     for (SyncPoint &sync_point : sync_points) {
