@@ -82,16 +82,16 @@ TVM_REGISTER_OP("tl.ascend_membase.brcb_f32")
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 TVM_REGISTER_OP("tl.ascend_membase.sub_rows_f32")
-    .set_num_inputs(5)
+    .set_num_inputs(6)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 TVM_REGISTER_OP("tl.ascend_membase.mul_rows_f32")
-    .set_num_inputs(5)
+    .set_num_inputs(6)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
 TVM_REGISTER_OP("tl.ascend_membase.div_rows_f32")
-    .set_num_inputs(5)
+    .set_num_inputs(6)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
@@ -292,7 +292,8 @@ private:
     BufferLoad dst = Downcast<BufferLoad>(Downcast<Call>(args[0])->args[0]);
     for (size_t i = 1; i < args.size(); ++i) {
       const auto *ptr = args[i].as<CallNode>();
-      if (!ptr || !ptr->op.same_as(tl::access_ptr()))
+      if (!ptr || (!ptr->op.same_as(tl::access_ptr()) &&
+                   !ptr->op.same_as(tl::region())))
         continue;
       BufferLoad src = Downcast<BufferLoad>(ptr->args[0]);
       if (!src->buffer->data.same_as(dst->buffer->data))
@@ -389,6 +390,47 @@ private:
                                    Substitute(physical, base_map_) + row);
   }
 
+  // A strided native row instruction consumes a real logical rectangle.
+  // Keep that rectangle through scheduling and version materialization; only
+  // AscendLowerTileOp converts it to a pointer after effects have been used.
+  bool IsRowMatrix(const BufferLoad &load) {
+    if (load->indices.size() != 2 || !batch_row_var_.has_value() ||
+        !batch_column_var_.has_value())
+      return false;
+    BufferLoad base = Base(load);
+    return analyzer_.CanProveEqual(load->indices[0],
+                                   base->indices[0] + batch_row_var_.value() -
+                                       batch_row_min_) &&
+           analyzer_.CanProveEqual(
+               load->indices[1], base->indices[1] + batch_column_var_.value() -
+                                     batch_column_min_) &&
+           analyzer_.CanProveEqual(
+               load->buffer->shape[1],
+               make_const(load->buffer->shape[1].dtype(), batch_columns_));
+  }
+
+  BufferLoad NewRowScratch() {
+    Buffer buffer = decl_buffer(
+        {make_const(DataType::Int(32), batch_rows_),
+         make_const(DataType::Int(32), batch_columns_)},
+        DataType::Float(32), "membase_tmp_" + std::to_string(next_temporary_++),
+        "shared.dyn");
+    scratch_.push_back(buffer);
+    return BufferLoad(buffer, {make_const(DataType::Int(32), 0),
+                               make_const(DataType::Int(32), 0)});
+  }
+
+  PrimExpr RowChunkRegion(const BufferLoad &base, int mask, int64_t column) {
+    ICHECK_EQ(base->indices.size(), 2U);
+    Array<PrimExpr> indices = base->indices;
+    indices.Set(1, indices[1] + make_const(indices[1].dtype(), column));
+    return Call(DataType::Handle(), tl::region(),
+                {BufferLoad(base->buffer, indices),
+                 make_const(DataType::Int(32), mask),
+                 make_const(indices[0].dtype(), batch_rows_),
+                 make_const(indices[1].dtype(), 64)});
+  }
+
   struct RowBinary {
     BufferLoad matrix;
     BufferLoad row;
@@ -422,9 +464,9 @@ private:
         b->buffer->dtype != DataType::Float(32))
       return std::nullopt;
     BufferLoad aa = GetRef<BufferLoad>(a), bb = GetRef<BufferLoad>(b);
-    if (IsRowBroadcast(aa) && DenseOrScalar(bb, false))
+    if (IsRowBroadcast(aa) && DenseOrScalar(bb, false) && IsRowMatrix(bb))
       return RowBinary{bb, aa, name, true};
-    if (IsRowBroadcast(bb) && DenseOrScalar(aa, false))
+    if (IsRowBroadcast(bb) && DenseOrScalar(aa, false) && IsRowMatrix(aa))
       return RowBinary{aa, bb, name, false};
     return std::nullopt;
   }
@@ -451,16 +493,24 @@ private:
     } else {
       blocks = found->second;
     }
-    BufferLoad dst =
-        output.has_value() ? output.value() : NewScratch(DataType::Float(32));
-    PrimExpr matrix_ptr = Ptr(matrix, kAccessRead);
-    PrimExpr row_ptr = Ptr(blocks, kAccessRead, block_elements);
-    Emit(binary.name,
-         {Ptr(dst, kAccessWrite), binary.row_lhs ? row_ptr : matrix_ptr,
-          binary.row_lhs ? matrix_ptr : row_ptr,
-          make_const(DataType::UInt(8), batch_rows_),
-          make_const(DataType::Bool(), binary.row_lhs)},
-         false);
+    BufferLoad dst = output.has_value() ? output.value() : NewRowScratch();
+    PrimExpr row_region = Call(
+        DataType::Handle(), tl::region(),
+        {blocks, make_const(DataType::Int(32), kAccessRead), block_elements});
+    // Each instruction processes 64 columns of all owned rows. Its exact
+    // multidimensional effects exclude the gaps between chunks and never
+    // describe a fictitious contiguous R*C span from a nonzero column origin.
+    for (int64_t column = 0; column < batch_columns_; column += 64) {
+      PrimExpr matrix_region = RowChunkRegion(matrix, kAccessRead, column);
+      Emit(binary.name,
+           {RowChunkRegion(dst, kAccessWrite, column),
+            binary.row_lhs ? row_region : matrix_region,
+            binary.row_lhs ? matrix_region : row_region,
+            make_const(DataType::UInt(8), batch_rows_),
+            make_const(DataType::Bool(), binary.row_lhs),
+            make_const(DataType::UInt(8), batch_columns_ / 8)},
+           false);
+    }
     return {dst, PrimExpr()};
   }
 
@@ -519,14 +569,20 @@ private:
     Map<Var, PrimExpr> saved_base = base_map_;
     PrimExpr saved_linear = linear_index_, saved_active = active_count_;
     int64_t saved_count = count_, saved_rows = batch_rows_;
+    int64_t saved_columns = batch_columns_;
     Optional<Var> saved_var = batch_row_var_;
     PrimExpr saved_min = batch_row_min_;
+    Optional<Var> saved_column_var = batch_column_var_;
+    PrimExpr saved_column_min = batch_column_min_;
     auto restore = [&]() {
       base_map_ = saved_base;
       linear_index_ = saved_linear;
       active_count_ = saved_active;
       count_ = saved_count;
       batch_rows_ = saved_rows;
+      batch_columns_ = saved_columns;
+      batch_column_var_ = saved_column_var;
+      batch_column_min_ = saved_column_min;
       batch_row_var_ = saved_var;
       batch_row_min_ = saved_min;
     };
@@ -539,10 +595,17 @@ private:
     count_ = rows * columns;
     // Dense independent assignments need only the ordinary count-mode
     // contract. Compact row operands additionally require Brcb's exact
-    // eight-row input blocks and the normal binary's one-FP32-VL row shape.
-    batch_rows_ = columns == 64 && rows % 8 == 0 && rows <= 255 ? rows : 0;
+    // eight-row input blocks and 64-lane normal binary chunks. The row repeat
+    // stride is in 32B blocks and must fit the native uint8_t operand.
+    batch_rows_ =
+        columns % 64 == 0 && columns / 8 <= 255 && rows % 8 == 0 && rows <= 255
+            ? rows
+            : 0;
+    batch_columns_ = columns;
     batch_row_var_ = op->loop_var;
     batch_row_min_ = op->min;
+    batch_column_var_ = column->loop_var;
+    batch_column_min_ = column->min;
 
     std::vector<BufferLoad> reads, writes;
     std::unordered_set<const BufferLoadNode *> row_reads;
@@ -576,6 +639,8 @@ private:
     };
     for (const BufferLoad &write : writes) {
       valid &= DenseOrScalar(write, false) && IsAligned32(Base(write));
+      if (!row_reads.empty())
+        valid &= IsRowMatrix(write);
       for (const BufferLoad &other : writes)
         valid &= exact_or_distinct(write, other);
     }
@@ -1368,8 +1433,11 @@ private:
   ValueMap values_;
   std::unordered_map<PrimExpr, BufferLoad, ValueHash, ValueEqual> row_blocks_;
   int64_t batch_rows_{0};
+  int64_t batch_columns_{0};
   Optional<Var> batch_row_var_;
   PrimExpr batch_row_min_;
+  Optional<Var> batch_column_var_;
+  PrimExpr batch_column_min_;
   int64_t count_{0};
   int next_temporary_{0};
 };

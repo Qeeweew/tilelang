@@ -173,33 +173,47 @@ typed rounding boundaries. Logical and physical continuity, alignment and
 same-storage alias checks establish lane independence; unowned serial loops,
 cross-row dependencies, predicates and dynamic domains retain their controls.
 
-Static FP32 row broadcasts in ordinary `T.Parallel(R, 64)` assignments can
-use one native Brcb and one strided subtract, multiply or division operation.
-Brcb fetches eight compact FP32 row values per repeat and copies each payload
-into one 32-byte block. Compiler-owned private UB scratch has `R * 8` FP32
-elements (`32 * R` bytes); it is allocated before scheduling and has an ordinary
-buffer lifetime. Both row-factor operand orders retain their mathematical
-order, including `row / matrix`. Division uses the same native FP32 `vdiv`
-primitive as the existing count API and inherits its accuracy and special-value
-limitations; it does not insert a reciprocal algorithm.
+Static FP32 row broadcasts in ordinary `T.Parallel(R, C)` assignments can
+use one native Brcb followed by one strided subtract, multiply or division
+operation for each 64-column chunk. Brcb fetches eight compact FP32 row values
+per repeat and copies each payload into one 32-byte block. Compiler-owned
+private UB scratch has `R * 8` FP32 elements (`32 * R` bytes); it is allocated
+before scheduling and has an ordinary buffer lifetime. Both row-factor operand
+orders retain their mathematical order, including `row / matrix`. Division
+uses the same native FP32 `vdiv` primitive as the existing count API and
+inherits its accuracy and special-value limitations; it does not insert a
+reciprocal algorithm.
 
 This path requires a proved static positive row count divisible by eight and
-at most 255, contiguous physical matrix rows of exactly 64 FP32 elements,
-compact row state, and 32-byte-aligned starts. Unconditional consecutive
-assignments can keep Exp and terminal casts at the whole-matrix count while
-preserving each expression node and assignment order. Row state must not alias
-matrix or output storage. Same-storage matrix operands require the identical
-typed physical start; shifted views, lane predicates, dynamic or empty row
-domains, and other widths retain the existing lowering. Partitioned mixed
-kernels use the same test on each AIV's actual private row domain.
+at most 255, a real rank-2 dense matrix with `C` a positive multiple of 64,
+compact row state, and 32-byte-aligned starts. The matrix row repeat stride is
+`C / 8` 32-byte blocks and must fit UInt8, so the largest selected width is
+1984. A row-factor block advances by one 32-byte block for each repeat. Every
+chunk uses normal/full mask; its matrix and destination start at column
+`0, 64, ...` and process exactly 64 columns of each owned row. Temporary matrix
+results have a real `[R, C]` allocation, rather than a flattened alias.
+Unconditional consecutive assignments keep Exp and terminal casts at the
+whole-matrix count while preserving each expression node and assignment order.
+Row state must not alias matrix or output storage. Same-storage matrix operands
+require the identical typed physical start. Flattened 1D representations,
+shifted views, lane predicates, dynamic or empty row domains, and unsupported
+widths retain the existing lowering. Partitioned mixed kernels apply the same
+checks to each AIV's actual private row domain.
 
-The IR retains FP32 `tl.access_ptr` read/write regions: Brcb reads `R` values
-and writes `R * 8`, and the strided binary reads a matrix of `R * 64` and the
-`R * 8` broadcast blocks while writing `R * 64`. Only native Brcb codegen
-reinterprets FP32 pointers as UInt32, matching the CANN 9.1 b32 interface.
-Every normal-mode instruction explicitly defines normal/full mask. These
-operations use PIPE_V and the shared RAW/WAR/WAW, version and completion
-analyses; no hidden event or composite softmax algorithm is introduced.
+Brcb retains typed FP32 `tl.access_ptr` effects for its contiguous read of `R`
+values and write of `R * 8` blocks. Each strided binary instead retains exact
+FP32 `tl.region` operands for its `[R, 64]` matrix/output chunk and `R * 8`
+broadcast elements, plus its explicit row stride. The common memory detector
+and multi-buffer rewriter consume these regions; independent source and
+destination version axes remain singleton region axes. After scheduling and
+synchronization, `AscendLowerTileOp` validates this contract for the three row
+binary operations and converts their regions to pointers using the existing
+buffer/layout remapping. The resulting late pointer extent is a bounded
+linear hull `(R - 1) * C + 64`; it does not replace the earlier exact chunk
+effects. Only native Brcb codegen reinterprets FP32 pointers as UInt32, matching
+the CANN 9.1 b32 interface. These operations use PIPE_V and the shared
+RAW/WAR/WAW, version and completion analyses; no hidden event or composite
+softmax algorithm is introduced.
 
 Private UB copies and direct dense Parallel assignments preserve source bits.
 The 2201 count primitive uses UInt16 OR of the source with itself, including

@@ -2063,9 +2063,11 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
                  callee->name == "tl.ascend_membase.mul_rows_f32" ||
                  callee->name == "tl.ascend_membase.div_rows_f32")) {
     ICHECK(is_dav2201_) << "FP32 row binary requires dav-2201";
-    ICHECK_EQ(op->args.size(), 5U);
+    ICHECK_EQ(op->args.size(), 6U);
     const auto *row_lhs = op->args[4].as<IntImmNode>();
-    ICHECK(row_lhs != nullptr);
+    const auto *stride = op->args[5].as<IntImmNode>();
+    ICHECK(row_lhs && stride && stride->value > 0 && stride->value <= 255 &&
+           stride->value % 8 == 0);
     std::string dst = PrintExpr(op->args[0]);
     std::string lhs = PrintExpr(op->args[1]);
     std::string rhs = PrintExpr(op->args[2]);
@@ -2083,9 +2085,10 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     PrintIndent();
     stream << name << "(" << dst << ", " << lhs << ", " << rhs << ", "
            << repeats << ", uint8_t(1), uint8_t(" << (row_lhs->value ? 0 : 1)
-           << "), uint8_t(" << (row_lhs->value ? 1 : 0)
-           << "), uint8_t(8), uint8_t(" << (row_lhs->value ? 1 : 8)
-           << "), uint8_t(" << (row_lhs->value ? 8 : 1) << "));\n";
+           << "), uint8_t(" << (row_lhs->value ? 1 : 0) << "), uint8_t("
+           << stride->value << "), uint8_t("
+           << (row_lhs->value ? 1 : stride->value) << "), uint8_t("
+           << (row_lhs->value ? stride->value : 1) << "));\n";
     // Leave normal/full mask explicitly defined for a following normal-mode
     // instruction. Count-mode consumers define their own count mask.
     PrintIndent();

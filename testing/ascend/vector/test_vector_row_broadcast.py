@@ -80,6 +80,10 @@ def _ptrs(call):
     return [arg for arg in call.args if isinstance(arg, tirx.Call) and arg.op.name == "tl.access_ptr"]
 
 
+def _regions(call):
+    return [arg for arg in call.args if isinstance(arg, tirx.Call) and arg.op.name == "tl.region"]
+
+
 def _source(program):
     return tilelang.lower(program, target=TARGET, enable_host_codegen=False, enable_device_compile=False).kernel_source
 
@@ -96,13 +100,15 @@ def test_static_full_vl_broadcast_exposes_exact_f32_regions(rows, operation):
     assert [int(ptr.args[1]) for ptr in brcb_ptrs] == [rows * 8, rows]
     assert [int(ptr.args[2]) for ptr in brcb_ptrs] == [2, 1]
     assert all(ptr.args[0].buffer.dtype == "float32" for ptr in brcb_ptrs)
-    binary_ptrs = _ptrs(binary)
-    expected = [rows * 64, rows * 8, rows * 64] if operation.startswith("r") else [rows * 64, rows * 64, rows * 8]
-    assert [int(ptr.args[1]) for ptr in binary_ptrs] == expected
-    assert [int(ptr.args[2]) for ptr in binary_ptrs] == [2, 1, 1]
-    assert all(ptr.args[0].buffer.dtype == "float32" for ptr in binary_ptrs)
+    binary_regions = _regions(binary)
+    expected = [[rows, 64], [rows * 8], [rows, 64]] if operation.startswith("r") else [[rows, 64], [rows, 64], [rows * 8]]
+    assert [[int(extent) for extent in region.args[2:]] for region in binary_regions] == expected
+    assert [int(region.args[1]) for region in binary_regions] == [2, 1, 1]
+    assert all(region.args[0].buffer.dtype == "float32" for region in binary_regions)
+    assert int(binary.args[5]) == 8
+    assert not _ptrs(binary)
     scratch_data = brcb_ptrs[0].args[0].buffer.data
-    assert any(ptr.args[0].buffer.data.same_as(scratch_data) for ptr in binary_ptrs[1:])
+    assert any(region.args[0].buffer.data.same_as(scratch_data) for region in binary_regions[1:])
     scratch = [buffer for block in nodes(after, tirx.SBlock) for buffer in block.alloc_buffers if buffer.data.same_as(scratch_data)]
     assert len(scratch) == 1 and scratch[0].scope() == "shared.dyn"
     assert int(scratch[0].shape[0]) == rows * 8
@@ -132,7 +138,7 @@ def test_ordinary_softmax_expression_has_one_sub_exp_and_terminal_cast(dtype):
 
 
 @pytest.mark.parametrize("rows,columns,dtype,row_offset", [(7, 64, "float32", 0), (9, 64, "float32", 0),
-    (256, 64, "float32", 0), (16, 32, "float32", 0), (16, 128, "float32", 0),
+    (256, 64, "float32", 0), (16, 32, "float32", 0), (16, 2048, "float32", 0),
     (16, 64, "float16", 0), (16, 64, "bfloat16", 0), (16, 64, "float32", 1)])
 @pytest.mark.parametrize("operation", ["sub", "div", "rdiv"])
 def test_unsupported_geometry_keeps_the_existing_row_route(rows, columns, dtype, row_offset, operation):
@@ -144,8 +150,9 @@ def test_unsupported_geometry_keeps_the_existing_row_route(rows, columns, dtype,
     assert nodes(after, tirx.Bind)
 
 
-def test_private_mixed_owner_serial_row_shell_is_selected_without_pointer_offset_hack():
-    before = _frontend(_program())
+@pytest.mark.parametrize("columns", [64, 128])
+def test_private_mixed_owner_serial_row_shell_is_selected_without_pointer_offset_hack(columns):
+    before = _frontend(_program(columns=columns))
 
     def private_owner(node):
         if isinstance(node, tirx.For) and node.kind == tirx.ForKind.PARALLEL and isinstance(node.body, tirx.For):
@@ -158,25 +165,26 @@ def test_private_mixed_owner_serial_row_shell_is_selected_without_pointer_offset
     before = tvm.IRModule({gvar: func.with_body(ir_transform(func.body, None, private_owner)) for gvar, func in before.functions.items()})
     after = transform.AscendLowerVectorTiles()(before)
     assert len(calls(after, "tl.ascend_membase.brcb_f32")) == 1
-    assert len(calls(after, "tl.ascend_membase.sub_rows_f32")) == 1
+    assert len(calls(after, "tl.ascend_membase.sub_rows_f32")) == columns // 64
     assert not nodes(after, tirx.For) and not nodes(after, tirx.Bind)
 
 
+@pytest.mark.parametrize("columns", [64, 128])
 @pytest.mark.parametrize("operation", ["sub", "div", "rdiv"])
-def test_bounded_dynamic_rows_keep_empty_owner_loop_semantics(operation):
+def test_bounded_dynamic_rows_keep_empty_owner_loop_semantics(columns, operation):
     binary = {"sub": lambda matrix, row: matrix - row,
               "div": lambda matrix, row: matrix / row,
               "rdiv": lambda matrix, row: row / matrix}[operation]
 
     @T.prim_func
-    def main(A: T.Tensor((16, 64), "float32"), F: T.Tensor((16,), "float32"), C: T.Tensor((16, 64), "float32"), active: T.int32):
+    def main(A: T.Tensor((16, columns), "float32"), F: T.Tensor((16,), "float32"), C: T.Tensor((16, columns), "float32"), active: T.int32):
         with T.Kernel(1):
-            matrix = T.alloc_shared((16, 64), "float32")
+            matrix = T.alloc_shared((16, columns), "float32")
             row = T.alloc_shared((16,), "float32")
-            result = T.alloc_shared((16, 64), "float32")
+            result = T.alloc_shared((16, columns), "float32")
             T.copy(A, matrix)
             T.copy(F, row)
-            for i, j in T.Parallel(T.max(T.min(active, 16), 0), 64):
+            for i, j in T.Parallel(T.max(T.min(active, 16), 0), columns):
                 result[i, j] = binary(matrix[i, j], row[i])
             T.copy(result, C)
 
@@ -265,15 +273,16 @@ def test_ordinary_fa_two_assignments_preserve_whole_tile_node_order(dtype):
         assert "asc_sync_pipe(PIPE_V)" in source[source.index(";", before):after]
 
 
-def test_shifted_matrix_rows_keep_the_existing_per_row_route():
+@pytest.mark.parametrize("columns", [64, 128])
+def test_shifted_matrix_rows_keep_the_existing_per_row_route(columns):
     @T.prim_func
-    def main(A: T.Tensor((17, 64), "float32"), F: T.Tensor((16,), "float32"), C: T.Tensor((16, 64), "float32")):
+    def main(A: T.Tensor((17, columns), "float32"), F: T.Tensor((16,), "float32"), C: T.Tensor((16, columns), "float32")):
         with T.Kernel(1):
-            matrix = T.alloc_shared((17, 64), "float32")
+            matrix = T.alloc_shared((17, columns), "float32")
             row = T.alloc_shared((16,), "float32")
             T.copy(A, matrix)
             T.copy(F, row)
-            for i, j in T.Parallel(16, 64):
+            for i, j in T.Parallel(16, columns):
                 matrix[i + 1, j] = matrix[i, j] - row[i]
             T.copy(matrix[1:17, :], C)
 
@@ -310,10 +319,12 @@ def test_row_division_codegen_uses_native_normal_repeat_and_exact_cast(operation
     (division,) = calls(after, "tl.ascend_membase.div_rows_f32")
     assert int(division.args[3]) == 16
     assert bool(int(division.args[4])) == (operation == "rdiv")
-    expected = [1024, 128, 1024] if operation == "rdiv" else [1024, 1024, 128]
-    pointers = _ptrs(division)
-    assert [int(pointer.args[1]) for pointer in pointers] == expected
-    assert all(pointer.args[0].buffer.dtype == "float32" for pointer in pointers)
+    expected = [[16, 64], [128], [16, 64]] if operation == "rdiv" else [[16, 64], [16, 64], [128]]
+    regions = _regions(division)
+    assert [[int(extent) for extent in region.args[2:]] for region in regions] == expected
+    assert [int(region.args[1]) for region in regions] == [2, 1, 1]
+    assert all(region.args[0].buffer.dtype == "float32" for region in regions)
+    assert int(division.args[5]) == 8 and not _ptrs(division)
     assert not nodes(after, tirx.Bind) and not nodes(after, tirx.For)
     source = _source(program)
     assert source.count("asc_brcb(") == source.count("asc_div(") == 1

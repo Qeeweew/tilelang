@@ -1143,8 +1143,105 @@ private:
     return IRMutatorWithAnalyzer::VisitStmt_(op);
   }
 
+  // These three native operations have exact typed tl.region effects until
+  // scheduling, synchronization, and buffer version materialization finish.
+  // Convert only their declared operands here; unrelated Calls keep their
+  // existing lowering contract.
+  Stmt LowerRowBinaryRegions(const EvaluateNode *op, const CallNode *call) {
+    ICHECK_EQ(call->args.size(), 6U) << "FP32 row binary expects six operands";
+    const auto *rows = call->args[3].as<IntImmNode>();
+    const auto *row_lhs = call->args[4].as<IntImmNode>();
+    const auto *stride = call->args[5].as<IntImmNode>();
+    ICHECK(rows && rows->value > 0 && rows->value <= 255 &&
+           rows->value % 8 == 0 && row_lhs && call->args[4].dtype().is_bool() &&
+           stride && stride->value > 0 && stride->value <= 255 &&
+           stride->value % 8 == 0)
+        << "FP32 row binary requires static full-row repeats and a uint8 "
+           "64-lane-multiple matrix row stride";
+    Array<PrimExpr> args = call->args;
+    for (size_t i = 0; i < 3; ++i) {
+      const auto *region = call->args[i].as<CallNode>();
+      ICHECK(region && region->op.same_as(tl::region()))
+          << "FP32 row binary requires typed tl.region operands before "
+             "AscendLowerTileOp";
+      BufferRegion access = NormalizeToBufferRegion(call->args[i]);
+      int mask = i == 0 ? kAccessWrite : kAccessRead;
+      ICHECK(is_const_int(region->args[1], mask));
+      ICHECK(access->buffer->dtype == DataType::Float(32) &&
+             IsSharedBuffer(access->buffer));
+      bool matrix =
+          i == 0 || (i == 1 && !row_lhs->value) || (i == 2 && row_lhs->value);
+      size_t rank = access->region.size();
+      ICHECK_GE(rank, matrix ? 2U : 1U);
+      size_t leading = rank - (matrix ? 2 : 1);
+      for (size_t axis = 0; axis < rank; ++axis)
+        ICHECK(CanProveAscendRangeInBounds(
+            access->region[axis]->min, access->region[axis]->extent,
+            access->buffer->shape[axis], analyzer_))
+            << "FP32 row binary region must lie inside its physical backing";
+      for (size_t axis = 0; axis < leading; ++axis)
+        ICHECK(is_one(access->region[axis]->extent))
+            << "FP32 row binary version/leading axes must be singleton";
+      if (!access->buffer->strides.empty()) {
+        ICHECK(analyzer_->CanProveEqual(
+            access->buffer->strides.back(),
+            make_const(access->buffer->strides.back().dtype(), 1)))
+            << "FP32 row binary requires contiguous columns/row blocks";
+        if (matrix)
+          ICHECK(analyzer_->CanProveEqual(
+              access->buffer->strides[rank - 2],
+              make_const(access->buffer->strides[rank - 2].dtype(),
+                         stride->value * 8)))
+              << "FP32 row binary physical row pitch differs from its stride";
+      }
+      PrimExpr span;
+      if (matrix) {
+        ICHECK(analyzer_->CanProveEqual(
+                   access->region[rank - 2]->extent,
+                   make_const(access->region[rank - 2]->extent.dtype(),
+                              rows->value)) &&
+               is_const_int(access->region.back()->extent, 64) &&
+               analyzer_->CanProveEqual(
+                   access->buffer->shape.back(),
+                   make_const(access->buffer->shape.back().dtype(),
+                              stride->value * 8)))
+            << "FP32 row binary matrix region must be [owned_rows, 64] "
+               "with the declared physical row stride";
+        DataType dtype = access->region[rank - 2]->extent.dtype();
+        span = (access->region[rank - 2]->extent - make_const(dtype, 1)) *
+                   make_const(dtype, stride->value * 8) +
+               make_const(dtype, 64);
+      } else {
+        ICHECK(analyzer_->CanProveEqual(
+            access->region.back()->extent,
+            make_const(access->region.back()->extent.dtype(), rows->value * 8)))
+            << "FP32 row binary row blocks require owned_rows * 8 elements";
+        span = access->region.back()->extent;
+      }
+      Array<PrimExpr> indices;
+      for (const Range &range : access->region)
+        indices.push_back(range->min);
+      args.Set(i, Call(DataType::Handle(), tl::access_ptr(),
+                       {BufferLoad(access->buffer, indices), span,
+                        make_const(DataType::Int(32), mask)}));
+    }
+    // Visit the new pointers exactly once so the existing logical-to-physical
+    // buffer/layout remapping also preserves materialized version origins.
+    Evaluate lowered(
+        Call(call->dtype, call->op, args, call->annotations, call->span),
+        op->span);
+    return IRMutatorWithAnalyzer::VisitStmt_(lowered.get());
+  }
+
   Stmt VisitStmt_(const EvaluateNode *op) final {
     const CallNode *call = op->value.as<CallNode>();
+    if (call) {
+      if (const auto *native = call->op.as<OpNode>();
+          native && (native->name == "tl.ascend_membase.sub_rows_f32" ||
+                     native->name == "tl.ascend_membase.mul_rows_f32" ||
+                     native->name == "tl.ascend_membase.div_rows_f32"))
+        return LowerRowBinaryRegions(op, call);
+    }
     // Do not analysis the call node to the global function.
     if (call && call->op.as<GlobalVarNode>())
       return Downcast<Evaluate>(IRMutatorWithAnalyzer::VisitStmt_(op));
