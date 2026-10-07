@@ -76,6 +76,13 @@ public:
   StoragePeriod(const tirx::Var &storage, ControlNode *scope) const = 0;
   virtual size_t PromoteLifetimeSite(const tirx::Var &storage, size_t site_id,
                                      ControlNode *control) const = 0;
+  // A physical entry/exit outside the control's data activation can bound a
+  // closed local lifetime even in lexical epochs with no active data work.
+  virtual bool IsUnconditionalControlBoundary(size_t site_id,
+                                              ControlNode *control,
+                                              bool at_beginning) const {
+    return false;
+  }
 };
 
 namespace buffer_alias_analysis_detail {
@@ -174,6 +181,10 @@ struct LifetimeSummary {
   // sibling-control summaries instead retain one component per child.
   ControlNode *summary_control{nullptr};
   std::vector<ControlLifetimeComponent> components;
+  // A direct generation extended through a repeated read-only child spans
+  // that whole child. Parent ordering cannot compare its last-iteration read
+  // with another allocation's first-iteration access inside the same child.
+  std::vector<ControlNode *> read_controls;
 };
 
 struct ConditionSignature {
@@ -496,6 +507,8 @@ private:
       return direct;
 
     ControlNode *child = FindSummaryControl(info, loop);
+    if (child == nullptr)
+      child = FindSingleTripSummaryControl(info, loop);
     if (child != nullptr) {
       auto child_scope = lifetime_summaries_.find(child);
       if (child_scope != lifetime_summaries_.end()) {
@@ -517,6 +530,18 @@ private:
         lhs.summary_control == rhs.summary_control) {
       return false;
     }
+    auto overlaps_read_control = [&](const LifetimeSummary &incoming,
+                                      const LifetimeSummary &other) {
+      const auto &accesses = storage_access_info_.at(other.storage).accesses;
+      for (ControlNode *control : incoming.read_controls) {
+        for (const TaskStorageAccess &access : accesses)
+          if (access.task->IsWithin(control))
+            return true;
+      }
+      return false;
+    };
+    if (overlaps_read_control(lhs, rhs) || overlaps_read_control(rhs, lhs))
+      return false;
     if (!lhs.components.empty() || !rhs.components.empty()) {
       if (lhs.components.size() != rhs.components.size() ||
           lhs.components.empty()) {
@@ -791,17 +816,49 @@ private:
     if (info.opaque)
       return result;
 
-    auto can_promote_to_scope = [&](TaskNode *task) {
-      IRStructure *node = task;
+    std::unordered_map<ControlNode *, bool> read_only_controls;
+    auto read_only_control = [&](ControlNode *control) {
+      auto found = read_only_controls.find(control);
+      if (found != read_only_controls.end())
+        return found->second;
+      auto period = context_->StoragePeriod(info.storage, control);
+      bool read_only = !control->BodyHasLoopBreak() && period &&
+                       period->iterations == 1;
+      const ForNode *loop = control->control.get();
+      arith::Analyzer analyzer;
+      if (control->task)
+        control->task->outer_ctx.Populate(analyzer);
+      read_only &= analyzer.CanProve(loop->extent > 0) &&
+                   analyzer.CanProve(loop->step.value_or(
+                                         make_const(loop->extent.dtype(), 1)) >
+                                     0);
+      for (const TaskStorageAccess &access : info.accesses)
+        read_only &= !(access.Writes() && access.task->IsWithin(control));
+      read_only_controls.emplace(control, read_only);
+      return read_only;
+    };
+    auto can_promote_to_scope = [&](const TaskStorageAccess &access) {
+      IRStructure *node = access.task;
+      std::vector<ControlNode *> read_controls;
       while (node->GetParent() != analysis_scope) {
         IRStructure *parent = node->GetParent();
         if (parent == nullptr || !parent->IsControl())
           return false;
         auto *control = static_cast<ControlNode *>(parent);
-        if (!IsGuaranteedSingleTrip(control))
-          return false;
+        // Repeating reads of one incoming generation extend its lifetime to
+        // the child's final read. They create no new generation or clock
+        // offset. Repeated writers still require the ordinary child summary.
+        if (!IsGuaranteedSingleTrip(control)) {
+          if (!access.Reads() || access.Writes() || !read_only_control(control))
+            return false;
+          read_controls.push_back(control);
+        }
         node = parent;
       }
+      for (ControlNode *control : read_controls)
+        if (std::find(result.read_controls.begin(), result.read_controls.end(),
+                      control) == result.read_controls.end())
+          result.read_controls.push_back(control);
       return true;
     };
     auto is_nested_in_scope = [&](TaskNode *task) {
@@ -820,7 +877,7 @@ private:
     bool has_access_before_scope = false;
     bool has_write_after_scope = false;
     for (const TaskStorageAccess &access : info.accesses) {
-      if (can_promote_to_scope(access.task)) {
+      if (can_promote_to_scope(access)) {
         accesses.push_back(access);
         continue;
       }
@@ -1235,6 +1292,31 @@ private:
     return result;
   }
 
+  ControlNode *FindSingleTripSummaryControl(const StorageAccessInfo &info,
+                                           ControlNode *parent_scope) const {
+    // A single-iteration container may enclose a repeated closed lifetime.
+    // Direct generation analysis cannot flatten that repeated child, but the
+    // already validated child summary still covers it. Require every actual
+    // access to be inside this one container; a sibling or direct access must
+    // not disappear through summary selection. Promotion keeps the original
+    // guard, incoming/outgoing values and real completion boundaries.
+    ControlNode *control = nullptr;
+    for (const TaskStorageAccess &access : info.accesses) {
+      IRStructure *child = access.task;
+      while (child != nullptr && child->GetParent() != parent_scope)
+        child = child->GetParent();
+      if (child == nullptr || !child->IsControl())
+        return nullptr;
+      auto *candidate = static_cast<ControlNode *>(child);
+      if (!IsGuaranteedSingleTrip(candidate) || candidate->BodyHasLoopBreak())
+        return nullptr;
+      if (control != nullptr && control != candidate)
+        return nullptr;
+      control = candidate;
+    }
+    return control;
+  }
+
   ControlNode *FindSummaryControl(const StorageAccessInfo &info,
                                   ControlNode *parent_scope) const {
     ControlNode *control = nullptr;
@@ -1328,10 +1410,31 @@ private:
       ffi::StructuralEqual structural_equal;
       std::vector<GenerationLifetime> local_summaries;
       for (const GenerationLifetime &generation : child_result.generations) {
+        auto unconditional_boundary = [&](const auto &events,
+                                           bool at_beginning) {
+          return !events.empty() &&
+                 std::all_of(
+                     events.begin(), events.end(), [&](const auto &event) {
+                       return event.offset == 0 &&
+                              context_->IsUnconditionalControlBoundary(
+                                  event.site, control, at_beginning);
+                     });
+        };
+        // This overapproximates the already closed child lifetime by its
+        // unconditional physical entry/exit. It does not assert that its data
+        // predicate is invariant, and introduces no completion relation.
+        // The parent still has to prove separation in both directions using
+        // these real endpoints, including recurrence across empty epochs.
+        bool envelope = !child_result.live_in && !child_result.live_out &&
+                        unconditional_boundary(generation.begin_sites, true) &&
+                        unconditional_boundary(generation.end_sites, false);
         PrimExpr generation_guard =
             generation.guard.defined() ? generation.guard : Bool(true);
         PrimExpr promoted_guard =
-            guard_analyzer.Simplify(control_guard && generation_guard);
+            envelope ? PrimExpr(Bool(true))
+                     : guard_analyzer.Simplify(control_guard && generation_guard);
+        bool invariant = envelope || (generation.guard_iteration_invariant &&
+                                      control_guard_iteration_invariant);
         auto existing = std::find_if(
             local_summaries.begin(), local_summaries.end(),
             [&](const GenerationLifetime &summary) {
@@ -1340,16 +1443,12 @@ private:
         if (existing == local_summaries.end()) {
           GenerationLifetime summary;
           summary.guard = promoted_guard;
-          summary.guard_iteration_invariant =
-              generation.guard_iteration_invariant &&
-              control_guard_iteration_invariant;
+          summary.guard_iteration_invariant = invariant;
           local_summaries.push_back(std::move(summary));
           existing = std::prev(local_summaries.end());
         } else {
           existing->guard_iteration_invariant =
-              existing->guard_iteration_invariant &&
-              generation.guard_iteration_invariant &&
-              control_guard_iteration_invariant;
+              existing->guard_iteration_invariant && invariant;
         }
         existing->begin_sites.insert(existing->begin_sites.end(),
                                      generation.begin_sites.begin(),

@@ -58,6 +58,7 @@
 #include "./auto_schedule/buffer_alias_analysis.h"
 #include "./auto_schedule/dependency_analysis.h"
 #include "./auto_schedule/kernel_rewriter.h"
+#include "./auto_schedule/l0ab_phase_reuse.h"
 #include "./auto_schedule/multi_buffer.h"
 #include "./auto_schedule/owner_result.h"
 #include "./auto_schedule/scheduled_tir.h"
@@ -349,6 +350,14 @@ enum class UnitFlagBoundaryRole {
   kExit
 };
 
+// A one-iteration child has no intra-child reuse. Its ready flag remains
+// real, but its repeated-activation lifetime is checked in the direct parent
+// after that parent's ordinary carried completion edges have been established.
+struct SingleIterationBinaryPlan {
+  ControlNode *parent;
+  bool validated{false};
+};
+
 struct SyncPoint {
   DepEdge edge;
   DependencyKind dependency_kind;
@@ -359,6 +368,7 @@ struct SyncPoint {
   size_t allocation_index;
   std::optional<CounterChannelKey> counter_channel;
   std::optional<LocalBinaryFlagPlan> local_binary_plan;
+  std::optional<SingleIterationBinaryPlan> single_iteration_binary_plan;
   UnitFlagBoundaryRole unit_boundary{UnitFlagBoundaryRole::kNone};
 
   SyncPoint(DepEdge edge, DependencyKind dependency_kind, int num_versions,
@@ -951,6 +961,12 @@ public:
     scope_closures_.insert_or_assign(nullptr, std::move(root_result.closure));
     if (owner_fallback_required_ || unit_fallback_required_)
       return false;
+    for (const SyncPoint &point : sync_points_) {
+      ICHECK(!point.single_iteration_binary_plan ||
+             point.single_iteration_binary_plan->validated)
+          << "dav-2201 local binary flag: unresolved single-iteration "
+             "parent lifetime";
+    }
 
     // The contract's presence still enables sequential allocation downstream.
     // Synchronization and flag reuse above remain necessary in this mode.
@@ -1044,7 +1060,31 @@ private:
     size_t parent_site =
         site_registry_.FindParentSiteInDomain(site_id, parent_domain_id);
     ICHECK_EQ(site_registry_.Sites()[parent_site].path_begin, control);
+    if (!domains_.Domain(parent_domain_id).IsCounter()) {
+      size_t lexical_site = site_registry_.FindParentSiteInDomain(
+          site_id,
+          domains_.UnconditionalLexicalDomain(control->GetParentControl()));
+      if (IsUnconditionalControlBoundary(
+              lexical_site, control,
+              site_registry_.Sites()[site_id].at_beginning)) {
+        // Enclose the child in a wider real physical boundary. This does not
+        // project its guarded closure: lifetime separation must be proved
+        // again using the unconditional parent's own completion graph.
+        parent_site = lexical_site;
+      }
+    }
     return parent_site;
+  }
+
+  bool IsUnconditionalControlBoundary(size_t site_id, ControlNode *control,
+                                      bool at_beginning) const final {
+    ICHECK_LT(site_id, site_registry_.Size());
+    const SyncInsertionSite &site = site_registry_.Sites()[site_id];
+    const EpochDomain &domain = site_registry_.Domain(site);
+    return site.path_begin == control && site.path_end == control &&
+           site.at_beginning == at_beginning && !domain.IsCounter() &&
+           domain.owner == control->GetParentControl() &&
+           is_one(domain.active_guard) && is_one(site.GetGuard());
   }
 
   std::optional<StorageIterationPeriod>
@@ -1138,6 +1178,13 @@ private:
         site_registry_.Domain(site_registry_.Dst(sync_point)).active_guard);
     if (!guard_analyzer.CanProve(source_guard == destination_guard))
       return std::nullopt;
+    return ContiguousLocalBinarySpan(source_guard, loop, trip_count, step);
+  }
+
+  std::optional<LocalBinaryEpochSpan>
+  ContiguousLocalBinarySpan(const PrimExpr &source_guard, ControlNode *loop,
+                            const PrimExpr &trip_count,
+                            const PrimExpr &step) const {
     PrimExpr zero = make_zero(trip_count.dtype());
     if (is_one(source_guard))
       return LocalBinaryEpochSpan{zero, trip_count};
@@ -1258,9 +1305,16 @@ private:
       max_distance = std::max(max_distance, sync_point.edge.distance);
 
     AddSamePipeEdges(result.closure, task_site_ids, max_distance, loop);
+    RemoveNestedCoveredLocalProtocols(local_sync_points, child_sync_points,
+                                      result.closure, max_distance, loop);
     OptimizeSyncPoints(local_sync_points, result.closure, max_distance, loop);
     if (loop != nullptr)
       OptimizeFlagVersions(local_sync_points, result.closure, loop);
+    if (owner_fallback_required_ || unit_fallback_required_)
+      return result;
+    ResolveSingleIterationBinaryPoints(child_sync_points, result.closure, loop);
+    if (owner_fallback_required_ || unit_fallback_required_)
+      return result;
 
     std::vector<VisibleSyncPoint> local_points;
     local_points.reserve(local_sync_points.size());
@@ -1852,6 +1906,206 @@ private:
         });
   }
 
+  bool UnshiftedBinaryLoop(ControlNode *loop, bool static_positive) const {
+    if (!loop || !loop->control.defined() || loop->GetStage() != 0 ||
+        loop->control->kind != ForKind::kSerial || loop->BodyHasLoopBreak())
+      return false;
+    const ForNode *node = loop->control.get();
+    const auto *min = node->min.as<IntImmNode>();
+    const auto *extent = node->extent.as<IntImmNode>();
+    PrimExpr step = node->step.has_value()
+                        ? node->step.value()
+                        : IntImm(node->extent.dtype(), 1);
+    const auto *constant_step = step.as<IntImmNode>();
+    if (!min || min->value != 0 || !constant_step ||
+        constant_step->value != 1 || !node->extent.dtype().is_int() ||
+        SideEffect(node->extent) != CallEffectKind::kPure ||
+        (static_positive && (!extent || extent->value <= 0)))
+      return false;
+    for (const auto &[key, value] : node->annotations) {
+      if (key == "num_stages") {
+        auto expression = value.as<PrimExpr>();
+        const auto *stages = expression ? expression->as<IntImmNode>() : nullptr;
+        if (!stages || stages->value != 1)
+          return false;
+      } else if (key == "enable_offset" || key == "tl.ascend_auto_pipeline") {
+        auto expression = value.as<PrimExpr>();
+        auto boolean = value.try_cast<bool>();
+        if (!(expression ? is_zero(*expression)
+                         : boolean.has_value() && !boolean.value()))
+          return false;
+      }
+    }
+    return true;
+  }
+
+  // A parent carried edge can be the last-to-first subset of a child's
+  // persistent binary protocol. Prove the whole finite protocol, rather than
+  // treating a child distance of one as one parent iteration by projection.
+  bool CoversNestedLocalProtocol(const SyncPoint &wide,
+                                 const SyncPoint &narrow,
+                                 ControlNode *parent) const {
+    ControlNode *child = wide.flag_loop;
+    auto persistent = [&](const SyncPoint &point) {
+      return point.edge.strict && point.edge.distance == 1 &&
+             point.num_versions == 1 && point.counter_group_id == 0 &&
+             !point.local_binary_plan.has_value() &&
+             point.unit_boundary == UnitFlagBoundaryRole::kNone &&
+             !site_registry_.IsCrossCore(point) &&
+             site_registry_.UsesFlag(point);
+    };
+    if (architecture_ != AscendArchitecture::kDav2201 ||
+        !persistent(wide) || !persistent(narrow) ||
+        narrow.flag_loop != parent || !child ||
+        child->GetParentControl() != parent ||
+        !UnshiftedBinaryLoop(parent, false) ||
+        !UnshiftedBinaryLoop(child, true) ||
+        !site_registry_.HasSameFlagKind(wide, narrow))
+      return false;
+
+    const auto &ws = site_registry_.Src(wide);
+    const auto &wd = site_registry_.Dst(wide);
+    const auto &ns = site_registry_.Src(narrow);
+    const auto &nd = site_registry_.Dst(narrow);
+    if (!ws.path_end->IsTask() || !wd.path_end->IsTask() ||
+        ws.path_end != ns.path_end || wd.path_end != nd.path_end ||
+        ws.at_beginning || ns.at_beginning || !wd.at_beginning ||
+        !nd.at_beginning || ns.path_begin != child || nd.path_begin != child ||
+        ws.path_begin->GetParent() != child ||
+        wd.path_begin->GetParent() != child)
+      return false;
+    for (const auto &[site, owner] :
+         {std::pair<const SyncInsertionSite *, ControlNode *>(&ws, child),
+          {&wd, child}, {&ns, parent}, {&nd, parent}}) {
+      const EpochDomain &domain = site_registry_.Domain(*site);
+      if (domain.IsCounter() || domain.owner != owner)
+        return false;
+    }
+    auto child_closure = scope_closures_.find(child);
+    if (child_closure == scope_closures_.end() ||
+        MinCompletionDistance(child_closure->second, wide.edge.dst,
+                              wide.edge.src) != 0)
+      return false;
+
+    ConstrSet proof = parent->GetLoopBodyContext();
+    arith::Analyzer outer;
+    proof.Populate(outer);
+    if (!outer.CanProve(narrow.flag_iteration ==
+                        CalculateIterationCount(parent)) ||
+        !outer.CanProve(wide.flag_iteration == CalculateIterationCount(child)))
+      return false;
+    PrimExpr activation = outer.Simplify(
+        child->GetConditionGuard() && site_registry_.Domain(ws).active_guard);
+    // A pure condition snapshot must expand to immutable enclosing loop
+    // coordinates. Freshened mutable Bind reads and unknown input predicates
+    // do not establish a finite active sequence for this certificate.
+    std::unordered_set<const VarNode *> enclosing;
+    for (ControlNode *loop = parent; loop; loop = loop->GetParentControl())
+      enclosing.insert(loop->control->loop_var.get());
+    bool stable_activation = true;
+    PostOrderVisit(activation, [&](const ffi::ObjectRef &node) {
+      if (const auto *var = node.as<VarNode>())
+        stable_activation &= enclosing.count(var) != 0;
+      if (node.as<BufferLoadNode>() || node.as<ProducerLoadNode>())
+        stable_activation = false;
+      if (const auto *call = node.as<CallNode>())
+        stable_activation &=
+            SideEffect(GetRef<PrimExpr>(call)) == CallEffectKind::kPure;
+    });
+    PrimExpr parent_trip = max(parent->control->extent,
+                              make_zero(parent->control->extent.dtype()));
+    PrimExpr parent_step = IntImm(parent->control->extent.dtype(), 1);
+    if (!stable_activation ||
+        !ContiguousLocalBinarySpan(activation, parent, parent_trip, parent_step))
+      return false;
+
+    std::unordered_set<ControlNode *> bound_loops;
+    auto boundary_guard = [&](IRStructure *endpoint, bool at_beginning)
+        -> std::optional<PrimExpr> {
+      PrimExpr guard = Bool(true);
+      for (IRStructure *node : endpoint->PathFrom(child)) {
+        if (node->GetStage() != 0)
+          return std::nullopt;
+        for (const auto &wrapper : node->GetGuards()) {
+          if (!wrapper->IsCondition() || node != child)
+            return std::nullopt;
+        }
+        if (!node->IsControl())
+          continue;
+        auto *loop = static_cast<ControlNode *>(node);
+        if (!UnshiftedBinaryLoop(loop, true))
+          return std::nullopt;
+        if (bound_loops.insert(loop).second)
+          proof.AddConstr(loop->control->loop_var,
+                          Range::FromMinExtent(loop->control->min,
+                                               loop->control->extent));
+        if (loop == child)
+          continue;
+        PrimExpr variable = loop->control->loop_var;
+        guard = guard && (at_beginning
+                             ? variable == loop->control->min
+                             : variable + 1 >= loop->control->extent);
+      }
+      return guard;
+    };
+    auto source_boundary = boundary_guard(ws.path_end, false);
+    auto destination_boundary = boundary_guard(wd.path_end, true);
+    if (!source_boundary || !destination_boundary)
+      return false;
+    PrimExpr first = child->control->loop_var == child->control->min;
+    PrimExpr last = child->control->loop_var + 1 >= child->control->extent;
+    auto emitted_guard = [&](const SyncInsertionSite &site) {
+      return child->GetConditionGuard() &&
+             site_registry_.Domain(site).active_guard && site.GetGuard();
+    };
+    // Exactly one wait/set per child iteration, and exactly the first wait
+    // and last set per parent activation. Extra guards cannot be discarded.
+    return GuardsEquivalent(emitted_guard(ws), activation && *source_boundary,
+                            proof) &&
+           GuardsEquivalent(emitted_guard(wd),
+                            activation && *destination_boundary, proof) &&
+           GuardsEquivalent(emitted_guard(ns),
+                            activation && last && *source_boundary, proof) &&
+           GuardsEquivalent(emitted_guard(nd),
+                            activation && first && *destination_boundary, proof);
+  }
+
+  void RemoveNestedCoveredLocalProtocols(
+      std::vector<SyncPoint> &local_points,
+      const std::vector<std::vector<VisibleSyncPoint>> &child_points,
+      DepClosure &closure, int max_distance, ControlNode *parent) const {
+    std::vector<SyncPoint> retained;
+    retained.reserve(local_points.size());
+    for (SyncPoint &narrow : local_points) {
+      bool covered = false;
+      for (const auto &points : child_points) {
+        for (const VisibleSyncPoint &visible : points) {
+          if (CoversNestedLocalProtocol(sync_points_[visible.sync_point_id],
+                                        narrow, parent)) {
+            covered = true;
+            break;
+          }
+        }
+        if (covered)
+          break;
+      }
+      if (!covered) {
+        retained.push_back(std::move(narrow));
+        continue;
+      }
+      // The retained child flag is seeded/drained once at kernel boundaries.
+      // Each wait clears it before the next real set (the child's validated
+      // reverse-completion edge). Its final child token is consumed by the
+      // first child in the next active parent iteration; inactive prefixes,
+      // suffixes and an empty whole loop leave the initial/final token for
+      // the one root drain. This complete finite certificate establishes the
+      // parent last-to-first completion edge without emitting another flag,
+      // and keeps that true relation available to alias/lifetime consumers.
+      SaturateDependencyEdge(closure, narrow.edge, max_distance, parent);
+    }
+    local_points = std::move(retained);
+  }
+
   bool CoversLocalProtocol(const SyncPoint &wide, const SyncPoint &narrow,
                            ControlNode *loop) const {
     if (architecture_ != AscendArchitecture::kDav2201 || loop == nullptr ||
@@ -1952,6 +2206,115 @@ private:
     sync_points = std::move(emit);
   }
 
+  ControlNode *SingleIterationBinaryParent(const SyncPoint &point,
+                                          ControlNode *loop) const {
+    if (!loop || point.flag_loop != loop || point.edge.distance != 0 ||
+        point.counter_group_id != 0 || point.local_binary_plan ||
+        point.unit_boundary != UnitFlagBoundaryRole::kNone)
+      return nullptr;
+    ControlNode *parent = loop->GetParentControl();
+    if (!parent)
+      return nullptr;
+    // Keep the first support domain exact: no conditional, empty, mutable,
+    // counter-driven or breaking repetition. This proves one matched set/wait
+    // per invocation, not completion between successive invocations.
+    for (ControlNode *scope = loop; scope;
+         scope = scope->GetParentControl()) {
+      if (scope->HasConditions() || scope->BodyHasLoopBreak() ||
+          scope->GetStage() != 0)
+        return nullptr;
+      const ForNode *node = scope->control.get();
+      PrimExpr step = node->step.has_value()
+                          ? node->step.value()
+                          : IntImm(node->extent.dtype(), 1);
+      const auto *extent = node->extent.as<IntImmNode>();
+      const auto *stride = step.as<IntImmNode>();
+      if (!extent || !stride || extent->value <= 0 || stride->value <= 0 ||
+          SideEffect(node->min) != CallEffectKind::kPure ||
+          (scope == loop && extent->value != stride->value))
+        return nullptr;
+    }
+    const SyncInsertionSite &src = site_registry_.Src(point);
+    const SyncInsertionSite &dst = site_registry_.Dst(point);
+    const ConstrSet &context = loop->GetLoopBodyContext();
+    if (src.path_begin != src.path_end || dst.path_begin != dst.path_end ||
+        src.path_begin->GetParent() != loop ||
+        dst.path_begin->GetParent() != loop ||
+        site_registry_.Domain(src).IsCounter() ||
+        site_registry_.Domain(dst).IsCounter() ||
+        site_registry_.Domain(src).owner != loop ||
+        site_registry_.Domain(dst).owner != loop ||
+        !context.CanProve(src.GetGuard()) ||
+        !context.CanProve(dst.GetGuard()) ||
+        !context.CanProve(site_registry_.Domain(src).active_guard) ||
+        !context.CanProve(site_registry_.Domain(dst).active_guard) ||
+        SideEffect(point.flag_iteration) != CallEffectKind::kPure ||
+        !context.CanProve(point.flag_iteration == CalculateIterationCount(parent)))
+      return nullptr;
+    return parent;
+  }
+
+  void ResolveSingleIterationBinaryPoints(
+      const std::vector<std::vector<VisibleSyncPoint>> &child_points,
+      const DepClosure &closure, ControlNode *parent) {
+    if (!parent)
+      return;
+    int parent_domain = domains_.UnconditionalLexicalDomain(parent);
+    for (const auto &points : child_points) {
+      for (const VisibleSyncPoint &visible : points) {
+        SyncPoint &point = sync_points_[visible.sync_point_id];
+        if (!point.single_iteration_binary_plan ||
+            point.single_iteration_binary_plan->parent != parent ||
+            point.single_iteration_binary_plan->validated)
+          continue;
+        int reverse = std::numeric_limits<int>::max();
+        for (const DepEdge &edge : visible.projected_edges) {
+          const SyncInsertionSite &src = site_registry_.Src(edge);
+          const SyncInsertionSite &dst = site_registry_.Dst(edge);
+          // Use actual leaf endpoints in the parent's unconditional domain.
+          // No loop-boundary substitution or manufactured unit C completion.
+          if (src.EpochDomainId() != parent_domain ||
+              dst.EpochDomainId() != parent_domain ||
+              src.path_end != site_registry_.Src(point).path_end ||
+              dst.path_end != site_registry_.Dst(point).path_end ||
+              !domains_.CanProjectDomain(
+                  site_registry_.Src(point).EpochDomainId(), parent_domain,
+                  parent))
+            continue;
+          reverse = std::min(
+              reverse, MinCompletionDistance(closure, edge.dst, edge.src));
+        }
+        if (reverse == std::numeric_limits<int>::max()) {
+          if ((owner_results_ && !owner_results_->empty()) ||
+              (owner_inputs_ && !owner_inputs_->empty())) {
+            owner_fallback_required_ = true;
+            return;
+          }
+          if (unit_streams_ && !unit_streams_->empty()) {
+            LOG(WARNING) << "Unit stream fallback: single-iteration local flag "
+                            "has no parent reverse completion; parent="
+                         << parent->control->loop_var->name_hint;
+            unit_fallback_required_ = true;
+            return;
+          }
+        }
+        ICHECK_NE(reverse, std::numeric_limits<int>::max())
+            << "dav-2201 local binary flag: no parent reverse completion path "
+               "for single-iteration "
+            << site_registry_.Src(point).pipe << "->"
+            << site_registry_.Dst(point).pipe;
+        ICHECK_GT(reverse, 0)
+            << "dav-2201 local binary flag: nonpositive parent reverse "
+               "completion distance";
+        // With d=0 and identical flattened clocks, r parent iterations is
+        // exactly r notifications. Keep the complete r-wide ring; storage
+        // width or a single child trip is not a substitute for this proof.
+        point.num_versions = reverse;
+        point.single_iteration_binary_plan->validated = true;
+      }
+    }
+  }
+
   void OptimizeFlagVersions(std::vector<SyncPoint> &sync_points,
                             const DepClosure &closure, ControlNode *loop) {
     for (SyncPoint &sync_point : sync_points) {
@@ -2010,6 +2373,14 @@ private:
         return detail.str();
       };
 
+      if (local_binary && min_distance == std::numeric_limits<int>::max()) {
+        if (ControlNode *parent = SingleIterationBinaryParent(sync_point, loop)) {
+          sync_point.single_iteration_binary_plan =
+              SingleIterationBinaryPlan{parent};
+          continue;
+        }
+      }
+
       if (local_binary && min_distance == std::numeric_limits<int>::max() &&
           ((owner_results_ && !owner_results_->empty()) ||
            (owner_inputs_ && !owner_inputs_->empty()))) {
@@ -2024,6 +2395,9 @@ private:
         // Unit protection cannot supply an unrelated flag's reverse whole-
         // completion witness. Retry the untouched ordinary program instead
         // of relaxing that phase contract or keeping half of the selection.
+        LOG(WARNING) << "Unit stream fallback due to unrelated local flag "
+                        "missing reverse completion"
+                     << binary_context();
         unit_fallback_required_ = true;
         return;
       }
@@ -2195,7 +2569,9 @@ private:
       return false;
     // Existing reuse proofs compare equal event phases. Keep a shifted local
     // binary channel exclusive rather than sharing its partial seed/drain.
-    if (lhs_sync.local_binary_plan || rhs_sync.local_binary_plan)
+    if (lhs_sync.local_binary_plan || rhs_sync.local_binary_plan ||
+        lhs_sync.single_iteration_binary_plan ||
+        rhs_sync.single_iteration_binary_plan)
       return false;
     if (!site_registry_.UsesFlag(lhs_sync) ||
         !site_registry_.UsesFlag(rhs_sync) ||
@@ -2633,8 +3009,13 @@ public:
     for (const auto &[domain, total] : next_intra_core_id) {
       if (total <= kIntraCoreFlagLimit)
         continue;
-      if (require_intra_core_capacity)
+      if (require_intra_core_capacity) {
+        LOG(WARNING) << "Optional unit stream exceeds local hard-event "
+                        "capacity after safe reuse: domain="
+                     << domain << ", total=" << total
+                     << ", limit=" << kIntraCoreFlagLimit;
         return false;
+      }
       LOG(WARNING) << "Ascend auto-schedule reached an intra-core flag-id "
                       "high-water mark of "
                    << total << " for " << domain << " after safe reuse, "
@@ -3696,6 +4077,7 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
       // must not force a previously legal 2201 kernel past its eight local
       // IDs: this target cannot spill hard events to the 3510 mutex API.
       ICHECK(unit_fallback.has_value());
+      LOG(WARNING) << "Unit stream fallback due to flag allocation capacity";
       return InsertKernelSync(kernel_body, std::move(unit_fallback.value()),
                               target, lane_variables, false);
     }
@@ -3713,6 +4095,30 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
     // result IDs keeps the normal collective implementation instead.
     ICHECK(!owner_results.empty());
     owner_results.clear();
+  }
+  if (auto selected = scheduled_tir.metadata.kernel_root->annotations.Get(
+          kL0ABPhaseReusePairs)) {
+    for (const Array<Var> &pair : selected.value().cast<Array<Array<Var>>>()) {
+      ICHECK_EQ(pair.size(), 2u);
+      bool proven =
+          HasBufferAlias(analyzer->BufferAliases(), pair[0], pair[1]) &&
+          HasBufferAlias(analyzer->BufferAliases(), pair[1], pair[0]);
+      if (!proven && !unit_streams.empty()) {
+        std::ostringstream loops;
+        for (const auto &plan : unit_streams)
+          loops << " " << plan.result_loop->control->loop_var->name_hint;
+        LOG(WARNING) << "L0 phase alias proof failed with "
+                     << unit_streams.size() << " active unit streams:"
+                     << loops.str();
+      }
+      ICHECK(proven)
+          << "Selected L0 phase reuse lacks a completion-proven physical "
+             "alias between "
+          << pair[0]->name_hint << " and " << pair[1]->name_hint
+          << "; max-budget scheduling cannot deploy independent allocations";
+    }
+    scheduled_tir.metadata.kernel_root.CopyOnWrite()->annotations.erase(
+        kL0ABPhaseReusePairs);
   }
   scheduled_tir.metadata.root_conflict_hints = {};
   scheduled_tir.metadata.buffer_aliases = analyzer->BufferAliases();

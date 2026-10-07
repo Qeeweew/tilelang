@@ -402,8 +402,20 @@ at a nested loop forms its own boundary; an explicit zero disables inheritance
 within that loop. Clear-accumulator and final-completion expressions keep the
 logical loop epoch when tasks receive a stage offset.
 
-For automatic 2201 loops, L0A/B/C version admission reserves every other root
-storage allocation before solving the current owner. The existing physical
+A closed native result stream can retain a positive static sub-K stage shift
+when the typed MAD chain, complete C definition/export and unit boundaries
+remain valid. Existing schedule lowering supplies fill, drain and logical
+clear/final predicates. A local ready event in a single-iteration child still
+needs a lifetime proof across repeated parent activations: synchronization
+keeps its actual leaf endpoints and flattened clock, then checks the parent's
+real reverse completion path after parent dependencies are established. That
+path determines the event ring width. Unconditional static positive ancestors
+are required; unsupported activation or an unresolved parent proof is rejected.
+Neither unit completion nor a single child iteration implies whole-MAD
+completion or permits unproved event reuse.
+
+For automatic 2201 loops, L0A/B/C version admission normally reserves every
+other root storage allocation before solving the current owner. The physical
 slot footprint includes layout and alignment; aliases with the same storage
 Var are charged once. Previously selected shared rings retain their maximum
 width as a hard minimum in later owners, including refinement, version
@@ -411,14 +423,74 @@ recalculation and sequential fallback. Fixed version requests with an owner
 are reserved before that owner is visited. A manually versioned allocation
 already includes its physical version axis and is charged once.
 
-This whole-kernel reservation is conservative: different storage Vars remain
-reserved even if a later lifetime proof could reuse their allocations. L0C
-coalescing runs before admission, so proven common storage identity is already
-reflected in this accounting. The remaining conservative reservation can
-reject such a reuse plan and does not claim optimal allocation. This admission
-boundary covers automatic L0A/B/C selection; it is not a complete bank validator
-for manual kernels or kernels without an automatic loop. UB, L1 and 3510
-retain their existing policies. Final physical allocations and native
+L0A/B can share physical addresses across two closed AIC phases while keeping
+their different canonical Buffers, layouts and version clocks. Early admission
+requires exactly two root allocations in the same physical scope, FP16/BF16
+canonical operands, typed L1 writers and native MAD readers, and separate
+direct phase children of one unconditional positive static outer loop. Escaped
+or aliased views, opaque or raw Cube accesses, MX scales, mutable activation,
+manual physical rings, and a common eligible owner for both allocations retain
+the conservative reservation. Disabling shared-memory reuse also disables this
+selection.
+
+The selected pair adds the existing cross-storage conflict contract at its
+common epoch. Ordinary dependency and completion analysis therefore retires
+every prior MAD reader before the other phase's MTE1 overwrite, including the
+next-epoch boundary. The enclosing lexical synchronization remains balanced
+when a phase has no active data work. Internal pipeline loads and MADs still
+use their own slot clocks and dependencies.
+
+A persistent 2201 local binary handshake in a static positive child loop can
+also cover its parent's exact last-to-first boundary. The synchronization
+pass requires the same real source and destination tasks, one slot at distance
+one, exact first/last activation predicates, and an independently established
+reverse completion path. The child protocol keeps its single kernel-root seed
+and drain; the entire redundant parent protocol is removed. Its parent-level
+completion relation is derived only from this finite protocol certificate.
+Dynamic or empty children, shifted stages, mutable counters, extra endpoint
+guards and different active sequences retain separate synchronization. The
+2201 limit of eight local hard-event slots remains enforced.
+
+A closed local lifetime may be summarized by an unconditional physical entry
+and exit outside its data guard. The lifetime analyzer checks both endpoint
+directions, zero local offsets, the unconditional parent lexical domain, and
+absence of incoming or outgoing values before using this conservative
+envelope. The real data predicate remains unchanged. This does not make a
+changing predicate invariant or add completion edges: periodic separation
+still requires both actual completion directions across lexical epochs.
+For an operand loaded outside a repeated read-only child, the final child read
+extends that incoming generation instead of creating another generation. This
+summary requires a positive nonbreaking child with a one-iteration storage
+period and no physical writes to the operand. Every read still needs a covering
+must-write, guard implication and actual completion ordering. Counter clocks,
+repeated writers and values escaping the child retain their normal analysis.
+The summary retains the enclosing read-only controls and rejects reuse with
+any allocation accessed inside them. Parent-level leaf ordering cannot stand
+in for completion between different iterations within one such control.
+A one-iteration control may carry an already validated repeated-child summary
+into its parent only when every actual access to that storage is inside that
+same control. Direct or sibling accesses prevent this fallback. Promotion
+retains the existing guard, incoming/outgoing values and completion endpoints;
+the control's extent alone supplies no alias proof.
+
+The resource query charges the maximum of both complete versioned physical
+sizes. A query with one variable member constrains that member normally and
+checks its fixed mate independently; two variable members are outside this
+selection. The internal root marker `tl.ascend_l0ab_phase_reuse_pairs` carries
+the chosen pair to InsertSync, which requires a symmetric alias proof from its
+final completion graph before consuming the marker. Missing proof is a
+selected-contract error: it cannot silently deploy the independently allocated
+sum after solving with the smaller budget. The existing late clique packer
+then co-locates the two allocations after layout flattening. No shared logical
+Buffer, changed canonical pitch or common version clock is introduced.
+
+Other different storage Vars remain reserved even if a later lifetime proof
+could reuse them. L0C coalescing runs before admission, so proven common storage
+identity is already reflected in this accounting. The remaining conservative
+reservation can reject a reuse plan and does not claim optimal allocation.
+This boundary covers automatic L0A/B/C selection; it is not a complete bank
+validator for manual kernels or kernels without an automatic loop. UB, L1 and
+3510 retain their existing policies. Final physical allocations and native
 completion still need their own validation.
 
 Compiler-created GM handoff storage also uses this buffer-version and epoch

@@ -833,6 +833,161 @@ def test_multi_trip_nested_scopes_use_hierarchical_summary():
         assert ("a", "b") in _insert_sync_alias_pairs(_make_nested_scope_program(inner_extent))
 
 
+def test_guarded_child_live_out_is_not_closed_by_its_physical_exit():
+    tile = 64
+
+    @T.prim_func
+    def main(x: T.Tensor((3, 2, tile), "int32"), y: T.Tensor((3, 2, tile), "int32"),
+             out_a: T.Tensor((3, tile), "int32"), out_b: T.Tensor((3, 2, tile), "int32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((tile,), "int32")
+            b = T.alloc_shared((tile,), "int32")
+            for epoch in T.Pipelined(3, num_stages=1):
+                if epoch < 2:
+                    for owner in T.serial(2):
+                        T.copy(x[epoch, owner, :], a)
+                for owner in T.serial(2):
+                    T.copy(y[epoch, owner, :], b)
+                    T.copy(b, out_b[epoch, owner, :])
+                if epoch < 2:
+                    T.copy(a, out_a[epoch, :])
+
+    # The final child write remains live through the later B phase until the
+    # parent read. An unconditional child-exit event cannot close that suffix.
+    assert ("a", "b") not in _insert_sync_alias_pairs(main)
+
+
+@pytest.mark.parametrize("overlap", [False, True], ids=["completed-read-only-child", "last-reader-still-live"])
+def test_direct_writer_generation_includes_every_read_only_child_reader(overlap):
+    tile = 64
+
+    @T.prim_func
+    def main(x: T.Tensor((tile,), "int32"), intermediate: T.Tensor((3, tile), "int32"),
+             out_b: T.Tensor((tile,), "int32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((tile,), "int32")
+            b = T.alloc_shared((tile,), "int32")
+            T.copy(x, a)
+            for reader in T.serial(3):
+                T.copy(a, intermediate[reader, :])
+                if overlap:
+                    if reader == 1:
+                        T.copy(intermediate[reader, :], b)
+                        T.copy(b, out_b)
+            if not overlap:
+                T.copy(intermediate[2, :], b)
+                T.copy(b, out_b)
+
+    # The positive's GM RAW completes the last MTE3 child reader before B's
+    # MTE2 overwrite. In the negative, that RAW only retires reader one; the
+    # subsequent reader two still uses the parent's incoming A generation.
+    assert (("a", "b") in _insert_sync_alias_pairs(main)) == (not overlap)
+
+
+def test_skipped_counter_epochs_keep_the_incoming_generation_live():
+    from tilelang import tvm
+    from tilelang.ascend import transform
+    from tvm import tirx
+    from testing.ascend._ir import allocated_buffer, nodes, schedule
+
+    @T.prim_func
+    def main(x: T.Tensor((12,), "int32"), y: T.Tensor((12,), "int32"),
+             previous: T.Tensor((12,), "int32"), out_b: T.Tensor((12,), "int32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((8,), "int32")
+            b = T.alloc_shared((8,), "int32")
+            T.annotate_buffer_versions({a: (2, "counter")})
+            for epoch in T.serial(6):
+                for owner in T.Pipelined(2, num_stages=1,
+                                         annotations={"multi_buffer_eligible": [a]}):
+                    if epoch % 2 == 0:
+                        if epoch >= 2:
+                            previous[epoch * 2 + owner] = a[0]
+                        a[0] = x[epoch * 2 + owner]
+                for owner in T.serial(2):
+                    b[0] = y[epoch * 2 + owner]
+                    out_b[epoch * 2 + owner] = b[0]
+
+    before = schedule(main, through="ResolveCore", auto_schedule=False)
+    a = allocated_buffer(before, "a")
+    root = next(block for block in nodes(before, tirx.SBlock) if block.name_hint == "tilelang_root")
+    assert int(root.annotations["tl.buffer_versions_map"][a.data]) == 2
+    (owner,) = [loop for loop in nodes(before, tirx.For)
+                if a.data in loop.annotations.get("tl.multi_buffer_counter_map", {})]
+    counter = owner.annotations["tl.multi_buffer_counter_map"][a.data]
+    assert counter.scope() == "local.var" and tuple(map(int, counter.shape)) == (1,)
+    assert any(store.buffer.same_as(counter) and isinstance(store.value, tirx.Add)
+               and isinstance(store.value.a, tirx.BufferLoad) and int(store.value.b) == 1
+               for store in nodes(before, tirx.BufferStore))
+    (epoch,) = [loop.loop_var for loop in nodes(before, tirx.For) if loop.loop_var.name == "epoch"]
+    guard = owner.annotations["tl.storage_epoch_guard_map"][a.data]
+    # Resolve immutable condition snapshots only. Counter loads remain actual
+    # mutable state, and are never replaced by the lexical epoch coordinate.
+    for binding in reversed(nodes(before, tirx.Bind)):
+        if not nodes(binding.value, (tirx.BufferLoad, tirx.Call)):
+            guard = tirx.stmt_functor.substitute(guard, {binding.var: binding.value})
+    analyzer = tvm.arith.Analyzer()
+    for iteration, active in ((0, True), (1, False), (2, True), (3, False)):
+        actual = tirx.stmt_functor.substitute(guard, {epoch: tirx.const(iteration, epoch.dtype)})
+        assert analyzer.can_prove_equal(actual, tirx.const(active, "bool"))
+
+    # Epoch zero writes the two slots. Epoch one advances no A counter, and
+    # epoch two reads those incoming slots before overwriting them. B's work
+    # between these activations must not reuse A's physical allocation. The
+    # prepared counter/guard assertions prevent a silently dropped counter
+    # claim from turning this into an ordinary lexical-clock regression.
+    after = transform.InsertSync()(before)
+    root = next(block for block in nodes(after, tirx.SBlock) if block.name_hint == "tilelang_root")
+    aliases = root.annotations.get("tl.buffer_alias_map", {})
+    b = allocated_buffer(after, "b")
+    assert b.data not in aliases.get(a.data, []) and a.data not in aliases.get(b.data, [])
+
+
+@pytest.mark.parametrize("sibling_reader", [False, True], ids=["direct-late-reader", "sibling-late-readers"])
+def test_single_trip_summary_cannot_drop_accesses_outside_its_activation(sibling_reader):
+    from tilelang import tvm
+    from tilelang.ascend import transform
+    from tvm import tirx
+    from testing.ascend._ir import calls, copy, kernel, nodes, seq
+    from testing.ascend.auto_schedule._scheduled_ir import unit
+
+    source = tirx.decl_buffer((3, 2, 64), "int32", name="Input")
+    intermediate = tirx.decl_buffer(source.shape, "int32", name="Intermediate")
+    out_a = tirx.decl_buffer(source.shape, "int32", name="OutA")
+    out_b = tirx.decl_buffer(source.shape, "int32", name="OutB")
+    a, b = [tirx.decl_buffer((64,), "int32", name=name, scope="shared.dyn") for name in ("a", "b")]
+    e, activation, owner, b_owner, reader = [tirx.Var(name, "int32")
+                                             for name in ("epoch", "unit_activation", "owner", "b_owner", "reader")]
+    a_owner = unit(tirx.For(owner, 0, 2, tirx.ForKind.SERIAL, seq(
+        unit(copy(source, a, src_indices=[e, owner, 0], src_shape=[1, 1, 64])),
+        unit(copy(a, intermediate, dst_indices=[e, owner, 0], dst_shape=[1, 1, 64])),
+    )), core=None)
+    # Build this shell at the scheduled boundary so frontend simplification
+    # cannot erase the very single-trip container whose summary is tested.
+    shell = unit(tirx.For(activation, 0, 1, tirx.ForKind.SERIAL, a_owner), core=None, guard=e < 2)
+    b_phase = unit(tirx.For(b_owner, 0, 2, tirx.ForKind.SERIAL, seq(
+        unit(copy(intermediate, b, src_indices=[e, b_owner, 0], src_shape=[1, 1, 64])),
+        unit(copy(b, out_b, dst_indices=[e, b_owner, 0], dst_shape=[1, 1, 64])),
+    )), core=None, guard=e < 2)
+    late_read = copy(a, out_a, dst_indices=[e, reader if sibling_reader else 0, 0], dst_shape=[1, 1, 64])
+    tail = (unit(tirx.For(reader, 0, 2, tirx.ForKind.SERIAL, unit(late_read)), core=None, guard=e < 2)
+            if sibling_reader else unit(late_read, guard=e < 2))
+    before = kernel(unit(tirx.For(e, 0, 3, tirx.ForKind.SERIAL, seq(shell, b_phase, tail)), core=None),
+                    buffers=[a, b], params=[source, intermediate, out_a, out_b])
+    before["main"] = before["main"].with_attr("target", tvm.target.Target({"kind": "ascend", "arch": "dav-2201"}))
+    with before["main"].attrs["target"]:
+        before = transform.PrepareMultiBuffer()(before)
+        (actual_shell,) = [loop for loop in nodes(before, tirx.For) if loop.loop_var.name == "unit_activation"]
+        assert int(actual_shell.extent) == 1 and len(calls(actual_shell, "tl.tileop.ascend_copy")) == 2
+        after = transform.InsertSync()(before)
+    root = next(block for block in nodes(after, tirx.SBlock) if block.name_hint == "tilelang_root")
+    aliases = root.annotations.get("tl.buffer_alias_map", {})
+    # The repeated child is locally closed, but its last A value still has
+    # a direct/sibling reader after B. Summary selection must inspect every
+    # actual access and cannot promote only the convenient one-trip subtree.
+    assert b.data not in aliases.get(a.data, []) and a.data not in aliases.get(b.data, [])
+
+
 def test_loop_varying_mutually_exclusive_phases_keep_distinct_epoch_storage():
     pairs = _insert_sync_alias_pairs(_make_mutually_exclusive_program(loop_varying=True))
     # The alternating branches use different active-epoch clocks. A distance-1

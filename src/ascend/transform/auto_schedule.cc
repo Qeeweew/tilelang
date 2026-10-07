@@ -58,6 +58,7 @@
 #include "./auto_schedule/dependency_analysis.h"
 #include "./auto_schedule/ir_structure.h"
 #include "./auto_schedule/kernel_rewriter.h"
+#include "./auto_schedule/l0ab_phase_reuse.h"
 #include "./auto_schedule/l0c_storage_reuse.h"
 #include "./auto_schedule/multi_buffer.h"
 #include "./auto_schedule/scheduled_tir.h"
@@ -67,6 +68,7 @@
 #include "ascend/op/utils.h"
 #include "ascend/transform/buffer_version.h"
 #include "backend/common/target_utils.h"
+#include "op/builtin.h"
 #include "op/utils.h"
 #include "runtime/thread_storage_scope.h"
 #include "storage_footprint.h"
@@ -175,9 +177,14 @@ public:
   // Structural GM prefetch preference for ordinary dav-2201 auto pipelines.
   void SetPreferPrefetchIssue(bool value) { prefer_prefetch_issue_ = value; }
 
-  // Conservative whole-kernel L0 admission for dav-2201 automatic loops.
-  // Physical reuse is a later decision, so it cannot increase this budget.
+  // Whole-kernel L0 admission for dav-2201 automatic loops. Separate phase
+  // allocations remain reserved unless a selected reuse contract retires
+  // every reader before the other phase may overwrite the same address.
   void SetReserveL0Storage(bool value) { reserve_l0_storage_ = value; }
+
+  void SetL0ABPhaseReuse(std::vector<L0ABPhaseReusePair> pairs) {
+    l0ab_phase_reuse_ = std::move(pairs);
+  }
 
   void SetMemoryLimit(const std::string &scope, int64_t bytes) {
     memory_limits_[scope] = bytes;
@@ -259,6 +266,7 @@ private:
   bool prefer_handoff_issue_{false};
   bool prefer_prefetch_issue_{false};
   bool reserve_l0_storage_{false};
+  std::vector<L0ABPhaseReusePair> l0ab_phase_reuse_;
   L0StorageGroups storage_groups_;
   ffi::Map<Var, PrimExpr> storage_slot_bytes_;
   CompilerWorkspaceStorageSet compiler_workspaces_;
@@ -1131,13 +1139,50 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
 
   std::vector<int64_t> storage_min_versions(storage_sizes.size(), 1);
   if (reserve_l0) {
-    // Every root allocation remains reserved until a later physical reuse
-    // proof. This deliberately may reject a downstream alias/reuse plan; it
-    // is a safe L0 bound, not a lifetime-optimal allocation model. L0C
-    // coalescing has already established any proven shared storage identity.
+    std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> phase_storages;
+    auto reserved_bytes = [&](const Var &storage) {
+      int versions = reserved_versions(storage);
+      ICHECK_GT(versions, 0);
+      int64_t bytes = get_storage_size(storage);
+      ICHECK_LE(bytes, std::numeric_limits<int64_t>::max() / versions);
+      return bytes * versions;
+    };
+    for (const L0ABPhaseReusePair &pair : l0ab_phase_reuse_) {
+      auto first = storage_version_id.find(pair.first);
+      auto second = storage_version_id.find(pair.second);
+      const bool first_variable = first != storage_version_id.end();
+      const bool second_variable = second != storage_version_id.end();
+      ICHECK(!(first_variable && second_variable))
+          << "L0 phase reuse cannot budget two independently variable "
+             "allocations in one scheduling query";
+      ICHECK(phase_storages.insert(pair.first).second &&
+             phase_storages.insert(pair.second).second);
+      int64_t &remaining = group_capacities[scope_to_group.at(pair.scope)];
+      int64_t first_bytes = reserved_bytes(pair.first);
+      int64_t second_bytes = reserved_bytes(pair.second);
+      if (!first_variable && !second_variable) {
+        int64_t bytes = std::max(first_bytes, second_bytes);
+        ICHECK_LE(bytes, remaining)
+            << "L0 phase reuse exceeds scope " << pair.scope << " capacity";
+        remaining -= bytes;
+      } else {
+        // Exactly two allocations occupy this bank. max(variable, fixed)
+        // fits iff both fit independently; keep the variable's full byte
+        // charge in its existing group and check its mate separately.
+        ICHECK_LE(first_variable ? second_bytes : first_bytes, remaining)
+            << "L0 phase reuse mate exceeds scope " << pair.scope
+            << " capacity";
+        const Var &variable = first_variable ? pair.first : pair.second;
+        size_t id = first_variable ? first->second : second->second;
+        storage_min_versions[id] = reserved_versions(variable);
+      }
+    }
+    // Unselected root allocations retain the conservative sum reservation.
+    // Chosen phase pairs retain distinct logical storage/version clocks;
+    // InsertSync must certify their alias before the late packer consumes it.
     for (const auto &[storage, _] : storage_slot_bytes_) {
       std::string scope = l0_scope(storage);
-      if (scope.empty())
+      if (scope.empty() || phase_storages.count(storage))
         continue;
       int versions = reserved_versions(storage);
       ICHECK_GT(versions, 0);
@@ -1680,6 +1725,20 @@ static void ScheduleSingleKernel(const Stmt &kernel_body, Target target,
   unit_builder.SetStorageSlotBytes(StorageFootprintCollector::SlotBytes(
       metadata.kernel_root, metadata.manual_buffer_versions));
   const AscendTargetInfo &target_info = GetAscendTargetInfo(target);
+  std::vector<L0ABPhaseReusePair> phase_reuse;
+  if (!tvm::transform::PassContext::Current()
+           ->GetConfig<Bool>(kDisableSharedMemoryReuse, Bool(false))
+           .value())
+    phase_reuse = AnalyzeL0ABPhaseReuse(*scheduled_tir, target_info);
+  if (!phase_reuse.empty()) {
+    ApplyL0ABPhaseReuseConflicts(phase_reuse, &metadata.root_conflict_hints);
+    Array<Array<Var>> pairs;
+    for (const L0ABPhaseReusePair &pair : phase_reuse)
+      pairs.push_back({pair.first, pair.second});
+    metadata.kernel_root.CopyOnWrite()->annotations.Set(kL0ABPhaseReusePairs,
+                                                        std::move(pairs));
+  }
+  unit_builder.SetL0ABPhaseReuse(std::move(phase_reuse));
   unit_builder.SetPreferHandoffIssue(target_info.architecture ==
                                      AscendArchitecture::kDav2201);
   unit_builder.SetPreferPrefetchIssue(target_info.architecture ==

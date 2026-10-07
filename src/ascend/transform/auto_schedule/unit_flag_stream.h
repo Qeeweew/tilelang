@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <functional>
+#include <limits>
 #include <optional>
 #include <unordered_set>
 #include <utility>
@@ -62,6 +63,16 @@ inline std::optional<int64_t> Constant(const PrimExpr &expr) {
   return std::nullopt;
 }
 
+inline std::optional<int64_t> StageCount(const ffi::Any &value) {
+  // For annotations retain Python integers as FFI scalars. Unlike cast,
+  // as<PrimExpr> does not convert those scalars into IntImm nodes.
+  if (auto integer = value.as<int64_t>())
+    return *integer;
+  if (auto expression = value.as<PrimExpr>())
+    return Constant(*expression);
+  return std::nullopt;
+}
+
 inline bool DefaultUnit(const Map<String, ObjectRef> &annotations) {
   auto control = annotations.Get("unit_flag_ctrl");
   return !control.has_value() ||
@@ -72,8 +83,10 @@ inline bool DefaultUnit(const Map<String, ObjectRef> &annotations) {
 // One typed operation, optionally enclosed in its semantic task marker.
 // Compound tasks, hidden loops and per-core candidate groups are outside the
 // first selection contract.
-inline std::optional<Call> Operation(const TaskNode *task) {
-  if (task->IsPerCoreTask() || task->GetStage() != 0 ||
+inline std::optional<Call> Operation(const TaskNode *task,
+                                    bool scheduled_descendant = false) {
+  if (task->IsPerCoreTask() || task->GetStage() < 0 ||
+      (task->GetStage() != 0 && !scheduled_descendant) ||
       task->GetCoreMask() != kCoreCube)
     return std::nullopt;
   Stmt body = task->stmt;
@@ -88,19 +101,35 @@ inline std::optional<Call> Operation(const TaskNode *task) {
   return Downcast<Call>(evaluate->value);
 }
 
-inline bool StaticLoopBounds(const ControlNode *loop, int64_t *count) {
+inline bool StaticLoopBounds(const ControlNode *loop, int64_t *count,
+                            bool scheduled_descendant = false) {
   auto min = Constant(loop->control->min);
   auto extent = Constant(loop->control->extent);
   auto step = loop->control->step.has_value()
                   ? Constant(loop->control->step.value())
                   : std::optional<int64_t>(1);
-  // Avoid pipeline offsets, skipped terminal iterations and counter clocks.
-  if (loop->GetStage() != 0 ||
-      loop->control->kind != ForKind::kSerial ||
+  // The result loop remains unshifted. A descendant's logical bounds are
+  // unchanged by its assigned child stages until LowerScheduledTIR.
+  if (loop->GetStage() != 0 || loop->control->kind != ForKind::kSerial ||
       !min || *min != 0 || !extent || *extent <= 0 ||
       *extent > kMaxProofIterations || !step || *step != 1)
     return false;
   for (const auto &[key, value] : loop->control->annotations) {
+    if (scheduled_descendant && key == "num_stages") {
+      auto stages = StageCount(value);
+      if (!stages || *stages <= 0 || *stages > kMaxProofIterations)
+        return false;
+      continue;
+    }
+    if (scheduled_descendant && key == "enable_offset")
+      continue;
+    if (scheduled_descendant && key == "tl.ascend_auto_pipeline") {
+      // AutoSchedule consumes true intent. An unconsumed request does not
+      // certify that these task stages form the selected native schedule.
+      if (value.cast<bool>())
+        return false;
+      continue;
+    }
     if (key != kMultiBufferEligible && key != kMultiBufferCounterMap &&
         key != kStorageEpochGuardMap)
       return false;
@@ -111,6 +140,31 @@ inline bool StaticLoopBounds(const ControlNode *loop, int64_t *count) {
 
 inline bool StaticLoop(const ControlNode *loop, int64_t *count) {
   return !loop->HasConditions() && StaticLoopBounds(loop, count);
+}
+
+inline bool StaticDescendantLoop(const ControlNode *loop, int64_t *count) {
+  if (loop->HasConditions() || loop->BodyHasLoopBreak() ||
+      !StaticLoopBounds(loop, count, true))
+    return false;
+  auto stages = loop->control->annotations.Get("num_stages");
+  int64_t limit = stages ? *StageCount(stages.value()) : 1;
+  bool offsets = true;
+  if (auto enabled = loop->control->annotations.Get("enable_offset"))
+    offsets &= enabled.value().cast<bool>();
+  if (auto automatic = loop->control->annotations.Get("tl.ascend_auto_pipeline"))
+    offsets &= automatic.value().cast<bool>();
+  int min_stage = std::numeric_limits<int>::max();
+  for (const auto &child : loop->children) {
+    int stage = child->GetStage();
+    if (stage < 0 || stage >= limit || (stage != 0 && !offsets) ||
+        (child->IsControl() && stage != 0))
+      return false;
+    min_stage = std::min(min_stage, stage);
+  }
+  // The one accepted shifted MAD chain has zero-stage input DMA and one
+  // constant-stage MAD. Shifting a whole nested control or a result scope is
+  // outside this contract; no private physical clock is reconstructed here.
+  return min_stage == 0;
 }
 
 // A result's own activation guard may be moved to one lexical shell around
@@ -401,8 +455,8 @@ inline bool Collect(ControlNode *result, std::vector<Mad> *mads,
         if (node->IsControl()) {
           auto *control = static_cast<ControlNode *>(node);
           int64_t count;
-          if (control->HasConditions() || !StaticLoop(control, &count) ||
-              *fix != nullptr || !AddInputCounters(control, &counters)) {
+          if (!StaticDescendantLoop(control, &count) || *fix != nullptr ||
+              !AddInputCounters(control, &counters)) {
             valid = false;
             return;
           }
@@ -414,7 +468,7 @@ inline bool Collect(ControlNode *result, std::vector<Mad> *mads,
         auto *task = static_cast<TaskNode *>(node);
         if (InputCounterCommit(task, counters))
           return;
-        auto operation = Operation(task);
+        auto operation = Operation(task, !loops.empty());
         if (!operation) {
           valid = false;
           return;
@@ -484,6 +538,10 @@ inline bool Collect(ControlNode *result, std::vector<Mad> *mads,
             return;
           }
         }
+        if (task->GetStage() != 0) {
+          valid = false;
+          return;
+        }
         // Input DMA may be early, but another Cube/FIX/Scalar operation is
         // not part of this closed result transaction.
         if (*fix ||
@@ -516,6 +574,13 @@ inline std::vector<UnitFlagStreamPlan> AnalyzeUnitFlagStreams(
     std::optional<AscendCopy> copy;
     bool selected = StaticResultLoop(result, &result_count) &&
                     Collect(result, &mads, &fix, &copy);
+    // The existing zero-stage contract can contain several explicit MAD
+    // tasks. For a shifted descendant, one task repeated over a static K
+    // nest preserves logical K order without a new scheduled-trace planner.
+    if (selected && mads.size() != 1 &&
+        std::any_of(mads.begin(), mads.end(),
+                    [](const Mad &mad) { return mad.task->GetStage() != 0; }))
+      selected = false;
     if (selected) {
       Buffer c = mads.front().gemm->c_;
       auto version = buffer_versions.Get(c->data);
@@ -585,7 +650,7 @@ inline std::vector<UnitFlagStreamPlan> AnalyzeUnitFlagStreams(
               }
               ControlNode *loop = mads[index].loops[depth];
               int64_t count;
-              if (!StaticLoop(loop, &count)) {
+              if (!StaticDescendantLoop(loop, &count)) {
                 selected = false;
                 return;
               }
@@ -612,7 +677,7 @@ inline std::vector<UnitFlagStreamPlan> AnalyzeUnitFlagStreams(
             PrimExpr terminal = Bool(true);
             for (ControlNode *loop : mads[i].loops) {
               int64_t count;
-              ICHECK(StaticLoop(loop, &count));
+              ICHECK(StaticDescendantLoop(loop, &count));
               terminal = terminal &&
                          (loop->control->loop_var ==
                           make_const(loop->control->loop_var.dtype(), count - 1));
