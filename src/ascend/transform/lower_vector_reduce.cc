@@ -388,6 +388,14 @@ private:
     if (!ub_owner_bytes_.has_value() || !ub_slots_.Get(src->data).has_value() ||
         !ub_slots_.Get(dst->data).has_value())
       return false;
+    // The late manual-version layout can change these operands' row stride.
+    // A separate manual ring does not change the native rows, but its aligned
+    // physical slots must still be included in the root's UB footprint.
+    for (const Var &data : {src->data, dst->data}) {
+      if (auto versions = manual_versions_.Get(data);
+          versions.has_value() && versions.value() > 1)
+        return false;
+    }
     int64_t remaining = ub_capacity_bytes_ - ub_owner_bytes_.value();
     auto charge = [&](int64_t bytes) {
       if (bytes < 0 || bytes > remaining)
@@ -685,15 +693,20 @@ private:
     LayoutMap saved = layouts_;
     auto saved_bytes = ub_owner_bytes_;
     auto saved_slots = ub_slots_;
+    auto saved_manual_versions = manual_versions_;
     int64_t saved_combine_bytes = future_combine_bytes_;
     auto saved_private = aiv_private_;
     if (root) {
       aiv_private_ = ascend::ValidatedAivPrivateData(op);
+      manual_versions_ = {};
+      if (auto value = op->annotations.Get(kManualMultiBuffer))
+        manual_versions_ = value.value().cast<BufferVersionMap>();
       // Reuse the common allocation/storage facts: owner aliases are charged
       // once at their maximum footprint, including layout output and alignment.
-      // Unknown storage or explicit future versioning keeps the original plan.
-      ub_slots_ =
-          ascend::StorageFootprintCollector::SlotBytes(GetRef<SBlock>(op));
+      // Manual rings already reserve their physical storage. Include their
+      // per-slot alignment; only automatic future versioning remains unknown.
+      ub_slots_ = ascend::StorageFootprintCollector::SlotBytes(
+          GetRef<SBlock>(op), manual_versions_);
       ub_owner_bytes_ = 0;
       future_combine_bytes_ = 0;
       for (const auto &[storage, footprint] : ub_slots_) {
@@ -708,14 +721,12 @@ private:
         }
         ub_owner_bytes_ = ub_owner_bytes_.value() + bytes->value;
       }
-      for (const char *key : {kBufferVersionsMap, kManualMultiBuffer}) {
-        if (auto value = op->annotations.Get(key)) {
-          for (const auto &[storage, versions] :
-               value.value().cast<BufferVersionMap>()) {
-            if (versions > 1 && ascend::AscendScopeAlignBytes(
-                                    GetPtrStorageScope(storage)) == 32)
-              ub_owner_bytes_ = std::nullopt;
-          }
+      if (auto value = op->annotations.Get(kBufferVersionsMap)) {
+        for (const auto &[storage, versions] :
+             value.value().cast<BufferVersionMap>()) {
+          if (versions > 1 && ascend::AscendScopeAlignBytes(
+                                  GetPtrStorageScope(storage)) == 32)
+            ub_owner_bytes_ = std::nullopt;
         }
       }
     }
@@ -734,6 +745,7 @@ private:
     if (root) {
       ub_owner_bytes_ = saved_bytes;
       ub_slots_ = saved_slots;
+      manual_versions_ = saved_manual_versions;
       future_combine_bytes_ = saved_combine_bytes;
       aiv_private_ = saved_private;
     }
@@ -745,6 +757,7 @@ private:
   Array<Buffer> scratch_;
   Array<Var> aiv_private_;
   ffi::Map<Var, PrimExpr> ub_slots_;
+  BufferVersionMap manual_versions_;
   std::optional<int64_t> ub_owner_bytes_;
   int64_t ub_capacity_bytes_{0};
   int64_t future_combine_bytes_{0};

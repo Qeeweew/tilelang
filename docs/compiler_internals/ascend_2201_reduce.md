@@ -52,9 +52,17 @@ The selection adds already generated reduction scratch, reserves the future
 combine scratch of previous selections, and charges this candidate's partials
 plus one aligned R-element FP32 temporary per binary combine node. This includes
 the final combine even when it can write directly to the output. Unknown
-allocation sizes, absent allocation owners and explicit future UB version
+allocation sizes, absent allocation owners and automatic future UB version
 requests keep the existing plan. These are conservative selection bounds;
 ordinary resource planning and final allocation checks still apply.
+
+An unrelated manual buffer ring already reserves physical storage and does
+not make the root's headroom unknown. The same collector charges each leading
+version slot with its own 32-byte alignment, while count-only annotations on
+flat allocations preserve their existing physical size. Aliases still share
+one storage owner and contribute their maximum physical footprint. If either
+native reduction operand itself has multiple manual versions, selection keeps
+the existing plan: the later version-layout rewrite can change its raw stride.
 
 The source's original strides and base alignment must also satisfy the late
 native validator. A compact inferred layout cannot silently override a
@@ -112,7 +120,7 @@ Focused CPU regressions cover exact disjoint chunk regions, compact output,
 ordinary combines and task boundaries, source/version offsets with wide index
 types, mask setup, completion in generated source, fallback domains and ordinary
 FA with Bkv128. Capacity regressions cover near-full UB, pending scratch and
-combine reservations, alias/layout footprints and unknown future allocation
-sizes. Successful CPU lowering alone does not establish native stride
-legality or numerical/device performance: CANN offline compilation and locked
-finite numerical comparisons are subsequent gates.
+combine reservations, manual slot padding, alias/layout footprints and unknown
+future allocation sizes. Successful CPU lowering alone does not establish
+native stride legality or numerical/device performance: CANN offline compilation
+and locked finite numerical comparisons are subsequent gates.
