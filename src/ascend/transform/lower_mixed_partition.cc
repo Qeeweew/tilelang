@@ -13,9 +13,11 @@
 #include <tvm/tirx/transform.h>
 
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
+#include "aiv_private.h"
 #include "ascend/op/copy.h"
 #include "ascend/op/utils.h"
 #include "ascend/target_utils.h"
@@ -93,8 +95,17 @@ class KernelIntentCollector : public StmtExprVisitor {
 public:
   std::vector<ParallelNest> nests;
   std::vector<Call> copies, reductions;
+  Map<Var, PrimExpr> bindings;
 
 private:
+  void VisitStmt_(const SBlockNode *op) final {
+    if (op->annotations.Get(ascend::kAivPrivate).has_value() ||
+        op->annotations.Get(ascend::kAivPrivateValidated).has_value())
+      TVM_FFI_THROW(ValueError)
+          << "dav-2201 AIV private domain: private declarations belong on the "
+             "kernel root";
+    StmtExprVisitor::VisitStmt_(op);
+  }
   void VisitStmt_(const ForNode *op) final {
     bool parallel = op->kind == ForKind::kParallel;
     if (parallel && parallel_depth_ == 0) {
@@ -121,6 +132,382 @@ private:
       reductions.push_back(GetRef<Call>(op));
     StmtExprVisitor::VisitExpr_(op);
   }
+  void VisitStmt_(const BindNode *op) final {
+    bindings.Set(op->var, Substitute(op->value, bindings));
+    StmtExprVisitor::VisitStmt_(op);
+  }
+  int parallel_depth_{0};
+};
+
+void RequirePrivate(bool condition, const char *message) {
+  if (!condition)
+    TVM_FFI_THROW(ValueError) << "dav-2201 AIV private domain: " << message;
+}
+
+// A declaration identifies complete local UB components, not a permission to
+// skip ownership checks. No shape, region or traversal is rewritten here.
+class PrivateDomainValidator : public StmtExprVisitor {
+public:
+  PrivateDomainValidator(const SBlock &root, const Var &sid,
+                         const ConstrSet &outer_ctx, Array<Var> members)
+      : sid_(sid), members_(std::move(members)) {
+    outer_ctx.Populate(analyzer_);
+    analyzer_.Bind(sid_, Range(0, 2));
+    for (const Buffer &buffer : root->alloc_buffers) {
+      if (!Contains(buffer->data))
+        continue;
+      RequirePrivate(IsSharedBuffer(buffer),
+                     "declared storage must be a kernel-root UB allocation");
+      RequirePrivate(allocations_.emplace(buffer->data.get(), buffer).second,
+                     "declared storage must have one kernel-root allocation");
+    }
+    for (const Var &member : members_) {
+      auto it = allocations_.find(member.get());
+      RequirePrivate(it != allocations_.end(),
+                     "declared storage must be a kernel-root UB allocation");
+      CheckAlias(it->second);
+    }
+    used_.clear();
+    CheckBlock(root.get());
+    KernelIntentCollector intent;
+    intent(root->body);
+    for (const auto &nest : intent.nests) {
+      Array<Buffer> buffers;
+      bool private_nest = false;
+      for (const auto &access : nest.accesses) {
+        buffers.push_back(access.buffer);
+        private_nest |= Contains(access.buffer->data);
+      }
+      if (private_nest) {
+        for (const Buffer &buffer : buffers)
+          RequirePrivate(IsSharedBuffer(buffer),
+                         "private Parallel accesses must use UB; use typed "
+                         "copies at GM boundaries");
+        CheckComponent(buffers);
+      }
+    }
+    VisitStmt(root->body);
+    for (const Var &member : members_)
+      RequirePrivate(used_.count(member.get()),
+                     "each declared UB member must belong to a used component");
+    CheckWrites();
+  }
+
+private:
+  struct Access {
+    BufferRegion region;
+    std::vector<std::pair<Var, Range>> loops;
+  };
+
+  bool Contains(const Var &data) const {
+    return ascend::ContainsAivPrivateData(members_, data);
+  }
+
+  PrimExpr Expand(const PrimExpr &expr) {
+    return analyzer_.Simplify(Substitute(expr, bindings_));
+  }
+
+  void CheckAlias(const Buffer &buffer) {
+    if (!Contains(buffer->data))
+      return;
+    const Buffer &owner = allocations_.at(buffer->data.get());
+    RequirePrivate(IsSharedBuffer(buffer) && buffer->dtype == owner->dtype &&
+                       buffer->shape.size() == owner->shape.size() &&
+                       buffer->strides.empty() && owner->strides.empty() &&
+                       buffer->axis_separators.empty() &&
+                       owner->axis_separators.empty() &&
+                       analyzer_.CanProveEqual(buffer->elem_offset, 0) &&
+                       analyzer_.CanProveEqual(owner->elem_offset, 0),
+                   "private UB aliases must preserve compact dtype, rank and "
+                   "zero origin");
+    for (size_t axis = 0; axis < owner->shape.size(); ++axis) {
+      PrimExpr extent = analyzer_.Simplify(owner->shape[axis]);
+      const auto *constant = extent.as<IntImmNode>();
+      RequirePrivate(constant && constant->value > 0 &&
+                         analyzer_.CanProveEqual(buffer->shape[axis], extent),
+                     "private UB aliases must preserve positive static shape");
+    }
+    used_.insert(buffer->data.get());
+  }
+
+  void CheckComponent(const Array<Buffer> &buffers) {
+    bool private_component = false;
+    for (const Buffer &buffer : buffers)
+      private_component |= Contains(buffer->data);
+    if (!private_component)
+      return;
+    for (const Buffer &buffer : buffers) {
+      if (!IsSharedBuffer(buffer))
+        continue;
+      RequirePrivate(Contains(buffer->data),
+                     "connected private UB components require every member "
+                     "to be declared; row/private components cannot mix");
+      CheckAlias(buffer);
+    }
+  }
+
+  void CheckBlock(const SBlockNode *block) {
+    if (block->name_hint != "tilelang_root")
+      RequirePrivate(
+          !block->annotations.Get(ascend::kAivPrivate).has_value() &&
+              !block->annotations.Get(ascend::kAivPrivateValidated).has_value(),
+          "private declarations belong on the kernel root");
+    if (auto layouts = block->annotations.Get(attr::kLayoutMap)) {
+      for (const auto &[key, value] :
+           layouts.value().cast<Map<ObjectRef, ObjectRef>>()) {
+        const auto *data = key.as<VarNode>();
+        const auto *buffer = key.as<BufferNode>();
+        RequirePrivate(!(data && Contains(GetRef<Var>(data))) &&
+                           !(buffer && Contains(buffer->data)),
+                       "private UB custom layouts require a separate contract");
+      }
+    }
+    for (const auto &match : block->match_buffers)
+      RequirePrivate(!Contains(match->buffer->data) &&
+                         !Contains(match->source->buffer->data),
+                     "private match-buffer aliases are unsupported");
+  }
+
+  void VisitRegion(const BufferRegion &region) {
+    CheckAlias(region->buffer);
+    for (const Range &range : region->region) {
+      VisitExpr(range->min);
+      VisitExpr(range->extent);
+    }
+  }
+
+  void VisitExpr_(const CallNode *op) final {
+    if (IsAscendCopyCall(op)) {
+      AscendCopy copy(op->args, op->annotations);
+      CheckComponent({copy->src, copy->dst});
+      bool source = Contains(copy->src->data);
+      bool destination = Contains(copy->dst->data);
+      if (IsSharedBuffer(copy->src) && !source && IsGlobalBuffer(copy->dst))
+        row_accesses_.insert(copy->dst->data.get());
+      if (IsGlobalBuffer(copy->src) && IsSharedBuffer(copy->dst) &&
+          !destination)
+        row_accesses_.insert(copy->src->data.get());
+      if (source || destination) {
+        RequirePrivate(copy->dual_dst_ctl == 0 &&
+                           !copy->annotations.Get("double").has_value(),
+                       "private copies cannot use dual_copy ownership");
+        RequirePrivate(
+            (IsSharedBuffer(copy->src) || IsGlobalBuffer(copy->src)) &&
+                (IsSharedBuffer(copy->dst) || IsGlobalBuffer(copy->dst)),
+            "private Cube handovers must use explicit GM regions");
+        if (source && IsGlobalBuffer(copy->dst)) {
+          Array<Range> ranges;
+          for (const Range &range : copy->dst_range)
+            ranges.push_back(Range::FromMinExtent(Expand(range->min),
+                                                  Expand(range->extent)));
+          writes_.push_back({BufferRegion(copy->dst, ranges), loops_});
+        }
+        if (destination && IsGlobalBuffer(copy->src)) {
+          Array<Range> ranges;
+          for (const Range &range : copy->src_range)
+            ranges.push_back(Range::FromMinExtent(Expand(range->min),
+                                                  Expand(range->extent)));
+          reads_.push_back({BufferRegion(copy->src, ranges), loops_});
+        }
+      }
+      VisitRegion(BufferRegion(copy->src, copy->src_range));
+      VisitRegion(BufferRegion(copy->dst, copy->dst_range));
+      return;
+    }
+    if (op->op.same_as(ReduceOp::Get())) {
+      ReduceOp reduce(op->args, op->annotations);
+      CheckComponent({reduce->src, reduce->dst});
+      VisitRegion(reduce->srcRegion_);
+      VisitRegion(reduce->dstRegion_);
+      return;
+    }
+    if (op->op.same_as(Fill::Get())) {
+      Fill fill(op->args, op->annotations);
+      VisitRegion(BufferRegion(fill->dst, fill->region));
+      VisitExpr(fill->value);
+      return;
+    }
+    if (op->op.same_as(tl::region())) {
+      BufferRegion region =
+          NormalizeToAccessRegion(GetRef<Call>(op), kAccessReadWrite).region;
+      RequirePrivate(!Contains(region->buffer->data),
+                     "private regions cannot escape through an opaque call");
+      if (IsGlobalBuffer(region->buffer))
+        escaped_.insert(region->buffer->data.get());
+      VisitRegion(region);
+      return;
+    }
+    StmtExprVisitor::VisitExpr_(op);
+  }
+
+  void VisitExpr_(const VarNode *op) final {
+    RequirePrivate(!Contains(GetRef<Var>(op)),
+                   "private storage cannot escape through an opaque pointer");
+    if (op->dtype.is_handle())
+      escaped_.insert(op);
+  }
+
+  void VisitExpr_(const BufferLoadNode *op) final {
+    CheckAlias(op->buffer);
+    RequirePrivate(!Contains(op->buffer->data) || parallel_depth_ > 0,
+                   "private scalar UB reads outside Parallel are unsupported");
+    if (IsGlobalBuffer(op->buffer))
+      escaped_.insert(op->buffer->data.get());
+    StmtExprVisitor::VisitExpr_(op);
+  }
+
+  void VisitStmt_(const BufferStoreNode *op) final {
+    CheckAlias(op->buffer);
+    RequirePrivate(!Contains(op->buffer->data) || parallel_depth_ > 0,
+                   "private scalar UB writes outside Parallel are unsupported");
+    if (IsGlobalBuffer(op->buffer))
+      row_accesses_.insert(op->buffer->data.get());
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const BindNode *op) final {
+    bindings_.Set(op->var, Expand(op->value));
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const ForNode *op) final {
+    Range range = Range::FromMinExtent(Expand(op->min), Expand(op->extent));
+    analyzer_.Bind(op->loop_var, range);
+    loops_.emplace_back(op->loop_var, range);
+    parallel_depth_ += op->kind == ForKind::kParallel;
+    StmtExprVisitor::VisitStmt_(op);
+    parallel_depth_ -= op->kind == ForKind::kParallel;
+    loops_.pop_back();
+  }
+
+  void VisitStmt_(const SBlockNode *op) final {
+    CheckBlock(op);
+    for (const Buffer &buffer : op->alloc_buffers)
+      RequirePrivate(
+          !Contains(buffer->data),
+          "private allocations must have a unique kernel-root owner");
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const AttrStmtNode *op) final {
+    const auto *iv = op->node.as<IterVarNode>();
+    RequirePrivate(!(op->attr_key == tirx::attr::thread_extent && iv &&
+                     iv->thread_tag == "cthread"),
+                   "private ownership requires one enclosing kernel SID");
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  Range AtSid(const Access &access, int axis, int sid) {
+    Map<Var, PrimExpr> values{{sid_, make_const(sid_.dtype(), sid)}};
+    for (const auto &[loop, range] : access.loops) {
+      Var fresh("private_access_iteration", loop.dtype());
+      analyzer_.Bind(fresh,
+                     Range::FromMinExtent(Substitute(range->min, values),
+                                          Substitute(range->extent, values)));
+      values.Set(loop, fresh);
+    }
+    const Range &range = access.region->region[axis];
+    return Range::FromMinExtent(Substitute(range->min, values),
+                                Substitute(range->extent, values));
+  }
+
+  bool CrossSidDisjoint(const Access &first, const Access &second, int axis) {
+    for (int first_sid = 0; first_sid < 2; ++first_sid) {
+      Range a = AtSid(first, axis, first_sid);
+      Range b = AtSid(second, axis, 1 - first_sid);
+      if (!analyzer_.CanProve(a->extent >= 0) ||
+          !analyzer_.CanProve(b->extent >= 0) ||
+          !(analyzer_.CanProve(a->extent == 0) ||
+            analyzer_.CanProve(b->extent == 0) ||
+            analyzer_.CanProve(a->min + a->extent <= b->min) ||
+            analyzer_.CanProve(b->min + b->extent <= a->min)))
+        return false;
+    }
+    return true;
+  }
+
+  void CheckGlobalLayout(const Buffer &buffer) {
+    // Logical SID planes imply different physical addresses only for an
+    // injective Buffer layout. Copy/OOB lowering owns each region's valid
+    // bounds and guards; do not repeat that proof across the other axes here.
+    RequirePrivate(buffer->axis_separators.empty(),
+                   "private GM writes require a compact or padded buffer "
+                   "layout");
+    if (buffer->strides.empty())
+      return;
+    RequirePrivate(buffer->strides.size() == buffer->shape.size() &&
+                       !buffer->strides.empty() &&
+                       analyzer_.CanProveEqual(buffer->strides.back(), 1),
+                   "private GM writes require unit inner stride");
+    for (int axis = static_cast<int>(buffer->shape.size()) - 2; axis >= 0;
+         --axis)
+      RequirePrivate(analyzer_.CanProve(buffer->strides[axis] >=
+                                        buffer->strides[axis + 1] *
+                                            buffer->shape[axis + 1]),
+                     "private GM writes require nonoverlapping compact or "
+                     "padded buffer strides");
+  }
+
+  void CheckWrites() {
+    // Compare all writes at independent AIV loop coordinates. Equal loop
+    // counters are not a lockstep guarantee, even inside a Serial source loop.
+    for (size_t i = 0; i < writes_.size(); ++i) {
+      const Buffer &buffer = writes_[i].region->buffer;
+      CheckGlobalLayout(buffer);
+      RequirePrivate(!row_accesses_.count(buffer->data.get()) &&
+                         !escaped_.count(buffer->data.get()),
+                     "private GM writes cannot share storage with row accesses "
+                     "or opaque escapes");
+      int selected = -1;
+      for (size_t axis = 0; axis < buffer->shape.size(); ++axis) {
+        if (!UsesVar(writes_[i].region->region[axis]->min, sid_))
+          continue;
+        bool separated = true;
+        for (size_t j = 0; j < writes_.size() && separated; ++j) {
+          const Buffer &other = writes_[j].region->buffer;
+          if (!other->data.same_as(buffer->data))
+            continue;
+          RequirePrivate(other.same_as(buffer),
+                         "GM write aliases must use one canonical buffer view");
+          separated &= UsesVar(writes_[j].region->region[axis]->min, sid_);
+          separated &= CrossSidDisjoint(writes_[i], writes_[j], axis);
+        }
+        // Same-pipe/local events cannot complete a write issued by the other
+        // AIV. Reads of a private-written GM allocation must therefore stay
+        // in the same established SID plane, even when all UB is private.
+        for (const Access &read : reads_) {
+          if (!separated)
+            break;
+          if (!read.region->buffer->data.same_as(buffer->data))
+            continue;
+          RequirePrivate(read.region->buffer.same_as(buffer),
+                         "GM read/write aliases must use one canonical buffer "
+                         "view");
+          separated &= UsesVar(read.region->region[axis]->min, sid_) &&
+                       CrossSidDisjoint(writes_[i], read, axis);
+        }
+        if (separated) {
+          selected = static_cast<int>(axis);
+          break;
+        }
+      }
+      RequirePrivate(
+          selected >= 0,
+          "GM private writes and reads require a common explicit SID-separated "
+          "axis "
+          "with disjoint regions across both AIVs and all iterations");
+    }
+  }
+
+  Var sid_;
+  Array<Var> members_;
+  arith::Analyzer analyzer_;
+  Map<Var, PrimExpr> bindings_;
+  std::unordered_map<const VarNode *, Buffer> allocations_;
+  std::unordered_set<const VarNode *> used_;
+  std::unordered_set<const VarNode *> row_accesses_, escaped_;
+  std::vector<std::pair<Var, Range>> loops_;
+  std::vector<Access> writes_, reads_;
   int parallel_depth_{0};
 };
 
@@ -136,7 +523,10 @@ struct OwnedStorage {
 
 class RowOwnership {
 public:
-  RowOwnership(const SBlock &root, const ConstrSet &outer_ctx) {
+  RowOwnership(const SBlock &root, const ConstrSet &outer_ctx,
+               Array<Var> private_members = {},
+               Optional<Var> sid = std::nullopt)
+      : private_members_(std::move(private_members)), sid_(std::move(sid)) {
     outer_ctx.Populate(analyzer_);
     mixed_ = ascend::HasAscendCubeIntent(root->body);
     for (const Buffer &buffer : root->alloc_buffers) {
@@ -158,7 +548,8 @@ public:
       if (nest.depth < 2)
         continue;
       for (const auto &access : nest.accesses) {
-        if (!access.write || !IsSharedBuffer(access.buffer))
+        if (!access.write || !IsSharedBuffer(access.buffer) ||
+            IsPrivate(access.buffer))
           continue;
         int axis = RowAxis(access, nest.outer->loop_var);
         if (axis >= 0)
@@ -180,7 +571,12 @@ public:
         changed |= ConnectReduce(ReduceOp(call->args, call->annotations));
     } while (changed);
 
-    Require(!owned_.empty() || intent_.nests.empty(),
+    bool has_row_nest = private_members_.empty() && !intent_.nests.empty();
+    for (const auto &nest : intent_.nests)
+      for (const auto &access : nest.accesses)
+        has_row_nest |=
+            IsSharedBuffer(access.buffer) && !IsPrivate(access.buffer);
+    Require(!owned_.empty() || !has_row_nest,
             "no shared affine row coordinate was found for the mixed vector "
             "component; express a dense row/column Parallel nest");
     for (const auto &nest : intent_.nests)
@@ -259,6 +655,10 @@ public:
   }
 
 private:
+  bool IsPrivate(const Buffer &buffer) const {
+    return ascend::ContainsAivPrivateData(private_members_, buffer->data);
+  }
+
   bool Mark(const Buffer &buffer, int axis) {
     Require(IsSharedBuffer(buffer), "owned rows require private UB storage");
     Require(axis == 0,
@@ -311,7 +711,7 @@ private:
   bool ConnectNest(const ParallelNest &nest) {
     int owner = -1;
     for (const auto &access : nest.accesses) {
-      if (!IsSharedBuffer(access.buffer))
+      if (!IsSharedBuffer(access.buffer) || IsPrivate(access.buffer))
         continue;
       int id = Find(access.buffer);
       if (id < 0)
@@ -332,7 +732,7 @@ private:
             "the row Parallel domain must cover the logical tile from zero");
     bool changed = false;
     for (const auto &access : nest.accesses) {
-      if (!IsSharedBuffer(access.buffer))
+      if (!IsSharedBuffer(access.buffer) || IsPrivate(access.buffer))
         continue;
       int axis = RowAxis(access, nest.outer->loop_var);
       if (axis < 0)
@@ -345,6 +745,8 @@ private:
   }
 
   bool ConnectCopy(const AscendCopy &copy) {
+    if (IsPrivate(copy->src) || IsPrivate(copy->dst))
+      return false;
     int source = Find(copy->src), destination = Find(copy->dst);
     bool changed = false;
     if (IsSharedBuffer(copy->src) && IsSharedBuffer(copy->dst) &&
@@ -363,6 +765,8 @@ private:
   }
 
   bool ConnectReduce(const ReduceOp &reduce) {
+    if (IsPrivate(reduce->src) || IsPrivate(reduce->dst))
+      return false;
     int source = Find(reduce->src), destination = Find(reduce->dst);
     if (source < 0 && destination < 0)
       return false;
@@ -381,6 +785,8 @@ private:
   }
 
   void EstablishCopyDomain(const AscendCopy &copy) {
+    if (IsPrivate(copy->src) || IsPrivate(copy->dst))
+      return;
     int source = Find(copy->src), destination = Find(copy->dst);
     if (source < 0 && destination < 0) {
       Require(!(IsSharedBuffer(copy->src) && IsGlobalBuffer(copy->dst)),
@@ -416,6 +822,16 @@ private:
             "copies before row partitioning");
     int gm_axis = GMRowAxis(copy, ub_source, axis);
     const auto &gm_ranges = ub_source ? copy->dst_range : copy->src_range;
+    if (sid_.has_value()) {
+      for (const Range &range : gm_ranges)
+        Require(
+            !UsesVar(Substitute(range->min, intent_.bindings), sid_.value()) &&
+                !UsesVar(Substitute(range->extent, intent_.bindings),
+                         sid_.value()),
+            "SID-dependent GM regions already select an owner; declare "
+            "the complete UB component with annotate_aiv_private instead "
+            "of applying automatic row partition again");
+    }
     PrimExpr valid = ub_ranges[axis]->extent;
     Require(!UsesAnyRowLoop(valid),
             "whole-tile copies must remain outside the owner row traversal");
@@ -447,6 +863,8 @@ private:
   }
 
   arith::Analyzer analyzer_;
+  Array<Var> private_members_;
+  Optional<Var> sid_;
   bool mixed_{false};
   KernelIntentCollector intent_;
   std::unordered_map<const VarNode *, Buffer> allocations_;
@@ -737,6 +1155,14 @@ public:
   }
 
 private:
+  Stmt VisitStmt_(const SBlockNode *op) final {
+    RequirePrivate(
+        op->name_hint == "tilelang_root" ||
+            (!op->annotations.Get(ascend::kAivPrivate).has_value() &&
+             !op->annotations.Get(ascend::kAivPrivateValidated).has_value()),
+        "private declarations belong on the kernel root");
+    return StmtMutator::VisitStmt_(op);
+  }
   Stmt VisitStmt_(const AttrStmtNode *op) final {
     const auto *iv = op->node.as<IterVarNode>();
     bool cthread = op->attr_key == tirx::attr::thread_extent && iv &&
@@ -755,18 +1181,39 @@ private:
   Stmt VisitStmt_(const SBlockRealizeNode *op) final {
     if (op->block->name_hint != "tilelang_root")
       return StmtMutator::VisitStmt_(op);
-    if (auto marker = op->block->annotations.Get(kRowPartitioned)) {
+    const ConstrSet &outer_ctx = outer_contexts_.at(op->block.get());
+    SBlock root = op->block;
+    Array<Var> private_members;
+    if (auto declared = root->annotations.Get(ascend::kAivPrivate)) {
+      private_members = declared.value().cast<Array<Var>>();
+      RequirePrivate(!private_members.empty(),
+                     "a private declaration requires UB members");
+      RequirePrivate(sid_.has_value() && sid_extent_.has_value(),
+                     "private ownership requires an existing kernel cthread");
+      const auto *extent = sid_extent_.value().as<IntImmNode>();
+      RequirePrivate(extent && extent->value == 2,
+                     "private ownership requires cthread extent two");
+      RequirePrivate(ascend::HasAscendCubeIntent(root->body),
+                     "private ownership requires a mixed Cube/Vector kernel");
+      PrivateDomainValidator(root, sid_.value(), outer_ctx, private_members);
+      root.CopyOnWrite()->annotations.Set(ascend::kAivPrivateValidated,
+                                          private_members);
+    } else {
+      RequirePrivate(
+          !root->annotations.Get(ascend::kAivPrivateValidated).has_value(),
+          "validated ownership requires a private declaration");
+    }
+    if (auto marker = root->annotations.Get(kRowPartitioned)) {
       Require(marker.value().cast<Integer>()->value == 2,
               "the existing row partition marker must specify two AIVs");
-      return GetRef<Stmt>(op);
+      return SBlockRealize(op->iter_values, op->predicate, root, op->span);
     }
-    const ConstrSet &outer_ctx = outer_contexts_.at(op->block.get());
-    RowOwnership ownership(op->block, outer_ctx);
+    RowOwnership ownership(root, outer_ctx, private_members, sid_);
     if (!ownership.IsMixed())
       return GetRef<Stmt>(op);
     ownership.Analyze();
     if (ownership.Empty())
-      return GetRef<Stmt>(op);
+      return SBlockRealize(op->iter_values, op->predicate, root, op->span);
     bool inner_cthread = false;
     PostOrderVisit(op->block->body, [&](const ObjectRef &node) {
       if (const auto *attr = node.as<AttrStmtNode>()) {
@@ -784,8 +1231,7 @@ private:
               "a mixed dav-2201 kernel requires cthread extent two");
     }
     Var sid = sid_.value_or(Var("aiv_row_sid", DataType::Int(32)));
-    SBlock root =
-        OwnedKernelRewriter(&ownership, sid, outer_ctx).Rewrite(op->block);
+    root = OwnedKernelRewriter(&ownership, sid, outer_ctx).Rewrite(root);
     Stmt result = SBlockRealize(op->iter_values, op->predicate, root, op->span);
     if (!sid_.has_value()) {
       IterVar iv(Range(0, 2), sid, IterVarType::kThreadIndex, "cthread");
@@ -808,9 +1254,19 @@ tvm::transform::Pass AscendLowerMixedPartition() {
         ICHECK(target.has_value())
             << "AscendLowerMixedPartition requires a bound target";
         if (GetAscendTargetInfo(target.value()).architecture ==
-            AscendArchitecture::kDav2201)
+            AscendArchitecture::kDav2201) {
           func.CopyOnWrite()->body =
               MixedPartitionRewriter(func->body)(func->body);
+        } else {
+          PostOrderVisit(func->body, [&](const ObjectRef &node) {
+            if (const auto *block = node.as<SBlockNode>())
+              RequirePrivate(
+                  !block->annotations.Get(ascend::kAivPrivate).has_value() &&
+                      !block->annotations.Get(ascend::kAivPrivateValidated)
+                           .has_value(),
+                  "AIV private ownership is supported only on dav-2201");
+          });
+        }
         return func;
       },
       0, "tl.AscendLowerMixedPartition", {});

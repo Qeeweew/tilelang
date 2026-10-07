@@ -1,12 +1,12 @@
-"""Ascend auto-schedule annotations: multi-buffer version control and memory
-capacity overrides consumed by the Z3 scheduler."""
+"""Ascend ownership, buffer-version and memory-capacity declarations."""
 
-from tvm.tirx import IntImm
+from tvm.tirx import Buffer, IntImm
 from tvm.tirx.script.builder.ir import sblock_attr
 
 _VALID_MEMORY_SCOPES = ("shared", "shared.l1", "shared.l0c", "shared.l0a", "shared.l0b")
 
 __all__ = [
+    "annotate_aiv_private",
     "annotate_buffer_versions",
     "annotate_manual_multi_buffer",
     "annotate_unlimit_memory",
@@ -14,6 +14,51 @@ __all__ = [
 
 
 _VALID_BUFFER_VERSION_MODES = ("auto", "iteration", "counter")
+
+
+def annotate_aiv_private(*buffers: Buffer):
+    """Declare complete local UB domains owned independently by each AIV.
+
+    Call once in the kernel root of ``T.MixedKernel(..., sids=2)``. Each
+    listed buffer retains its complete shape on each physical AIV; the compiler
+    does not split its rows between the two lanes. Leading query-state or
+    manually indexed slot dimensions remain ordinary buffer coordinates.
+    This declaration neither selects buffer versions nor launches a core.
+
+    Declare every UB storage connected to a private component through ordinary
+    Parallel expressions, copies, or reductions. GM writes must explicitly
+    describe disjoint regions for the two SIDs. Compiler validation checks the
+    root allocation, aliases, access domains, and write separation before
+    layout or scheduling; this annotation does not waive those checks.
+
+    Membership uses storage variables, so identical views of one storage are
+    deduplicated. Rank-changing or incompatible aliases are diagnosed by the
+    ownership pass when used. The automatic shared-row partition remains the
+    default for components without this declaration.
+
+    Example
+    -------
+    >>> with T.MixedKernel(physical_groups, sids=2) as (group, sid):
+    ...     scores = T.alloc_shared((128, 128), "float32")
+    ...     state = T.alloc_shared((2, 128), "float32")
+    ...     T.annotate_aiv_private(scores, state)
+    ...     # SID selects a complete query in the ordinary GM regions.
+    ...     T.copy(score_workspace[group, sid, :, :], scores)
+
+    This surface is implemented for dav-2201. Its completion protocol still
+    requires both AIVs, including lanes with no active data, to participate.
+    """
+    if not buffers:
+        raise ValueError("annotate_aiv_private requires at least one UB buffer")
+    members = []
+    for buffer in buffers:
+        if not isinstance(buffer, Buffer):
+            raise TypeError("annotate_aiv_private arguments must be UB buffers")
+        if buffer.scope() not in ("shared", "shared.dyn"):
+            raise ValueError(f"annotate_aiv_private requires UB storage, got {buffer.scope()!r}")
+        if not any(buffer.data.same_as(data) for data in members):
+            members.append(buffer.data)
+    return sblock_attr({"tl.ascend_aiv_private": members})
 
 
 def annotate_buffer_versions(buffer_versions_map: dict):

@@ -21,6 +21,7 @@
 #include "ascend/op/oob_padding.h"
 #include "ascend/op/utils.h"
 #include "ascend/target_utils.h"
+#include "ascend/transform/aiv_private.h"
 #include "ascend/transform/attr.h"
 #include "ascend/transform/buffer_version.h"
 #include "ascend/transform/storage_footprint.h"
@@ -639,8 +640,22 @@ private:
 
   Stmt VisitStmt_(const EvaluateNode *op) final {
     if (const auto *call = op->value.as<CallNode>();
-        call && call->op.same_as(ReduceOp::Get()))
-      return LowerReduce(ReduceOp(call->args, call->annotations));
+        call && call->op.same_as(ReduceOp::Get())) {
+      ReduceOp reduce(call->args, call->annotations);
+      bool private_domain =
+          ascend::ContainsAivPrivateData(aiv_private_, reduce->src->data) &&
+          ascend::ContainsAivPrivateData(aiv_private_, reduce->dst->data);
+      size_t first_scratch = scratch_.size();
+      Stmt lowered = LowerReduce(reduce);
+      // Scratch is allocated by this producer, in the same local execution
+      // domain as the reduction. Later vector lowering consumes that fact;
+      // it must not infer ownership again from the scratch's padded shape.
+      if (private_domain) {
+        for (size_t i = first_scratch; i < scratch_.size(); ++i)
+          ascend::AppendAivPrivateData(&aiv_private_, scratch_[i]->data);
+      }
+      return lowered;
+    }
     return StmtExprMutator::VisitStmt_(op);
   }
 
@@ -671,7 +686,9 @@ private:
     auto saved_bytes = ub_owner_bytes_;
     auto saved_slots = ub_slots_;
     int64_t saved_combine_bytes = future_combine_bytes_;
+    auto saved_private = aiv_private_;
     if (root) {
+      aiv_private_ = ascend::ValidatedAivPrivateData(op);
       // Reuse the common allocation/storage facts: owner aliases are charged
       // once at their maximum footprint, including layout output and alignment.
       // Unknown storage or explicit future versioning keeps the original plan.
@@ -709,6 +726,8 @@ private:
       SBlockNode *writer = block.CopyOnWrite();
       for (const Buffer &buffer : scratch_)
         writer->alloc_buffers.push_back(buffer);
+      if (!aiv_private_.empty())
+        writer->annotations.Set(ascend::kAivPrivateValidated, aiv_private_);
       scratch_.clear();
     }
     layouts_ = saved;
@@ -716,6 +735,7 @@ private:
       ub_owner_bytes_ = saved_bytes;
       ub_slots_ = saved_slots;
       future_combine_bytes_ = saved_combine_bytes;
+      aiv_private_ = saved_private;
     }
     return block;
   }
@@ -723,6 +743,7 @@ private:
   arith::Analyzer analyzer_;
   LayoutMap layouts_;
   Array<Buffer> scratch_;
+  Array<Var> aiv_private_;
   ffi::Map<Var, PrimExpr> ub_slots_;
   std::optional<int64_t> ub_owner_bytes_;
   int64_t ub_capacity_bytes_{0};

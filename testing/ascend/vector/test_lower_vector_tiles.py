@@ -145,6 +145,50 @@ def test_dense_two_dimensional_tile_is_one_instruction():
     assert not nodes(after, tirx.For)
 
 
+def _guarded_slots(*, branch="then", invalid=False, sibling=False):
+    state = tirx.decl_buffer((2, 64), "float32", name="state", scope="shared")
+    out = tirx.decl_buffer((64,), "float32", name="out", scope="shared")
+    e, i = tirx.Var("epoch", "int32"), tirx.Var("column", "int32")
+
+    def operation(slot):
+        return _parallel(tirx.BufferStore(out, state[slot, i] + 1, [i]), [(i, 64)])
+
+    if branch == "then":
+        condition = tirx.And(e >= 1, e < (4 if invalid else 3))
+        body = tirx.IfThenElse(condition, operation(e - 1), None)
+        extent = 4
+    else:
+        condition = e < 2
+        body = tirx.IfThenElse(condition, operation(e), operation(e - (1 if invalid else 2)))
+        extent = 4
+    if sibling:
+        body = tirx.SeqStmt([body, operation(e - 1)])
+    return _target(kernel(tirx.For(e, 0, extent, tirx.ForKind.SERIAL, body), buffers=[state, out]))
+
+
+@pytest.mark.parametrize("branch", ["then", "else"])
+def test_slot_bounds_consume_each_enclosing_fill_drain_branch(branch):
+    before = _guarded_slots(branch=branch)
+    after = transform.AscendLowerVectorTiles()(before)
+    conditional, = nodes(after, tirx.IfThenElse)
+    original, = nodes(before, tirx.IfThenElse)
+    tvm.ir.assert_structural_equal(conditional.condition, original.condition)
+    assert all(loop.kind == tirx.ForKind.SERIAL for loop in nodes(after, tirx.For))
+    assert len(_ops(after)) == (1 if branch == "then" else 2)
+    assert all(int(op.args[-1]) == 64 for op in _ops(after))
+
+
+@pytest.mark.parametrize("branch", ["then", "else"])
+def test_branch_guard_does_not_admit_an_out_of_bounds_slot(branch):
+    with pytest.raises(ValueError, match="vector region must lie within state"):
+        transform.AscendLowerVectorTiles()(_guarded_slots(branch=branch, invalid=True))
+
+
+def test_fill_drain_slot_constraint_does_not_leak_to_a_sibling():
+    with pytest.raises(ValueError, match="vector region must lie within state"):
+        transform.AscendLowerVectorTiles()(_guarded_slots(sibling=True))
+
+
 def _row_broadcast(width=32):
     a, c = [tirx.decl_buffer((2, width), "float32", name=name, scope="shared") for name in "ac"]
     b = tirx.decl_buffer((2,), "float32", name="row", scope="shared")

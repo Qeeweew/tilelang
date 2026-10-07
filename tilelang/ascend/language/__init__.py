@@ -17,6 +17,7 @@ from .allocate import (  # noqa: F401
     alloc_l0c,
 )
 from .annotations import (  # noqa: F401
+    annotate_aiv_private,
     annotate_buffer_versions,
     annotate_manual_multi_buffer,
     annotate_unlimit_memory,
@@ -106,6 +107,7 @@ _ASCEND_API_ALL = (
     "alloc_l0b_sf",
     "alloc_l0c",
     "alloc_l1",
+    "annotate_aiv_private",
     "annotate_buffer_versions",
     "annotate_manual_multi_buffer",
     "annotate_unlimit_memory",

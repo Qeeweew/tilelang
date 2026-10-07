@@ -22,6 +22,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "aiv_private.h"
 #include "ascend/op/copy.h"
 #include "ascend/op/oob_padding.h"
 #include "ascend/op/utils.h"
@@ -128,6 +129,44 @@ public:
   }
 
 private:
+  bool IsPrivateBody(const Stmt &body) const {
+    if (aiv_private_.empty())
+      return false;
+    bool found = false, complete = true;
+    auto buffer = [&](const Buffer &buffer) {
+      if (IsSharedBuffer(buffer)) {
+        found = true;
+        complete &= ascend::ContainsAivPrivateData(aiv_private_, buffer->data);
+      }
+    };
+    PostOrderVisit(body, [&](const ObjectRef &node) {
+      if (const auto *load = node.as<BufferLoadNode>())
+        buffer(load->buffer);
+      if (const auto *store = node.as<BufferStoreNode>())
+        buffer(store->buffer);
+    });
+    return found && complete;
+  }
+
+  class PrivateOperationScope {
+  public:
+    PrivateOperationScope(bool *state, bool value)
+        : state_(state), saved_(*state) {
+      *state_ = value;
+    }
+    ~PrivateOperationScope() { *state_ = saved_; }
+
+  private:
+    bool *state_;
+    bool saved_;
+  };
+
+  void RegisterScratch(const Buffer &buffer) {
+    scratch_.push_back(buffer);
+    if (private_operation_)
+      ascend::AppendAivPrivateData(&aiv_private_, buffer->data);
+  }
+
   struct Value {
     Optional<BufferLoad> tile;
     PrimExpr scalar;
@@ -274,7 +313,7 @@ private:
     Buffer buffer = decl_buffer(
         {capacity}, dtype, "membase_tmp_" + std::to_string(next_temporary_++),
         "shared.dyn");
-    scratch_.push_back(buffer);
+    RegisterScratch(buffer);
     return BufferLoad(buffer, {make_const(DataType::Int(32), 0)});
   }
 
@@ -415,7 +454,7 @@ private:
          make_const(DataType::Int(32), batch_columns_)},
         DataType::Float(32), "membase_tmp_" + std::to_string(next_temporary_++),
         "shared.dyn");
-    scratch_.push_back(buffer);
+    RegisterScratch(buffer);
     return BufferLoad(buffer, {make_const(DataType::Int(32), 0),
                                make_const(DataType::Int(32), 0)});
   }
@@ -542,7 +581,7 @@ private:
     // Mixed ownership turns its row Parallel into a private Serial loop. Only
     // unconditional independent row/column assignments can be flattened here;
     // arbitrary serial controls and cross-row state are never reordered.
-    if (mixed_cube_ && !row_partitioned_)
+    if (mixed_cube_ && !row_partitioned_ && !private_operation_)
       return std::nullopt;
     if (op->kind != ForKind::kParallel &&
         !(op->kind == ForKind::kSerial && row_partitioned_))
@@ -756,7 +795,7 @@ private:
     Buffer buffer = decl_buffer(
         {Integer(4)}, DataType::UInt(64),
         "membase_predicate_" + std::to_string(next_temporary_++), "shared.dyn");
-    scratch_.push_back(buffer); // 32 B capacity, 16 B actual CMPMASK input.
+    RegisterScratch(buffer); // 32 B capacity, 16 B actual CMPMASK input.
     return buffer;
   }
 
@@ -1203,9 +1242,12 @@ private:
   }
 
   Stmt LowerUBCopy(const Copy &copy) {
-    Require(!mixed_cube_ || row_partitioned_,
-            "mixed Cube/Vector kernels require explicit two-AIV partition "
-            "semantics");
+    Require(
+        !mixed_cube_ || row_partitioned_ ||
+            (ascend::ContainsAivPrivateData(aiv_private_, copy->src->data) &&
+             ascend::ContainsAivPrivateData(aiv_private_, copy->dst->data)),
+        "mixed Cube/Vector kernels require explicit two-AIV partition "
+        "semantics");
     CheckBuffer(copy->src);
     CheckBuffer(copy->dst);
     Require(copy->src->dtype == copy->dst->dtype,
@@ -1268,12 +1310,14 @@ private:
   }
 
   Stmt VisitStmt_(const ForNode *op) final {
+    PrivateOperationScope private_scope(&private_operation_,
+                                        IsPrivateBody(op->body));
     analyzer_.Bind(op->loop_var, Range::FromMinExtent(op->min, op->extent));
     if (auto batched = TryCoalescedRows(op))
       return batched.value();
     if (op->kind != ForKind::kParallel)
       return StmtExprMutator::VisitStmt_(op);
-    Require(!mixed_cube_ || row_partitioned_,
+    Require(!mixed_cube_ || row_partitioned_ || private_operation_,
             "mixed Cube/Vector kernels require explicit two-AIV partition "
             "semantics, which this pure-vector slice does not yet provide");
     std::vector<const ForNode *> loops;
@@ -1379,6 +1423,23 @@ private:
     return StmtExprMutator::VisitStmt_(op);
   }
 
+  Stmt VisitStmt_(const IfThenElseNode *op) final {
+    // Prior simplification may use a fill/drain guard to remove a slot modulo.
+    // Retain that same scoped fact when checking the resulting UB accesses.
+    PrimExpr condition = VisitExpr(op->condition);
+    Stmt then_case;
+    {
+      With<arith::ConstraintContext> context(&analyzer_, condition);
+      then_case = VisitStmt(op->then_case);
+    }
+    Optional<Stmt> else_case;
+    if (op->else_case.has_value()) {
+      With<arith::ConstraintContext> context(&analyzer_, Not(condition));
+      else_case = VisitStmt(op->else_case.value());
+    }
+    return IfThenElse(condition, then_case, else_case, op->span);
+  }
+
   Stmt VisitStmt_(const EvaluateNode *op) final {
     const auto *call = op->value.as<CallNode>();
     if (IsAscendCopyCall(call)) {
@@ -1398,11 +1459,13 @@ private:
     bool root = op->name_hint == "tilelang_root";
     bool saved_mixed = mixed_cube_;
     bool saved_partitioned = row_partitioned_;
+    auto saved_private = aiv_private_;
     if (root) {
       auto partition = op->annotations.Get("tl.ascend_row_partitioned");
       row_partitioned_ = partition.has_value() &&
                          partition.value().cast<Integer>()->value == 2;
       mixed_cube_ = ascend::HasAscendCubeIntent(op->body);
+      aiv_private_ = ascend::ValidatedAivPrivateData(op);
     }
     LayoutMap saved = layouts_;
     if (auto map = op->annotations.Get(attr::kLayoutMap))
@@ -1413,10 +1476,14 @@ private:
       for (const Buffer &buffer : scratch_)
         writer->alloc_buffers.push_back(buffer);
       scratch_.clear();
+      if (!aiv_private_.empty())
+        writer->annotations.Set(ascend::kAivPrivateValidated, aiv_private_);
     }
     layouts_ = saved;
     mixed_cube_ = saved_mixed;
     row_partitioned_ = saved_partitioned;
+    if (root)
+      aiv_private_ = saved_private;
     return block;
   }
 
@@ -1424,6 +1491,8 @@ private:
   LayoutMap layouts_;
   bool mixed_cube_{false};
   bool row_partitioned_{false};
+  bool private_operation_{false};
+  Array<Var> aiv_private_;
   Array<Buffer> scratch_;
   Array<Stmt> emitted_;
   Map<Var, PrimExpr> base_map_;
