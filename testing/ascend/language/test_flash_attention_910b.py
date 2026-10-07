@@ -213,3 +213,268 @@ def test_variants_share_typed_math_and_pipeline_exposes_independent_rescale(exam
     (pv_import_index,) = [i for i, stmt in enumerate(pipeline_body)
                          if any(call.args[1].args[0].buffer.name == "pv" for call in calls(stmt, "tl.tileop.ascend_copy"))]
     assert rescale_index < p_export_index < pv_import_index < update_index
+
+
+def _causal_frontend(example, *, variant, query_start=0, kv_len=65):
+    import tilelang
+    from tilelang import tvm
+    from tvm import tirx
+    from testing.ascend._ir import nodes
+
+    program = example.flash_attention_fwd(
+        2, 2, 1, 33, kv_len, 16, dtype="float16", variant=variant,
+        causal=True, query_start=query_start, tiling=example.FwdTiling(32, 16, 3),
+    )
+    mod = tilelang.transform.MaterializeKernelLaunch(
+        lower_grid_binding=True, lower_thread_binding=False, default_threads=None,
+        unsupported_annotations=["cluster_dims"], launch_dim_tags=["cthread"],
+    )(tvm.IRModule({"main": program}))
+    (loop,) = [node for node in nodes(mod, tirx.For) if node.kind == tirx.ForKind.SERIAL]
+    group = next(attr.node.var for attr in nodes(mod, tirx.AttrStmt)
+                 if attr.attr_key == "thread_extent" and attr.node.thread_tag == "blockIdx.x")
+    definitions = {binding.var: binding.value for binding in nodes(mod, tirx.Bind)}
+    extent = loop.extent
+    for _ in definitions:
+        extent = tirx.stmt_functor.substitute(extent, definitions)
+    return mod, loop, group, extent
+
+
+def _constant(expr, bindings):
+    from tilelang import tvm
+    from tvm import tirx
+    values = {var: tirx.IntImm(var.dtype, value) for var, value in bindings.items()}
+    return int(tvm.arith.Analyzer().simplify(tirx.stmt_functor.substitute(expr, values)))
+
+
+@pytest.mark.parametrize("query_start,expected", [(0, [2, 3]), (16, [3, 4]), (32, [4, 5])])
+def test_causal_variants_share_group_uniform_tail_and_offset_trip_bounds(example, query_start, expected):
+    from tvm import tirx
+    from testing.ascend._ir import nodes
+
+    extents = []
+    for variant in ("generic", "pipeline"):
+        mod, loop, group, extent = _causal_frontend(example, variant=variant, query_start=query_start)
+        assert str(loop.loop_var.dtype) == str(extent.dtype) == "int64"
+        assert not any("sid" in var.name for var in nodes(extent, tirx.Var))
+        counts = [_constant(extent, {group: index}) for index in range(8)]
+        assert counts == expected * 4  # Both batches and both query heads.
+        # Capacity32 partitions into two private capacities16. The final group
+        # has one valid row and an empty SID1, but both SIDs keep the group's
+        # same KV loop; private ownership must never determine trip count.
+        for index, count in enumerate(counts):
+            base = (index % 2) * 32
+            valid_rows = min(32, 33 - base)
+            owner_rows = [min(16, max(valid_rows - sid * 16, 0)) for sid in (0, 1)]
+            assert owner_rows == ([16, 16] if index % 2 == 0 else [1, 0])
+            end = query_start + base + valid_rows
+            assert count >= 1 and (count - 1) * 16 < end <= count * 16
+            assert count <= (65 + 15) // 16
+        extents.append(counts)
+    assert extents[0] == extents[1]
+
+
+def test_causal_trip_ceil_keeps_large_key_positions_in_int64(example):
+    # An actual frontend tensor must have representable strides. This length
+    # crosses Int32 when rounded to a KV tile, while all tensor strides fit
+    # Int64; an INT64_MAX tensor would overflow before kernel construction.
+    largest = (1 << 31) - 1
+    offset = largest - 33
+    expected = [(largest - 1) // 16 + ((largest - 1) % 16 != 0),
+                largest // 16 + (largest % 16 != 0)]
+    for variant in ("generic", "pipeline"):
+        _, loop, group, extent = _causal_frontend(example, variant=variant, query_start=offset, kv_len=largest)
+        assert str(loop.loop_var.dtype) == "int64"
+        assert [_constant(extent, {group: index}) for index in range(2)] == expected
+
+
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+@pytest.mark.parametrize("query_start", [0, 16])
+def test_causal_group_bound_skips_only_identity_online_softmax_updates(example, dtype, query_start):
+    random = np.random.default_rng(79)
+    q = random.normal(0, 0.5, (1, 2, 33, 16)).astype(np.float32)
+    k = random.normal(0, 0.5, (1, 1, 65, 16)).astype(np.float32)
+    v = random.normal(0, 0.5, k.shape).astype(np.float32)
+    for base in (0, 32):
+        rows = min(32, 33 - base)
+        end = query_start + base + rows
+        limit = min(5, end // 16 + (end % 16 != 0))
+        stop = min(65, limit * 16)
+        query = q[:, :, base:base + rows]
+        kwargs = dict(dtype=dtype, block_kv=16, causal=True, query_start=query_start + base)
+        full = example.attention_reference(query, k, v, **kwargs)
+        bounded = example.attention_reference(query, k[:, :, :stop], v[:, :, :stop], **kwargs)
+        np.testing.assert_array_equal(bounded, full)
+
+
+def test_dynamic_causal_extent_keeps_both_core_stage_guards_and_empty_sid_tasks(example):
+    # Exercise the existing stage rewriter with the actual frontend expression.
+    # Stages0/2 are a diagnostic pass input, not an automatic optimizer claim.
+    from tilelang import tvm
+    from tilelang.ascend import transform
+    from tvm import tirx
+    from testing.ascend._ir import copy, kernel, nodes, seq, statements
+    from testing.ascend.auto_schedule._scheduled_ir import unit
+
+    _, _, group, extent = _causal_frontend(example, variant="pipeline", query_start=16)
+    epoch = tirx.Var("kv_epoch", "int64")
+    sid = tirx.Var("sid", "int32")
+    qrows = tirx.min(32, 33 - (group % 2) * 32)
+    owned = tirx.min(16, tirx.max(qrows - sid * 16, 0))
+    source = tirx.decl_buffer((80, 16), "float16", name="cube_source")
+    l1 = tirx.decl_buffer((16, 16), "float16", name="cube_operand", scope="shared.l1")
+    l1_late = tirx.decl_buffer((16, 16), "float16", name="cube_late", scope="shared.l1")
+    workspace = tirx.decl_buffer((5, 32, 16), "float32", name="vector_source")
+    ub = tirx.decl_buffer((16, 16), "float32", name="vector_private", scope="shared.dyn")
+    ub_late = tirx.decl_buffer((16, 16), "float32", name="vector_late", scope="shared.dyn")
+    cube = copy(source, l1, src_indices=[epoch * 16, 0], src_shape=[16, 16])
+    vector = copy(workspace, ub, src_indices=[epoch, sid * 16, 0], src_shape=[1, owned, 16], dst_shape=[owned, 16])
+    cube_late = copy(source, l1_late, src_indices=[epoch * 16, 0], src_shape=[16, 16])
+    vector_late = copy(workspace, ub_late, src_indices=[epoch, sid * 16, 0], src_shape=[1, owned, 16], dst_shape=[owned, 16])
+    loop = tirx.For(epoch, tirx.IntImm("int64", 0), extent, tirx.ForKind.SERIAL,
+        seq(unit(cube, core=2, stage=0), unit(vector, core=1, stage=0),
+            unit(cube_late, core=2, stage=2), unit(vector_late, core=1, stage=2)))
+    before = kernel(unit(loop, core=None), buffers=[l1, l1_late, ub, ub_late], params=[group, source, workspace],
+                    annotations={"vector_count": 2})
+    lane = tirx.IterVar(tvm.ir.Range(0, 2), sid, tirx.IterVar.ThreadIndex, "cthread")
+    before["main"] = before["main"].with_body(tirx.AttrStmt(lane, "thread_extent", 2, before["main"].body))
+    target = tvm.target.Target({"kind": "ascend", "arch": "dav-2201"})
+    before["main"] = before["main"].with_attr("target", target)
+    with target:
+        after = transform.LowerScheduledTIR()(before)
+    vectors = [block for block in nodes(after, tirx.SBlock) if block.name_hint == "VECTOR"]
+    assert vectors and all(int(block.annotations["vector_count"]) == 2 for block in vectors)
+    sites = [(stmt.value, parents) for stmt, parents in statements(after)
+             if isinstance(stmt, tirx.Evaluate) and isinstance(stmt.value, tirx.Call)
+             and isinstance(stmt.value.op, tvm.ir.Op) and stmt.value.op.name == "tl.tileop.ascend_copy"]
+    assert len(sites) == 4
+    for group_index in (0, 1):
+        trip_count = _constant(extent, {group: group_index})
+        active = {"cube_source": [], "vector_source": []}
+        for call, parents in sites:
+            control = next(node for node in reversed(parents) if isinstance(node, tirx.For) and node.loop_var.name == "kv_epoch")
+            guards = [node.condition for node in parents if isinstance(node, tirx.IfThenElse)]
+            assert guards
+            assert _constant(control.extent, {group: group_index}) == trip_count + 2
+            source_name = call.args[0].args[0].buffer.name
+            for owner in (0, 1):
+                iterations = []
+                for physical_epoch in range(_constant(control.extent, {group: group_index})):
+                    bindings = {group: group_index, sid: owner, control.loop_var: physical_epoch}
+                    if all(_constant(guard, bindings) for guard in guards):
+                        logical = _constant(call.args[0].args[0].indices[0], bindings)
+                        iterations.append(logical // 16 if source_name == "cube_source" else logical)
+                assert iterations == list(range(trip_count))
+                active[source_name].append(iterations)
+            if source_name == "vector_source" and group_index == 1:
+                assert _constant(call.args[0].args[3], {group: 1, sid: 1}) == 0
+        assert active["cube_source"] == active["vector_source"]
+
+
+def _whole_valid_score_branch(mod, loop):
+    from tvm import tirx
+    from testing.ascend._ir import nodes
+
+    # The shared recurrence stays outside this control node. It branches only
+    # between score scaling and the original per-lane prefix mask.
+    candidates = []
+    for branch in nodes(loop.body, tirx.IfThenElse):
+        if branch.else_case is None:
+            continue
+        then_stores = nodes(branch.then_case, tirx.BufferStore)
+        else_stores = nodes(branch.else_case, tirx.BufferStore)
+        if (len(then_stores) == len(else_stores) == 1
+                and then_stores[0].buffer.name == else_stores[0].buffer.name == "scores"
+                and isinstance(then_stores[0].value, tirx.Mul)):
+            candidates.append(branch)
+    (branch,) = candidates
+    definitions = {binding.var: binding.value for binding in nodes(mod, tirx.Bind)}
+    condition = branch.condition
+    for _ in definitions:
+        condition = tirx.stmt_functor.substitute(condition, definitions)
+    return branch, condition
+
+
+@pytest.mark.parametrize("variant", ["generic", "pipeline"])
+@pytest.mark.parametrize("query_start", [14, 15, 16])
+def test_causal_whole_valid_scale_uses_first_query_and_keeps_original_mask(example, variant, query_start):
+    from tilelang import tvm
+    from tvm import tirx
+    from testing.ascend._ir import calls, nodes
+
+    mod, loop, group, extent = _causal_frontend(example, variant=variant, query_start=query_start)
+    branch, condition = _whole_valid_score_branch(mod, loop)
+    assert str(condition.dtype) == "bool"
+    assert all(var.same_as(group) or var.same_as(loop.loop_var)
+               for var in nodes(condition, tirx.Var))
+    assert not calls(branch, "tl.tileop.ascend_copy")
+    assert not calls(branch, "tl.tileop.gemm")
+    assert not calls(branch, "tl.tileop.reduce")
+    (dense,) = nodes(branch.then_case, tirx.BufferStore)
+    (masked,) = nodes(branch.else_case, tirx.BufferStore)
+    assert dense.value.dtype == masked.value.dtype == "float32"
+    assert isinstance(dense.value, tirx.Mul)
+    assert not calls(branch.then_case, "tirx.if_then_else")
+    (select,) = calls(branch.else_case, "tirx.if_then_else")
+    tvm.ir.assert_structural_equal(select.args[1], dense.value, map_free_vars=True)
+    # Both original inequalities remain in the fallback: KV-tail visibility
+    # and the inclusive causal diagonal. The score arithmetic stays identical.
+    (tail_check,) = nodes(select.args[0], tirx.LT)
+    (causal_check,) = nodes(select.args[0], tirx.LE)
+    definitions = {binding.var: binding.value for binding in nodes(mod, tirx.Bind)}
+    predicates = [tail_check, causal_check]
+    for _ in definitions:
+        predicates = [tirx.stmt_functor.substitute(expr, definitions) for expr in predicates]
+    (row_loop, col_loop) = nodes(branch.else_case, tirx.For)[::-1]
+    assert int(row_loop.extent) == 32 and int(col_loop.extent) == 16
+    scale = np.float32(0.25)
+    scores = np.arange(32 * 16, dtype=np.float32).reshape(32, 16) / 8 - 30
+    seen = []
+    for group_index in range(8):
+        base = (group_index % 2) * 32
+        rows = min(32, 33 - base)
+        active = _constant(extent, {group: group_index})
+        selected = []
+        for epoch in range(active):
+            key_base = epoch * 16
+            bindings = {group: group_index, loop.loop_var: epoch}
+            actual = bool(_constant(condition, bindings))
+            expected = key_base + 16 <= query_start + base + 1
+            assert actual == expected
+            selected.append(actual)
+            visible = ((key_base + np.arange(16)[None, :] < 65)
+                       & (key_base + np.arange(16)[None, :]
+                          <= query_start + base + np.arange(rows)[:, None]))
+            if actual:
+                assert visible.all()
+                np.testing.assert_array_equal(
+                    scores[:rows] * scale,
+                    np.where(visible, scores[:rows] * scale, -np.inf),
+                )
+            # Check an actual first-row and last-valid-row lane against both
+            # unchanged fallback inequalities, not a second mask algorithm.
+            for row in (0, rows - 1):
+                for col in (0, 15):
+                    lane = {**bindings, row_loop.loop_var: row, col_loop.loop_var: col}
+                    assert bool(_constant(predicates[0], lane)) == (key_base + col < 65)
+                    assert bool(_constant(predicates[1], lane)) == (key_base + col <= query_start + base + row)
+        seen.append(selected)
+    assert seen[0] == seen[2] == seen[4] == seen[6]
+    assert seen[1] == seen[3] == seen[5] == seen[7]
+    assert seen[0][0] == (query_start >= 15)  # Exact whole-tile boundary.
+    # A one-row qtail's empty SID1 uses this same group/epoch predicate:
+    # the allowed-variable assertion excludes every private row/SID value.
+
+
+def test_causal_whole_valid_tail_avoids_int32_endpoint_overflow(example):
+    largest = (1 << 31) - 1
+    for variant in ("generic", "pipeline"):
+        mod, loop, group, extent = _causal_frontend(
+            example, variant=variant, query_start=largest - 33, kv_len=largest,
+        )
+        _, condition = _whole_valid_score_branch(mod, loop)
+        for group_index in (0, 1):
+            active = _constant(extent, {group: group_index})
+            bindings = {group: group_index, loop.loop_var: active - 1}
+            assert (active - 1) * 16 + 16 > largest
+            assert not _constant(condition, bindings)
+            assert _constant(condition, {group: group_index, loop.loop_var: 0})

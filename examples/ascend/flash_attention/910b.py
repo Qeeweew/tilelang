@@ -92,12 +92,20 @@ def flash_attention_fwd(
             for i, j in T.Parallel(block_q, block_kv):
                 scores[i, j] = scores[i, j] * T.float32(scale)
         else:
-            for i, j in T.Parallel(block_q, block_kv):
-                scores[i, j] = T.if_then_else(
-                    (key_base + j < kv_len) & ((not causal) | (key_base + j <= query_start + query_base + i)),
-                    scores[i, j] * T.float32(scale),
-                    -T.infinity("float32"),
-                )
+            # Every row in this logical query group can see the complete KV
+            # tile. Use the group's first query, independent of AIV ownership.
+            # Subtraction is equivalent to key_base+B <= first_query+1 but
+            # avoids an overflowing endpoint in the final Int64 KV tile.
+            if causal and (T.cast(key_base, "int64") <= T.int64(query_start) + T.cast(query_base, "int64") + T.int64(1) - T.int64(block_kv)):
+                for i, j in T.Parallel(block_q, block_kv):
+                    scores[i, j] = scores[i, j] * T.float32(scale)
+            else:
+                for i, j in T.Parallel(block_q, block_kv):
+                    scores[i, j] = T.if_then_else(
+                        (key_base + j < kv_len) & ((not causal) | (key_base + j <= query_start + query_base + i)),
+                        scores[i, j] * T.float32(scale),
+                        -T.infinity("float32"),
+                    )
         T.reduce_max(scores, next_maximum, dim=1, clear=True)
         for i in T.Parallel(block_q):
             next_maximum[i] = T.max(maximum[i], next_maximum[i])
@@ -141,6 +149,16 @@ def flash_attention_fwd(
             kv_head = query_head // groups
             query_base = core % q_tiles * block_q
             qrows = T.min(block_q, query_len - query_base)
+            if causal:
+                # Exclusive largest visible key across this group's valid
+                # queries. Keep this group-uniform, including an empty AIV
+                # partition; it is unrelated to each SID's private row count.
+                visible_end = T.int64(query_start) + T.cast(query_base, "int64") + T.cast(qrows, "int64")
+                kv_width = T.int64(block_kv)
+                # Quotient plus remainder avoids visible_end + B - 1 overflow.
+                active_kv_tiles = T.min(T.int64(kv_tiles), visible_end // kv_width + T.cast(visible_end % kv_width != 0, "int64"))
+            else:
+                active_kv_tiles = kv_tiles
 
             # Q is reused across KV iterations. Tile shape and this cache
             # policy are algorithm choices expressed here in Python.
@@ -166,10 +184,10 @@ def flash_attention_fwd(
             T.fill(denominator, 0)
             T.fill(maximum, -T.infinity("float32"))
             if variant == "generic":
-                for kv_tile in T.serial(kv_tiles):
+                for kv_tile in T.serial(active_kv_tiles):
                     kv_step(kv_tile, batch_id, query_head, kv_head, query_base, qrows, Q, K, V, q_l1, k_l1, v_l1, p_l1, score_acc, pv_acc, scores, p, pv, output, maximum, next_maximum, denominator, row_sum, alpha)
             else:
-                for kv_tile in T.Pipelined(kv_tiles, max_stages=max_stages):
+                for kv_tile in T.Pipelined(active_kv_tiles, max_stages=max_stages):
                     kv_step(kv_tile, batch_id, query_head, kv_head, query_base, qrows, Q, K, V, q_l1, k_l1, v_l1, p_l1, score_acc, pv_acc, scores, p, pv, output, maximum, next_maximum, denominator, row_sum, alpha)
 
             for i, j in T.Parallel(block_q, head_dim):
