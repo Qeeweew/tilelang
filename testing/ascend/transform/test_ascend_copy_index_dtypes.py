@@ -9,6 +9,7 @@ import tilelang
 from tilelang import tvm
 from tilelang.ascend import transform
 from tilelang.layout import (
+    Layout,
     make_ascend_l0a_2201_layout,
     make_ascend_major_k_layout,
     make_ascend_sf_layout,
@@ -39,6 +40,47 @@ def _equal(actual, expected, *, loops=()):
     assert len(actual) == len(expected)
     for left, right in zip(actual, expected):
         assert analyzer.can_prove_equal(left, right), (left, right)
+
+
+@pytest.mark.parametrize("arch", ["dav-2201", "dav-3510"])
+@pytest.mark.parametrize("index_dtype", ["int32", "int64"])
+@pytest.mark.parametrize("versioned", [False, True])
+def test_layout_buffer_load_and_store_preserve_mixed_index_widths(arch, index_dtype, versioned):
+    shape = (2, 32, 32) if versioned else (32, 32)
+    source = tirx.decl_buffer(shape, "float32", name="source")
+    destination = tirx.decl_buffer(shape, "float32", name="destination")
+    row, col = _i(17, index_dtype), _i(31, "int32")
+    indices = [_i(1), row, col] if versioned else [row, col]
+    mapping = (lambda v, i, j: [v, i // 16, j // 8, i % 16, j % 8]) if versioned else (
+        lambda i, j: [i // 16, j // 8, i % 16, j % 8])
+    layout = Layout(shape, mapping)
+    before = tirx.BufferStore(destination, tirx.BufferLoad(source, indices), indices)
+    after = _lower(before, params=[source, destination],
+                   layouts={source: layout, destination: layout}, arch=arch)
+    (load,), (store,) = nodes(after, tirx.BufferLoad), nodes(after, tirx.BufferStore)
+    expected = [row // 16, col // 8, row % 16, col % 8]
+    if versioned:
+        expected.insert(0, _i(1))
+    for actual in (load.indices, store.indices):
+        _equal(actual, expected)
+        assert [str(index.dtype) for index in actual] == [str(index.dtype) for index in expected]
+
+
+@pytest.mark.parametrize("arch", ["dav-2201", "dav-3510"])
+def test_layout_forwarding_does_not_truncate_a_large_global_coordinate(arch):
+    # A virtual global tensor exercises address mapping only; no allocation,
+    # device code generation or hardware run is needed for this regression.
+    source = tirx.decl_buffer((_i(2**32), _i(32), _i(32)), "float32", name="large_source")
+    result = tirx.decl_buffer((1,), "float32", name="result")
+    index = _i(2**31 + 7)
+    # The canonical layout retains a wide leading batch coordinate; all
+    # trailing tile coordinates and the final mapped address remain valid.
+    layout = make_ascend_major_k_layout(source)
+    before = tirx.BufferStore(result, tirx.BufferLoad(source, [index, _i(17), _i(31)]), [0])
+    after = _lower(before, params=[source, result], layouts={source: layout}, arch=arch)
+    (load,) = nodes(after, tirx.BufferLoad)
+    _equal(load.indices, [index, _i(3), _i(1), _i(1), _i(7)])
+    assert all(str(value.dtype) == "int64" for value in load.indices)
 
 
 @pytest.mark.parametrize("index_dtype", ["int32", "int64"])

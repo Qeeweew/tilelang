@@ -914,8 +914,13 @@ Array<PrimExpr> LayoutNode::Forward(const Array<PrimExpr> &vars) const {
     vmap.Set(InputPlaceholder(i), transform_vars[i]);
   }
 
-  Array<PrimExpr> transformed = forward_index_.Map(
-      [&](const PrimExpr &e) { return Substitute(e, vmap); });
+  // Match IndexMap::MapIndices: a loop or address expression can be wider
+  // than the layout's placeholders. Legalize the mapped arithmetic rather
+  // than narrowing the caller's indices to satisfy strict substitution.
+  Array<PrimExpr> transformed = forward_index_.Map([&](const PrimExpr &e) {
+    return SubstituteWithDataTypeLegalization(
+        e, [&](const Var &var) { return vmap.Get(var); });
+  });
   // Concatenate with the remaining elements from vars
   Array<PrimExpr> result;
   for (size_t i = 0; i < vars.size() - InputDim(); i++) {
