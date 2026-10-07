@@ -578,6 +578,101 @@ def _refine_loop_issue_order(
     return candidate
 
 
+def _loop_resource_ii_lower_bound(iis, resource_flags, resource_deps):
+    """Bound one modulo period by verified, mutually exclusive issue work.
+
+    Tasks in a resource clique occupy disjoint cyclic intervals. Summing the
+    adjacent forward gaps and the final wrap gap proves II >= sum(task II).
+    Pipe masks only nominate groups; the supplied pair constraints must prove
+    each clique, since equal masks can belong to independent cores.
+    """
+    lower = max([1, *iis])
+    if any(interval < 0 for interval in iis):
+        return lower
+    resources = {(i, j) for i, j in resource_deps if i < j}
+    for bit in (1, 2, 4, 8, 16, 32, 64):
+        remaining = {i for i, flags in enumerate(resource_flags) if flags & bit}
+        while remaining:
+            # Independent cores commonly form separate complete components
+            # within one pipe mask. Do not infer edges between components or
+            # sum work in a connected component that is not itself a clique.
+            component = {remaining.pop()}
+            pending = list(component)
+            while pending:
+                current = pending.pop()
+                neighbors = {other for other in remaining
+                             if (min(current, other), max(current, other)) in resources}
+                remaining.difference_update(neighbors)
+                component.update(neighbors)
+                pending.extend(neighbors)
+            group = sorted(component)
+            if all((i, j) in resources for offset, i in enumerate(group)
+                   for j in group[offset + 1:]):
+                lower = max(lower, sum(iis[i] for i in group))
+    return lower
+
+
+def _single_stage_loop_ii_lower_bound(iis, resource_flags, data_deps, resource_deps, pipe_order_deps):
+    """Bound the residue window by distance-zero releases and completion tails.
+
+    With k=0, every feasible modulo plan is a straight-line plan on r, and
+    max(r)+1 <= II. Unit completion tails bound this window's last issue, not
+    native task completion. Discard the helper's source-oriented upper bound.
+    """
+    directed = [(i, j, weight) for i, j, distance, weight in data_deps
+                if distance == 0 and weight >= 0]
+    lower, _ = _straight_line_makespan_bounds(
+        [1] * len(iis), iis, resource_flags, directed, resource_deps, [], pipe_order_deps,
+    )
+    return lower
+
+
+def _reduce_single_stage_loop_resources(n, iis, data_deps, resource_deps):
+    """Remove impossible modulo orders only when every task's k is zero.
+
+    A nonnegative distance-zero path proves r_j >= r_i. With a positive
+    reverse issue gap, j cannot precede i. The chosen direction must retain
+    both its forward and wrap gaps. Loop-carried and buffer-version distances
+    do not prove such a residue order and are deliberately ignored here.
+    """
+    resources = sorted({(i, j) for i, j in resource_deps if i < j})
+    edges = [dict() for _ in range(n)]
+    for i, j, distance, weight in data_deps:
+        if distance == 0 and weight >= 0:
+            edges[i][j] = max(edges[i].get(j, 0), weight)
+    degrees = [0] * n
+    for row in edges:
+        for j in row:
+            degrees[j] += 1
+    ready = [i for i, degree in enumerate(degrees) if degree == 0]
+    topological = []
+    while ready:
+        i = ready.pop()
+        topological.append(i)
+        for j in edges[i]:
+            degrees[j] -= 1
+            if degrees[j] == 0:
+                ready.append(j)
+    if len(topological) != n:
+        return [], resources
+    reach = [dict() for _ in range(n)]
+    for i in reversed(topological):
+        for j, weight in edges[i].items():
+            reach[i][j] = max(reach[i].get(j, 0), weight)
+            for k, suffix in reach[j].items():
+                reach[i][k] = max(reach[i].get(k, 0), weight + suffix)
+    ordered, unordered = [], []
+    for i, j in resources:
+        forward, reverse = reach[i].get(j), reach[j].get(i)
+        if forward is not None and forward + iis[j] > 0:
+            ordered.append((i, j))
+        elif reverse is not None and reverse + iis[i] > 0:
+            ordered.append((j, i))
+        else:
+            unordered.append((i, j))
+    return ordered, unordered
+
+
 def z3_schedule_loop_python(
     num_stages: int,
     latencies: list[int],
@@ -604,8 +699,8 @@ def z3_schedule_loop_python(
 
     Each start time is represented as ``k * II + r``. Directed dependencies
     constrain absolute start times, while resource and owner exclusions choose
-    a non-overlapping modulo order. The solver finds the minimum feasible II by
-    binary search.
+    a non-overlapping modulo order. Binary search selects a feasible II;
+    resource exhaustion can leave its minimality unproven.
 
     Parameters
     ----------
@@ -613,12 +708,12 @@ def z3_schedule_loop_python(
         Maximum number of physical versions available to automatic buffers.
     issue_priority_pairs : list[tuple[int, int]] | None
         Soft physical-source-order preferences derived from forward cross-core
-        RAW handoffs. Applied only after the minimum-II solve, with its selected
+        RAW handoffs. Applied only after selecting a feasible II, with its selected
         stages and emitted version counts fixed. They never replace dependencies.
     prefetch_priority_pairs : list[tuple[int, int]] | None
         Soft load-to-consumer preferences from eligible typed GM-to-on-chip
         forward RAW accesses on one concrete core and distinct pipes. Applied
-        at the minimum II before fixing stages or recalculating versions; a
+        at the selected II before fixing stages or recalculating versions; a
         preference requires both epoch lead and producer-first physical issue.
     stage_horizon : int | None
         Optional maximum number of task stages for automatic Ascend pipelines.
@@ -675,7 +770,8 @@ def z3_schedule_loop_python(
     tuple[list[int], list[int], int]
         start_times: Start time for each task
         buffer_versions: Number of versions for each buffer
-        minimal_II: The minimal initiation interval found
+        selected_II: The selected initiation interval (minimality is not proven
+        when a smaller feasibility query returns unknown)
     """
     n = len(latencies)
 
@@ -726,15 +822,25 @@ def z3_schedule_loop_python(
     # models run-to-run; a fresh context per call keeps the result deterministic.
     ctx = z3.Context()
 
-    # Binary search for minimal II
-    # Lower bound: 1 cycle
+    # Binary search for a feasible II. Only unsat proves that a queried II is
+    # too small; unknown may still guide the bounded search toward a larger II
+    # but must not be reported as a proof of infeasibility or minimality.
     # A sequential schedule must cover both dependency latency and the issue
     # intervals of tasks sharing a resource.
-    ii_lower = max(iis)
+    ii_lower = _loop_resource_ii_lower_bound(iis, resource_flags, resource_deps)
     ii_upper = max(sum(latencies), sum(iis)) + 1
     best_ii = ii_upper
     best_model = None
     best_start_vars = None
+    unknown_checks = []
+    ordered_resources, unordered_resources = [], resource_deps
+    if stage_horizon == 1 and not manual_schedule:
+        ii_lower = max(ii_lower, _single_stage_loop_ii_lower_bound(
+            iis, resource_flags, data_deps, resource_deps, pipe_order_deps,
+        ))
+        ordered_resources, unordered_resources = _reduce_single_stage_loop_resources(
+            n, iis, data_deps, resource_deps,
+        )
 
     if verbose:
         print(f"[Python Z3 Loop] Binary search range: [{ii_lower}, {ii_upper})")
@@ -794,7 +900,10 @@ def z3_schedule_loop_python(
         # Add resource dependency constraints
         # For tasks i and j that use same resource, they cannot execute simultaneously
         # We create ordering variable O_i,j (True means i before j, False means j before i)
-        for i, j in resource_deps:
+        for previous, current in ordered_resources:
+            solver.add(r_vars[current] - r_vars[previous] >= iis[previous])
+            solver.add(r_vars[previous] - r_vars[current] + ii_mid >= iis[current])
+        for i, j in unordered_resources:
             if i < j:  # Only consider each pair once
                 ii_i = iis[i]
                 ii_j = iis[j]
@@ -853,7 +962,8 @@ def z3_schedule_loop_python(
         # Check feasibility
         if verbose:
             print(f"[Python Z3 Loop] Checking feasibility for II = {ii_mid}...")
-        if solver.check() == z3.sat:
+        status = solver.check()
+        if status == z3.sat:
             if verbose:
                 print(f"[Python Z3 Loop] II = {ii_mid} is feasible")
             best_ii = ii_mid
@@ -866,13 +976,24 @@ def z3_schedule_loop_python(
             # Try smaller II
             ii_upper = ii_mid
         else:
-            if verbose:
-                print(f"[Python Z3 Loop] II = {ii_mid} is infeasible")
-            # Need larger II
+            if status == z3.unsat:
+                if verbose:
+                    print(f"[Python Z3 Loop] II = {ii_mid} is infeasible")
+            else:
+                reason = solver.reason_unknown()
+                unknown_checks.append((ii_mid, reason))
+                if verbose:
+                    print(f"[Python Z3 Loop] II = {ii_mid} returned unknown ({reason}); "
+                          "feasibility is unproven, trying a larger II")
+            # A larger II is required after unsat, or tried as a bounded search
+            # policy after unknown. The latter does not prove a lower bound.
             ii_lower = ii_mid + 1
 
     if best_model is None:
         if manual_schedule:
+            if unknown_checks:
+                reasons = "; ".join(f"II {ii}: {reason}" for ii, reason in unknown_checks)
+                raise RuntimeError(f"Manual schedule search returned unknown ({reasons}); feasibility is unproven")
             raise RuntimeError(
                 "Manual schedule constraints are infeasible; check per-pipe source order, T.Stage values, dependencies, and resource usage"
             )
@@ -890,7 +1011,8 @@ def z3_schedule_loop_python(
         buffer_versions = [1] * len(buffer_sizes)
     else:
         if verbose:
-            print(f"[Python Z3 Loop] Minimal feasible II = {best_ii}")
+            detail = "; minimality is unproven after unknown" if unknown_checks else ""
+            print(f"[Python Z3 Loop] Selected feasible II = {best_ii}{detail}")
 
         if prefetch_priority_pairs and enable_offset and not manual_schedule:
             best_model = _refine_loop_prefetch(
@@ -944,7 +1066,7 @@ def z3_schedule_loop_python(
     task_indices.sort(key=lambda idx: (start_times[idx], idx))
 
     if verbose:
-        print(f"[Python Z3 Loop] Scheduling completed. Minimal II = {best_ii}.")
+        print(f"[Python Z3 Loop] Scheduling completed. Selected II = {best_ii}.")
     for i in range(n):
         idx = task_indices[i]
         if verbose:
@@ -969,7 +1091,9 @@ def z3_schedule_loop_python(
             schedule_info = {
                 "num_stages": num_stages,
                 "num_tasks": n,
-                "minimal_II": best_ii,
+                "selected_II": best_ii,
+                "minimality_proven": best_model is not None and not unknown_checks,
+                "unknown_checks": unknown_checks,
                 "latencies": latencies,
                 "iis": iis,
                 "resource_flags": resource_flags,
@@ -1088,7 +1212,7 @@ def z3_schedule_loop_python(
                 ax.set_ylim(-1, n)
                 ax.set_xlabel("Time (cost-model units)")
                 ax.set_ylabel("Task Index")
-                ax.set_title(f"Z3 Schedule Timeline (Minimal II={best_ii})")
+                ax.set_title(f"Z3 Schedule Timeline (Selected II={best_ii})")
                 ax.grid(True, alpha=0.3)
 
                 # Add legend for resource types and phases (outside the plot)

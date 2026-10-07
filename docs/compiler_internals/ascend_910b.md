@@ -297,8 +297,23 @@ the supplied model's units, including dimensionless 2201 weights. A solver
 `unknown` result reports its reason separately from `unsat` and retains the
 existing fallback policy.
 
+Modulo search bounds II by the total issue work of verified resource cliques.
+Pipe masks nominate groups; only actual pairwise exclusions establish a
+clique, and independent cores are bounded separately. With automatic stage
+horizon one, nonnegative distance-zero paths can prove a resource order.
+Removing its impossible reverse choice still retains the forward and wrap
+gaps. Free stages and manual schedules retain their original choices.
+For horizon one, a straight-line relaxation also bounds the residue window
+from distance-zero releases and remaining issue paths. Unit completion tails
+represent the last integer issue residue fitting below II; they do not change
+native completion costs or require instructions to finish within the period.
+`unknown` is distinct from `unsat`: trying a larger II after resource
+exhaustion is a bounded search policy, not a proof that the smaller II is
+infeasible. Such a result is reported as a selected feasible II with unproven
+minimality. Manual search exhaustion has a separate diagnostic.
+
 Ordinary automatic 2201 loops with offsets also consider prefetch at the
-already selected minimum II, before fixing stages or recalculating versions.
+already selected II, before fixing stages or recalculating versions.
 A typed GM-to-L1/UB copy and its forward RAW reader qualify only on the same
 concrete core and distinct pipes, with one automatic storage owner and a
 version variable. Read-modify-write roles, ambiguous or mixed-core units,
@@ -322,7 +337,7 @@ through an ambiguous-core intermediate. Native task candidates use the same
 instruction and memory capability function as AssignCore, intersected with
 lexical ownership; ambiguous placement remains conservative.
 
-After the minimum-II solve and version recalculation, one bounded refinement
+After selecting a feasible II and recalculating versions, one bounded refinement
 can select different issue residues with stages, emitted version counts and
 all original constraints fixed. An unavailable or worse result retains the
 feasible plan; verbose diagnostics report the solver status and unknown reason.
