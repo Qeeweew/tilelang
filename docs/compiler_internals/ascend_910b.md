@@ -134,6 +134,16 @@ native operations to automatic scheduling and completion analysis.
 The original `cthread` variable, extent and `vector_count` remain lexical launch
 facts. They do not permit an empty AIV owner to skip collective completion.
 
+Common buffer-owner inference can recognize a full GEMM definition on the
+first iteration of a guaranteed static descendant loop. Only positive,
+unguarded, unit-step descendants contribute their first coordinate; the
+proposed owner's coordinate remains symbolic. The clear predicate must prove
+true for the complete, unique allocation, without an earlier scalar, opaque
+or alias read. Conditional or unknown initialization and partial views cannot
+supply this proof. The analysis preserves the GEMM's conservative read-write
+region and existing L0A/B loop structure; scheduling, storage reuse and
+synchronization consume the resulting common owner independently.
+
 2201 NZ-to-ND Fixpipe copies configure `ND_PARA` explicitly with
 `asc_set_l0c_copy_params(1, 0, 0)` before issuing the transfer. The installed
 `asc_copy_l0c2gm` implementation issues the copy without configuring this

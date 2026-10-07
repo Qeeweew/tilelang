@@ -50,6 +50,7 @@
 #include "ascend/transform/buffer_version.h"
 #include "ascend/transform/storage_footprint.h"
 #include "op/builtin.h"
+#include "op/gemm.h"
 #include "transform/common/attr.h"
 
 namespace tvm {
@@ -64,6 +65,8 @@ namespace {
 using StorageSet = std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual>;
 using ControlStorageClaims =
     std::unordered_map<ControlNode *, std::vector<Var>>;
+using AllocationBufferMap =
+    std::unordered_map<Var, Buffer, ObjectPtrHash, ObjectPtrEqual>;
 
 Array<Var> NormalizeEligibleStorages(const Any &annotation) {
   Array<Var> result;
@@ -173,6 +176,12 @@ AccessOrder AssumeForExecutes(AccessOrder body) {
 
 class WriteFirstClassifier : public StmtExprVisitor {
 public:
+  WriteFirstClassifier() = default;
+  WriteFirstClassifier(const AllocationBufferMap &allocations,
+                       Map<Var, PrimExpr> first_iteration)
+      : allocations_(&allocations),
+        first_iteration_(std::move(first_iteration)) {}
+
   AccessOrder Classify(const Stmt &s, const Var &storage) {
     target_storage_ = storage;
     result_ = AccessOrder::kUntouched;
@@ -190,6 +199,9 @@ public:
 private:
   Var target_storage_;
   AccessOrder result_ = AccessOrder::kUntouched;
+  const AllocationBufferMap *allocations_{nullptr};
+  Map<Var, PrimExpr> first_iteration_;
+  bool first_definition_allowed_{true};
 
   // Dispatch short-circuit: skip further work once a terminal is reached.
   void VisitStmt(const Stmt &s) final {
@@ -203,13 +215,24 @@ private:
     StmtExprVisitor::VisitExpr(e);
   }
 
-  template <typename F> AccessOrder ClassifyLocal(F f) {
+  template <typename F>
+  AccessOrder ClassifyLocal(F f, bool allow_first_definition = true) {
     AccessOrder saved = result_;
+    bool saved_allowed = first_definition_allowed_;
     result_ = AccessOrder::kUntouched;
+    first_definition_allowed_ &= allow_first_definition;
     f();
     AccessOrder local = result_;
     result_ = saved;
+    first_definition_allowed_ = saved_allowed;
     return local;
+  }
+
+  void VisitExpr_(const VarNode *op) final {
+    // A bare storage pointer in an opaque call may consume old contents.
+    // Typed region identities are handled separately below.
+    if (op == target_storage_.get())
+      result_ = AccessOrder::kReadFirst;
   }
 
   void VisitExpr_(const BufferLoadNode *op) final {
@@ -258,7 +281,7 @@ private:
       if (IsTerminal(result_))
         return;
     }
-    auto body = ClassifyLocal([&] { VisitStmt(op->body); });
+    auto body = ClassifyLocal([&] { VisitStmt(op->body); }, false);
     result_ = SeqCompose(result_, AssumeForExecutes(body));
   }
 
@@ -266,10 +289,10 @@ private:
     VisitExpr(op->condition);
     if (IsTerminal(result_))
       return;
-    auto t = ClassifyLocal([&] { VisitStmt(op->then_case); });
+    auto t = ClassifyLocal([&] { VisitStmt(op->then_case); }, false);
     AccessOrder branch;
     if (op->else_case) {
-      auto e = ClassifyLocal([&] { VisitStmt(op->else_case.value()); });
+      auto e = ClassifyLocal([&] { VisitStmt(op->else_case.value()); }, false);
       branch = MergeIfThenElse(t, e);
     } else {
       branch = MergeIfThenOnly(t);
@@ -295,7 +318,7 @@ private:
     VisitExpr(op->condition);
     if (IsTerminal(result_))
       return;
-    auto body = ClassifyLocal([&] { VisitStmt(op->body); });
+    auto body = ClassifyLocal([&] { VisitStmt(op->body); }, false);
     result_ = SeqCompose(result_,
                          DemoteIfNotMustExecute(body, /*must_execute=*/false));
   }
@@ -304,7 +327,7 @@ private:
     // Reduce-init runs only on the first iteration of the surrounding loop;
     // its writes are not guaranteed across iterations -> kMaybeWriteFirst.
     if (op->init.defined()) {
-      auto init = ClassifyLocal([&] { VisitStmt(op->init.value()); });
+      auto init = ClassifyLocal([&] { VisitStmt(op->init.value()); }, false);
       AccessOrder init_eff = init;
       if (init == AccessOrder::kWriteFirst)
         init_eff = AccessOrder::kMaybeWriteFirst;
@@ -322,7 +345,7 @@ private:
     bool must_execute = false;
     if (const auto *imm = op->predicate.as<IntImmNode>())
       must_execute = (imm->value != 0);
-    auto body = ClassifyLocal([&] { VisitStmt(op->block); });
+    auto body = ClassifyLocal([&] { VisitStmt(op->block); }, must_execute);
     result_ = SeqCompose(result_, DemoteIfNotMustExecute(body, must_execute));
   }
 
@@ -338,11 +361,92 @@ private:
       HandleAccessPtrCall(op);
       return;
     }
+    if (op->op.same_as(Gemm::Get()) && IsFirstFullGemmDefinition(op)) {
+      result_ = AccessOrder::kWriteFirst;
+      return;
+    }
     for (const auto &arg : op->args) {
       VisitExpr(arg);
       if (IsTerminal(result_))
         return;
     }
+  }
+
+  // A sub-K GEMM keeps its conservative read-write C region in the real IR.
+  // Only the proposed owner's first, guaranteed descendant iteration may
+  // prove that this operation defines the complete allocation. In particular,
+  // an unknown clear is not a write proof, and a small alias is not an owner.
+  bool IsFirstFullGemmDefinition(const CallNode *op) const {
+    if (!first_definition_allowed_ || allocations_ == nullptr ||
+        first_iteration_.empty())
+      return false;
+    Gemm gemm(op->args, op->annotations);
+    if (!gemm->c_->data.same_as(target_storage_))
+      return false;
+    auto allocation = allocations_->find(target_storage_);
+    if (allocation == allocations_->end() ||
+        !allocation->second.same_as(gemm->c_) ||
+        gemm->cRegion_->region.size() != 2 || gemm->c_->shape.size() != 2 ||
+        gemm->a_->data.same_as(target_storage_) ||
+        gemm->b_->data.same_as(target_storage_))
+      return false;
+
+    // Region identities are metadata, but their coordinates, scalar arguments
+    // and annotations are evaluated before the definition. Inspect the
+    // original expressions, before simplification can erase a storage use.
+    auto uses_storage = [&](const PrimExpr &expr) {
+      return UsesVar(expr, [&](const VarNode *var) {
+        return var == target_storage_.get();
+      });
+    };
+    for (size_t i = 0; i < 3; ++i) {
+      const auto *region_call = op->args[i].as<CallNode>();
+      if (region_call == nullptr || !region_call->op.same_as(region()) ||
+          region_call->args.empty() || !region_call->annotations.empty())
+        return false;
+      const auto *identity = region_call->args[0].as<BufferLoadNode>();
+      if (identity == nullptr || identity->predicate.has_value())
+        return false;
+    }
+    for (const BufferRegion &region :
+         {gemm->aRegion_, gemm->bRegion_, gemm->cRegion_}) {
+      for (const Range &range : region->region)
+        if (uses_storage(range->min) || uses_storage(range->extent))
+          return false;
+      const Buffer &buffer = region->buffer;
+      if (uses_storage(buffer->elem_offset))
+        return false;
+      for (const PrimExpr &extent : buffer->shape)
+        if (uses_storage(extent))
+          return false;
+      for (const PrimExpr &stride : buffer->strides)
+        if (uses_storage(stride))
+          return false;
+    }
+    for (size_t i = 3; i < op->args.size(); ++i)
+      if (uses_storage(op->args[i]))
+        return false;
+    for (const auto &[_, value] : op->annotations) {
+      if (value.as<PrimExprNode>() == nullptr ||
+          uses_storage(Downcast<PrimExpr>(value)))
+        return false;
+    }
+
+    arith::Analyzer analyzer;
+    if (!is_one(analyzer.Simplify(
+            Substitute(gemm->clearAccum_, first_iteration_))) ||
+        !analyzer.CanProveEqual(gemm->c_->shape[0], gemm->m_) ||
+        !analyzer.CanProveEqual(gemm->c_->shape[1], gemm->n_))
+      return false;
+    for (size_t axis = 0; axis < 2; ++axis) {
+      const Range &range = gemm->cRegion_->region[axis];
+      if (!is_zero(
+              analyzer.Simplify(Substitute(range->min, first_iteration_))) ||
+          !analyzer.CanProveEqual(Substitute(range->extent, first_iteration_),
+                                  gemm->c_->shape[axis]))
+        return false;
+    }
+    return true;
   }
 
   // tl.region(BufferLoad(buf, indices...), access_type, extents...)
@@ -456,10 +560,25 @@ class IRWriteFirstClassifier {
 public:
   static AccessOrder
   Classify(const std::vector<std::shared_ptr<IRStructure>> &nodes,
-           const Var &storage, const ConstrSet &outer_ctx) {
+           const Var &storage, const ConstrSet &outer_ctx,
+           const AllocationBufferMap &allocations) {
+    // The proposed owner's coordinate stays symbolic. Only descending into
+    // another guaranteed loop adds a first-iteration substitution.
+    return ClassifyFirstIteration(nodes, storage, outer_ctx, allocations, {},
+                                  true);
+  }
+
+private:
+  static AccessOrder
+  ClassifyFirstIteration(const std::vector<std::shared_ptr<IRStructure>> &nodes,
+                         const Var &storage, const ConstrSet &outer_ctx,
+                         const AllocationBufferMap &allocations,
+                         const Map<Var, PrimExpr> &first_iteration,
+                         bool guaranteed_path) {
     State state;
     for (const IRStructure *node : GetWriteFirstOrder(nodes)) {
-      ProcessNode(node, storage, outer_ctx, &state);
+      ProcessNode(node, storage, outer_ctx, allocations, first_iteration,
+                  guaranteed_path, &state);
       if (state.unsafe)
         return AccessOrder::kReadFirst;
     }
@@ -470,7 +589,6 @@ public:
                : AccessOrder::kMaybeWriteFirst;
   }
 
-private:
   struct State {
     bool touched{false};
     bool unsafe{false};
@@ -514,27 +632,46 @@ private:
   }
 
   static AccessOrder ClassifyPayload(const IRStructure *node,
-                                     const Var &storage) {
-    WriteFirstClassifier classifier;
+                                     const Var &storage,
+                                     const AllocationBufferMap &allocations,
+                                     const Map<Var, PrimExpr> &first_iteration,
+                                     bool guaranteed_path) {
     if (node->IsTask()) {
+      WriteFirstClassifier classifier(allocations, guaranteed_path
+                                                       ? first_iteration
+                                                       : Map<Var, PrimExpr>());
       return classifier.Classify(static_cast<const TaskNode *>(node)->stmt,
                                  storage);
     }
 
     const auto *control = static_cast<const ControlNode *>(node);
+    WriteFirstClassifier classifier;
     AccessOrder header = classifier.Classify(control->task->stmt, storage);
     if (header == AccessOrder::kReadFirst ||
         header == AccessOrder::kWriteFirst) {
       return header;
     }
 
-    AccessOrder body =
-        Classify(control->children, storage, control->GetLoopBodyContext());
+    const For &loop = control->control;
+    const int64_t *extent = as_const_int(loop->extent);
+    guaranteed_path &=
+        !control->HasConditions() && !control->BodyHasLoopBreak() &&
+        as_const_int(loop->min) != nullptr && extent != nullptr &&
+        *extent > 0 && (!loop->step.has_value() || is_one(loop->step.value()));
+    Map<Var, PrimExpr> nested_first = first_iteration;
+    if (guaranteed_path)
+      nested_first.Set(loop->loop_var, loop->min);
+    AccessOrder body = ClassifyFirstIteration(
+        control->children, storage, control->GetLoopBodyContext(), allocations,
+        nested_first, guaranteed_path);
     return SeqCompose(header, AssumeForExecutes(body));
   }
 
   static void ProcessNode(const IRStructure *node, const Var &storage,
-                          const ConstrSet &outer_ctx, State *state) {
+                          const ConstrSet &outer_ctx,
+                          const AllocationBufferMap &allocations,
+                          const Map<Var, PrimExpr> &first_iteration,
+                          bool guaranteed_path, State *state) {
     PrimExpr active_guard = Bool(true);
     WriteFirstClassifier classifier;
     for (const auto &guard : node->GetGuards()) {
@@ -554,8 +691,9 @@ private:
                       active_guard, outer_ctx, state);
       }
     }
-    ProcessAccess(ClassifyPayload(node, storage), active_guard, outer_ctx,
-                  state);
+    ProcessAccess(ClassifyPayload(node, storage, allocations, first_iteration,
+                                  guaranteed_path && !node->HasConditions()),
+                  active_guard, outer_ctx, state);
   }
 };
 
@@ -571,8 +709,9 @@ public:
   static ControlStorageClaims
   Plan(const std::vector<std::shared_ptr<IRStructure>> &root,
        const StorageSet &excluded_storages, const L0StorageGroups &groups,
-       const CompilerWorkspaceStorageSet &compiler_workspaces) {
-    MultiBufferOwnerPlanner planner;
+       const CompilerWorkspaceStorageSet &compiler_workspaces,
+       const SBlock &kernel_root) {
+    MultiBufferOwnerPlanner planner(kernel_root);
     StorageSet seen;
     for (const auto &node : root) {
       for (const Var &storage :
@@ -594,6 +733,18 @@ public:
   }
 
 private:
+  explicit MultiBufferOwnerPlanner(const SBlock &kernel_root) {
+    StorageSet ambiguous;
+    for (const Buffer &buffer : kernel_root->alloc_buffers) {
+      if (ambiguous.count(buffer->data))
+        continue;
+      if (!allocations_.emplace(buffer->data, buffer).second) {
+        allocations_.erase(buffer->data);
+        ambiguous.insert(buffer->data);
+      }
+    }
+  }
+
   // Ordered from least to most restrictive; sibling composition takes max.
   enum class Coverage {
     kUntouched,
@@ -626,6 +777,7 @@ private:
   };
 
   ControlStorageClaims claims_;
+  AllocationBufferMap allocations_;
 
   static CoveragePlan PlanLeaf(const TaskNode *task,
                                const Array<Var> &members) {
@@ -664,7 +816,8 @@ private:
       bool write_first = true;
       for (const Var &storage : members) {
         AccessOrder order = IRWriteFirstClassifier::Classify(
-            control->children, storage, control->GetLoopBodyContext());
+            control->children, storage, control->GetLoopBodyContext(),
+            allocations_);
         write_first &= order != AccessOrder::kReadFirst;
       }
       if (write_first) {
@@ -707,7 +860,8 @@ public:
     excluded_storages = std::move(expanded);
     ControlStorageClaims claims = MultiBufferOwnerPlanner::Plan(
         scheduled_tir->tree, excluded_storages, groups,
-        GetCompilerWorkspaceStorages(scheduled_tir->metadata.kernel_root));
+        GetCompilerWorkspaceStorages(scheduled_tir->metadata.kernel_root),
+        scheduled_tir->metadata.kernel_root);
     MultiBufferAnnotator annotator(std::move(claims), std::move(manual_buffers),
                                    std::move(single_version_buffers), groups);
     annotator.RewriteNodes(scheduled_tir->tree);
