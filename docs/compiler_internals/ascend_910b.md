@@ -48,8 +48,9 @@ and FP32 accumulation; transposed A remains unsupported.
 
 When one logical accumulator exceeds L0C capacity, the same boundary can pair
 its full-clear GEMM with its adjacent complete GM export. It replaces that
-pair with ordinary M/N loops, a compact single-version L0C accumulator, and
-subtile exports into the original GM region. K lowering then operates on each
+pair with an ordinary physical-tile loop, a compact L0C accumulator with two
+explicit slots when capacity permits, and subtile exports into the original
+GM region. K lowering then operates on each
 physical tile. The whole GM reader remains outside these loops. See
 [physical GEMM tiles](ascend_2201_physical_tiles.md) for admission and completion
 contracts; this does not imply that the logical L1 or UB allocations fit.

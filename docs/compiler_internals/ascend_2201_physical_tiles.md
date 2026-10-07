@@ -12,26 +12,31 @@ requires a unique full-clear L1 GEMM followed by its complete L0C-to-GM export.
 It rewrites both operations together:
 
 ```text
-for m in Serial(M / tile_m):
-    for n in Serial(N / tile_n):
-        gemm(A[m slice, full K], B[n slice, full K], scratch, clear=True)
-        copy(scratch, original_GM_output[m slice, n slice])
+for tile in Serial((M / tile_m) * (N / tile_n)):
+    m, n = tile // (N / tile_n), tile % (N / tile_n)
+    slot = tile % 2
+    gemm(A[m slice, full K], B[n slice, full K], scratch[slot], clear=True)
+    copy(scratch[slot], original_GM_output[m slice, n slice])
 ```
 
-The scratch has compact canonical L0C layout and one physical version. Its
-canonical layout is registered with the frontend storage-Var layout map when
+When capacity permits, the scratch has shape `[2, tile_m, tile_n]` and compact
+canonical L0C layout. Both operations address the same explicit slot region.
+The leading axis is registered as an existing manual period of two; automatic
+versioning must not add another axis. Its canonical layout is registered with
+the frontend storage-Var layout map when
 the allocation is created; layout inference consumes that anchor. The
 original oversized allocation and its layout/version entries disappear. The original GM
 allocation, storage identity, leading coordinates and row pitch remain. Any
-whole-output GM reader follows both physical loops. Each output element is
+whole-output GM reader follows the physical loop. Each output element is
 written exactly once after its complete K accumulation; the rewrite introduces
 no GM partial sums or intermediate narrow accumulator.
 
 The existing K lowerer expands each physical GEMM into bounded sub-K loads
 and MADs. The first sub-K clears that physical tile, later sub-Ks accumulate,
-and intermediate sub-Ks cannot publish whole-GEMM completion. New M/N loops
-are ordinary static serial loops; enclosing automatic pipeline intent remains
-visible to the existing scheduling path.
+and intermediate sub-Ks cannot publish whole-GEMM completion. One ordinary
+static serial loop supplies the physical tile ordinal, including across M/N
+boundaries; enclosing automatic pipeline intent remains visible to the existing
+scheduling path.
 
 An adjacent producer/export pair may occur inside a shared conditional branch,
 an Ascend Stage, or a transparent CUBE core block. The replacement stays inside
@@ -43,8 +48,11 @@ or two separately guarded statements, does not satisfy this local contract.
 
 Tile selection uses the target L0C capacity, canonical padded footprints and
 alignment. Other root L0C allocations are reserved by physical storage identity,
-including fixed versions and existing manual physical axes. The scratch's
-single-version override is recorded in the common root version map. Subsequent
+including fixed versions and existing manual physical axes. Two slots are
+reserved from the remaining capacity before choosing aligned tile dimensions.
+If two minimum 16×16 FP32 slots cannot fit, one minimum slot may still use the
+single-slot path with a fixed count of one. Manual shape includes its slots and
+is charged once, rather than being multiplied by its period again. Subsequent
 automatic L0A/B/C admission reserves the whole root and preserves counts chosen
 for earlier owners, so another owner cannot later exceed the same bank.
 
@@ -57,7 +65,11 @@ the existing 2D load fallback when the full-M 3D-load contract no longer holds.
 Dependency and synchronization lowering consume these ordinary effects:
 
 - Each tile's MAD completes before FIX reads it.
-- FIX releases scratch before the next N/M tile or outer epoch overwrites it.
+- FIX releases a slot before the next physical tile using that same slot
+  overwrites it. Adjacent different slots have no C-storage reuse dependency.
+- Each enclosing owner/epoch boundary retains its own release obligation. The
+  physical ordinal restarts there; a flattened flag clock alone does not prove
+  slot reuse safe, especially after an odd number of physical tiles.
 - All subtile exports complete before a whole-output reader or mixed publish.
 - Both AIV readers release a mixed GM slot before the next outer epoch's first
   FIX overwrites it. Empty private partitions retain collective completion.
@@ -87,3 +99,6 @@ accumulation (`clear=False`) and dynamic/unaligned M/N
 tails require a different lifetime or remainder lowering. The logical L1
 inputs, GM output and private UB consumers must still fit their own contracts.
 This capacity mechanism makes no performance claim about a chosen Python tile.
+Reserving a second slot can produce smaller tiles and more MAD/FIX commands.
+It also leaves mixed C/V publication collective on 2201: independent completion
+for each AIV requires a separate owner publication contract.

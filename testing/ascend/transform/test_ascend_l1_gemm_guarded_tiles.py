@@ -58,14 +58,15 @@ def _expanded(statement, mapping=None):
 
 
 def _fixture(*, scope="nested", metadata="fixed", count=1, mode=None,
-             m=128, n=1024, dtype="float16", kind="ordinary", pv_chunk=None):
+             m=128, n=1024, dtype="float16", kind="ordinary", pv_chunk=None,
+             epochs=3, active_epochs=2, active_owners=2):
     a = tirx.decl_buffer((2, m, 64), dtype, name="q", scope="shared.l1")
     b = tirx.decl_buffer((n, 64), dtype, name="k", scope="shared.l1")
     c = tirx.decl_buffer((m, n), "float32", name="logical_c", scope="shared.l0c")
     # The leading axis is two distinct accumulators, not two compiler versions.
     pv = tirx.decl_buffer((2, m, 64), "float32", name="pv_c", scope="shared.l0c")
     ring = tirx.decl_buffer((2, 16, 64), dtype, name="other_ring", scope="shared.l1")
-    out = tirx.decl_buffer((3, 2, m, n + 32), "float32", name="out")
+    out = tirx.decl_buffer((epochs, 2, m, n + 32), "float32", name="out")
     e, owner = tirx.Var("epoch", "int32"), tirx.Var("owner", "int32")
     enabled = tirx.Var("enabled", "bool")
     gemm = tirx.Evaluate(T.gemm(_region(a, [owner, 0, 0], [1, m, 64]), b, c,
@@ -81,12 +82,16 @@ def _fixture(*, scope="nested", metadata="fixed", count=1, mode=None,
                    tirx.IfThenElse(enabled, export, None))
     elif kind == "multi-reader":
         body = seq(body, export)
+    elif kind == "uniform-guard":
+        body = tirx.IfThenElse(enabled, body, None)
+    if active_owners != 2:
+        body = tirx.IfThenElse(owner < active_owners, body, None)
     body = tirx.For(owner, 0, 2, tirx.ForKind.SERIAL, body)
     if scope in ("cube", "nested", "core-realize", "core-region", "core-region-realize"):
         core = tirx.SBlock([], [], [], "ascend_core_region" if scope.startswith("core-region") else "CUBE", body)
         body = tirx.SBlockRealize([], True, core) if scope.endswith("realize") else core
     if scope in ("if", "nested"):
-        body = tirx.IfThenElse(e < 2, body, None)
+        body = tirx.IfThenElse(e < active_epochs, body, None)
     if scope in ("stage", "nested"):
         body = tirx.AttrStmt(tirx.IntImm("int64", 0), "tl.ascend_stage", 1, body)
     if scope in ("task", "per-core-task", "schedule-unit"):
@@ -101,7 +106,7 @@ def _fixture(*, scope="nested", metadata="fixed", count=1, mode=None,
         body = tirx.SBlockRealize([], enabled, block) if scope == "predicated-core" else block
     loop_annotations = {"tl_pipeline_order": [0]} if scope == "pipeline-order" else (
         {"tl_pipeline_stage": [0]} if scope == "pipeline-stage" else {})
-    body = tirx.For(e, 0, 3, tirx.ForKind.SERIAL, body, annotations=loop_annotations)
+    body = tirx.For(e, 0, epochs, tirx.ForKind.SERIAL, body, annotations=loop_annotations)
     allocations = [a, b, c, pv, ring]
     layouts = {c.data: make_ascend_l0c_layout(c), pv.data: make_ascend_l0c_layout(pv)}
     annotations = {"layout_map": layouts, "tl.buffer_versions_map": {pv.data: 1},
@@ -138,7 +143,27 @@ def _fixture(*, scope="nested", metadata="fixed", count=1, mode=None,
     mod = kernel(body, buffers=allocations, params=params, annotations=annotations)
     mod["main"] = mod["main"].with_attr("target", tvm.target.Target({"kind": "ascend", "arch": "dav-2201"}))
     return mod, {"a": a, "b": b, "c": c, "pv": pv, "ring": ring, "out": out,
-                 "e": e, "owner": owner, "m": m, "n": n, "scope": scope}
+                 "e": e, "owner": owner, "enabled": enabled, "m": m, "n": n, "scope": scope,
+                 "epochs": epochs, "active_epochs": active_epochs, "active_owners": active_owners}
+
+
+def _slot_geometry(scratch):
+    shape = tuple(map(int, scratch.shape))
+    assert len(shape) in (2, 3)
+    slots = shape[0] if len(shape) == 3 else 1
+    assert slots in (1, 2)
+    return slots, shape[-2:]
+
+
+def _assert_slot_region(scratch, origin, shape):
+    slots, tile = _slot_geometry(scratch)
+    assert origin[-2:] == (0, 0) and shape[-2:] == tile
+    if len(scratch.shape) == 3:
+        assert len(origin) == len(shape) == 3 and shape[0] == 1
+        assert 0 <= origin[0] < slots
+    else:
+        assert len(origin) == len(shape) == 2
+    return origin
 
 
 def _scratch_and_metadata(after, facts):
@@ -152,7 +177,10 @@ def _scratch_and_metadata(after, facts):
             for identity in block.annotations.get(key, {}):
                 storage = identity.data if isinstance(identity, tirx.Buffer) else identity
                 assert not storage.same_as(facts["c"].data), key
-    assert int(root.annotations["tl.buffer_versions_map"][scratch.data]) == 1
+    slots, _ = _slot_geometry(scratch)
+    assert slots == 2
+    assert int(root.annotations["tl.manual_multi_buffer"][scratch.data]) == 2
+    assert scratch.data not in root.annotations["tl.buffer_versions_map"]
     assert int(root.annotations["tl.buffer_versions_map"][facts["pv"].data]) == 1
     assert int(root.annotations["tl.manual_multi_buffer"][facts["ring"].data]) == 2
     assert str(root.annotations["tl.buffer_version_mode"][facts["ring"].data]) == "counter"
@@ -160,50 +188,67 @@ def _scratch_and_metadata(after, facts):
     return scratch
 
 
-def _assert_coverage(after, facts, scratch):
-    rectangles, loads, pending = {}, {}, []
-    for call, mapping in _expanded(after["main"].body):
+def _assert_coverage(after, facts, scratch, *, enabled=True):
+    rectangles, loads, pending, exported_slots = {}, {}, {}, {}
+    slots, tile = _slot_geometry(scratch)
+    controls = {facts["enabled"]: tirx.const(enabled, "bool")}
+    for call, mapping in _expanded(after["main"].body, controls):
         if call.op.name == "tl.tileop.gemm":
             a, _, _ = _decode(call.args[0])
             b, _, _ = _decode(call.args[1])
             c, origin, shape = _decode(call.args[2])
             assert c.data.same_as(scratch.data)
-            assert tuple(_value(index, mapping) for index in origin) == (0, 0)
-            assert tuple(_value(extent, mapping) for extent in shape) == tuple(map(int, scratch.shape))
-            pending.append((loads[a.data], loads[b.data], _value(call.args[9], mapping),
-                            _value(call.args[7], mapping)))
+            slot = _assert_slot_region(scratch, tuple(_value(index, mapping) for index in origin),
+                                       tuple(_value(extent, mapping) for extent in shape))
+            assert tuple(_value(value, mapping) for value in call.args[5:7]) == tile
+            assert int(call.args[0].args[1]) == int(call.args[1].args[1]) == 1
+            clear = _value(call.args[9], mapping)
+            assert not clear or slot not in pending, "An owner cleared a C slot before its export"
+            pending.setdefault(slot, []).append((loads[a.data], loads[b.data], clear,
+                                                 _value(call.args[7], mapping), int(call.args[2].args[1])))
         elif call.op.name == "tl.tileop.ascend_copy":
             src, origin, shape = _decode(call.args[0])
             dst, dst_origin, dst_shape = _decode(call.args[1])
             origin = tuple(_value(index, mapping) for index in origin)
             shape = tuple(_value(extent, mapping) for extent in shape)
             if src.scope() == "shared.l1":
+                assert int(call.args[0].args[1]) == 1 and int(call.args[1].args[1]) == 2
                 loads[dst.data] = (src, origin, shape)
             elif src.data.same_as(scratch.data):
+                assert dst.data.same_as(facts["out"].data)
+                assert int(call.args[0].args[1]) == 1 and int(call.args[1].args[1]) == 2
+                slot = _assert_slot_region(scratch, origin, shape)
                 destination = tuple(_value(index, mapping) for index in dst_origin)
-                assert tuple(_value(extent, mapping) for extent in dst_shape) == (1, 1, *shape)
-                assert origin == (0, 0) and pending
+                assert tuple(_value(extent, mapping) for extent in dst_shape) == (1, 1, *tile)
+                assert slot in pending, "Export selected another owner or generation's C slot"
                 epoch, owner, row, column = destination
                 cursor = 0
-                for index, (a, b, clear, k) in enumerate(pending):
+                for index, (a, b, clear, k, mask) in enumerate(pending.pop(slot)):
                     assert a[0].data.same_as(facts["a"].data) and b[0].data.same_as(facts["b"].data)
-                    assert a[1] == (owner, row, cursor) and a[2] == (1, shape[0], k)
-                    assert b[1] == (column - 16, cursor) and b[2] == (shape[1], k)
+                    assert a[1] == (owner, row, cursor) and a[2] == (1, tile[0], k)
+                    assert b[1] == (column - 16, cursor) and b[2] == (tile[1], k)
                     assert clear == int(index == 0)
+                    assert mask in (2, 3) and (clear or mask == 3)
                     cursor += k
                 assert cursor == 64
-                rectangles.setdefault((epoch, owner), []).append((row, column, *shape))
-                pending = []
+                rectangles.setdefault((epoch, owner), []).append((row, column, *tile))
+                exported_slots.setdefault((epoch, owner), []).append(slot[0] if slots == 2 else 0)
     assert not pending
-    active = 2 if facts["scope"] in ("if", "nested") else 3
-    assert set(rectangles) == {(epoch, owner) for epoch in range(active) for owner in range(2)}
-    for tiles in rectangles.values():
+    active = min(facts["epochs"], facts["active_epochs"]) if facts["scope"] in ("if", "nested") else facts["epochs"]
+    if not enabled:
+        active = 0
+    assert set(rectangles) == {(epoch, owner) for epoch in range(active) for owner in range(facts["active_owners"])}
+    for coordinate, tiles in rectangles.items():
         assert sum(rows * columns for _, _, rows, columns in tiles) == facts["m"] * facts["n"]
         for row in range(facts["m"]):
             intervals = sorted((column, column + columns) for start, column, rows, columns in tiles
                                if start <= row < start + rows)
             assert intervals[0][0] == 16 and intervals[-1][1] == 16 + facts["n"]
             assert all(left[1] == right[0] for left, right in zip(intervals, intervals[1:]))
+        # Each lexical owner/epoch invocation starts its own physical ordinal.
+        # An odd tile count must not shift the next owner's generation index.
+        assert exported_slots[coordinate] == [ordinal % slots for ordinal in range(len(tiles))]
+    return exported_slots
 
 
 @pytest.mark.parametrize("scope", ["if", "stage", "cube", "core-realize", "core-region", "core-region-realize", "nested"])
@@ -232,6 +277,33 @@ def test_nondefault_geometry_preserves_complete_owner_coverage():
     before, facts = _fixture(m=96, n=512)
     after = transform.AscendLowerL1Gemm()(before)
     _assert_coverage(after, facts, _scratch_and_metadata(after, facts))
+
+
+@pytest.mark.parametrize("m,n,parity", [(16, 2064, 1), (32, 2048, 0)], ids=["odd", "even"])
+def test_slot_ordinal_restarts_for_each_guarded_owner_and_epoch(m, n, parity):
+    # The number of aligned 16x16 blocks is respectively odd / a power of
+    # two. Every legal oversized physical tiling retains the chosen parity,
+    # without constraining the tile selector's M/N tradeoff.
+    before, facts = _fixture(m=m, n=n)
+    after = transform.AscendLowerL1Gemm()(before)
+    exports = _assert_coverage(after, facts, _scratch_and_metadata(after, facts))
+    assert len(exports) == 4
+    assert all(len(sequence) > 1 and len(sequence) % 2 == parity for sequence in exports.values())
+
+
+def test_uniform_disabled_pair_does_not_publish_a_physical_slot():
+    before, facts = _fixture(kind="uniform-guard", m=16, n=2064)
+    after = transform.AscendLowerL1Gemm()(before)
+    scratch = _scratch_and_metadata(after, facts)
+    assert not _assert_coverage(after, facts, scratch, enabled=False)
+    _assert_coverage(after, facts, scratch, enabled=True)
+
+
+def test_empty_owner_keeps_active_owners_slot_clock_and_coverage():
+    before, facts = _fixture(active_owners=1, m=16, n=2064)
+    after = transform.AscendLowerL1Gemm()(before)
+    exports = _assert_coverage(after, facts, _scratch_and_metadata(after, facts))
+    assert set(exports) == {(0, 0), (1, 0)}
 
 
 @pytest.mark.parametrize("metadata", ["none", "fixed", "manual", "both"])

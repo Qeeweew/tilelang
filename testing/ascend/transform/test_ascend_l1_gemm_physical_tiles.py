@@ -35,7 +35,8 @@ def _value(expression, mapping=None):
 
 
 def _fixture(m=256, n=256, k=64, *, dtype="float16", transpose_b=True,
-             epochs=1, extra_l0c=False, kind="ordinary", arch="dav-2201"):
+             epochs=1, extra_l0c=False, extra_l0c_shape=(128, 64),
+             extra_l0c_versions=1, kind="ordinary", arch="dav-2201"):
     # Nonzero L1 origins and a wider GM destination make dropping a region
     # origin or using the sub-tile width as the destination pitch observable.
     prefix = (2,) if epochs > 1 else ()
@@ -63,7 +64,9 @@ def _fixture(m=256, n=256, k=64, *, dtype="float16", transpose_b=True,
     annotations = {"layout_map": layouts}
     params = [out]
     if extra_l0c:
-        allocations.append(tirx.decl_buffer((128, 64), "float32", name="other_c", scope="shared.l0c"))
+        other = tirx.decl_buffer(extra_l0c_shape, "float32", name="other_c", scope="shared.l0c")
+        allocations.append(other)
+        annotations["tl.buffer_versions_map"] = {other.data: extra_l0c_versions}
     if kind == "multi-reader":
         body = seq(body, export)
     elif kind == "escape":
@@ -74,7 +77,7 @@ def _fixture(m=256, n=256, k=64, *, dtype="float16", transpose_b=True,
     elif kind == "custom-layout":
         layouts[c.data] = Layout(c.shape, lambda i, j: [j // 16, i // 16, i % 16, (j + 1) % 16])
     elif kind == "manual-version":
-        annotations["tl.buffer_versions_map"] = {c.data: 2}
+        annotations.setdefault("tl.buffer_versions_map", {})[c.data] = 2
     elif kind == "separate-conditional":
         enabled = tirx.Var("enabled", "bool")
         params.append(enabled)
@@ -98,6 +101,10 @@ def _expanded(statement, mapping=None):
         for coordinate in range(start, start + count):
             yield from _expanded(statement.body, {**mapping, statement.loop_var:
                                                   tirx.const(coordinate, statement.loop_var.dtype)})
+    elif isinstance(statement, tirx.IfThenElse):
+        branch = statement.then_case if _value(statement.condition, mapping) else statement.else_case
+        if branch is not None:
+            yield from _expanded(branch, mapping)
     elif isinstance(statement, tirx.SeqStmt):
         for child in statement.seq:
             yield from _expanded(child, mapping)
@@ -119,21 +126,51 @@ def _l0c(mod):
             if buffer.scope() == "shared.l0c"]
 
 
-def _assert_replaced(mod, facts, *, extra_bytes=0):
+def _slot_geometry(scratch):
+    shape = tuple(map(int, scratch.shape))
+    assert len(shape) in (2, 3)
+    slots = shape[0] if len(shape) == 3 else 1
+    assert slots in (1, 2)
+    return slots, shape[-2:]
+
+
+def _assert_slot_region(scratch, origin, shape):
+    slots, tile = _slot_geometry(scratch)
+    assert origin[-2:] == (0, 0) and shape[-2:] == tile
+    if len(scratch.shape) == 3:
+        assert len(origin) == len(shape) == 3 and shape[0] == 1
+        assert 0 <= origin[0] < slots
+    else:
+        assert len(origin) == len(shape) == 2
+    return origin
+
+
+def _assert_replaced(mod, facts, *, extra_bytes=0, expected_slots=2):
     old = facts["c"]
     allocations = _l0c(mod)
     scratch = [buffer for buffer in allocations if buffer.name != "other_c"]
     assert len(scratch) == 1
     scratch = scratch[0]
     assert not scratch.data.same_as(old.data)
-    rows, columns = map(int, scratch.shape)
+    slots, (rows, columns) = _slot_geometry(scratch)
+    assert slots == expected_slots
     assert rows > 0 and columns > 0 and rows % 16 == columns % 16 == 0
     assert facts["m"] % rows == facts["n"] % columns == 0
-    assert rows * columns * 4 + extra_bytes <= 128 * 1024
-    assert sum(math.prod(map(int, buffer.shape)) * 4 for buffer in allocations) <= 128 * 1024
-    assert not scratch.strides or tuple(map(int, scratch.strides)) == (columns, 1)
     root = mod["main"].body.block
-    assert int(root.annotations["tl.buffer_versions_map"][scratch.data]) == 1
+    versions = root.annotations.get("tl.buffer_versions_map", {})
+    manual = root.annotations.get("tl.manual_multi_buffer", {})
+    assert slots * rows * columns * 4 + extra_bytes <= 128 * 1024
+    assert sum(math.prod(map(int, buffer.shape)) * 4 *
+               (1 if buffer.data in manual else int(versions.get(buffer.data, 1)))
+               for buffer in allocations) <= 128 * 1024
+    expected_strides = (rows * columns, columns, 1) if slots == 2 else (columns, 1)
+    assert not scratch.strides or tuple(map(int, scratch.strides)) == expected_strides
+    if slots == 2:
+        assert int(manual[scratch.data]) == 2
+        assert scratch.data not in versions
+    else:
+        assert scratch.data not in manual
+        assert int(versions[scratch.data]) == 1
     assert all(not buffer.data.same_as(old.data) for buffer in root.alloc_buffers)
     for key in root.annotations.get("layout_map", {}):
         storage = key.data if isinstance(key, tirx.Buffer) else key
@@ -144,7 +181,10 @@ def _assert_replaced(mod, facts, *, extra_bytes=0):
 
 
 def _assert_coverage_and_k_order(mod, facts, scratch):
-    pending, loads, rectangles = [], {}, {epoch: [] for epoch in range(facts["epochs"])}
+    pending, loads = {}, {}
+    rectangles = {epoch: [] for epoch in range(facts["epochs"])}
+    exported_slots = {epoch: [] for epoch in range(facts["epochs"])}
+    slots, tile = _slot_geometry(scratch)
     for call, mapping in _expanded(mod["main"].body):
         if not isinstance(call.op, tvm.ir.Op):
             continue
@@ -162,24 +202,25 @@ def _assert_coverage_and_k_order(mod, facts, scratch):
                 loads[destination.data] = (source, src_origin, src_shape)
             elif source.scope() == "shared.l0c":
                 assert source.data.same_as(scratch.data) and destination.data.same_as(facts["out"].data)
-                assert src_origin == (0, 0) and src_shape == tuple(map(int, scratch.shape))
-                assert dst_shape[-2:] == src_shape and all(extent == 1 for extent in dst_shape[:-2])
+                slot = _assert_slot_region(scratch, src_origin, src_shape)
+                assert dst_shape[-2:] == tile and all(extent == 1 for extent in dst_shape[:-2])
                 epoch = dst_origin[0] if facts["epochs"] > 1 else 0
                 row, col = dst_origin[-2:]
-                rectangles[epoch].append((row, col, *src_shape))
-                assert pending, "A physical FIX must follow its complete accumulation"
+                rectangles[epoch].append((row, col, *tile))
+                exported_slots[epoch].append(slot[0] if slots == 2 else 0)
+                assert slot in pending, "A physical FIX must consume its own complete accumulation"
                 cursor = 0
-                for index, (a_load, b_load, clear, mask, dimensions) in enumerate(pending):
+                for index, (a_load, b_load, clear, mask, dimensions) in enumerate(pending.pop(slot)):
                     a_buffer, a_origin, a_shape = a_load
                     b_buffer, b_origin, b_shape = b_load
                     assert a_buffer.data.same_as(facts["a"].data) and b_buffer.data.same_as(facts["b"].data)
-                    assert dimensions[:2] == src_shape
+                    assert dimensions[:2] == tile
                     chunk_k = dimensions[2]
                     assert a_origin[-2:] == (row, 32 + cursor)
-                    assert a_shape[-2:] == (src_shape[0], chunk_k)
+                    assert a_shape[-2:] == (tile[0], chunk_k)
                     expected_b = (col - 16, 32 + cursor) if facts["transpose_b"] else (32 + cursor, col - 16)
                     assert b_origin[-2:] == expected_b
-                    assert b_shape[-2:] == ((src_shape[1], chunk_k) if facts["transpose_b"] else (chunk_k, src_shape[1]))
+                    assert b_shape[-2:] == ((tile[1], chunk_k) if facts["transpose_b"] else (chunk_k, tile[1]))
                     if facts["epochs"] > 1:
                         assert a_origin[:-2] == b_origin[:-2] == (epoch % 2,)
                         assert a_shape[:-2] == b_shape[:-2] == (1,)
@@ -189,18 +230,21 @@ def _assert_coverage_and_k_order(mod, facts, scratch):
                     assert mask in (2, 3) and (clear or mask == 3)
                     cursor += chunk_k
                 assert cursor == facts["k"]
-                pending = []
         elif call.op.name == "tl.tileop.gemm":
             a, a_origin, _ = _decode(call.args[0])
             b, b_origin, _ = _decode(call.args[1])
             c, c_origin, c_shape = _decode(call.args[2])
             assert c.data.same_as(scratch.data)
-            assert tuple(_value(index, mapping) for index in c_origin) == (0, 0)
+            slot = _assert_slot_region(scratch, tuple(_value(index, mapping) for index in c_origin),
+                                       tuple(_value(extent, mapping) for extent in c_shape))
             dimensions = tuple(_value(value, mapping) for value in call.args[5:8])
-            assert tuple(_value(extent, mapping) for extent in c_shape) == dimensions[:2]
+            assert tile == dimensions[:2]
             assert all(_value(index, mapping) == 0 for index in [*a_origin, *b_origin])
-            pending.append((loads[a.data], loads[b.data], _value(call.args[9], mapping),
-                            int(call.args[2].args[1]), dimensions))
+            assert int(call.args[0].args[1]) == int(call.args[1].args[1]) == 1
+            clear = _value(call.args[9], mapping)
+            assert not clear or slot not in pending, "A live C slot was cleared before its export"
+            pending.setdefault(slot, []).append((loads[a.data], loads[b.data], clear,
+                                                 int(call.args[2].args[1]), dimensions))
     assert not pending
     for epoch, tiles in rectangles.items():
         assert tiles, epoch
@@ -211,6 +255,8 @@ def _assert_coverage_and_k_order(mod, facts, scratch):
             assert intervals[0][0] == 32 and intervals[-1][1] == 32 + facts["n"]
             assert all(left[1] == right[0] for left, right in zip(intervals, intervals[1:]))
         assert sum(rows * columns for _, _, rows, columns in tiles) == facts["m"] * facts["n"]
+        assert exported_slots[epoch] == [ordinal % slots for ordinal in range(len(tiles))]
+    return exported_slots
 
 
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
@@ -234,7 +280,7 @@ def test_m_axis_is_split_when_full_m_exceeds_even_a_minimum_n_fractal():
     before, facts = _fixture(2304, 32, 16)
     after = transform.AscendLowerL1Gemm()(before)
     scratch = _assert_replaced(after, facts)
-    assert int(scratch.shape[0]) < facts["m"]
+    assert int(scratch.shape[-2]) < facts["m"]
     _assert_coverage_and_k_order(after, facts, scratch)
 
 
@@ -260,6 +306,39 @@ def test_other_root_accumulator_is_charged_before_selecting_physical_tile():
     scratch = _assert_replaced(after, facts, extra_bytes=32 * 1024)
     assert any(buffer.name == "other_c" for buffer in _l0c(after))
     _assert_coverage_and_k_order(after, facts, scratch)
+
+
+def test_other_root_accumulator_fixed_versions_are_charged_before_both_slots():
+    before, facts = _fixture(extra_l0c=True, extra_l0c_versions=3)
+    after = transform.AscendLowerL1Gemm()(before)
+    scratch = _assert_replaced(after, facts, extra_bytes=96 * 1024)
+    other = next(buffer for buffer in _l0c(after) if buffer.name == "other_c")
+    assert int(after["main"].body.block.annotations["tl.buffer_versions_map"][other.data]) == 3
+    _assert_coverage_and_k_order(after, facts, scratch)
+
+
+@pytest.mark.parametrize("remaining_kib,slots", [(1, 1), (2, 2)])
+@pytest.mark.parametrize("n", [2064, 2080], ids=["odd-tiles", "even-tiles"])
+def test_minimum_slot_capacity_and_epoch_restart(remaining_kib, slots, n):
+    # Reserving all but 1/2KiB forces minimum 16x16 slots. The logical
+    # accumulator still exceeds the whole bank, so this reaches the rewrite
+    # boundary rather than testing an already-fitting logical allocation.
+    before, facts = _fixture(16, n, 16, epochs=3, extra_l0c=True,
+                             extra_l0c_shape=((128 - remaining_kib) * 16, 16))
+    after = transform.AscendLowerL1Gemm()(before)
+    scratch = _assert_replaced(after, facts, extra_bytes=(128 - remaining_kib) * 1024,
+                              expected_slots=slots)
+    exports = _assert_coverage_and_k_order(after, facts, scratch)
+    assert _slot_geometry(scratch)[1] == (16, 16)
+    assert all(len(sequence) == n // 16 for sequence in exports.values())
+
+
+def test_less_than_one_minimum_slot_is_diagnosed_without_partial_rewrite():
+    before, _ = _fixture(extra_l0c=True, extra_l0c_shape=(2048, 16))
+    snapshot = tvm.ir.save_json(before)
+    with pytest.raises(ValueError, match="physical M/N GEMM cannot fit a 16x16 L0C tile"):
+        transform.AscendLowerL1Gemm()(before)
+    assert tvm.ir.save_json(before) == snapshot
 
 
 @pytest.mark.parametrize("kind", ["clear-false", "multi-reader", "escape", "alias", "custom-layout",
@@ -307,14 +386,14 @@ def test_native_fix_uses_compact_padded_m_and_full_destination_row_pitch(transpo
     for export in exports:
         assert export.args[1].op.name == "tirx.tvm_access_ptr"
         physical = allocations[export.args[1].args[1]]
-        assert len(physical.shape) == 4
+        assert len(physical.shape) == 5 and int(physical.shape[0]) == 2
         padded_m = int(physical.shape[-3]) * 16
         assert _value(export.args[4]) == _value(export.args[6]) == padded_m
         assert _value(export.args[5]) == facts["n"] + 64
         assert _value(export.args[3]) == int(physical.shape[-4]) * 16
 
 
-def _lower_frontend(program):
+def _lower_frontend(program, *, host_codegen=False):
     snapshots = {}
 
     @tvm.ir.instrument.pass_instrument
@@ -327,27 +406,103 @@ def _lower_frontend(program):
     with tvm.transform.PassContext(instruments=[Capture()]):
         result = tilelang.lower(program.with_attr("global_symbol", "main"),
                                 target={"kind": "ascend", "arch": "dav-2201"},
-                                enable_host_codegen=False, enable_device_compile=False)
+                                target_host="c", enable_host_codegen=host_codegen,
+                                enable_device_compile=False)
+    if host_codegen:
+        assert result.host_mod
     assert set(snapshots) == {"tl.AscendLowerL1Gemm", "tl.AscendLowerMixedPartition", "tl.AutoSchedule",
                               "tl.InsertSync", "tl.MaterializeMultiBuffer", "tl.AscendLowerTileOp"}
     return result.kernel_source, snapshots
 
 
-def _fixed_scratch(mod, *, explicit=False):
+def _physical_scratch(mod):
     (scratch,) = [buffer for buffer in _l0c(mod) if buffer.name != "other_c"]
     roots = [block for block in nodes(mod, tirx.SBlock) if block.name_hint == "tilelang_root"]
     assert len(roots) == 1
     versions = roots[0].annotations.get("tl.buffer_versions_map", {})
-    # Before owner discovery the override is explicit. AutoSchedule may omit
-    # an ownerless allocation from its result table; omission means one slot.
-    if explicit:
-        assert scratch.data in versions
-    assert int(versions.get(scratch.data, 1)) == 1
-    if not explicit:
-        for loop in nodes(mod, tirx.For):
-            assert all(not storage.same_as(scratch.data)
-                       for storage in loop.annotations.get("multi_buffer_eligible", []))
+    assert _slot_geometry(scratch)[0] == 2
+    assert int(roots[0].annotations["tl.manual_multi_buffer"][scratch.data]) == 2
+    # The leading axis already owns two physical slots. A fixed/automatic
+    # version request would either suppress distance2 reuse or add storage.
+    assert scratch.data not in versions
+    for loop in nodes(mod, tirx.For):
+        assert all(not storage.same_as(scratch.data)
+                   for storage in loop.annotations.get("multi_buffer_eligible", []))
     return scratch
+
+
+def _odd_owner_program():
+    @T.prim_func
+    def program(a: T.Tensor((2, 1552, 96), "float16"),
+                b: T.Tensor((3, 48, 96), "float16"),
+                out: T.Tensor((3, 2, 1568, 96), "float32")):
+        with T.Kernel(1):
+            a_l1 = T.alloc_l1((1552, 96), "float16")
+            b_l1 = T.alloc_l1((48, 96), "float16")
+            c = T.alloc_l0c((1536, 32), "float32")
+            for epoch in T.serial(3):
+                if epoch < 2:
+                    T.copy(b[epoch, :, :], b_l1)
+                    for owner in T.serial(2):
+                        T.copy(a[owner, :, :], a_l1)
+                        T.gemm(a_l1[16:1552, 32:96], b_l1[16:48, 32:96], c,
+                               transpose_B=True, clear_accum=True)
+                        T.copy(c, out[epoch, owner, 16:1552, 32:64])
+
+    return program
+
+
+def test_full_host_odd_physical_tile_ring_restarts_inside_guarded_owners():
+    source, snapshots = _lower_frontend(_odd_owner_program(), host_codegen=True)
+    split = snapshots["tl.AscendLowerL1Gemm"]
+    scratch = _physical_scratch(split)
+    assert tuple(map(int, scratch.shape)) == (2, 512, 32)
+    assert sum(math.prod(map(int, buffer.shape)) * 4 for buffer in _l0c(split)) == 128 * 1024
+    loops = {loop.loop_var.name: loop for loop in nodes(split, tirx.For)}
+    assert int(loops["epoch"].extent) == 3 and int(loops["owner"].extent) == 2
+    for call in calls(split, "tl.tileop.gemm"):
+        (parents,) = [parents for statement, parents in statements(split)
+                      if isinstance(statement, tirx.Evaluate) and statement.value.same_as(call)]
+        (guard,) = [parent for parent in parents if isinstance(parent, tirx.IfThenElse)]
+        tvm.ir.assert_structural_equal(guard.condition, loops["epoch"].loop_var < 2)
+        assert any(parent.same_as(loops["owner"]) for parent in parents)
+    pending, exports, input_loads = {}, {}, {"a": [], "b": []}
+    for call, mapping in _expanded(split["main"].body):
+        if call.op.name == "tl.tileop.gemm":
+            c, origin, shape = _decode(call.args[2])
+            assert c.data.same_as(scratch.data)
+            slot = _assert_slot_region(scratch, tuple(_value(i, mapping) for i in origin),
+                                       tuple(_value(i, mapping) for i in shape))
+            clear = _value(call.args[9], mapping)
+            assert not clear or slot not in pending
+            assert int(call.args[0].args[1]) == int(call.args[1].args[1]) == 1
+            mask = int(call.args[2].args[1])
+            assert mask in (2, 3) and (clear or mask == 3)
+            pending.setdefault(slot, []).append((clear, _value(call.args[7], mapping)))
+        elif call.op.name == "tl.tileop.ascend_copy":
+            src, origin, shape = _decode(call.args[0])
+            dst, dst_origin, dst_shape = _decode(call.args[1])
+            if src.name in input_loads and src.scope() == "global" and dst.scope() == "shared.l1":
+                input_loads[src.name].append(_value(origin[0], mapping))
+            elif src.data.same_as(scratch.data):
+                slot = _assert_slot_region(scratch, tuple(_value(i, mapping) for i in origin),
+                                           tuple(_value(i, mapping) for i in shape))
+                assert int(call.args[0].args[1]) == 1 and int(call.args[1].args[1]) == 2
+                chain = pending.pop(slot)
+                assert [clear for clear, _ in chain] == [1] + [0] * (len(chain) - 1)
+                assert sum(k for _, k in chain) == 64
+                assert tuple(_value(i, mapping) for i in dst_shape) == (1, 1, 512, 32)
+                epoch, owner, row, column = [_value(i, mapping) for i in dst_origin]
+                exports.setdefault((epoch, owner), []).append((slot[0], row, column))
+    assert not pending and input_loads == {"a": [0, 1, 0, 1], "b": [0, 1]}
+    assert set(exports) == {(epoch, owner) for epoch in range(2) for owner in range(2)}
+    assert all(tiles == [(0, 16, 32), (1, 528, 32), (0, 1040, 32)] for tiles in exports.values())
+    for name in ("tl.AutoSchedule", "tl.MaterializeMultiBuffer"):
+        assert tuple(map(int, _physical_scratch(snapshots[name]).shape)) == (2, 512, 32)
+        assert sum(math.prod(map(int, buffer.shape)) * 4 for buffer in _l0c(snapshots[name])) == 128 * 1024
+    assert "asc_mmad(" in source and "asc_copy_l0c2gm(" in source
+    # Reaching full host/native code generation checks this odd owner/epoch
+    # shape. Finite token accounting and completion paths require ASC review.
 
 
 def test_mixed_full_handoff_follows_all_subtiles_and_keeps_private_row_ownership():
@@ -370,7 +525,7 @@ def test_mixed_full_handoff_follows_all_subtiles_and_keeps_private_row_ownership
 
     source, snapshots = _lower_frontend(program)
     split = snapshots["tl.AscendLowerL1Gemm"]
-    _fixed_scratch(split, explicit=True)
+    _physical_scratch(split)
     (workspace,) = [buffer for block in nodes(split, tirx.SBlock) for buffer in block.alloc_buffers
                     if buffer.scope() == "global" and buffer.name.startswith("gm_handoff_")]
     # The GM→UB reader consumes the whole logical matrix after the M/N
@@ -385,8 +540,9 @@ def test_mixed_full_handoff_follows_all_subtiles_and_keeps_private_row_ownership
     private = [buffer for block in nodes(partitioned, tirx.SBlock) for buffer in block.alloc_buffers
                if buffer.scope() == "shared.dyn"]
     assert any(tuple(map(int, buffer.shape[-2:])) == (128, 256) for buffer in private)
-    _fixed_scratch(snapshots["tl.AutoSchedule"])
+    _physical_scratch(snapshots["tl.AutoSchedule"])
     materialized = snapshots["tl.MaterializeMultiBuffer"]
+    _physical_scratch(materialized)
     assert sum(math.prod(map(int, buffer.shape)) * 4 for buffer in _l0c(materialized)) <= 128 * 1024
     assert "asc_sync_wait(PIPE_FIX, PIPE_M," in source
     synced = snapshots["tl.InsertSync"]
@@ -425,12 +581,13 @@ def test_independent_automatic_accumulator_owner_shares_the_full_root_bank_budge
                 T.copy(other_c, other_out[other_epoch, :, :])
 
     _, snapshots = _lower_frontend(program)
-    _fixed_scratch(snapshots["tl.AscendLowerL1Gemm"], explicit=True)
+    _physical_scratch(snapshots["tl.AscendLowerL1Gemm"])
     scheduled = snapshots["tl.AutoSchedule"]
-    scratch = _fixed_scratch(scheduled)
+    scratch = _physical_scratch(scheduled)
     assert math.prod(map(int, scratch.shape)) * 4 <= 96 * 1024
     assert any(buffer.name == "other_c" for buffer in _l0c(scheduled))
     materialized = snapshots["tl.MaterializeMultiBuffer"]
+    _physical_scratch(materialized)
     allocations = _l0c(materialized)
     assert len(allocations) == 2
     assert sum(math.prod(map(int, buffer.shape)) * 4 for buffer in allocations) <= 128 * 1024

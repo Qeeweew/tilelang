@@ -387,7 +387,7 @@ inline PrimExpr MakeRegion(const Buffer &buffer, const Array<Range> &ranges,
 }
 
 inline Array<Range> SliceAxis(Array<Range> ranges, size_t axis,
-                              const Var &index, int64_t tile) {
+                              const PrimExpr &index, int64_t tile) {
   const Range &original = ranges[axis];
   PrimExpr offset = cast(original->min.dtype(), index) *
                     make_const(original->min.dtype(), tile);
@@ -419,6 +419,7 @@ public:
   }
 
   Buffer scratch;
+  int scratch_versions{1};
 
 private:
   using Parent = arith::IRMutatorWithAnalyzer;
@@ -513,10 +514,16 @@ private:
       return Stmt();
     Gemm gemm(producer->args, producer->annotations);
     AscendCopy copy(consumer->args, consumer->annotations);
+    // These are physical slots, not a request to expand a logical buffer in
+    // MaterializeMultiBuffer. Reserve both before choosing the tile geometry.
+    // If only one minimum aligned tile fits, preserve the one-slot lowering.
+    constexpr int64_t min_slot_bytes = 16 * 16 * 4;
+    scratch_versions = budget_ >= 2 * min_slot_bytes ? 2 : 1;
+    int64_t tile_budget = budget_ / scratch_versions;
     int64_t tile_m = 0, tile_n = 0, area = 0;
     for (int64_t m : AlignedDivisors(gemm->m_))
       for (int64_t n : AlignedDivisors(gemm->n_)) {
-        if (m > budget_ / 4 / n)
+        if (m > tile_budget / 4 / n)
           continue;
         int64_t candidate = m * n;
         if (candidate > area || (candidate == area && m > tile_m)) {
@@ -530,13 +537,27 @@ private:
            "after reserving other root allocations (remaining bytes="
         << budget_ << ")";
     std::string suffix = std::to_string(suffix_);
-    scratch =
-        decl_buffer({Integer(tile_m), Integer(tile_n)}, DataType::Float(32),
-                    "gemm_mn_l0c_" + suffix, "shared.l0c");
-    Var mi("gemm_m_" + suffix, DataType::Int(32));
-    Var ni("gemm_n_" + suffix, DataType::Int(32));
-    Array<Range> c{Range::FromMinExtent(0, Integer(tile_m)),
-                   Range::FromMinExtent(0, Integer(tile_n))};
+    Array<PrimExpr> shape;
+    if (scratch_versions > 1)
+      shape.push_back(Integer(scratch_versions));
+    shape.push_back(Integer(tile_m));
+    shape.push_back(Integer(tile_n));
+    scratch = decl_buffer(shape, DataType::Float(32), "gemm_mn_l0c_" + suffix,
+                          "shared.l0c");
+    int64_t n_tiles = gemm->n_ / tile_n;
+    int64_t tile_count = (gemm->m_ / tile_m) * n_tiles;
+    DataType index_type = DataType::Int(
+        tile_count <= std::numeric_limits<int32_t>::max() ? 32 : 64);
+    Var tile("gemm_tile_" + suffix, index_type);
+    PrimExpr mi = indexdiv(tile, make_const(index_type, n_tiles));
+    PrimExpr ni = indexmod(tile, make_const(index_type, n_tiles));
+    Array<Range> c;
+    if (scratch_versions > 1)
+      c.push_back(Range::FromMinExtent(
+          indexmod(tile, make_const(index_type, scratch_versions)),
+          make_const(index_type, 1)));
+    c.push_back(Range::FromMinExtent(0, Integer(tile_m)));
+    c.push_back(Range::FromMinExtent(0, Integer(tile_n)));
     Call sliced = ffi::GetRef<Call>(producer);
     auto *writer = sliced.CopyOnWrite();
     writer->args.Set(
@@ -563,8 +584,11 @@ private:
         1, MakeRegion(copy->dst, destination, kAccessWrite));
     Stmt body = SeqStmt({ReplaceLeaf(producer_stmt, Evaluate(sliced)),
                          ReplaceLeaf(consumer_stmt, Evaluate(exported))});
-    body = For(ni, 0, Integer(gemm->n_ / tile_n), ForKind::kSerial, body);
-    return For(mi, 0, Integer(gemm->m_ / tile_m), ForKind::kSerial, body);
+    // One physical-tile clock avoids resetting the slot selector at an M/N
+    // boundary. Enclosing lexical epochs and their hazards remain unchanged;
+    // common dependency analysis must retain their separate wrap obligations.
+    return For(tile, make_zero(index_type), make_const(index_type, tile_count),
+               ForKind::kSerial, body);
   }
 
   Stmt VisitStmt_(const SeqStmtNode *op) final {
@@ -737,11 +761,22 @@ inline SBlock RewriteRoot(const SBlock &root, const AscendTargetInfo &target,
     layouts = value.value().cast<Map<ObjectRef, Layout>>();
   layouts.Set(rewriter.scratch->data, MakeAscendL0CLayout(rewriter.scratch));
   result.CopyOnWrite()->annotations.Set(attr::kLayoutMap, layouts);
-  BufferVersionMap versions;
-  if (auto value = result->annotations.Get(kBufferVersionsMap))
-    versions = value.value().cast<BufferVersionMap>();
-  versions.Set(rewriter.scratch->data, 1);
-  result.CopyOnWrite()->annotations.Set(kBufferVersionsMap, versions);
+  if (rewriter.scratch_versions > 1) {
+    // The explicit leading axis is already allocated. Its manual period lets
+    // dependency analysis prove adjacent slots disjoint and retain distance2
+    // reuse; automatic version expansion must not add another leading axis.
+    BufferVersionMap versions;
+    if (auto value = result->annotations.Get(kManualMultiBuffer))
+      versions = value.value().cast<BufferVersionMap>();
+    versions.Set(rewriter.scratch->data, rewriter.scratch_versions);
+    result.CopyOnWrite()->annotations.Set(kManualMultiBuffer, versions);
+  } else {
+    BufferVersionMap versions;
+    if (auto value = result->annotations.Get(kBufferVersionsMap))
+      versions = value.value().cast<BufferVersionMap>();
+    versions.Set(rewriter.scratch->data, 1);
+    result.CopyOnWrite()->annotations.Set(kBufferVersionsMap, versions);
+  }
   return result;
 }
 
