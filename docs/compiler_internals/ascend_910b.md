@@ -402,15 +402,22 @@ at a nested loop forms its own boundary; an explicit zero disables inheritance
 within that loop. Clear-accumulator and final-completion expressions keep the
 logical loop epoch when tasks receive a stage offset.
 
-A closed native result stream can retain a positive static sub-K stage shift
-when the typed MAD chain, complete C definition/export and unit boundaries
-remain valid. Existing schedule lowering supplies fill, drain and logical
-clear/final predicates. A local ready event in a single-iteration child still
-needs a lifetime proof across repeated parent activations: synchronization
+A closed native result stream can retain positive static sub-K stage shifts
+and deeper scheduled controls when the typed MAD chain, complete C
+definition/export and unit boundaries remain valid. The result and its direct
+child controls remain unshifted. Each deeper control's incoming stage is
+validated against its direct parent's consumed stage bound and offset policy;
+its own bound only governs its children. Any shifted control or MAD requires
+one logical MAD task chain. Existing recursive schedule lowering supplies
+fill, drain and logical clear/final predicates, including an outer cache
+prefetch and an inner native-K shift together. A local ready event in a
+single-iteration child still needs a lifetime proof across repeated parent
+activations: synchronization
 keeps its actual leaf endpoints and flattened clock, then checks the parent's
 real reverse completion path after parent dependencies are established. That
-path determines the event ring width. Unconditional static positive ancestors
-are required; unsupported activation or an unresolved parent proof is rejected.
+path determines the event ring width. Unconditional, unshifted ancestors with
+positive static extents are required; unsupported activation or an unresolved
+parent proof is rejected.
 Neither unit completion nor a single child iteration implies whole-MAD
 completion or permits unproved event reuse.
 

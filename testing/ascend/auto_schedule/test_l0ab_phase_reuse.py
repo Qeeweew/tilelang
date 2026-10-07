@@ -46,12 +46,15 @@ def _pairs(mod):
     return {frozenset(pair) for pair in _root(mod).annotations.get(_PAIRS, [])}
 
 
-def _program(dtype="float16", guarded=False, cached_qk=False, unit_streams=False):
+def _program(dtype="float16", guarded=False, cached_qk=False, unit_streams=False,
+             pipelined_p_cache=False):
     """Independent 3/4-step K rings, or one fixed Q cache and an automatic PV."""
     qk_k_extent, qk_n_extent = (64, 1024) if cached_qk else (192, 256)
 
     def fixed_versions(q, k, p, v, c, aq, bq):
         result = {q: 1, k: 1, p: 1, v: 1, c: 1}
+        if pipelined_p_cache:
+            del result[p]
         if cached_qk:
             result.update({aq: 1, bq: 1})
         return result
@@ -66,12 +69,13 @@ def _program(dtype="float16", guarded=False, cached_qk=False, unit_streams=False
         with T.Kernel(1):
             q_l1 = T.alloc_l1((128, qk_k_extent), dtype)
             k_l1 = T.alloc_l1((qk_n_extent, qk_k_extent), dtype)
-            p_l1 = T.alloc_l1((128, 512), dtype)
+            p_l1 = T.alloc_l1((128, 256 if pipelined_p_cache else 512), dtype)
             v_l1 = T.alloc_l1((512, 64), dtype)
             aq = T.alloc_l0a((128, 64), dtype)
             bq = T.alloc_l0b((256, 64), dtype)
-            ap = T.alloc_l0a((128, 128), dtype)
-            bp = T.alloc_l0b((128, 64), dtype)
+            if not pipelined_p_cache:
+                ap = T.alloc_l0a((128, 128), dtype)
+                bp = T.alloc_l0b((128, 64), dtype)
             accum = T.alloc_l0c((128, 256), "float32")
             T.annotate_buffer_versions(fixed_versions(q_l1, k_l1, p_l1, v_l1, accum, aq, bq))
             # This regression isolates A/B phase reuse and whole-pipe C
@@ -106,16 +110,27 @@ def _program(dtype="float16", guarded=False, cached_qk=False, unit_streams=False
                 with T.Stage(0):
                     if epoch < (2 if guarded else 3):
                         for pv_owner in T.serial(2):
-                            T.copy(P[epoch, pv_owner, :, :], p_l1)
-                            T.copy(V[epoch, pv_owner, :, :], v_l1)
-                            for pv_k in T.Pipelined(4, max_stages=2):
-                                with T.Task(latency=2, ii=1):
-                                    T.copy(p_l1[:, pv_k * 128:(pv_k + 1) * 128], ap)
-                                with T.Task(latency=2, ii=1):
-                                    T.copy(v_l1[pv_k * 128:(pv_k + 1) * 128, :], bp)
-                                with T.Task(latency=3, ii=1):
-                                    T.gemm(ap, bp, accum[:, :64], transpose_B=False,
-                                           clear_accum=pv_k == 0)
+                            if pipelined_p_cache:
+                                T.copy(V[epoch, pv_owner, :, :], v_l1)
+                                # Ordinary L1 GEMM generates two native K128
+                                # steps. Both this P ring and that native ring
+                                # remain choices of the automatic scheduler.
+                                for pv_chunk in T.Pipelined(2, max_stages=4):
+                                    T.copy(P[epoch, pv_owner, :, pv_chunk * 256:(pv_chunk + 1) * 256], p_l1)
+                                    T.gemm(p_l1, v_l1[pv_chunk * 256:(pv_chunk + 1) * 256, :],
+                                           accum[:, :64], transpose_B=False,
+                                           clear_accum=pv_chunk == 0)
+                            else:
+                                T.copy(P[epoch, pv_owner, :, :], p_l1)
+                                T.copy(V[epoch, pv_owner, :, :], v_l1)
+                                for pv_k in T.Pipelined(4, max_stages=2):
+                                    with T.Task(latency=2, ii=1):
+                                        T.copy(p_l1[:, pv_k * 128:(pv_k + 1) * 128], ap)
+                                    with T.Task(latency=2, ii=1):
+                                        T.copy(v_l1[pv_k * 128:(pv_k + 1) * 128, :], bp)
+                                    with T.Task(latency=3, ii=1):
+                                        T.gemm(ap, bp, accum[:, :64], transpose_B=False,
+                                               clear_accum=pv_k == 0)
                             T.copy(accum[:, :64], Result[epoch, pv_owner, :, :])
     return main
 
@@ -123,7 +138,7 @@ def _program(dtype="float16", guarded=False, cached_qk=False, unit_streams=False
 def _lower(program):
     snapshots = {}
     wanted = {"tl.AnnotateMultiBufferEligible", "tl.AutoSchedule", "tl.PrepareMultiBuffer",
-              "tl.InsertSync", "tl.MaterializeMultiBuffer", "tl.LowerScheduledTIR"}
+              "tl.ResolveCore", "tl.InsertSync", "tl.MaterializeMultiBuffer", "tl.LowerScheduledTIR"}
 
     @tvm.ir.instrument.pass_instrument
     class Capture:
@@ -139,11 +154,14 @@ def _lower(program):
     return artifact, snapshots
 
 
-def _assert_logical_rings(snapshots, cached_qk=False):
+def _assert_logical_rings(snapshots, cached_qk=False, pipelined_p_cache=False):
     before, scheduled = (snapshots[name] for name in
                          ("tl.AnnotateMultiBufferEligible", "tl.AutoSchedule"))
     root = _root(scheduled)
-    operands = {name: allocated_buffer(scheduled, name) for name in ("aq", "bq", "ap", "bp")}
+    names = {"aq": "aq", "bq": "bq",
+             "ap": "gemm_l0a_0" if pipelined_p_cache else "ap",
+             "bp": "gemm_l0b_0" if pipelined_p_cache else "bp"}
+    operands = {role: allocated_buffer(scheduled, name) for role, name in names.items()}
     assert _pairs(scheduled) == {frozenset(operands[name].data for name in pair)
                                 for pair in (("aq", "ap"), ("bq", "bp"))}
     assert len({buffer.data for buffer in operands.values()}) == 4
@@ -152,7 +170,7 @@ def _assert_logical_rings(snapshots, cached_qk=False):
     expected_layout = {"aq": make_ascend_l0a_2201_layout, "ap": make_ascend_l0a_2201_layout,
                        "bq": make_ascend_major_k_layout, "bp": make_ascend_major_mn_layout}
     for name, buffer in operands.items():
-        original = allocated_buffer(before, name)
+        original = allocated_buffer(before, names[name])
         assert original.same_as(buffer)
         tvm.ir.assert_structural_equal(root.annotations["layout_map"][buffer],
                                        expected_layout[name](buffer))
@@ -163,8 +181,9 @@ def _assert_logical_rings(snapshots, cached_qk=False):
             assert int(_root(before).annotations["tl.buffer_versions_map"][buffer.data]) == 1
         else:
             assert int(versions[buffer.data]) == 2
-            assert len(owners) == 1 and owners[0].loop_var.name == ("qk_k" if name.endswith("q") else "pv_k")
-            assert int(owners[0].extent) == (3 if name.endswith("q") else 4)
+            expected_owner = "qk_k" if name.endswith("q") else "gemm_sub_k_0" if pipelined_p_cache else "pv_k"
+            assert len(owners) == 1 and owners[0].loop_var.name == expected_owner
+            assert int(owners[0].extent) == (3 if name.endswith("q") else 2 if pipelined_p_cache else 4)
             assert all(not other.data in owners[0].annotations["multi_buffer_eligible"]
                        for other_name, other in operands.items() if other_name[-1] != name[-1])
     counts = {name: 1 if cached_qk and name.endswith("q") else 2 for name in operands}
@@ -198,7 +217,7 @@ def _assert_logical_rings(snapshots, cached_qk=False):
         assert b in aliases[a] and a in aliases[b]
     physical = snapshots["tl.MaterializeMultiBuffer"]
     for name, buffer in operands.items():
-        actual = allocated_buffer(physical, name)
+        actual = allocated_buffer(physical, names[name])
         assert actual.data.same_as(buffer.data)
         assert tuple(map(int, actual.shape)) == (
             tuple(map(int, buffer.shape)) if counts[name] == 1 else (2, *tuple(map(int, buffer.shape))))
@@ -409,10 +428,7 @@ def _matching_unit_boundary(records, event, start, end):
     return any(notify < wait and flag == acquired for notify, flag in sent for wait, acquired in received)
 
 
-def test_guarded_cached_qk_and_pipelined_pv_keep_unit_streams_and_phase_aliases():
-    artifact, snapshots = _lower(_program("float16", guarded=True, cached_qk=True, unit_streams=True))
-    _assert_logical_rings(snapshots, cached_qk=True)
-    _assert_late_bases(artifact, cached_qk=True)
+def _assert_joint_unit_streams(snapshots, pv_operand="ap"):
     synced = snapshots["tl.InsertSync"]
     directions = calls(synced, "tl.ascend_set_mmad_direction")
     assert Counter(call.args[0].value for call in directions) == {"n": 2, "m": 2}, "Both native result streams must remain selected"
@@ -457,7 +473,7 @@ def test_guarded_cached_qk_and_pipelined_pv_keep_unit_streams_and_phase_aliases(
         assert len(phases) == 1
         (operand,) = phases
         phase = "qk" if operand == "aq" else "pv"
-        assert operand in ("aq", "ap")
+        assert operand in ("aq", pv_operand)
         seen[phase] += 1
         controls = [_value(call.annotations["unit_flag_ctrl"], env) for _, call, env, _ in mads]
         clears = [_value(call.args[9], env) for _, call, env, _ in mads]
@@ -476,6 +492,92 @@ def test_guarded_cached_qk_and_pipelined_pv_keep_unit_streams_and_phase_aliases(
     assert seen == {"qk": 4, "pv": 2}
     assert any(_name(call) == _GEMM and any(var.name == "unit_activation" for var, _, _ in loops)
                for call, _, loops in records), "The one-trip activation shell must contain actual native work"
+
+
+def test_guarded_cached_qk_and_pipelined_pv_keep_unit_streams_and_phase_aliases():
+    artifact, snapshots = _lower(_program("float16", guarded=True, cached_qk=True, unit_streams=True))
+    _assert_logical_rings(snapshots, cached_qk=True)
+    _assert_late_bases(artifact, cached_qk=True)
+    _assert_joint_unit_streams(snapshots)
+
+
+def test_automatic_p_cache_and_shifted_native_k_keep_joint_phase_and_unit_contracts():
+    artifact, snapshots = _lower(_program("float16", guarded=True, cached_qk=True,
+                                          unit_streams=True, pipelined_p_cache=True))
+    operands = _assert_logical_rings(snapshots, cached_qk=True, pipelined_p_cache=True)
+    _assert_late_bases(artifact, cached_qk=True)
+    _assert_joint_unit_streams(snapshots, pv_operand=operands["ap"].name)
+
+    before = snapshots["tl.AnnotateMultiBufferEligible"]
+    scheduled = snapshots["tl.AutoSchedule"]
+    p = allocated_buffer(scheduled, "p_l1")
+    assert p.data not in _root(before).annotations["tl.buffer_versions_map"]
+    assert int(_root(scheduled).annotations["tl.buffer_versions_map"][p.data]) == 2
+    tvm.ir.assert_structural_equal(_root(scheduled).annotations["layout_map"][p],
+                                   make_ascend_major_k_layout(p))
+    (p_owner,) = [loop for loop in nodes(scheduled, tirx.For)
+                  if p.data in loop.annotations.get("multi_buffer_eligible", [])]
+    assert p_owner.loop_var.name == "pv_chunk" and int(p_owner.extent) == 2
+    # This checks the actual automatic outcome, not hand-written T.Stage
+    # offsets: the complete native K control and its MAD are both shifted.
+    control_markers = [marker for marker in nodes(scheduled, tirx.AttrStmt)
+                       if marker.attr_key == "tl.schedule_unit"
+                       and isinstance(marker.body, tirx.For)
+                       and marker.body.loop_var.name == "gemm_sub_k_0"]
+    assert len(control_markers) == 1 and int(control_markers[0].node["stage"]) == 1
+    mad_markers = [marker for marker in nodes(control_markers[0].body.body, tirx.AttrStmt)
+                   if marker.attr_key == "tl.schedule_unit"
+                   and isinstance(marker.body, tirx.AttrStmt)
+                   and marker.body.attr_key == "tl.ascend_task"
+                   and calls(marker.body, _GEMM)]
+    assert len(mad_markers) == 1 and int(mad_markers[0].node["stage"]) == 1
+    assert int(control_markers[0].body.annotations["num_stages"]) > 1
+
+    for name in ("tl.PrepareMultiBuffer", "tl.ResolveCore"):
+        mod = snapshots[name]
+        root = _root(mod)
+        assert int(root.annotations["tl.buffer_versions_map"][p.data]) == 2
+        assert all(int(root.annotations["tl.buffer_versions_map"][operands[role].data]) == 2
+                   for role in ("ap", "bp"))
+        clocks = {}
+        for role, storage in (("p", p), ("a", operands["ap"]), ("b", operands["bp"])):
+            (owner,) = [loop for loop in nodes(mod, tirx.For)
+                        if storage.data in loop.annotations.get("multi_buffer_eligible", [])]
+            counters = owner.annotations.get("tl.multi_buffer_counter_map", {})
+            clocks[role] = counters[storage.data].data if storage.data in counters else owner.loop_var
+        assert clocks["a"].same_as(clocks["b"])
+        assert not clocks["p"].same_as(clocks["a"]), "Chunk and native-K versions must retain distinct clocks"
+    physical = snapshots["tl.MaterializeMultiBuffer"]
+    actual_p = allocated_buffer(physical, "p_l1")
+    assert actual_p.data.same_as(p.data) and tuple(map(int, actual_p.shape)) == (2, 128, 256)
+    assert tuple(map(int, allocated_buffer(physical, "accum").shape)) == (128, 256)
+    # P has two 64-KiB versions. Root L1 use includes every physical version
+    # of Q/K/P/V, while the independent A/B phase contract checks their banks.
+    assert sum(_bytes(buffer) for buffer in _root(physical).alloc_buffers
+               if buffer.scope() == "shared.l1") == 336 * 1024
+
+    fills = Counter()
+    p_read_slots = Counter()
+    for call, env, _ in _trace(snapshots["tl.LowerScheduledTIR"], core=2, lane=0):
+        if _name(call) not in (_COPY, _LOAD3D):
+            continue
+        src, source_min, source_extent = _region(call.args[0], env)
+        dst, dest_min, dest_extent = _region(call.args[1], env)
+        if dst.name == "p_l1":
+            assert src.name == "P" and source_extent == (1, 1, 128, 256)
+            assert dest_extent == (1, 128, 256) and dest_min[1:] == (0, 0)
+            assert dest_min[0] in (0, 1)
+            epoch, owner, row, column = source_min
+            assert row == 0 and column in (0, 256)
+            fills[epoch, owner, column // 256] += 1
+        if src.name == "p_l1":
+            assert dst.name == operands["ap"].name
+            assert source_extent == (1, 128, 128) and source_min[1] == 0
+            assert source_min[0] in (0, 1) and source_min[2] in (0, 128)
+            p_read_slots[source_min[0]] += 1
+    assert fills == Counter({(epoch, owner, chunk): 1
+                             for epoch in range(2) for owner in range(2) for chunk in range(2)})
+    assert p_read_slots == {0: 8, 1: 8}, "Both automatic P versions must feed every native K step"
 
 
 def _admission_fixture(kind="ordinary", arch="dav-2201"):

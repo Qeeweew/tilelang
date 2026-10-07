@@ -108,9 +108,12 @@ inline bool StaticLoopBounds(const ControlNode *loop, int64_t *count,
   auto step = loop->control->step.has_value()
                   ? Constant(loop->control->step.value())
                   : std::optional<int64_t>(1);
-  // The result loop remains unshifted. A descendant's logical bounds are
-  // unchanged by its assigned child stages until LowerScheduledTIR.
-  if (loop->GetStage() != 0 || loop->control->kind != ForKind::kSerial ||
+  // The result loop remains unshifted. A descendant's incoming stage is
+  // validated by its direct parent before recursion; its logical bounds
+  // remain unchanged until LowerScheduledTIR recursively applies offsets.
+  if (loop->GetStage() < 0 ||
+      (!scheduled_descendant && loop->GetStage() != 0) ||
+      loop->control->kind != ForKind::kSerial ||
       !min || *min != 0 || !extent || *extent <= 0 ||
       *extent > kMaxProofIterations || !step || *step != 1)
     return false;
@@ -156,14 +159,14 @@ inline bool StaticDescendantLoop(const ControlNode *loop, int64_t *count) {
   int min_stage = std::numeric_limits<int>::max();
   for (const auto &child : loop->children) {
     int stage = child->GetStage();
-    if (stage < 0 || stage >= limit || (stage != 0 && !offsets) ||
-        (child->IsControl() && stage != 0))
+    if (stage < 0 || stage >= limit || (stage != 0 && !offsets))
       return false;
     min_stage = std::min(min_stage, stage);
   }
-  // The one accepted shifted MAD chain has zero-stage input DMA and one
-  // constant-stage MAD. Shifting a whole nested control or a result scope is
-  // outside this contract; no private physical clock is reconstructed here.
+  // Check every immediate child's stage against this loop's consumed bound,
+  // including a whole nested control. A zero-stage input keeps the logical
+  // origin unchanged; LowerScheduledTIR shifts that child's complete body,
+  // including C controls and its own native-K fill/drain, together.
   return min_stage == 0;
 }
 
@@ -455,7 +458,11 @@ inline bool Collect(ControlNode *result, std::vector<Mad> *mads,
         if (node->IsControl()) {
           auto *control = static_cast<ControlNode *>(node);
           int64_t count;
-          if (!StaticDescendantLoop(control, &count) || *fix != nullptr ||
+          // The result boundary has no consumed pipeline stage bound. Only
+          // deeper controls may be shifted, after their direct parent's
+          // StaticDescendantLoop check has validated that incoming stage.
+          if ((loops.empty() && control->GetStage() != 0) ||
+              !StaticDescendantLoop(control, &count) || *fix != nullptr ||
               !AddInputCounters(control, &counters)) {
             valid = false;
             return;
@@ -575,11 +582,17 @@ inline std::vector<UnitFlagStreamPlan> AnalyzeUnitFlagStreams(
     bool selected = StaticResultLoop(result, &result_count) &&
                     Collect(result, &mads, &fix, &copy);
     // The existing zero-stage contract can contain several explicit MAD
-    // tasks. For a shifted descendant, one task repeated over a static K
-    // nest preserves logical K order without a new scheduled-trace planner.
+    // tasks. For any shifted descendant task or control, one task repeated
+    // over a static K nest preserves logical K order without a new physical
+    // trace planner.
     if (selected && mads.size() != 1 &&
-        std::any_of(mads.begin(), mads.end(),
-                    [](const Mad &mad) { return mad.task->GetStage() != 0; }))
+        std::any_of(mads.begin(), mads.end(), [](const Mad &mad) {
+          return mad.task->GetStage() != 0 ||
+                 std::any_of(mad.loops.begin(), mad.loops.end(),
+                             [](const ControlNode *loop) {
+                               return loop->GetStage() != 0;
+                             });
+        }))
       selected = false;
     if (selected) {
       Buffer c = mads.front().gemm->c_;

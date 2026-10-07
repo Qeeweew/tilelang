@@ -10,13 +10,14 @@ from collections import Counter
 import pytest
 from tilelang import tvm
 from tilelang.ascend import transform
+from tilelang.layout import make_ascend_nz_layout
 from tvm import tirx
 
 from testing.ascend._ir import calls, copy, kernel, seq
 from testing.ascend.auto_schedule._scheduled_ir import unit
 from testing.ascend.auto_schedule.test_unit_flag_activation_guards import _replace_root
 from testing.ascend.auto_schedule.test_unit_flag_stream import (
-    _DIRECTION, _GEMM, _SET, _WAIT, _fixture, _insert, _is_export,
+    _COPY, _DIRECTION, _GEMM, _SET, _WAIT, _fixture, _insert, _is_export,
     _matching_completion, _name, _trace, _value,
 )
 
@@ -284,3 +285,161 @@ def test_unproved_scheduled_chain_retains_ordinary_protocol(rejection):
     for call in calls(after, _GEMM):
         assert "unit_flag_ctrl" not in call.annotations
     assert any(call.args[0].value == "M_FIX" for call in calls(after, _SET))
+
+
+def _shifted_control_pipeline(*, control_stage=1, mad_stage=1, native_k=2,
+                             versions=2, rejection=None):
+    before, facts = _pipeline(native_k=native_k, mad_stage=mad_stage, versions=versions)
+    root = before["main"].body.block
+    source = next(buffer for buffer in before["main"].buffer_map.values() if buffer.name == "A")
+    # This is the ordinary nested P-chunk pattern: one current GM->L1 copy,
+    # then a prior-chunk native-K control with its own shifted MAD and drain.
+    chunk_l1 = tirx.decl_buffer((32, 16), "float16", name="chunk_l1", scope="shared.l1")
+    changed = Counter()
+
+    def mutate(node):
+        if (isinstance(node, tirx.Evaluate) and isinstance(node.value, tirx.Call)
+                and _name(node.value) == _COPY
+                and node.value.args[1].args[0].buffer.data.same_as(facts["a"].data)):
+            changed["A-input"] += 1
+            return copy(chunk_l1, facts["a"])
+        if isinstance(node, tirx.For) and node.loop_var.same_as(facts["k"]):
+            extent, body = node.extent, node.body
+            if rejection == "dynamic-descendant":
+                extent = facts["epoch"] + 1
+            elif rejection == "breaking-descendant":
+                body = seq(*list(body.seq), unit(tirx.Evaluate(tirx.Call(
+                    "handle", tvm.ir.Op.get("tl.loop_break"), [])), core=2))
+            elif rejection == "multiple-MADs-with-shifted-control":
+                mad = calls(body, _GEMM)[0]
+                args = list(mad.args)
+                args[9] = tirx.const(False, "bool")
+                extra = tirx.Evaluate(tirx.Call(mad.dtype, mad.op, args, annotations=mad.annotations))
+                body = seq(*list(body.seq), unit(extra, core=2, stage=mad_stage))
+            return tirx.For(node.loop_var, node.min, extent, node.kind,
+                            body, annotations=node.annotations)
+        if (isinstance(node, tirx.AttrStmt) and node.attr_key == "tl.schedule_unit"
+                and isinstance(node.body, tirx.For)):
+            if node.body.loop_var.same_as(facts["k"]):
+                changed["native-control"] += 1
+                return unit(node.body, core=None, stage=control_stage,
+                            guard=facts["chunk"] == 0 if rejection == "guarded-descendant" else None)
+            if node.body.loop_var.same_as(facts["chunk"]) and rejection == "direct-child-shift":
+                return unit(node.body, core=None, stage=1)
+            if node.body.loop_var.same_as(facts["result"]) and rejection == "result-shift":
+                return unit(node.body, core=None, stage=1)
+        if isinstance(node, tirx.For) and node.loop_var.same_as(facts["chunk"]):
+            changed["chunk"] += 1
+            annotations = {"multi_buffer_eligible": [chunk_l1.data], "num_stages": 4}
+            if rejection == "parent-bound-too-small":
+                annotations["num_stages"] = control_stage
+            elif rejection == "missing-parent-bound":
+                del annotations["num_stages"]
+            elif rejection == "parent-offset-disabled":
+                annotations["enable_offset"] = False
+            elif rejection == "parent-unconsumed-auto":
+                annotations["tl.ascend_auto_pipeline"] = True
+            fill = unit(copy(source, chunk_l1,
+                             src_indices=[facts["epoch"], facts["owner"], 0, 0],
+                             src_shape=[1, 1, 32, 16]), core=2)
+            return tirx.For(node.loop_var, node.min, node.extent, node.kind,
+                            seq(fill, node.body), annotations=annotations)
+
+    body = tirx.stmt_functor.ir_transform(root.body, None, mutate)
+    assert changed == {"A-input": 1, "native-control": 1, "chunk": 1}
+    annotations = dict(root.annotations)
+    annotations["layout_map"] = {**dict(annotations["layout_map"]),
+                                 chunk_l1: make_ascend_nz_layout(chunk_l1)}
+    annotations["tl.buffer_versions_map"] = {**dict(annotations["tl.buffer_versions_map"]),
+                                            chunk_l1.data: 2}
+    before = _replace_root(before, body, allocations=[*root.alloc_buffers, chunk_l1],
+                           annotations=annotations)
+    facts.update(chunk_l1=chunk_l1, control_stage=control_stage)
+    return before, facts
+
+
+@pytest.mark.parametrize("control_stage,mad_stage,versions", [(1, 1, 1), (1, 1, 2), (2, 1, 2), (1, 2, 2)])
+def test_shifted_native_control_keeps_logical_clear_terminal_and_complete_bracket(control_stage, mad_stage, versions):
+    before, facts = _shifted_control_pipeline(
+        control_stage=control_stage, mad_stage=mad_stage, versions=versions)
+    original = tvm.ir.save_json(before)
+    _, synced, materialized, after = _lower(before)
+    assert tvm.ir.save_json(before) == original
+    assert calls(synced, _DIRECTION), "The admissible nested stream fell back"
+    physical = materialized["main"].body.block
+    for storage, count in ((facts["chunk_l1"], 2), (facts["a"], versions), (facts["b"], versions)):
+        buffer = next(buffer for buffer in physical.alloc_buffers if buffer.data.same_as(storage.data))
+        assert tuple(int(extent) for extent in buffer.shape) == ((count, 32, 16) if count > 1 else (32, 16))
+    c = next(buffer for buffer in physical.alloc_buffers if buffer.data.same_as(facts["c"].data))
+    assert tuple(int(extent) for extent in c.shape) == (32, 64)
+    facts = _physical_loop_facts(after, facts, ("epoch", "owner", "result", "chunk", "k"))
+    records = _trace(after)
+    transactions, activations = {}, {}
+    for index, (call, env, _) in enumerate(records):
+        if facts["epoch"] in env and facts["owner"] in env:
+            activation = (_value(facts["epoch"], env), _value(facts["owner"], env))
+            activations.setdefault(activation, []).append(index)
+        if _name(call) == _GEMM or _is_export(call, facts):
+            key = (*activation, _value(facts["result"], env))
+            transactions.setdefault(key, []).append((index, call, env))
+    assert set(transactions) == {(e, owner, result) for e in range(3) for owner in range(2) for result in range(4)}
+    for transaction in transactions.values():
+        mads, export = transaction[:-1], transaction[-1]
+        assert len(mads) == 4
+        assert [(_value(facts["chunk"], env), _value(facts["k"], env)) for _, _, env in mads] == [
+            (chunk + control_stage, k + mad_stage) for chunk in range(2) for k in range(2)]
+        assert [_value(call.args[9], env) for _, call, env in mads] == [1, 0, 0, 0]
+        assert [_value(call.annotations["unit_flag_ctrl"], env) for _, call, env in mads] == [2, 2, 2, 3]
+        assert _is_export(export[1], facts) and _value(export[1].annotations["unit_flag_ctrl"], export[2]) == 3
+    fills = [(call, env) for call, env, _ in records if _name(call) == _COPY
+             and call.args[1].args[0].buffer.data.same_as(facts["chunk_l1"].data)]
+    reads = [(call, env) for call, env, _ in records if _name(call) == _COPY
+             and call.args[0].args[0].buffer.data.same_as(facts["chunk_l1"].data)]
+    assert len(fills) == 48 and len(reads) == 96
+    assert all(_value(call.args[1].args[0].indices[0], env) == _value(facts["chunk"], env) % 2
+               for call, env in fills)
+    assert all(_value(call.args[0].args[0].indices[0], env) == (_value(facts["chunk"], env) - control_stage) % 2
+               for call, env in reads)
+    _check_brackets(records, facts, activations)
+
+
+@pytest.mark.parametrize("rejection", ["parent-bound-too-small", "missing-parent-bound", "parent-offset-disabled",
+                                       "parent-unconsumed-auto", "guarded-descendant", "dynamic-descendant",
+                                       "breaking-descendant", "direct-child-shift", "result-shift",
+                                       "multiple-MADs-with-shifted-control"])
+def test_unproved_nested_control_keeps_ordinary_protocol(rejection):
+    # Zero-stage MADs isolate the whole-Control single-task gate from the
+    # previously covered leaf-stage restriction.
+    before, _ = _shifted_control_pipeline(mad_stage=0 if rejection == "multiple-MADs-with-shifted-control" else 1,
+                                         rejection=rejection)
+    original = tvm.ir.save_json(before)
+    prepared = transform.PrepareMultiBuffer()(before)
+    unsupported_scope = {"guarded-descendant": "result", "breaking-descendant": "chunk"}.get(rejection)
+    if unsupported_scope is not None:
+        # Skipping or breaking the native-K activation also prevents the
+        # ordinary parent's projected binary channel from proving its
+        # supported clock. Unit selection cannot bypass that diagnostic.
+        with pytest.raises(tvm.error.InternalError, match=(
+                "shifted carried events require an unconditional outermost lexical loop"
+                f".*pipe=MTE1->M.*analysis_loop={unsupported_scope}")):
+            _insert(prepared)
+        assert tvm.ir.save_json(before) == original
+        return
+    after = _insert(prepared)
+    assert tvm.ir.save_json(before) == original
+    assert not calls(after, _DIRECTION)
+    assert all("unit_flag_ctrl" not in call.annotations for call in calls(after, _GEMM))
+    assert any(call.args[0].value == "M_FIX" for call in calls(after, _SET))
+
+
+def test_single_trip_shifted_control_retains_its_unproved_operand_lifetime_diagnostic():
+    # Selection cannot make the unrelated MTE1->M flag binary-safe. The
+    # existing single-trip parent proof excludes a shifted ancestor; keep
+    # that diagnostic rather than using unit C protection as whole-MAD
+    # completion or silently accepting an ordinary fallback.
+    before, _ = _shifted_control_pipeline(native_k=1)
+    original = tvm.ir.save_json(before)
+    prepared = transform.PrepareMultiBuffer()(before)
+    with pytest.raises(tvm.error.InternalError, match="no reverse completion path for MTE1->M"):
+        _insert(prepared)
+    assert tvm.ir.save_json(before) == original
