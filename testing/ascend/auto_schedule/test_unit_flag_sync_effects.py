@@ -1,4 +1,4 @@
-"""Unit flags replace only the existing MAD/FIX L0C data handshake.
+"""Numeric unit controls do not discharge unrelated completion obligations.
 
 These are explicit inputs to InsertSync, without scheduling, native lowering
 or a device. They preserve unrelated completion obligations; they do not
@@ -101,7 +101,7 @@ def test_unit_flag_cannot_drop_non_l0c_gm_hazard(arch, unit_flag, reverse):
 @pytest.mark.parametrize("arch", ["dav-2201", "dav-3510"])
 @pytest.mark.parametrize("unit_flag", [0, 3])
 @pytest.mark.parametrize("scope", ["shared.l0c", "shared.l0c.dyn"])
-def test_existing_l0c_mad_fix_unit_flag_replacement_is_unchanged(arch, unit_flag, scope):
+def test_unqualified_l0c_controls_preserve_2201_completion(arch, unit_flag, scope):
     a = tirx.decl_buffer((16, 16), "float16", name="a", scope="shared.l0a")
     b = tirx.decl_buffer((16, 16), "float16", name="b", scope="shared.l0b")
     acc = tirx.decl_buffer((16, 16), "float32", name="acc", scope=scope)
@@ -119,9 +119,8 @@ def test_existing_l0c_mad_fix_unit_flag_replacement_is_unchanged(arch, unit_flag
     for event in ("M_FIX", "FIX_M"):
         sets = [call for call in calls(after, "tl.ascend_set_flag") if call.args[0].value == event]
         waits = [call for call in calls(after, "tl.ascend_wait_flag") if call.args[0].value == event]
-        if unit_flag:
-            # Compatibility only: this does not claim the complete unit-flag
-            # protocol has been validated or authorize a new device path.
+        if unit_flag and arch == "dav-3510":
+            # The 3510 compatibility path has its own hardware contract.
             assert not sets and not waits
         else:
             assert sets and waits

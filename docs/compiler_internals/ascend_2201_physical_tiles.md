@@ -115,19 +115,57 @@ synchronization mechanism nor chooses this storage policy automatically.
 
 ## Explicit unit controls
 
-The default native path uses unit control zero and ordinary completion events.
+Unselected native operations use unit control zero and ordinary completion events.
 For an explicitly annotated L1 GEMM, K lowering retains the CHECK bit on every
 nonterminal native MAD and preserves the original control on the final MAD,
 including a separate K tail. Thus control 3 becomes `2, ..., 2, 3`; control 2
 remains 2 throughout. An absent annotation stays absent. This does not publish
 an intermediate K result or change which sub-K clears the accumulator.
 
-The existing explicit unit-control path can replace only AIC MAD/FIX data
-handshakes on L0C. It must not suppress register configuration, GM hazards,
-owner exclusion or other storage completion. This path does not validate a
-complete producer/export stream: numeric controls alone do not prove matching
-C regions, safe initial reuse, finite drain or physical layout state. Automatic
-selection of that protocol requires a separate validated contract.
+On 2201, numeric controls alone do not remove completion events. They do not
+prove matching C regions, safe initial reuse, finite drain or direction state.
+The 3510 explicit compatibility path is separate from the 2201 selector.
+
+## Closed 2201 unit streams
+
+After scheduling and core resolution, `InsertSync` can select a serial result
+loop containing ordinary native-L0 GEMMs followed by one complete C-to-GM
+export per result. C must be the actual rank-two FP32 allocation with canonical
+compact NZ layout, aligned M/N and one fixed physical slot. A/B are FP16 or
+BF16. The finite native-K chain clears C exactly once at its start and
+accumulates thereafter. The selector assigns MAD controls `2, ..., 2, 3` and
+FIX control 3 atomically after validating the whole transaction.
+
+Only matching C RAW edges within that result and C WAR edges carried by that
+exact result loop are discharged. Unit protection is not added to the generic
+completion graph. M accumulation order, outer owner/epoch reuse, A/B readiness,
+GM publication, register state and other storage dependencies retain ordinary
+completion proofs.
+
+The stream has explicit ordinary event boundaries allocated by the existing
+flag allocator: M-to-S before selecting N direction, S-to-M before its first
+MAD, S-to-FIX before its first export, full FIX-to-M after its last export,
+and M-to-S before restoring M direction. The S-to-FIX gate carries the entry's
+real MAD completion to the next activation's FIX, preserving enclosing
+owner/epoch dependencies. A final S-to-M gate makes the restored state visible
+to subsequent MADs, including unselected ones. The terminal drain runs once
+per stream activation, including when an enclosing owner or epoch repeats.
+Its dedicated binary flag is cleared before the following blocking Scalar
+wait permits another activation to issue a notification; this flag-lifetime
+proof does not add a whole-MAD/FIX completion edge. No unit seed is assumed.
+
+If selection removes an unrelated event's reverse-completion witness or
+exceeds the eight local hard-event IDs after safe reuse,
+`InsertSync` retries the untouched ordinary scheduled program. Unit data
+protection cannot establish GM or operand completion for flag reuse.
+
+Partial C regions, M/N tails, interleaved C writers, guarded terminal MAD/FIX,
+compound tasks, versioned C and nonzero stages retain their original path.
+An entire enclosing guard may enable or disable the stream; a guard on the
+result loop itself is not selected. Explicit direction or atomic-state control
+and opaque external calls also prevent automatic selection. These conservative
+boundaries do not require new user DSL and do not choose Python tiling policy
+or emulate 3510 RegBase/VF execution.
 
 ## Supported boundary
 

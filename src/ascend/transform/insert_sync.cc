@@ -63,6 +63,7 @@
 #include "./auto_schedule/scheduled_tir.h"
 #include "./auto_schedule/task_analysis.h"
 #include "./auto_schedule/task_annotations.h"
+#include "./auto_schedule/unit_flag_stream.h"
 #include "ascend/op/builtin.h"
 #include "ascend/target_utils.h"
 #include "ascend/transform/attr.h"
@@ -337,6 +338,16 @@ struct LocalBinaryEpochSpan {
   PrimExpr trip_count;
 };
 
+enum class UnitFlagBoundaryRole {
+  kNone,
+  kEntry,
+  kSetup,
+  kFixSetup,
+  kDrain,
+  kRestore,
+  kExit
+};
+
 struct SyncPoint {
   DepEdge edge;
   DependencyKind dependency_kind;
@@ -347,6 +358,7 @@ struct SyncPoint {
   size_t allocation_index;
   std::optional<CounterChannelKey> counter_channel;
   std::optional<LocalBinaryFlagPlan> local_binary_plan;
+  UnitFlagBoundaryRole unit_boundary{UnitFlagBoundaryRole::kNone};
 
   SyncPoint(DepEdge edge, DependencyKind dependency_kind, int num_versions,
             ControlNode *flag_loop)
@@ -820,6 +832,18 @@ struct SyncAnalysisResult {
   std::vector<VisibleSyncPoint> visible_sync_points;
 };
 
+// Ordinary completion edges at the boundary of a selected unit stream. These
+// use the same sites, closure and flag allocator as data dependencies. Unit
+// protection itself is deliberately never inserted into the completion graph.
+struct UnitFlagBoundary {
+  ControlNode *scope;
+  IRStructure *producer_node;
+  TaskNode *producer;
+  IRStructure *consumer_node;
+  TaskNode *consumer;
+  UnitFlagBoundaryRole role;
+};
+
 // Check if any operation in stmt has unit_flag_ctl/ctrl != 0. This walks the
 // whole statement because a T.PerCoreTask leaf may hold a compound body.
 bool HasUnitFlagCtrl(const Stmt &stmt) {
@@ -883,12 +907,15 @@ public:
       const EpochDomainRegistry &domains, AscendArchitecture architecture,
       BufferVersionMap manual = {}, ConflictHintList root_conflicts = {},
       L0StorageGroups storage_groups = L0StorageGroups(),
-      const std::vector<OwnerResultPlan> *owner_results = nullptr)
+      const std::vector<OwnerResultPlan> *owner_results = nullptr,
+      const std::vector<UnitFlagStreamPlan> *unit_streams = nullptr,
+      const std::vector<UnitFlagBoundary> *unit_boundaries = nullptr)
       : storage_groups_(std::move(storage_groups)),
         multi_buffer_plan_(multi_buffer_plan), domains_(domains),
         architecture_(architecture), manual_(std::move(manual)),
         root_conflicts_(std::move(root_conflicts)),
-        owner_results_(owner_results), site_registry_(domains) {
+        owner_results_(owner_results), unit_streams_(unit_streams),
+        unit_boundaries_(unit_boundaries), site_registry_(domains) {
     for (const MultiBufferInfo &info : multi_buffer_plan_.Infos()) {
       ICHECK(!info.owners.empty());
       std::vector<ControlNode *> owners;
@@ -919,7 +946,7 @@ public:
     lifetime_orders_.clear();
     SyncAnalysisResult root_result = AnalyzeNodeList(nodes, /*loop=*/nullptr);
     scope_closures_.insert_or_assign(nullptr, std::move(root_result.closure));
-    if (owner_fallback_required_)
+    if (owner_fallback_required_ || unit_fallback_required_)
       return false;
 
     // The contract's presence still enables sequential allocation downstream.
@@ -946,6 +973,7 @@ public:
   }
 
   const BufferAliasMap &BufferAliases() const { return buffer_aliases_; }
+  bool NeedsUnitFallback() const { return unit_fallback_required_; }
 
   bool HasOwnerResultRelease(const OwnerResultPlan &plan) const {
     int domain = domains_.DomainForStorage(plan.storage, plan.epoch);
@@ -1199,6 +1227,8 @@ private:
     std::vector<std::vector<VisibleSyncPoint>> child_sync_points;
     for (IRStructure *node : nodes) {
       SyncAnalysisResult child_result = AnalyzeNode(node);
+      if (unit_fallback_required_)
+        return result;
       AddPromotedChildClosure(result.closure, node, child_result.closure, loop);
       child_sync_points.push_back(std::move(child_result.visible_sync_points));
     }
@@ -1570,16 +1600,20 @@ private:
         std::string consumer_pipe =
             GetResourcePipeName(consumer->GetPipeMask());
         std::string hard_event = GetHardEvent(producer_pipe, consumer_pipe);
-        // Preserve the legacy unit-flag replacement only for L0C data
-        // handshakes between MAD and FIX. Unit flags do not establish SPR
-        // state, other storage hazards, or complete owner lifetimes.
+        // dav-2201 requires a closed, selected stream. Numeric controls alone
+        // do not prove C ownership or completion. Keep dav-3510 compatibility
+        // separate: its unit protocol is not selected by this 2201 analysis.
         bool fix_unit_flag =
             dep.kind == DependencyKind::kData && dep.storage.has_value() &&
             (storage_scope == "shared.l0c" ||
              storage_scope == "shared.l0c.dyn") &&
             (hard_event == "M_FIX" || hard_event == "FIX_M") &&
-            (HasUnitFlagCtrl(producer->stmt) ||
-             HasUnitFlagCtrl(consumer->stmt));
+            ((architecture_ == AscendArchitecture::kDav2201 && unit_streams_ &&
+              CoversUnitFlagDependency(*unit_streams_, loop, dep, producer,
+                                       consumer)) ||
+             (architecture_ != AscendArchitecture::kDav2201 &&
+              (HasUnitFlagCtrl(producer->stmt) ||
+               HasUnitFlagCtrl(consumer->stmt))));
         for (CoreMask producer_core : expand_cores(producer->GetCoreMask())) {
           for (CoreMask consumer_core : expand_cores(consumer->GetCoreMask())) {
             if (owner_results_ && dep.kind == DependencyKind::kData &&
@@ -1625,6 +1659,22 @@ private:
             }
           }
         }
+      }
+    }
+    if (unit_boundaries_) {
+      for (const UnitFlagBoundary &boundary : *unit_boundaries_) {
+        if (boundary.scope != loop)
+          continue;
+        int domain = domains_.UnconditionalLexicalDomain(loop);
+        size_t src = site_registry_.FindSiteId(
+            SyncInsertionSiteKey{boundary.producer_node, boundary.producer,
+                                 false, kCoreCube, domain});
+        size_t dst = site_registry_.FindSiteId(
+            SyncInsertionSiteKey{boundary.consumer_node, boundary.consumer,
+                                 true, kCoreCube, domain});
+        sync_points.emplace_back(DepEdge(src, dst, 0, true),
+                                 DependencyKind::kData, 1, loop);
+        sync_points.back().unit_boundary = boundary.role;
       }
     }
     return sync_points;
@@ -1848,7 +1898,10 @@ private:
     std::stable_sort(sync_points.begin(), sync_points.end());
     std::vector<SyncPoint> emit;
     for (SyncPoint &sync_point : sync_points) {
-      if (closure.Contains(sync_point.edge))
+      // The real boundary gates jointly establish the closed stream and its
+      // terminal flag lifetime. Retain their exact blocking Scalar cuts.
+      if (sync_point.unit_boundary == UnitFlagBoundaryRole::kNone &&
+          closure.Contains(sync_point.edge))
         continue;
       if (sync_point.dependency_kind == DependencyKind::kOwnerExclusion &&
           sync_point.edge.distance != 0 && sync_point.edge.distance != 1) {
@@ -1875,6 +1928,19 @@ private:
       int innermost_num_versions = is_innermost ? sync_point.num_versions : 1;
       bool local_binary = architecture_ == AscendArchitecture::kDav2201 &&
                           !site_registry_.IsCrossCore(sync_point);
+      if (sync_point.unit_boundary == UnitFlagBoundaryRole::kDrain) {
+        ICHECK(local_binary && src.pipe == "FIX" && dst.pipe == "M" &&
+               sync_point.edge.distance == 0 && sync_point.num_versions == 1 &&
+               sync_point.counter_group_id == 0 && is_innermost);
+        // This is a flag-bit lifetime proof, not a C completion edge. The
+        // drain's M wait clears FIX_M before the following M_S notification;
+        // its PIPE_S wait blocks dispatch before the next activation can
+        // issue another FIX_M notification. The complete boundary bracket
+        // is constructed together and retained above. Give this point its
+        // own ID; never use unit protection to manufacture a reverse whole-
+        // MAD/FIX completion relation in DepClosure.
+        continue;
+      }
       int min_distance =
           local_binary
               ? MinCompletionDistance(closure, sync_point.edge.dst,
@@ -1915,6 +1981,14 @@ private:
         // reverse-completion witness. Do not use an owner edge as its proof
         // or weaken binary validation; retry the normal collective analysis.
         owner_fallback_required_ = true;
+        return;
+      }
+      if (local_binary && min_distance == std::numeric_limits<int>::max() &&
+          unit_streams_ && !unit_streams_->empty()) {
+        // Unit protection cannot supply an unrelated flag's reverse whole-
+        // completion witness. Retry the untouched ordinary program instead
+        // of relaxing that phase contract or keeping half of the selection.
+        unit_fallback_required_ = true;
         return;
       }
 
@@ -2080,6 +2154,9 @@ private:
                 bool allow_mixed_iter) const {
     const SyncPoint &lhs_sync = sync_points_[lhs.sync_point_id];
     const SyncPoint &rhs_sync = sync_points_[rhs.sync_point_id];
+    if (lhs_sync.unit_boundary == UnitFlagBoundaryRole::kDrain ||
+        rhs_sync.unit_boundary == UnitFlagBoundaryRole::kDrain)
+      return false;
     // Existing reuse proofs compare equal event phases. Keep a shifted local
     // binary channel exclusive rather than sharing its partial seed/drain.
     if (lhs_sync.local_binary_plan || rhs_sync.local_binary_plan)
@@ -2214,6 +2291,8 @@ private:
   MultiBufferOwnerMap multi_buffer_owners_;
   ConflictHintList root_conflicts_;
   const std::vector<OwnerResultPlan> *owner_results_;
+  const std::vector<UnitFlagStreamPlan> *unit_streams_;
+  const std::vector<UnitFlagBoundary> *unit_boundaries_;
   SyncSiteRegistry site_registry_;
   std::vector<SyncPoint> sync_points_;
   std::set<std::pair<size_t, size_t>> reusable_pairs_;
@@ -2225,6 +2304,7 @@ private:
   BufferAliasMap buffer_aliases_;
   bool disable_buffer_reuse_{false};
   bool owner_fallback_required_{false};
+  bool unit_fallback_required_{false};
 };
 
 // ============================================================================
@@ -2349,7 +2429,8 @@ public:
         cross_core_flag_reservation_(cross_core_flag_reservation),
         cross_core_contract_(cross_core_contract) {}
 
-  bool Plan(bool allow_fallback = false) {
+  bool Plan(bool allow_fallback = false,
+            bool require_intra_core_capacity = false) {
     allocations_.clear();
     flag_infos_.clear();
     GroupCounterChannels();
@@ -2515,6 +2596,8 @@ public:
     for (const auto &[domain, total] : next_intra_core_id) {
       if (total <= kIntraCoreFlagLimit)
         continue;
+      if (require_intra_core_capacity)
+        return false;
       LOG(WARNING) << "Ascend auto-schedule reached an intra-core flag-id "
                       "high-water mark of "
                    << total << " for " << domain << " after safe reuse, "
@@ -2725,7 +2808,7 @@ Stmt MakeSyncTask(const Stmt &body, CoreMask core_mask) {
 
 std::shared_ptr<TaskNode> MakeSyncTaskNode(const Stmt &body, CoreMask core_mask,
                                            int stage) {
-  auto task = std::make_shared<TaskNode>();
+  auto task = std::make_shared<TaskNode>(MakeSyncInsertionExtraInfo());
   task->stmt = MakeSyncTask(body, core_mask);
   task->SetStage(stage);
   task->SetCoreMask(core_mask);
@@ -2807,6 +2890,73 @@ inline Stmt MakeAscendWaitFlag(const std::string &hard_event,
 inline Stmt MakeAscendPipeBarrier(const std::string &pipe) {
   return Evaluate(
       Call(DataType::Handle(), ascend_pipe_barrier(), {StringImm(pipe)}));
+}
+
+// Bracket each selected result loop with a real direction-state transition
+// and a whole-FIX completion. Empty M tasks are insertion sites only: they do
+// not claim a C read/write or manufacture an allocation-lifetime proof.
+void InsertUnitFlagBoundaries(std::vector<std::shared_ptr<IRStructure>> &nodes,
+                              ControlNode *parent,
+                              const std::vector<UnitFlagStreamPlan> &plans,
+                              std::vector<UnitFlagBoundary> *boundaries) {
+  std::vector<std::shared_ptr<IRStructure>> result;
+  for (const auto &node : nodes) {
+    if (node->IsControl()) {
+      auto *control = static_cast<ControlNode *>(node.get());
+      InsertUnitFlagBoundaries(control->children, control, plans, boundaries);
+    }
+    auto plan = std::find_if(plans.begin(), plans.end(), [&](const auto &p) {
+      return p.result_loop == node.get();
+    });
+    if (plan == plans.end()) {
+      result.push_back(node);
+      continue;
+    }
+    auto make_site = [&](ResourcePipe pipe, const Stmt &body) {
+      auto task = MakeSyncTaskNode(body, kCoreCube, node->GetStage());
+      task->SetPipeMask(PipeMask(pipe));
+      task->outer_ctx = plan->result_loop->task->outer_ctx;
+      task->SetParent(parent);
+      return task;
+    };
+    auto entry = make_site(ResourcePipe::kCube, Evaluate(0));
+    auto setup =
+        make_site(ResourcePipe::kScalar,
+                  Evaluate(Call(DataType::Handle(), ascend_set_mmad_direction(),
+                                {StringImm("n")})));
+    setup->AddSpecialWrite(SpecialRegister::kMmadDirection);
+    auto drain = make_site(ResourcePipe::kCube, Evaluate(0));
+    auto restore =
+        make_site(ResourcePipe::kScalar,
+                  Evaluate(Call(DataType::Handle(), ascend_set_mmad_direction(),
+                                {StringImm("m")})));
+    restore->AddSpecialWrite(SpecialRegister::kMmadDirection);
+    auto exit = make_site(ResourcePipe::kCube, Evaluate(0));
+    boundaries->push_back({parent, entry.get(), entry.get(), setup.get(),
+                           setup.get(), UnitFlagBoundaryRole::kEntry});
+    boundaries->push_back({parent, setup.get(), setup.get(), node.get(),
+                           plan->mads.front(), UnitFlagBoundaryRole::kSetup});
+    // The entry M_S also retires MADs from the preceding activation. Carry
+    // that real completion to FIX explicitly: the selected MAD/FIX unit
+    // relation is C data protection, not a whole-pipe completion witness for
+    // an enclosing owner/epoch's carried RAW dependency.
+    boundaries->push_back({parent, setup.get(), setup.get(), node.get(),
+                           plan->fix, UnitFlagBoundaryRole::kFixSetup});
+    boundaries->push_back({parent, node.get(), plan->fix, drain.get(),
+                           drain.get(), UnitFlagBoundaryRole::kDrain});
+    boundaries->push_back({parent, drain.get(), drain.get(), restore.get(),
+                           restore.get(), UnitFlagBoundaryRole::kRestore});
+    // AutoSchedule ran before this state transition was introduced. Make the
+    // restored direction visible to subsequent, unselected MADs as well.
+    boundaries->push_back({parent, restore.get(), restore.get(), exit.get(),
+                           exit.get(), UnitFlagBoundaryRole::kExit});
+    result.insert(result.end(), {entry, setup, node, drain, restore, exit});
+  }
+  for (size_t i = 0; i < result.size(); ++i) {
+    result[i]->SetIndex(i);
+    result[i]->SetParent(parent);
+  }
+  nodes = std::move(result);
 }
 
 inline Stmt MakeAscendCrossCoreSetFlag(int mode_id, const std::string &pipe,
@@ -3165,7 +3315,8 @@ private:
 // Kernel-level validation and scheduled-TIR rewrite
 // ============================================================================
 SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
-                        Target target, const std::vector<Var> &lane_variables) {
+                        Target target, const std::vector<Var> &lane_variables,
+                        bool enable_unit_streams = true) {
   std::vector<std::shared_ptr<IRStructure>> &root = scheduled_tir.tree;
   const AscendTargetInfo &target_info = GetAscendTargetInfo(target);
   CrossCoreSyncContract cross_core_contract{
@@ -3176,6 +3327,37 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
       CollectL0SFBindings(scheduled_tir.metadata.kernel_root));
   MultiBufferPlan multi_buffer_plan =
       ReadMultiBufferPlan(root, scheduled_tir.metadata.buffer_versions, groups);
+  std::vector<UnitFlagStreamPlan> unit_streams;
+  std::vector<UnitFlagBoundary> unit_boundaries;
+  std::optional<ScheduledTIR> unit_fallback;
+  if (enable_unit_streams &&
+      target_info.architecture == AscendArchitecture::kDav2201) {
+    // An existing direction setter has an explicit state contract. Do not
+    // silently replace its scope or assume the state to restore on exit.
+    bool explicit_state = false;
+    PostOrderVisit(kernel_body, [&](const ffi::ObjectRef &node) {
+      if (const auto *call = node.as<CallNode>())
+        explicit_state |= call->op.same_as(ascend_set_mmad_direction()) ||
+                          call->op.same_as(ascend_set_atomic()) ||
+                          call->op.same_as(ascend_set_atomic_none()) ||
+                          call->op.same_as(builtin::call_extern()) ||
+                          call->op.same_as(builtin::call_pure_extern());
+    });
+    if (!explicit_state) {
+      unit_streams =
+          AnalyzeUnitFlagStreams(root, scheduled_tir.metadata.kernel_root,
+                                 scheduled_tir.metadata.buffer_versions,
+                                 scheduled_tir.metadata.manual_buffer_versions);
+      if (!unit_streams.empty()) {
+        unit_fallback.emplace();
+        unit_fallback->metadata = scheduled_tir.metadata;
+        for (const auto &node : root)
+          unit_fallback->tree.push_back(node->Clone());
+      }
+      ApplyUnitFlagStreams(unit_streams);
+      InsertUnitFlagBoundaries(root, nullptr, unit_streams, &unit_boundaries);
+    }
+  }
   std::vector<TaskNode *> tasks;
   CollectAllTaskNodes(root, tasks);
   for (TaskNode *task : tasks) {
@@ -3200,8 +3382,14 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
     analyzer = std::make_unique<SyncAnalyzer>(
         multi_buffer_plan, domains, target_info.architecture,
         scheduled_tir.metadata.manual_buffer_versions,
-        scheduled_tir.metadata.root_conflict_hints, groups, &owner_results);
+        scheduled_tir.metadata.root_conflict_hints, groups, &owner_results,
+        &unit_streams, &unit_boundaries);
     if (!analyzer->Analyze(root)) {
+      if (analyzer->NeedsUnitFallback()) {
+        ICHECK(unit_fallback.has_value());
+        return InsertKernelSync(kernel_body, std::move(unit_fallback.value()),
+                                target, lane_variables, false);
+      }
       ICHECK(!owner_results.empty());
       owner_results.clear();
       continue;
@@ -3219,9 +3407,18 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
         analyzer->SiteRegistry(), analyzer->SyncPoints(),
         analyzer->ReusablePairs(), cross_core_flag_reservation,
         cross_core_contract);
-    if (!flag_allocator->Plan(!owner_results.empty())) {
-      owner_results.clear();
-      continue;
+    if (!flag_allocator->Plan(!owner_results.empty() || !unit_streams.empty(),
+                              !unit_streams.empty())) {
+      if (!owner_results.empty()) {
+        owner_results.clear();
+        continue;
+      }
+      // A closed stream's terminal flag is exclusive. Optional selection
+      // must not force a previously legal 2201 kernel past its eight local
+      // IDs: this target cannot spill hard events to the 3510 mutex API.
+      ICHECK(unit_fallback.has_value());
+      return InsertKernelSync(kernel_body, std::move(unit_fallback.value()),
+                              target, lane_variables, false);
     }
     owner_events = AllocateOwnerResultEvents(
         owner_results, analyzer->SiteRegistry(), analyzer->SyncPoints(),
