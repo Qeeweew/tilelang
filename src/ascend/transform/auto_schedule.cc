@@ -175,6 +175,10 @@ public:
   // Structural GM prefetch preference for ordinary dav-2201 auto pipelines.
   void SetPreferPrefetchIssue(bool value) { prefer_prefetch_issue_ = value; }
 
+  // Conservative whole-kernel L0A/B admission for dav-2201 automatic loops.
+  // Physical reuse is a later decision, so it cannot increase this budget.
+  void SetReserveL0Storage(bool value) { reserve_l0_storage_ = value; }
+
   void SetMemoryLimit(const std::string &scope, int64_t bytes) {
     memory_limits_[scope] = bytes;
   }
@@ -242,13 +246,10 @@ private:
     auto existing = selected_buffer_versions_.find(storage);
     if (existing != selected_buffer_versions_.end()) {
       // Disjoint owners are scheduled independently but share one physical
-      // storage ring, so keep enough versions for every owner. The per-owner
-      // memory limits are intentionally not revalidated after this merge:
-      // they are a coarse scheduling heuristic and do not model downstream
-      // storage reuse, so a global sum here would not be authoritative. This
-      // can produce a merged allocation above the physical limit; until a
-      // lifetime-aware global check exists, this is an accepted limitation and
-      // such a kernel may only be rejected by downstream/runtime validation.
+      // storage ring, so keep enough versions for every owner. Automatic
+      // dav-2201 L0A/B queries reserve other root allocations and carry this
+      // existing count as a hard lower bound before selecting again. Other
+      // scopes and manual schedules retain their existing per-owner policy.
       num_versions = std::max((*existing).second, num_versions);
     }
     for (const Var &member : storage_groups_.Members(storage))
@@ -257,6 +258,7 @@ private:
 
   bool prefer_handoff_issue_{false};
   bool prefer_prefetch_issue_{false};
+  bool reserve_l0_storage_{false};
   L0StorageGroups storage_groups_;
   ffi::Map<Var, PrimExpr> storage_slot_bytes_;
   CompilerWorkspaceStorageSet compiler_workspaces_;
@@ -1009,21 +1011,45 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
   }
   std::unordered_map<Var, int, ObjectPtrHash, ObjectPtrEqual>
       annotated_storage_versions;
-  auto get_buffer_size = [&](const Buffer &buffer) -> int64_t {
-    auto slot = storage_slot_bytes_.Get(buffer->data);
+  auto get_storage_size = [&](const Var &storage) -> int64_t {
+    auto slot = storage_slot_bytes_.Get(storage);
     ICHECK(slot.has_value())
         << "AutoSchedule cannot find the allocation owner for storage "
-        << buffer->data->name_hint;
+        << storage->name_hint;
     arith::Analyzer analyzer;
     PrimExpr size = analyzer.Simplify(slot.value());
     const auto *constant = size.as<IntImmNode>();
     ICHECK(constant)
         << "AutoSchedule requires a static physical storage footprint for "
-        << buffer->data->name_hint << ", got " << size;
+        << storage->name_hint << ", got " << size;
     ICHECK_GE(constant->value, 0)
         << "AutoSchedule found a negative physical storage footprint for "
-        << buffer->data->name_hint;
+        << storage->name_hint;
     return constant->value;
+  };
+  auto get_buffer_size = [&](const Buffer &buffer) {
+    return get_storage_size(buffer->data);
+  };
+  const bool reserve_l0 = reserve_l0_storage_ && !manual_schedule;
+  auto l0_scope = [](const Var &storage) -> std::string {
+    const std::string scope = GetPtrStorageScope(storage);
+    if (scope == "shared.l0a" || scope == "shared.l0a.dyn")
+      return "shared.l0a";
+    if (scope == "shared.l0b" || scope == "shared.l0b.dyn")
+      return "shared.l0b";
+    return "";
+  };
+  auto reserved_versions = [&](const Var &storage) -> int {
+    // The manual allocation already contains its physical version axis.
+    if (manual_buffer_versions_.count(storage))
+      return 1;
+    int versions = selected_buffer_versions_.Get(storage).value_or(1);
+    // A fixed count with an established owner will be applied when that owner
+    // is scheduled; reserve it even if the owner has not been visited yet.
+    if (multi_buffer_owners_.count(storage))
+      versions = std::max(versions,
+                          buffer_version_overrides_.Get(storage).value_or(1));
+    return versions;
   };
   auto enumerate_buffers = [&](auto &&visit) {
     for (const auto &r : ctrl->GetReadRegions())
@@ -1074,17 +1100,24 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
       scope = "shared";
     }
     int group_id = scope_to_group[scope];
+    bool root_l0 = reserve_l0 && !l0_scope(storage).empty();
+    if (root_l0 && manual_buffer_versions_.count(storage))
+      continue;
     if (!ctrl->IsMultiBufferEligible(storage)) {
       // These buffers cannot be multi-buffered, and cannot share memory with
       // other buffers either, so we directly reduce the capacity of the
       // memory group by their size
-      group_capacities[group_id] -= get_buffer_size(buffer);
+      if (!root_l0)
+        group_capacities[group_id] -= get_buffer_size(buffer);
     } else {
       auto override_it = buffer_version_overrides_.find(storage);
       if (override_it != buffer_version_overrides_.end()) {
         int override_val = (*override_it).second;
+        if (root_l0)
+          override_val = std::max(override_val, reserved_versions(storage));
         annotated_storage_versions[storage] = override_val;
-        group_capacities[group_id] -= get_buffer_size(buffer) * override_val;
+        if (!root_l0)
+          group_capacities[group_id] -= get_buffer_size(buffer) * override_val;
       } else {
         size_t id = storage_sizes.size();
         storage_version_id.emplace(storage, id);
@@ -1094,9 +1127,37 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
     }
   }
 
-  // Validate buffer capacities upfront: if the minimum requirement (one
-  // version of each eligible buffer) already exceeds the remaining capacity,
-  // Z3 will never find a feasible solution.
+  std::vector<int64_t> storage_min_versions(storage_sizes.size(), 1);
+  if (reserve_l0) {
+    // Every root allocation remains reserved until a later physical reuse
+    // proof. This deliberately may reject a downstream alias/reuse plan; it
+    // is a safe L0A/B bound, not a lifetime-optimal allocation model.
+    for (const auto &[storage, _] : storage_slot_bytes_) {
+      std::string scope = l0_scope(storage);
+      if (scope.empty())
+        continue;
+      int versions = reserved_versions(storage);
+      ICHECK_GT(versions, 0);
+      auto variable = storage_version_id.find(storage);
+      if (variable != storage_version_id.end()) {
+        storage_min_versions[variable->second] = versions;
+        continue;
+      }
+      int64_t bytes = get_storage_size(storage);
+      int group_id = scope_to_group.at(scope);
+      int64_t &remaining = group_capacities[group_id];
+      ICHECK_LE(bytes, remaining / versions)
+          << "Z3 loop scheduling failed: scope \"" << scope << "\" capacity "
+          << remaining << " is insufficient for reserved root storage "
+          << storage->name_hint << " (" << bytes << " bytes, " << versions
+          << " physical versions)";
+      remaining -= bytes * versions;
+    }
+  }
+
+  // Validate buffer capacities upfront: every eligible buffer needs at least
+  // one version, or the existing shared ring count for automatic 2201 L0A/B.
+  // If that minimum exceeds the remaining capacity, Z3 cannot be feasible.
   for (size_t g = 0; g < group_capacities.size(); ++g) {
     int64_t capacity = group_capacities[g];
     const auto &idxs = group_indices[g];
@@ -1110,7 +1171,10 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
     if (!idxs.empty()) {
       int64_t min_usage = 0;
       for (int64_t idx : idxs) {
-        min_usage += storage_sizes[idx];
+        ICHECK_LE(storage_sizes[idx],
+                  (std::numeric_limits<int64_t>::max() - min_usage) /
+                      storage_min_versions[idx]);
+        min_usage += storage_sizes[idx] * storage_min_versions[idx];
       }
       if (min_usage > capacity) {
         LOG(FATAL) << "Z3 loop scheduling failed: scope \"" << group_scopes[g]
@@ -1286,6 +1350,7 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
   ffi::Array<ffi::Array<int64_t>> tvm_issue_priority_pairs;
   ffi::Array<ffi::Array<int64_t>> tvm_prefetch_priority_pairs;
   ffi::Array<int64_t> tvm_storage_sizes;
+  ffi::Array<int64_t> tvm_storage_min_versions;
   ffi::Array<int64_t> tvm_manual_stages;
 
   for (auto val : latencies) {
@@ -1339,6 +1404,8 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
   for (int64_t size : storage_sizes) {
     tvm_storage_sizes.push_back(size);
   }
+  for (int64_t versions : storage_min_versions)
+    tvm_storage_min_versions.push_back(versions);
   for (int64_t stage : manual_stages) {
     tvm_manual_stages.push_back(stage);
   }
@@ -1371,11 +1438,15 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
                    tvm_pipe_order_deps, tvm_storage_sizes, tvm_memory_groups,
                    tvm_stage_order_deps, enable_offset, tvm_manual_stages,
                    manual_schedule, stage_horizon, tvm_issue_priority_pairs,
-                   tvm_prefetch_priority_pairs)
+                   tvm_prefetch_priority_pairs, tvm_storage_min_versions)
           .cast<ffi::Tuple<ffi::Array<int64_t>, ffi::Array<int>, int64_t>>();
 
   ffi::Array<int64_t> start_times = return_val.get<0>();
   ffi::Array<int> storage_versions = return_val.get<1>();
+  ICHECK_EQ(storage_versions.size(), storage_min_versions.size());
+  for (size_t i = 0; i < storage_versions.size(); ++i)
+    ICHECK_GE(storage_versions[i], storage_min_versions[i])
+        << "AutoSchedule returned fewer versions than the shared storage ring";
   int64_t ii = return_val.get<2>();
 
   // Derive a per-task stage from (start_time / ii). Z3 schedules
@@ -1610,6 +1681,8 @@ static void ScheduleSingleKernel(const Stmt &kernel_body, Target target,
                                      AscendArchitecture::kDav2201);
   unit_builder.SetPreferPrefetchIssue(target_info.architecture ==
                                       AscendArchitecture::kDav2201);
+  unit_builder.SetReserveL0Storage(target_info.architecture ==
+                                   AscendArchitecture::kDav2201);
   int64_t shared_mem_limit = GetSharedMemoryLimit(kernel_body, target_info);
   unit_builder.SetMemoryLimit("shared", shared_mem_limit);
   unit_builder.SetMemoryLimit("shared.l1", target_info.l1_bytes);

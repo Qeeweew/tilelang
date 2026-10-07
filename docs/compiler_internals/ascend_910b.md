@@ -373,6 +373,23 @@ at a nested loop forms its own boundary; an explicit zero disables inheritance
 within that loop. Clear-accumulator and final-completion expressions keep the
 logical loop epoch when tasks receive a stage offset.
 
+For automatic 2201 loops, L0A/B version admission reserves every other root
+storage allocation before solving the current owner. The existing physical
+slot footprint includes layout and alignment; aliases with the same storage
+Var are charged once. Previously selected shared rings retain their maximum
+width as a hard minimum in later owners, including refinement, version
+recalculation and sequential fallback. Fixed version requests with an owner
+are reserved before that owner is visited. A manually versioned allocation
+already includes its physical version axis and is charged once.
+
+This whole-kernel reservation is conservative: different storage Vars remain
+reserved even if a later lifetime proof could reuse their allocations. It can
+reject such a reuse plan and does not claim optimal allocation. This admission
+boundary covers automatic L0A/B selection; it is not a complete bank validator
+for manual kernels or kernels without an automatic loop. UB, L1, L0C and 3510
+retain their existing policies. Final physical allocations and native
+completion still need their own validation.
+
 Compiler-created GM handoff storage also uses this buffer-version and epoch
 protocol. Its root provenance annotation,
 `tl.ascend.compiler_workspace_storages`, registers allocation data Vars;

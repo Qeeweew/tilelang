@@ -774,6 +774,7 @@ def z3_schedule_loop_python(
     stage_horizon: int | None = None,
     issue_priority_pairs: list[tuple[int, int]] | None = None,
     prefetch_priority_pairs: list[tuple[int, int]] | None = None,
+    buffer_min_versions: list[int] | None = None,
 ) -> tuple[list[int], list[int], int]:
     """Schedule a loop body with modulo, stage, and storage constraints.
 
@@ -822,6 +823,10 @@ def z3_schedule_loop_python(
         Bytes occupied by one version of each automatic buffer.
     memory_groups : list[list[int]]
         Capacity followed by member buffer indices for each memory scope.
+    buffer_min_versions : list[int] | None
+        Physical ring widths already selected by other owners. Keep these
+        lower bounds through solving, refinement and final recalculation;
+        they may exceed this owner's bound for newly allocated versions.
     stage_order_deps : list[tuple[int, int]] | None
         Stage-order constraints (u, w) requiring k_u <= k_w (same or earlier
         iteration-stage).
@@ -860,6 +865,18 @@ def z3_schedule_loop_python(
         raise RuntimeError("Z3 loop scheduling failed: n too small")
     if stage_horizon is not None and stage_horizon < 1:
         raise ValueError("Automatic pipeline stage_horizon must be positive")
+    if buffer_min_versions is None:
+        buffer_min_versions = [1] * len(buffer_sizes)
+    if (len(buffer_min_versions) != len(buffer_sizes)
+            or any(not isinstance(count, int) or isinstance(count, bool) or count < 1
+                   for count in buffer_min_versions)):
+        raise ValueError("buffer_min_versions must contain one positive integer per buffer")
+    # The sequential fallback must also fit the physical allocation contract.
+    # Check the common minimum before any optional bounded solver query.
+    for group in memory_groups:
+        capacity, *members = group
+        if sum(buffer_min_versions[i] * buffer_sizes[i] for i in members) > capacity:
+            raise ValueError("Loop memory capacity is insufficient for minimum buffer versions")
 
     if issue_priority_pairs is None:
         issue_priority_pairs = []
@@ -955,8 +972,8 @@ def z3_schedule_loop_python(
 
         buffer_vars = [z3.Int(f"buf_{i}", ctx) for i in range(len(buffer_sizes))]
         for i in range(len(buffer_sizes)):
-            solver.add(buffer_vars[i] >= 1)
-            solver.add(buffer_vars[i] <= num_stages)
+            solver.add(buffer_vars[i] >= buffer_min_versions[i])
+            solver.add(buffer_vars[i] <= max(num_stages, buffer_min_versions[i]))
         for group in memory_groups:
             cap = group[0]
             idxs = group[1:]
@@ -1088,7 +1105,7 @@ def z3_schedule_loop_python(
         for i in range(1, n):
             start_times[i] = start_times[i - 1] + latencies[i - 1]
         best_ii = max(sum(latencies), 1)
-        buffer_versions = [1] * len(buffer_sizes)
+        buffer_versions = list(buffer_min_versions)
     else:
         if verbose:
             detail = "; minimality is unproven after unknown" if unknown_checks else ""
@@ -1114,7 +1131,7 @@ def z3_schedule_loop_python(
         if recalculate_buffer_versions:
             # if recalculation is true, we recalculate based on the schedule and dependencies
             buffer_versions = _loop_buffer_versions(
-                start_times, data_deps, best_ii, [1] * len(buffer_sizes),
+                start_times, data_deps, best_ii, buffer_min_versions,
             )
         else:
             buffer_versions = []
@@ -1359,6 +1376,7 @@ def z3_schedule_loop_ffi(
     stage_horizon=0,
     issue_priority_pairs=None,
     prefetch_priority_pairs=None,
+    buffer_min_versions=None,
 ):
     """FFI wrapper for z3_schedule_loop_python.
 
@@ -1392,6 +1410,7 @@ def z3_schedule_loop_ffi(
     owner_exclusion_deps_list = _convert_int_tuples(owner_exclusion_deps, 4)
     issue_priority_pairs_list = _convert_int_tuples(issue_priority_pairs, 2)
     prefetch_priority_pairs_list = _convert_int_tuples(prefetch_priority_pairs, 2)
+    buffer_min_versions_list = None if buffer_min_versions is None else [int(value) for value in buffer_min_versions]
 
     # Call the actual scheduler (Z3 is not thread-safe, serialize access)
     with _z3_lock:
@@ -1414,6 +1433,7 @@ def z3_schedule_loop_ffi(
             stage_horizon=int(stage_horizon) if stage_horizon else None,
             issue_priority_pairs=issue_priority_pairs_list,
             prefetch_priority_pairs=prefetch_priority_pairs_list,
+            buffer_min_versions=buffer_min_versions_list,
         )
 
     # Return start_times and buffer_versions as separate arrays for easier FFI handling

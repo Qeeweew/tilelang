@@ -343,8 +343,9 @@ from testing.ascend.auto_schedule.test_prefetch_selection import _boundary_fixtu
 original = tvm_ffi.get_global_func("tl.transform.z3_schedule_loop_python")
 seen = []
 def observe(*args):
-    assert len(args) == 17, len(args)
-    seen.append([tuple(map(int, pair)) for pair in args[-1]])
+    assert len(args) == 18, len(args)
+    assert list(map(int, args[17])) == [1] * len(args[8])
+    seen.append([tuple(map(int, pair)) for pair in args[16]])
     return original(*args)
 tvm_ffi.register_global_func("tl.transform.z3_schedule_loop_python", observe, override=True)
 for kind in ("eligible", "3510", "rmw", "mixed-child", "overlap-pipe", "cross-core"):
