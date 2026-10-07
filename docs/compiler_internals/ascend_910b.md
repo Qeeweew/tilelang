@@ -291,6 +291,22 @@ the supplied model's units, including dimensionless 2201 weights. A solver
 `unknown` result reports its reason separately from `unsat` and retains the
 existing fallback policy.
 
+Ordinary automatic 2201 loops with offsets also consider prefetch at the
+already selected minimum II, before fixing stages or recalculating versions.
+A typed GM-to-L1/UB copy and its forward RAW reader qualify only on the same
+concrete core and distinct pipes, with one automatic storage owner and a
+version variable. Read-modify-write roles, ambiguous or mixed-core units,
+manual schedules and 3510 are excluded. The bounded joint refinement retains
+every dependency, capacity and completion constraint while leaving stages and
+versions free. It first prefers at least one epoch of consumer lag together
+with producer-first physical issue, then fewer allocated bytes and a smaller
+stage span. Physical issue follows residue, descending stage at equal residue,
+then source index; a stage lead alone is insufficient. Only a strictly better,
+independently validated feasible model is accepted. Unknown or unsat retains
+the original model. Start normalization and emitted counts are recomputed from
+the selected plan. These are structural preferences in the existing cost
+model, not measured load latency or proof of a performance improvement.
+
 For ordinary automatic 2201 mixed loops, shared memory effects identify forward
 cross-core writer-to-reader handoffs separately from reverse slot-release
 dependencies. The issue-quality heuristic prefers an independent handoff
@@ -304,6 +320,9 @@ After the minimum-II solve and version recalculation, one bounded refinement
 can select different issue residues with stages, emitted version counts and
 all original constraints fixed. An unavailable or worse result retains the
 feasible plan; verbose diagnostics report the solver status and unknown reason.
+Useful prefetch predicates selected by the earlier joint refinement are kept
+through this later issue refinement as frozen quality decisions, not new data
+dependencies.
 These structural preferences do not estimate wait duration and do not establish
 optimal overlap. Manual schedules and 3510 retain their existing policy.
 
@@ -338,7 +357,7 @@ compares relative resource pressure and buffer choices in an ordinary automatic
 pipeline; it predicts neither asynchronous completion latency nor kernel time.
 3510 cycle estimates and INI rate fields do not supply measured 2201 costs.
 
-The initial native FP16 reference is a 128×128×128 FP16-to-FP32 MMAD, a full-M
+The native FP16/BF16 reference is a 128×128×128 FP16/BF16-to-FP32 MMAD, a full-M
 128×128 A Load3Dv2 and a full-physical-N merged 128×128 B LoadData2D, with NZ
 L1 input and independent two-slot destinations. Current CANN 9.1/dav-2201
 measurements cover one AIC and a 20-AIC grid. Counter windows use raw SYS_CNT
@@ -354,7 +373,9 @@ timer coefficients or an exact measured latency. MMAD scales by physical
 destination payload. Source dependency bounding regions and allocation-wide
 K-cache pitches do not represent transferred bytes. The estimator and native
 copy lowering share the merged-B2D descriptor predicate. Other geometries are
-extrapolated estimates. BF16 and other precision paths, segmented/unidentified
+extrapolated estimates. Both calibrated precision paths passed independent
+numerical gates; BF16 A3D preserves operand bits through the CAPI's half storage
+view, while MMAD consumes BF16. Other precision paths, segmented/unidentified
 copies, dynamic work and all other unknown leaves retain uncalibrated ordinal
 one; one never means one cycle/tick. See
 [the service-weight definition](../ascend/2201_service_weights.md).

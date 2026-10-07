@@ -46,11 +46,12 @@ def _gemm(m, n, k, dtype="float16", *, dynamic_k=False):
     (128, 128, 128, 4), (128, 128, 64, 2), (64, 64, 64, 1),
     (127, 128, 128, 4), (256, 128, 64, 4),
 ])
-def test_mmad_weight_scales_physical_fractal_work(m, n, k, expected):
-    assert _estimate(_gemm(m, n, k))[-1] == (expected, expected)
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+def test_mmad_weight_scales_physical_fractal_work(m, n, k, expected, dtype):
+    assert _estimate(_gemm(m, n, k, dtype))[-1] == (expected, expected)
 
 
-@pytest.mark.parametrize("dtype,dynamic_k", [("bfloat16", False), ("float16", True)])
+@pytest.mark.parametrize("dtype,dynamic_k", [("float32", False), ("float16", True), ("bfloat16", True)])
 def test_uncalibrated_precision_or_dynamic_work_retains_ordinal_one(dtype, dynamic_k):
     assert _estimate(_gemm(128, 128, 128, dtype, dynamic_k=dynamic_k))[-1] == (1, 1)
 
@@ -80,21 +81,23 @@ def _load(which, *, n=128, k=128, cache_k=256, source_n=None,
 
 @pytest.mark.parametrize("leading", [False, True])
 @pytest.mark.parametrize("cache_k", [128, 256, 1024])
-def test_native_load_payload_ignores_source_cache_span_and_version_slots(leading, cache_k):
-    assert _estimate(_load("a3d", cache_k=cache_k, leading=leading))[-1] == (1, 1)
-    assert _estimate(_load("b2d", cache_k=cache_k, leading=leading))[-1] == (2, 2)
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+def test_native_load_payload_ignores_source_cache_span_and_version_slots(leading, cache_k, dtype):
+    assert _estimate(_load("a3d", cache_k=cache_k, leading=leading, dtype=dtype))[-1] == (1, 1)
+    assert _estimate(_load("b2d", cache_k=cache_k, leading=leading, dtype=dtype))[-1] == (2, 2)
 
 
 @pytest.mark.parametrize("n,k,wa,wb", [(128, 64, 1, 1), (128, 128, 1, 2), (256, 128, 2, 4)])
-def test_native_load_weight_scales_destination_payload(n, k, wa, wb):
-    assert _estimate(_load("a3d", n=n, k=k))[-1] == (wa, wa)
-    assert _estimate(_load("b2d", n=n, k=k))[-1] == (wb, wb)
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+def test_native_load_weight_scales_destination_payload(n, k, wa, wb, dtype):
+    assert _estimate(_load("a3d", n=n, k=k, dtype=dtype))[-1] == (wa, wa)
+    assert _estimate(_load("b2d", n=n, k=k, dtype=dtype))[-1] == (wb, wb)
 
 
 @pytest.mark.parametrize("options", [
-    {"source_n": 256}, {"transpose": True}, {"tagged": False}, {"dtype": "bfloat16"},
+    {"source_n": 256}, {"transpose": True}, {"tagged": False}, {"dtype": "float32"},
 ])
-def test_segmented_unidentified_or_bf16_b_load_retains_ordinal_one(options):
+def test_segmented_unidentified_or_unmeasured_b_load_retains_ordinal_one(options):
     assert _estimate(_load("b2d", **options))[-1] == (1, 1)
 
 
@@ -125,8 +128,8 @@ def test_frontend_var_key_layout_native_b_load_retains_uncalibrated_ordinal():
     assert _estimate(frontend)[-1] == (1, 1)
 
 
-def test_bf16_a3d_keeps_uncalibrated_ordinal():
-    assert _estimate(_load("a3d", n=256, dtype="bfloat16"))[-1] == (1, 1)
+def test_unmeasured_a3d_precision_keeps_uncalibrated_ordinal():
+    assert _estimate(_load("a3d", n=256, dtype="float32", tagged=False))[-1] == (1, 1)
 
 
 def test_unmeasured_gm_to_l1_leaf_retains_ordinal_one():
@@ -139,16 +142,17 @@ def test_unmeasured_gm_to_l1_leaf_retains_ordinal_one():
 
 
 @pytest.mark.parametrize("n", [128, 256])
-def test_ordinary_auto_gemm_selects_two_a_and_b_slots_with_service_weights(n):
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+def test_ordinary_auto_gemm_selects_two_a_and_b_slots_with_service_weights(n, dtype):
     # This is an acceptance test for the scheduling effect, not a cost-table
     # mirror. No explicit task duration, stages, buffer counts or issue order.
     @T.prim_func
-    def main(A: T.Tensor((128, 1024), "float16"),
-             B: T.Tensor((n, 1024), "float16"),
+    def main(A: T.Tensor((128, 1024), dtype),
+             B: T.Tensor((n, 1024), dtype),
              C: T.Tensor((128, n), "float32")):
         with T.Kernel(1):
-            a = T.alloc_l1((128, 256), "float16")
-            b = T.alloc_l1((n, 256), "float16")
+            a = T.alloc_l1((128, 256), dtype)
+            b = T.alloc_l1((n, 256), dtype)
             c = T.alloc_l0c((128, n), "float32")
             for ko in T.Pipelined(4):
                 T.copy(A[:, ko * 256:(ko + 1) * 256], a)

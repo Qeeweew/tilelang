@@ -270,7 +270,7 @@ struct TaskCostFeatures {
 };
 
 // dav-2201 uses dimensionless service/order weights, never cycles. The
-// reference FP16 128^3 MAD : 128x128 A3D : merged B2D ratio is 4:1:2.
+// reference FP16/BF16 128^3 MAD : 128x128 A3D : merged B2D ratio is 4:1:2.
 // Scaling other physical work/payload is an estimate; unknown leaves retain
 // ordinal one. These are scheduler preferences, not completion-time bounds.
 class Dav2201ServiceWeights {
@@ -286,11 +286,11 @@ public:
     if (call->op.same_as(Op::Get("tl.tileop.gemm"))) {
       Gemm gemm(call->args, call->annotations);
       if (!IsL0ABuffer(gemm->a_) || !IsL0BBuffer(gemm->b_) ||
-          !gemm->a_->dtype.is_float16() || !gemm->b_->dtype.is_float16() ||
+          !CalibratedOperands(gemm->a_->dtype, gemm->b_->dtype) ||
           gemm->c_->dtype != DataType::Float(32) ||
           gemm->a_->dtype.lanes() != 1 || gemm->b_->dtype.lanes() != 1 ||
           gemm->c_->dtype.lanes() != 1)
-        return 1; // BF16 MAD and other precision paths are uncalibrated.
+        return 1; // Other precision paths are uncalibrated.
       const auto &c = gemm->cRegion_->region;
       const auto &a = gemm->aRegion_->region;
       int64_t m = FractalExtent(c[c.size() - 2]->extent);
@@ -300,8 +300,8 @@ public:
     }
     if (call->op.same_as(AscendCubeLoad3D::Get())) {
       AscendCubeLoad3D load(call->args, call->annotations);
-      if (!load->src->buffer->dtype.is_float16() ||
-          !load->dst->buffer->dtype.is_float16())
+      if (!CalibratedOperands(load->src->buffer->dtype,
+                              load->dst->buffer->dtype))
         return 1;
       // The selected native op's destination is the exact padded transfer.
       // Its source region may conservatively span NZ gaps: never charge it
@@ -317,6 +317,10 @@ public:
   }
 
 private:
+  static bool CalibratedOperands(DataType source, DataType destination) {
+    return source == destination && source.lanes() == 1 &&
+           (source.is_float16() || source.is_bfloat16());
+  }
   int64_t Constant(const PrimExpr &expr) const {
     PrimExpr simplified = analyzer_->Simplify(expr);
     const auto *value = simplified.as<IntImmNode>();
@@ -357,7 +361,7 @@ private:
   }
   bool IsMergedB2D(const AscendCopyNode &copy) const {
     if (!IsL1Buffer(copy.src) || !IsL0BBuffer(copy.dst) ||
-        !copy.src->dtype.is_float16() || !copy.dst->dtype.is_float16() ||
+        !CalibratedOperands(copy.src->dtype, copy.dst->dtype) ||
         copy.src->dtype.lanes() != 1 || copy.dst->dtype.lanes() != 1 ||
         !copy.annotations.empty() || copy.transpose != 0 ||
         !LeadingUnit(BufferRegion(copy.src, copy.src_range)) ||

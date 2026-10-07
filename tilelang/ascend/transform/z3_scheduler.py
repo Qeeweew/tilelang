@@ -441,9 +441,83 @@ def z3_schedule_ffi(
     return start_times
 
 
+def _loop_issue_before(ctx, k_vars, r_vars, producer, consumer):
+    """Match AutoSchedule's residue, descending-stage, source-index sort."""
+    return z3.Or(
+        r_vars[producer] < r_vars[consumer],
+        z3.And(r_vars[producer] == r_vars[consumer], z3.Or(
+            k_vars[producer] > k_vars[consumer],
+            z3.And(k_vars[producer] == k_vars[consumer],
+                   z3.BoolVal(producer < consumer, ctx)),
+        )),
+    )
+
+
+def _refine_loop_prefetch(
+    ctx, assertions, model, k_vars, r_vars, buffer_vars,
+    prefetch_priority_pairs, buffer_sizes, *, verbose=False,
+):
+    """Jointly prefer a useful one-epoch load lead at the already chosen II.
+
+    Keep every original hard assertion, including storage capacity, while
+    leaving stages and versions free. A stage lead is useful only when the
+    producer also issues before its consumer in the physical child list. This
+    is a bounded structural preference, not a calibrated latency objective.
+    """
+    if not prefetch_priority_pairs:
+        return model
+    optimizer = z3.Optimize(ctx=ctx)
+    optimizer.set("rlimit", 100000)
+    optimizer.set("timeout", 100)
+    optimizer.add(*assertions)
+    penalties = [z3.If(z3.And(
+        k_vars[consumer] >= k_vars[producer] + 1,
+        _loop_issue_before(ctx, k_vars, r_vars, producer, consumer),
+    ), 0, 1) for producer, consumer in prefetch_priority_pairs]
+    allocated_bytes = z3.Sum([var * size for var, size in zip(buffer_vars, buffer_sizes)])
+    # These auxiliary bounds cannot exclude an original feasible assignment.
+    # Minimize their difference to obtain max(k)-min(k) without expanding a
+    # nested max/min expression or adding a quadratic set of stage relations.
+    low, high = z3.Ints("prefetch_min_k prefetch_max_k", ctx)
+    optimizer.add(*[low <= stage for stage in k_vars],
+                  *[high >= stage for stage in k_vars])
+    objectives = [z3.Sum(penalties), allocated_bytes, high - low]
+    for objective in objectives:
+        optimizer.minimize(objective)
+    status = optimizer.check()
+    if status != z3.sat:
+        if verbose:
+            reason = optimizer.reason_unknown() if status == z3.unknown else str(status)
+            print(f"[Python Z3 Loop] Prefetch refinement {status} ({reason}); retain feasible plan")
+        return model
+    candidate = optimizer.model()
+
+    def cost(selected):
+        # The original model has no auxiliary min/max variables. Evaluate the
+        # same score from its actual stages rather than completing those new
+        # variables with arbitrary zeros.
+        stages = [selected.eval(var, model_completion=True).as_long() for var in k_vars]
+        return (
+            selected.eval(objectives[0], model_completion=True).as_long(),
+            selected.eval(allocated_bytes, model_completion=True).as_long(),
+            max(stages) - min(stages),
+        )
+
+    # A bounded optimizer may supply only a feasible incumbent. Require a
+    # strict lexicographic improvement and independently check every original
+    # assertion before replacing the known-feasible plan.
+    if cost(candidate) >= cost(model) or any(
+        not z3.is_true(candidate.eval(value, model_completion=True)) for value in assertions
+    ):
+        return model
+    if verbose:
+        print(f"[Python Z3 Loop] Prefetch preference cost: {cost(model)} -> {cost(candidate)}")
+    return candidate
+
+
 def _refine_loop_issue_order(
     ctx, assertions, model, k_vars, r_vars, buffer_vars, issue_priority_pairs,
-    *, buffer_counts=None, verbose=False,
+    *, buffer_counts=None, prefetch_priority_pairs=None, verbose=False,
 ):
     """Select a better physical issue order within an already feasible plan.
 
@@ -465,16 +539,22 @@ def _refine_loop_issue_order(
                  else model.eval(var, model_completion=True))
         optimizer.add(var == count)
 
+    # This later residue-only preference must retain useful prefetch choices
+    # already selected by the joint refinement. The current model witnesses
+    # each of these conditions; freezing that quality decision adds no data
+    # dependency and does not replace any original completion assertion.
+    for producer, consumer in prefetch_priority_pairs or []:
+        useful = z3.And(
+            k_vars[consumer] >= k_vars[producer] + 1,
+            _loop_issue_before(ctx, k_vars, r_vars, producer, consumer),
+        )
+        if z3.is_true(model.eval(useful, model_completion=True)):
+            optimizer.add(useful)
+
     penalties = []
     promoted = sorted({producer for producer, _ in issue_priority_pairs})
     for producer, consumer in issue_priority_pairs:
-        equal_phase_before = z3.Or(
-            k_vars[producer] > k_vars[consumer],
-            z3.And(k_vars[producer] == k_vars[consumer],
-                   z3.BoolVal(producer < consumer, ctx)),
-        )
-        before = z3.Or(r_vars[producer] < r_vars[consumer],
-                       z3.And(r_vars[producer] == r_vars[consumer], equal_phase_before))
+        before = _loop_issue_before(ctx, k_vars, r_vars, producer, consumer)
         penalties.append(z3.If(before, 0, 1))
     objectives = [z3.Sum(penalties), z3.Sum([r_vars[i] for i in promoted])]
     for objective in objectives:
@@ -518,6 +598,7 @@ def z3_schedule_loop_python(
     verbose: bool = False,
     stage_horizon: int | None = None,
     issue_priority_pairs: list[tuple[int, int]] | None = None,
+    prefetch_priority_pairs: list[tuple[int, int]] | None = None,
 ) -> tuple[list[int], list[int], int]:
     """Schedule a loop body with modulo, stage, and storage constraints.
 
@@ -534,6 +615,11 @@ def z3_schedule_loop_python(
         Soft physical-source-order preferences derived from forward cross-core
         RAW handoffs. Applied only after the minimum-II solve, with its selected
         stages and emitted version counts fixed. They never replace dependencies.
+    prefetch_priority_pairs : list[tuple[int, int]] | None
+        Soft load-to-consumer preferences from eligible typed GM-to-on-chip
+        forward RAW accesses on one concrete core and distinct pipes. Applied
+        at the minimum II before fixing stages or recalculating versions; a
+        preference requires both epoch lead and producer-first physical issue.
     stage_horizon : int | None
         Optional maximum number of task stages for automatic Ascend pipelines.
         Bounds the same joint solve that selects order and physical versions;
@@ -601,6 +687,8 @@ def z3_schedule_loop_python(
 
     if issue_priority_pairs is None:
         issue_priority_pairs = []
+    if prefetch_priority_pairs is None:
+        prefetch_priority_pairs = []
     if stage_order_deps is None:
         stage_order_deps = []
     if pipe_order_deps is None:
@@ -804,6 +892,13 @@ def z3_schedule_loop_python(
         if verbose:
             print(f"[Python Z3 Loop] Minimal feasible II = {best_ii}")
 
+        if prefetch_priority_pairs and enable_offset and not manual_schedule:
+            best_model = _refine_loop_prefetch(
+                ctx, best_assertions, best_model, best_k_vars, best_r_vars,
+                best_buffer_vars, prefetch_priority_pairs, buffer_sizes,
+                verbose=verbose,
+            )
+
         # Extract start times from best model. Normalize by the smallest k so the
         # earliest iteration starts at 0.
         start_times = []
@@ -837,7 +932,8 @@ def z3_schedule_loop_python(
             best_model = _refine_loop_issue_order(
                 ctx, best_assertions, best_model, best_k_vars, best_r_vars,
                 best_buffer_vars, issue_priority_pairs,
-                buffer_counts=buffer_versions, verbose=verbose,
+                buffer_counts=buffer_versions,
+                prefetch_priority_pairs=prefetch_priority_pairs, verbose=verbose,
             )
             # Stages and version counts stay unchanged; only residues may move.
             start_times = [best_model.eval(best_start_vars[i]).as_long() - offset * best_ii
@@ -1064,6 +1160,7 @@ def z3_schedule_loop_ffi(
     manual_schedule=False,
     stage_horizon=0,
     issue_priority_pairs=None,
+    prefetch_priority_pairs=None,
 ):
     """FFI wrapper for z3_schedule_loop_python.
 
@@ -1096,6 +1193,7 @@ def z3_schedule_loop_ffi(
     pipe_order_deps_list = _convert_int_tuples(pipe_order_deps, 2)
     owner_exclusion_deps_list = _convert_int_tuples(owner_exclusion_deps, 4)
     issue_priority_pairs_list = _convert_int_tuples(issue_priority_pairs, 2)
+    prefetch_priority_pairs_list = _convert_int_tuples(prefetch_priority_pairs, 2)
 
     # Call the actual scheduler (Z3 is not thread-safe, serialize access)
     with _z3_lock:
@@ -1117,6 +1215,7 @@ def z3_schedule_loop_ffi(
             seed=42,
             stage_horizon=int(stage_horizon) if stage_horizon else None,
             issue_priority_pairs=issue_priority_pairs_list,
+            prefetch_priority_pairs=prefetch_priority_pairs_list,
         )
 
     # Return start_times and buffer_versions as separate arrays for easier FFI handling

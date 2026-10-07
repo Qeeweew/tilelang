@@ -171,6 +171,9 @@ public:
   // this source-issue preference. No target timing calibration is implied.
   void SetPreferHandoffIssue(bool value) { prefer_handoff_issue_ = value; }
 
+  // Structural GM prefetch preference for ordinary dav-2201 auto pipelines.
+  void SetPreferPrefetchIssue(bool value) { prefer_prefetch_issue_ = value; }
+
   void SetMemoryLimit(const std::string &scope, int64_t bytes) {
     memory_limits_[scope] = bytes;
   }
@@ -252,6 +255,7 @@ private:
   }
 
   bool prefer_handoff_issue_{false};
+  bool prefer_prefetch_issue_{false};
   L0StorageGroups storage_groups_;
   ffi::Map<Var, PrimExpr> storage_slot_bytes_;
   CompilerWorkspaceStorageSet compiler_workspaces_;
@@ -345,6 +349,32 @@ bool HasResourceDependency(const IRStructure *a, const IRStructure *b,
   return (a->GetHbmMask() & b->GetHbmMask()) != 0;
 }
 
+CoreMask TaskExecutionCore(const TaskNode *task) {
+  CoreMask candidate = GetTaskCandidateCoreMask(task);
+  CoreMask lexical = task->GetCoreMask();
+  return lexical == kCoreUnassigned ? candidate : candidate & lexical;
+}
+
+CoreMask NodeExecutionCore(IRStructure *node) {
+  CoreMask result = kCoreUnassigned;
+  std::vector<TaskNode *> leaves;
+  CollectAllTaskNodes(node, leaves);
+  for (TaskNode *task : leaves) {
+    // Scalar bookkeeping with no memory or SPR effects is domain-neutral.
+    if (task->GetCoreMask() == kCoreUnassigned &&
+        task->UsesOnlyPipe(ResourcePipe::kScalar) &&
+        task->GetReadRegions().empty() && task->GetWriteRegions().empty() &&
+        task->GetSpecialWriteMask() == 0 &&
+        task->GetExplicitSpecialReadMask() == 0)
+      continue;
+    CoreMask core = TaskExecutionCore(task);
+    if (!IsConcreteCore(core))
+      return kCoreBroadcast;
+    result |= core;
+  }
+  return result;
+}
+
 // Derive an issue-quality preference from the shared leaf access facts. This
 // does not add, erase or redirect a completion dependency. A forward handoff is
 // a concrete-core writer -> other-core reader of the dependency storage. The
@@ -356,32 +386,9 @@ CollectHandoffIssuePreferences(const std::vector<IRStructure *> &nodes,
   const size_t n = nodes.size();
   std::unordered_map<IRStructure *, size_t> index;
   std::vector<CoreMask> cores(n, kCoreUnassigned);
-  auto task_core = [](const TaskNode *task) {
-    CoreMask candidate = GetTaskCandidateCoreMask(task);
-    CoreMask lexical = task->GetCoreMask();
-    return lexical == kCoreUnassigned ? candidate : candidate & lexical;
-  };
   for (size_t i = 0; i < n; ++i) {
     index[nodes[i]] = i;
-    std::vector<TaskNode *> leaves;
-    CollectAllTaskNodes(nodes[i], leaves);
-    for (TaskNode *task : leaves) {
-      // Scalar bookkeeping with no memory or SPR effects is domain-neutral.
-      // Other leaves use the same hardware candidate facts as AssignCore,
-      // intersected with any existing lexical ownership metadata.
-      if (task->GetCoreMask() == kCoreUnassigned &&
-          task->UsesOnlyPipe(ResourcePipe::kScalar) &&
-          task->GetReadRegions().empty() && task->GetWriteRegions().empty() &&
-          task->GetSpecialWriteMask() == 0 &&
-          task->GetExplicitSpecialReadMask() == 0)
-        continue;
-      CoreMask core = task_core(task);
-      if (!IsConcreteCore(core)) {
-        cores[i] = kCoreBroadcast;
-        break;
-      }
-      cores[i] |= core;
-    }
+    cores[i] = NodeExecutionCore(nodes[i]);
   }
   std::vector<bool> handoff(n, false), blocking_consumer(n, false);
   std::vector<std::vector<size_t>> predecessors(n), successors(n);
@@ -399,8 +406,8 @@ CollectHandoffIssuePreferences(const std::vector<IRStructure *> &nodes,
     if (!dep.storage.has_value())
       continue;
     for (const auto &[producer, consumer] : dep.task_pairs) {
-      CoreMask pcore = task_core(producer);
-      CoreMask ccore = task_core(consumer);
+      CoreMask pcore = TaskExecutionCore(producer);
+      CoreMask ccore = TaskExecutionCore(consumer);
       if (!IsConcreteCore(pcore) || !IsConcreteCore(ccore) || pcore == ccore ||
           cores[i] != pcore || cores[j] != ccore)
         continue;
@@ -456,6 +463,69 @@ CollectHandoffIssuePreferences(const std::vector<IRStructure *> &nodes,
     }
   }
   return result;
+}
+
+// A preference is a typed asynchronous GM load's forward RAW consumer, not
+// its reverse slot-release edge. Shared dependency facts still establish all
+// readiness, last-reader, owner, tail and SPR constraints independently.
+std::vector<std::pair<int64_t, int64_t>> CollectPrefetchIssuePreferences(
+    const std::vector<IRStructure *> &nodes, const std::vector<DepInfo> &deps,
+    const std::unordered_map<Var, size_t, ObjectPtrHash, ObjectPtrEqual>
+        &storage_version_id,
+    const MultiBufferOwnerMap &owners, ControlNode *loop) {
+  std::unordered_map<IRStructure *, size_t> index;
+  std::vector<CoreMask> cores;
+  for (size_t i = 0; i < nodes.size(); ++i) {
+    index[nodes[i]] = i;
+    cores.push_back(NodeExecutionCore(nodes[i]));
+  }
+  std::unordered_map<const TaskNode *,
+                     std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual>>
+      load_storages;
+  auto is_load = [&](const TaskNode *task, const Var &storage) {
+    if (!task->UsesOnlyPipe(ResourcePipe::kMTE2))
+      return false;
+    auto [entry, inserted] = load_storages.try_emplace(task);
+    if (inserted) {
+      PostOrderVisit(task->stmt, [&](const ObjectRef &node) {
+        const auto *call = node.as<CallNode>();
+        if (!call || !IsAscendCopyCall(call))
+          return;
+        AscendCopy copy(call->args, call->annotations);
+        if (IsGlobalBuffer(copy->src) &&
+            (IsSharedBuffer(copy->dst) || IsL1Buffer(copy->dst)))
+          entry->second.insert(copy->dst->data);
+      });
+    }
+    return entry->second.count(storage) != 0;
+  };
+  std::set<std::pair<int64_t, int64_t>> pairs;
+  for (const DepInfo &dep : deps) {
+    if (dep.kind != DependencyKind::kData || dep.distance != 0 ||
+        !dep.storage.has_value())
+      continue;
+    const Var &storage = dep.storage.value();
+    auto owner = owners.find(storage);
+    if (!storage_version_id.count(storage) ||
+        !loop->IsMultiBufferEligible(storage) || owner == owners.end() ||
+        owner->second.size() != 1 || owner->second[0] != loop)
+      continue;
+    size_t i = index.at(dep.prod_node), j = index.at(dep.cons_node);
+    if (i == j || !IsConcreteCore(cores[i]) || cores[i] != cores[j] ||
+        (nodes[i]->GetPipeMask() & nodes[j]->GetPipeMask()) != 0 ||
+        nodes[i]->ReadsStorage(storage) || nodes[j]->WritesStorage(storage))
+      continue;
+    for (const auto &[producer, consumer] : dep.task_pairs) {
+      if (TaskExecutionCore(producer) != cores[i] ||
+          TaskExecutionCore(consumer) != cores[j] ||
+          !producer->WritesStorage(storage) ||
+          producer->ReadsStorage(storage) || !consumer->ReadsStorage(storage) ||
+          consumer->WritesStorage(storage) || !is_load(producer, storage))
+        continue;
+      pairs.emplace(i, j);
+    }
+  }
+  return {pairs.begin(), pairs.end()};
 }
 
 ScheduleBuilder::LetDependencyClosure
@@ -1155,6 +1225,14 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
   if (prefer_handoff_issue_ && auto_pipeline && !manual_schedule)
     issue_priority_pairs = CollectHandoffIssuePreferences(nodes, deps);
 
+  // This refinement runs jointly over stage/residue/version variables at the
+  // minimum II, before the Python scheduler fixes stages or emitted counts.
+  std::vector<std::pair<int64_t, int64_t>> prefetch_priority_pairs;
+  if (prefer_prefetch_issue_ && auto_pipeline && enable_offset &&
+      !manual_schedule && num_stages > 1)
+    prefetch_priority_pairs = CollectPrefetchIssuePreferences(
+        nodes, deps, storage_version_id, multi_buffer_owners_, ctrl);
+
   // Stage-order constraints for copied Let variables.
   //
   // A Let task `a = buf[...]` only READS buffers (it writes a scalar var).
@@ -1205,6 +1283,7 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
   ffi::Array<ffi::Array<int64_t>> tvm_owner_exclusion_deps;
   ffi::Array<ffi::Array<int64_t>> tvm_pipe_order_deps;
   ffi::Array<ffi::Array<int64_t>> tvm_issue_priority_pairs;
+  ffi::Array<ffi::Array<int64_t>> tvm_prefetch_priority_pairs;
   ffi::Array<int64_t> tvm_storage_sizes;
   ffi::Array<int64_t> tvm_manual_stages;
 
@@ -1247,6 +1326,8 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
   }
   for (const auto &[producer, consumer] : issue_priority_pairs)
     tvm_issue_priority_pairs.push_back({producer, consumer});
+  for (const auto &[producer, consumer] : prefetch_priority_pairs)
+    tvm_prefetch_priority_pairs.push_back({producer, consumer});
   ffi::Array<ffi::Array<int64_t>> tvm_stage_order_deps;
   for (const auto &dep : stage_order_deps) {
     ffi::Array<int64_t> pair;
@@ -1288,7 +1369,8 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
                    tvm_data_deps, tvm_resource_deps, tvm_owner_exclusion_deps,
                    tvm_pipe_order_deps, tvm_storage_sizes, tvm_memory_groups,
                    tvm_stage_order_deps, enable_offset, tvm_manual_stages,
-                   manual_schedule, stage_horizon, tvm_issue_priority_pairs)
+                   manual_schedule, stage_horizon, tvm_issue_priority_pairs,
+                   tvm_prefetch_priority_pairs)
           .cast<ffi::Tuple<ffi::Array<int64_t>, ffi::Array<int>, int64_t>>();
 
   ffi::Array<int64_t> start_times = return_val.get<0>();
@@ -1525,6 +1607,8 @@ static void ScheduleSingleKernel(const Stmt &kernel_body, Target target,
   const AscendTargetInfo &target_info = GetAscendTargetInfo(target);
   unit_builder.SetPreferHandoffIssue(target_info.architecture ==
                                      AscendArchitecture::kDav2201);
+  unit_builder.SetPreferPrefetchIssue(target_info.architecture ==
+                                      AscendArchitecture::kDav2201);
   int64_t shared_mem_limit = GetSharedMemoryLimit(kernel_body, target_info);
   unit_builder.SetMemoryLimit("shared", shared_mem_limit);
   unit_builder.SetMemoryLimit("shared.l1", target_info.l1_bytes);
