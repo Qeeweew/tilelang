@@ -64,6 +64,162 @@ def _convert_int_tuples(values, arity: int) -> list[tuple[int, ...]]:
     return result
 
 
+def _reduce_straight_line_orders(
+    latencies, iis, resource_flags, data_deps, resource_deps,
+    owner_exclusion_deps, pipe_order_deps,
+):
+    """Remove implied orders and choose representatives of exact graph symmetries.
+
+    This uses only the supplied scheduling constraints. Equal resource masks
+    alone do not make tasks interchangeable: all weighted data, pipe, owner,
+    cost and resource neighbors must match. Swapping such tasks preserves the
+    constraints and makespan, so ordering each class retains an optimal member.
+    """
+    n = len(latencies)
+    resources = sorted({(i, j) for i, j in resource_deps if i < j})
+    if any(ii < 0 for ii in iis) or any(weight < 0 for _, _, weight in data_deps):
+        return [], resources, []
+    incoming, outgoing = [dict() for _ in range(n)], [dict() for _ in range(n)]
+    neighbors = [set() for _ in range(n)]
+    owners = [dict() for _ in range(n)]
+    pipe_in, pipe_out = [set() for _ in range(n)], [set() for _ in range(n)]
+    for i, j, weight in data_deps:
+        outgoing[i][j] = max(outgoing[i].get(j, 0), weight)
+        incoming[j][i] = outgoing[i][j]
+    for i, j in resources:
+        neighbors[i].add(j)
+        neighbors[j].add(i)
+    for i, j, forward, reverse in owner_exclusion_deps:
+        # Repeated owner pairs share one Bool in the original query. Retain
+        # their orientation groups as well as their weighted neighbors.
+        owners[i].setdefault((j, True), set()).add((forward, reverse))
+        owners[j].setdefault((i, False), set()).add((reverse, forward))
+    for i, j in pipe_order_deps:
+        pipe_out[i].add(j)
+        pipe_in[j].add(i)
+
+    classes = {}
+    for i in range(n):
+        signature = (
+            latencies[i], iis[i], resource_flags[i],
+            tuple(sorted(incoming[i].items())), tuple(sorted(outgoing[i].items())),
+            tuple(sorted(pipe_in[i])), tuple(sorted(pipe_out[i])),
+            # Closed resource neighborhoods permit mutually conflicting twins.
+            tuple(sorted(neighbors[i] | {i})),
+            tuple((other, tuple(sorted(weights))) for other, weights in sorted(owners[i].items())),
+        )
+        classes.setdefault(signature, []).append(i)
+    symmetry_orders = [pair for group in classes.values() for pair in zip(group, group[1:])]
+
+    # A data edge is a lower bound on the difference of start times; pipe and
+    # symmetry orders contribute zero. On a DAG, longest paths retain the
+    # exact implied lower bounds without asking Z3 to rediscover them.
+    edges = [dict(row) for row in outgoing]
+    for i, j in [*pipe_order_deps, *symmetry_orders]:
+        edges[i][j] = max(edges[i].get(j, 0), 0)
+    degrees = [0] * n
+    for row in edges:
+        for j in row:
+            degrees[j] += 1
+    ready = [i for i, degree in enumerate(degrees) if degree == 0]
+    topological = []
+    while ready:
+        i = ready.pop()
+        topological.append(i)
+        for j in edges[i]:
+            degrees[j] -= 1
+            if degrees[j] == 0:
+                ready.append(j)
+    if len(topological) != n:
+        # Preserve general/cyclic inputs, including genuinely inconsistent ones.
+        return [], resources, []
+    reach = [dict() for _ in range(n)]
+    for i in reversed(topological):
+        for j, weight in edges[i].items():
+            reach[i][j] = max(reach[i].get(j, 0), weight)
+            for k, suffix in reach[j].items():
+                reach[i][k] = max(reach[i].get(k, 0), weight + suffix)
+
+    ordered, unordered = [], []
+    for i, j in resources:
+        forward, reverse = reach[i].get(j), reach[j].get(i)
+        if ((forward is not None and forward >= iis[i])
+                or (reverse is not None and reverse >= iis[j])):
+            continue
+        if forward is not None and forward + iis[j] > 0:
+            # The reverse disjunct is impossible, but the forward II gap may
+            # still be stronger than the data/pipe path: keep that hard gap.
+            ordered.append((i, j, iis[i]))
+        elif reverse is not None and reverse + iis[i] > 0:
+            ordered.append((j, i, iis[j]))
+        else:
+            unordered.append((i, j))
+    return ordered, unordered, symmetry_orders
+
+
+def _straight_line_makespan_bounds(latencies, iis, resource_flags, data_deps, resource_deps, owner_exclusion_deps, pipe_order_deps):
+    """Prove objective bounds from the existing graph and a feasible assignment.
+
+    These are bounds in the supplied model's units, not target measurements.
+    A resource clique cannot finish sooner than its total issue work plus the
+    earliest possible release and smallest remaining completion tail.
+    """
+    n = len(latencies)
+    if any(ii < 0 for ii in iis) or any(weight < 0 for _, _, weight in data_deps):
+        return 0, None
+    edges = [dict() for _ in range(n)]
+    for i, j, weight in [*data_deps, *((i, j, 0) for i, j in pipe_order_deps)]:
+        edges[i][j] = max(edges[i].get(j, 0), weight)
+
+    def earliest(graph):
+        degrees = [0] * n
+        for row in graph:
+            for j in row:
+                degrees[j] += 1
+        ready = [i for i, degree in enumerate(degrees) if degree == 0]
+        order, starts = [], [0] * n
+        while ready:
+            i = ready.pop()
+            order.append(i)
+            for j, weight in graph[i].items():
+                starts[j] = max(starts[j], starts[i] + weight)
+                degrees[j] -= 1
+                if degrees[j] == 0:
+                    ready.append(j)
+        return (order, starts) if len(order) == n else ([], [])
+
+    order, heads = earliest(edges)
+    if not order:
+        return 0, None
+    tails = list(latencies)
+    for i in reversed(order):
+        for j, weight in edges[i].items():
+            tails[i] = max(tails[i], weight + tails[j])
+    lower = max([0, *(head + tail for head, tail in zip(heads, tails))])
+    resources = {(i, j) for i, j in resource_deps if i < j}
+    for bit in (1, 2, 4, 8, 16, 32, 64):
+        group = [i for i in range(n) if resource_flags[i] & bit]
+        # The actual supplied exclusions, including explicit API inputs, are
+        # authoritative; a resource mask alone never adds a hard constraint.
+        if group and all((i, j) in resources for offset, i in enumerate(group) for j in group[offset + 1:]):
+            lower = max(lower, sum(iis[i] for i in group) + min(heads[i] for i in group)
+                        + min(tails[i] - iis[i] for i in group))
+
+    # Fix every disjunction in source order to construct one feasible upper
+    # bound. This does not fix the optimized schedule's issue order. If that
+    # orientation creates a cycle, retain only the independently proven lower.
+    serial = [dict(row) for row in edges]
+    for i, j in resources:
+        serial[i][j] = max(serial[i].get(j, 0), iis[i])
+    for i, j, forward, reverse in owner_exclusion_deps:
+        if i > j:
+            i, j, forward = j, i, reverse
+        serial[i][j] = max(serial[i].get(j, 0), forward)
+    order, starts = earliest(serial)
+    upper = max([0, *(start + latency for start, latency in zip(starts, latencies))]) if order else None
+    return lower, upper
+
+
 def z3_schedule_python(
     latencies: list[int],
     iis: list[int],
@@ -150,10 +306,19 @@ def z3_schedule_python(
         if verbose:
             print(f"[Python Z3] Data dependency: task {j} >= task {i} + {latency}")
 
+    ordered_resources, unordered_resources, symmetry_orders = _reduce_straight_line_orders(
+        latencies, iis, resource_flags, data_deps, resource_deps,
+        owner_exclusion_deps, pipe_order_deps,
+    )
+    for previous, current in symmetry_orders:
+        solver.add(start_vars[previous] <= start_vars[current])
+    for previous, current, interval in ordered_resources:
+        solver.add(start_vars[current] >= start_vars[previous] + interval)
+
     # Add resource dependency constraints
     # For tasks i and j that use same resource, they cannot execute simultaneously
     # We create ordering variable O_i,j (True means i before j, False means j before i)
-    for i, j in resource_deps:
+    for i, j in unordered_resources:
         if i < j:  # Only consider each pair once
             ii_i = iis[i]
             ii_j = iis[j]
@@ -186,6 +351,14 @@ def z3_schedule_python(
         latency_i = latencies[i]
         solver.add(makespan >= start_vars[i] + latency_i)
     solver.add(makespan >= 0)
+    lower, upper = _straight_line_makespan_bounds(
+        latencies, iis, resource_flags,
+        [*data_deps, *ordered_resources], resource_deps, owner_exclusion_deps,
+        [*pipe_order_deps, *symmetry_orders],
+    )
+    solver.add(makespan >= lower)
+    if upper is not None:
+        solver.add(makespan <= upper)
 
     # Minimize makespan
     solver.minimize(makespan)
@@ -193,7 +366,8 @@ def z3_schedule_python(
     # Check satisfiability
     if verbose:
         print("[Python Z3] Checking satisfiability...")
-    if solver.check() == z3.sat:
+    status = solver.check()
+    if status == z3.sat:
         model = solver.model()
 
         # Extract start times
@@ -221,8 +395,9 @@ def z3_schedule_python(
                 )
 
         return start_times, task_indices
-    else:
+    if status == z3.unsat:
         raise RuntimeError("Z3 scheduling failed: solver returned unsat")
+    raise RuntimeError(f"Z3 scheduling failed: solver returned unknown ({solver.reason_unknown()})")
 
 
 # FFI-exposed function that matches C++ interface

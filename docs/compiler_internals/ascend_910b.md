@@ -268,6 +268,18 @@ Plain serial loops and explicit `num_stages=0` without an offset request keep
 all tasks at stage zero. They do not search arbitrary cross-pipe epoch offsets.
 Explicit positive version bounds retain their existing scheduling policy.
 
+Straight-line sibling lists minimize makespan using the same task effects and
+resource exclusions. Weighted data and pipe paths remove implied resource
+choices while retaining any stronger issue-interval gap. Tasks with identical
+costs and complete weighted data, pipe, resource and owner neighborhoods can
+use source order to select one representative of an exact graph symmetry;
+distinct independent operations retain their ordering choices. Proven resource
+work, release and completion bounds and a feasible source-oriented assignment
+bound the objective without fixing the optimized issue order. These bounds use
+the supplied model's units, including dimensionless 2201 weights. A solver
+`unknown` result reports its reason separately from `unsat` and retains the
+existing fallback policy.
+
 For ordinary automatic 2201 mixed loops, shared memory effects identify forward
 cross-core writer-to-reader handoffs separately from reverse slot-release
 dependencies. The issue-quality heuristic prefers an independent handoff
