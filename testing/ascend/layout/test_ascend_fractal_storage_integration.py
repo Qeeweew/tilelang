@@ -37,7 +37,18 @@ def test_padded_alias_storage_sets_the_physical_version_pitch():
     assert int(allocation.shape[0]) == 512
     pointers = [call for call in calls(flat, "tirx.tvm_access_ptr") if call.args[1].type_annotation.storage_scope == "shared.l1"]
     assert len(pointers) == 2
-    tvm.ir.assert_structural_equal(pointers[0].args[2], pointers[1].args[2])
+    assert all(pointer.args[1].same_as(allocation.data) for pointer in pointers)
+    (loop,) = nodes(flat, tirx.For)
+    assert int(loop.min) == 0 and int(loop.extent) == 4
+    analyzer = tvm.arith.Analyzer()
+    # Aliased views may retain different index casts. Verify the actual
+    # physical ring address for every iteration, including both wraparounds,
+    # using only the bound loop Var so an unbound or different Var still fails.
+    for iteration, expected in enumerate((0, 256, 0, 256)):
+        substitute = {loop.loop_var: tirx.IntImm(loop.loop_var.dtype, iteration)}
+        for pointer in pointers:
+            offset = tirx.stmt_functor.substitute(pointer.args[2], substitute)
+            assert int(analyzer.simplify(offset)) == expected
 
 
 def test_dynamic_fixpipe_padding_survives_full_lowering():
@@ -79,6 +90,7 @@ def test_dynamic_fixpipe_padding_survives_full_lowering():
 
 
 @pytest.mark.parametrize("use_alias", [False, True])
+@tilelang.testing.requires_ascend
 def test_full_logical_tile_padding_npu(use_alias):
     import torch
 
@@ -114,6 +126,7 @@ def test_full_logical_tile_padding_npu(use_alias):
     torch.testing.assert_close(actual, a[:, 112:128].float() @ b[:, :16].float().T, atol=1e-3, rtol=1e-3)
 
 
+@tilelang.testing.requires_ascend
 def test_short_k_slice_does_not_consume_neighboring_gm_values_npu():
     import torch
 
