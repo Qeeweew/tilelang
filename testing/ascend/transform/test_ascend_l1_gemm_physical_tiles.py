@@ -75,10 +75,10 @@ def _fixture(m=256, n=256, k=64, *, dtype="float16", transpose_b=True,
         layouts[c.data] = Layout(c.shape, lambda i, j: [j // 16, i // 16, i % 16, (j + 1) % 16])
     elif kind == "manual-version":
         annotations["tl.buffer_versions_map"] = {c.data: 2}
-    elif kind == "conditional":
+    elif kind == "separate-conditional":
         enabled = tirx.Var("enabled", "bool")
         params.append(enabled)
-        body = tirx.IfThenElse(enabled, body, None)
+        body = seq(tirx.IfThenElse(enabled, gemm, None), export)
     if epochs > 1:
         body = tirx.For(epoch, tirx.const(0, "int64"), tirx.const(epochs, "int64"),
                         tirx.ForKind.SERIAL, body,
@@ -263,7 +263,7 @@ def test_other_root_accumulator_is_charged_before_selecting_physical_tile():
 
 
 @pytest.mark.parametrize("kind", ["clear-false", "multi-reader", "escape", "alias", "custom-layout",
-                                  "manual-version", "partial-export", "conditional", "matrix-tail"])
+                                  "manual-version", "partial-export", "separate-conditional", "matrix-tail"])
 def test_unsupported_oversized_lifetime_is_diagnosed_without_partial_rewrite(kind):
     before, facts = _fixture(m=255 if kind == "matrix-tail" else 256, kind=kind)
     snapshot = tvm.ir.save_json(before)

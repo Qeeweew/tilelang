@@ -21,7 +21,7 @@ for m in Serial(M / tile_m):
 The scratch has compact canonical L0C layout and one physical version. Its
 canonical layout is registered with the frontend storage-Var layout map when
 the allocation is created; layout inference consumes that anchor. The
-original oversized allocation and its layout entry disappear. The original GM
+original oversized allocation and its layout/version entries disappear. The original GM
 allocation, storage identity, leading coordinates and row pitch remain. Any
 whole-output GM reader follows both physical loops. Each output element is
 written exactly once after its complete K accumulation; the rewrite introduces
@@ -32,6 +32,12 @@ and MADs. The first sub-K clears that physical tile, later sub-Ks accumulate,
 and intermediate sub-Ks cannot publish whole-GEMM completion. New M/N loops
 are ordinary static serial loops; enclosing automatic pipeline intent remains
 visible to the existing scheduling path.
+
+An adjacent producer/export pair may occur inside a shared conditional branch,
+an Ascend Stage, or a transparent CUBE core block. The replacement stays inside
+that same scope: its guard, stage and owner loop still dominate every physical
+GEMM and export. A guarded producer followed by an export outside the guard,
+or two separately guarded statements, does not satisfy this local contract.
 
 ## Capacity and native effects
 
@@ -68,10 +74,16 @@ fractal-aligned nonzero L1 origins are retained. Only one oversized root
 accumulator is admitted. Accumulators already fitting the bank and 3510 keep
 their existing path.
 
-An oversized accumulator has a diagnostic when it has partial or guarded
-export, multiple readers, alias or pointer escape, custom layout, manual
-version metadata, special completion control, or an explicit Task/Stage
-boundary. Cross-GEMM accumulation (`clear=False`) and dynamic/unaligned M/N
+The logical accumulator may have an explicit fixed count of one. Removing it
+also removes its keys from known layout, fixed/manual count and version-mode
+maps; metadata for all other storage remains. A count greater than one or an
+explicit version mode requires a different lifetime lowering and is diagnosed.
+
+An oversized accumulator has a diagnostic when it has partial export, a
+producer/export split across guards, multiple readers, alias or pointer escape,
+custom layout, special completion control, an opaque block, a While loop, or
+an explicit Task/schedule-unit or pipeline-order boundary. Cross-GEMM
+accumulation (`clear=False`) and dynamic/unaligned M/N
 tails require a different lifetime or remainder lowering. The logical L1
 inputs, GM output and private UB consumers must still fit their own contracts.
 This capacity mechanism makes no performance claim about a chosen Python tile.

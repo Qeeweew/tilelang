@@ -39,6 +39,7 @@
 #include "ascend/op/utils.h"
 #include "ascend/target_utils.h"
 #include "ascend/transform/attr.h"
+#include "ascend/transform/auto_schedule/multi_buffer.h"
 #include "ascend/transform/buffer_version.h"
 #include "ascend/transform/storage_footprint.h"
 #include "op/builtin.h"
@@ -78,8 +79,8 @@ struct Access {
 };
 
 // One root-wide inventory proves that replacing this allocation removes all
-// its uses. Layout keys are handled separately because they transport storage
-// identity; ordinary scalar/pointer/container references are real escapes.
+// its uses. Known layout/version keys transport storage identity; ordinary
+// scalar/pointer/container references are real escapes.
 class KernelFacts : public StmtExprVisitor {
 public:
   explicit KernelFacts(const SBlock &root) { operator()(root); }
@@ -95,6 +96,7 @@ public:
   std::vector<std::pair<ObjectRef, Layout>> layouts;
   BufferVersionMap fixed_versions;
   BufferVersionMap manual_versions;
+  BufferVersionModeMap version_modes;
   StorageSet escaped;
   bool has_match_buffer{false};
   bool unknown_metadata{false};
@@ -223,19 +225,21 @@ private:
           for (const PrimExpr &index : layout->GetForwardIndex())
             VisitExpr(index);
         }
-      } else {
-        if (key == kBufferVersionsMap || key == kManualMultiBuffer) {
-          BufferVersionMap versions = value.cast<BufferVersionMap>();
-          auto &destination =
-              key == kBufferVersionsMap ? fixed_versions : manual_versions;
-          for (const auto &[storage, count] : versions) {
-            TVM_FFI_CHECK(count > 0, ValueError)
-                << "Ascend dav-2201 physical M/N GEMM requires positive "
-                   "version counts";
-            destination.Set(
-                storage, std::max(destination.Get(storage).value_or(1), count));
-          }
+      } else if (key == kBufferVersionsMap || key == kManualMultiBuffer) {
+        BufferVersionMap versions = value.cast<BufferVersionMap>();
+        auto &destination =
+            key == kBufferVersionsMap ? fixed_versions : manual_versions;
+        for (const auto &[storage, count] : versions) {
+          TVM_FFI_CHECK(count > 0, ValueError)
+              << "Ascend dav-2201 physical M/N GEMM requires positive "
+                 "version counts";
+          destination.Set(
+              storage, std::max(destination.Get(storage).value_or(1), count));
         }
+      } else if (key == kBufferVersionMode) {
+        for (const auto &[storage, mode] : value.cast<BufferVersionModeMap>())
+          version_modes.Set(storage, mode);
+      } else {
         Metadata(value);
       }
     }
@@ -322,6 +326,15 @@ inline bool CanonicalLayouts(const KernelFacts &facts, const Buffer &owner) {
   return true;
 }
 
+inline bool IsTransparentCoreBlock(const SBlockNode *block) {
+  return (block->name_hint == "CUBE" ||
+          block->name_hint == "ascend_core_region") &&
+         !block->init.defined() && block->alloc_buffers.empty() &&
+         block->match_buffers.empty() && block->iter_vars.empty() &&
+         block->reads.empty() && block->writes.empty() &&
+         block->annotations.empty();
+}
+
 inline const CallNode *LeafCall(const Stmt &statement) {
   if (const auto *evaluate = statement.as<EvaluateNode>())
     return evaluate->value.as<CallNode>();
@@ -331,10 +344,7 @@ inline const CallNode *LeafCall(const Stmt &statement) {
     return LeafCall(realize->block);
   }
   if (const auto *block = statement.as<SBlockNode>()) {
-    if (block->name_hint != "CUBE" || block->init.defined() ||
-        !block->alloc_buffers.empty() || !block->match_buffers.empty() ||
-        !block->iter_vars.empty() || !block->reads.empty() ||
-        !block->writes.empty() || !block->annotations.empty())
+    if (!IsTransparentCoreBlock(block))
       return nullptr;
     return LeafCall(block->body);
   }
@@ -579,14 +589,24 @@ private:
     --blocked_;
     return result;
   }
-  Stmt VisitStmt_(const IfThenElseNode *op) final { return Blocked(op); }
+  // Rewrite only adjacent statements inside the original lexical scope. No
+  // producer/export is moved across a guard, stage or core boundary.
+  Stmt VisitStmt_(const IfThenElseNode *op) final {
+    return Parent::VisitStmt_(op);
+  }
   Stmt VisitStmt_(const WhileNode *op) final { return Blocked(op); }
-  Stmt VisitStmt_(const SBlockNode *op) final { return Blocked(op); }
-  Stmt VisitStmt_(const SBlockRealizeNode *op) final { return Blocked(op); }
+  Stmt VisitStmt_(const SBlockNode *op) final {
+    return IsTransparentCoreBlock(op) ? Parent::VisitStmt_(op) : Blocked(op);
+  }
+  Stmt VisitStmt_(const SBlockRealizeNode *op) final {
+    return is_one(op->predicate) && op->iter_values.empty() &&
+                   IsTransparentCoreBlock(op->block.get())
+               ? Parent::VisitStmt_(op)
+               : Blocked(op);
+  }
   Stmt VisitStmt_(const AttrStmtNode *op) final {
     if (op->attr_key == attr::kAscendTask ||
         op->attr_key == attr::kAscendPerCoreTask ||
-        op->attr_key == attr::kAscendStage ||
         op->attr_key == attr::kScheduleUnit)
       return Blocked(op);
     return Parent::VisitStmt_(op);
@@ -606,9 +626,10 @@ private:
   int blocked_{0};
 };
 
-class LayoutRemover : public StmtMutator {
+class AccumulatorMetadataRemover : public StmtMutator {
 public:
-  explicit LayoutRemover(Var storage) : storage_(std::move(storage)) {}
+  explicit AccumulatorMetadataRemover(Var storage)
+      : storage_(std::move(storage)) {}
 
 private:
   Stmt VisitStmt_(const SBlockNode *op) final {
@@ -620,6 +641,18 @@ private:
         if (!LayoutStorage(key).same_as(storage_))
           layouts.Set(key, layout);
       block.CopyOnWrite()->annotations.Set(attr::kLayoutMap, layouts);
+    }
+    for (const char *key : {kBufferVersionsMap, kManualMultiBuffer}) {
+      if (auto value = block->annotations.Get(key)) {
+        BufferVersionMap versions = value.value().cast<BufferVersionMap>();
+        versions.erase(storage_);
+        block.CopyOnWrite()->annotations.Set(key, versions);
+      }
+    }
+    if (auto value = block->annotations.Get(kBufferVersionMode)) {
+      BufferVersionModeMap modes = value.value().cast<BufferVersionModeMap>();
+      modes.erase(storage_);
+      block.CopyOnWrite()->annotations.Set(kBufferVersionMode, modes);
     }
     return block;
   }
@@ -645,6 +678,12 @@ inline SBlock RewriteRoot(const SBlock &root, const AscendTargetInfo &target,
     return root;
   KernelFacts facts(root);
   const Var &storage = oversized->data;
+  TVM_FFI_CHECK(facts.fixed_versions.Get(storage).value_or(1) == 1 &&
+                    facts.manual_versions.Get(storage).value_or(1) == 1 &&
+                    !facts.version_modes.count(storage),
+                ValueError)
+      << "Ascend dav-2201 physical M/N GEMM requires one fixed accumulator "
+         "version without a manual ring or version mode";
   TVM_FFI_CHECK(
       !facts.has_match_buffer && !facts.unknown_metadata &&
           facts.owners[storage] == 1 && facts.buffers[storage].size() == 1 &&
@@ -652,7 +691,7 @@ inline SBlock RewriteRoot(const SBlock &root, const AscendTargetInfo &target,
           oversized->strides.empty() && is_zero(oversized->elem_offset),
       ValueError)
       << "Ascend dav-2201 physical M/N GEMM requires a unique canonical "
-         "L0C allocation without aliases, escapes or manual version metadata";
+         "L0C allocation without aliases or escapes";
   std::unordered_map<Var, int64_t, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>
       slots;
   for (const Buffer &buffer : facts.l0c_allocations) {
@@ -680,7 +719,7 @@ inline SBlock RewriteRoot(const SBlock &root, const AscendTargetInfo &target,
   TVM_FFI_CHECK(rewriter.scratch.defined(), ValueError)
       << "Ascend dav-2201 physical M/N GEMM requires adjacent full-clear "
          "L1 GEMM and unique full L0C-to-GM export, static aligned M/N, "
-         "and ordinary unguarded ownership/completion";
+         "and ordinary lexical ownership/completion";
   SBlock result = root;
   Array<Buffer> allocations;
   for (const Buffer &buffer : root->alloc_buffers)
@@ -689,7 +728,7 @@ inline SBlock RewriteRoot(const SBlock &root, const AscendTargetInfo &target,
   allocations.push_back(rewriter.scratch);
   result.CopyOnWrite()->alloc_buffers = allocations;
   result.CopyOnWrite()->body = body;
-  result = Downcast<SBlock>(LayoutRemover(storage)(result));
+  result = Downcast<SBlock>(AccumulatorMetadataRemover(storage)(result));
   // AscendLayoutInference consumes frontend storage-Var layout anchors. This
   // new allocation replaces the annotated logical C and needs its own anchor;
   // typed GEMM/export regions alone do not infer the accumulator's layout.
