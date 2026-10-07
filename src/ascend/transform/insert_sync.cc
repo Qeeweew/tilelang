@@ -909,14 +909,16 @@ public:
       BufferVersionMap manual = {}, ConflictHintList root_conflicts = {},
       L0StorageGroups storage_groups = L0StorageGroups(),
       const std::vector<OwnerResultPlan> *owner_results = nullptr,
+      const std::vector<OwnerResultPlan> *owner_inputs = nullptr,
       const std::vector<UnitFlagStreamPlan> *unit_streams = nullptr,
       const std::vector<UnitFlagBoundary> *unit_boundaries = nullptr)
       : storage_groups_(std::move(storage_groups)),
         multi_buffer_plan_(multi_buffer_plan), domains_(domains),
         architecture_(architecture), manual_(std::move(manual)),
         root_conflicts_(std::move(root_conflicts)),
-        owner_results_(owner_results), unit_streams_(unit_streams),
-        unit_boundaries_(unit_boundaries), site_registry_(domains) {
+        owner_results_(owner_results), owner_inputs_(owner_inputs),
+        unit_streams_(unit_streams), unit_boundaries_(unit_boundaries),
+        site_registry_(domains) {
     for (const MultiBufferInfo &info : multi_buffer_plan_.Infos()) {
       ICHECK(!info.owners.empty());
       std::vector<ControlNode *> owners;
@@ -989,6 +991,22 @@ public:
     // The ordinary collective release must retire all reads before this GM
     // slot is written again. No owner-result edge contributes to this proof.
     return distance <= plan.num_slots - plan.distance;
+  }
+
+  bool HasOwnerInputRelease(const OwnerResultPlan &plan) const {
+    int domain = domains_.DomainForStorage(plan.storage, plan.epoch);
+    size_t read_end = site_registry_.FindSiteId(
+        SyncInsertionSiteKey{plan.consumer->GetChildOnPathFrom(plan.epoch),
+                             plan.consumer, false, kCoreCube, domain});
+    size_t write_begin = site_registry_.FindSiteId(
+        SyncInsertionSiteKey{plan.producer->GetChildOnPathFrom(plan.epoch),
+                             plan.producer, true, kCoreVector, domain});
+    const DepClosure &closure = scope_closures_.at(plan.epoch);
+    // This must be the ordinary paired input-consumed release, independent
+    // of the new readiness protocol. It retires both owners' reads before
+    // either lane may contribute a token for the next use of this GM slot.
+    return MinCompletionDistance(closure, read_end, write_begin) <=
+           plan.num_slots - plan.distance;
   }
 
 private:
@@ -1633,6 +1651,22 @@ private:
               // unrelated GM hazard or prove a collective allocation lifetime.
               continue;
             }
+            if (owner_inputs_ && dep.kind == DependencyKind::kData &&
+                dep.storage.has_value() && producer_core == kCoreVector &&
+                consumer_core == kCoreCube &&
+                std::any_of(
+                    owner_inputs_->begin(), owner_inputs_->end(),
+                    [&](const OwnerResultPlan &plan) {
+                      return plan.storage.same_as(dep.storage.value()) &&
+                             plan.producer == producer &&
+                             plan.consumer == consumer && plan.epoch == loop &&
+                             plan.distance == distance;
+                    })) {
+              // Only this exact per-owner RAW receives staggered collective
+              // readiness. It contributes no all-participant completion edge;
+              // ordinary WAR/reuse and unrelated buffer proofs stay intact.
+              continue;
+            }
             if (producer_core == kCoreCube && consumer_core == kCoreCube &&
                 fix_unit_flag)
               continue;
@@ -1977,7 +2011,8 @@ private:
       };
 
       if (local_binary && min_distance == std::numeric_limits<int>::max() &&
-          owner_results_ && !owner_results_->empty()) {
+          ((owner_results_ && !owner_results_->empty()) ||
+           (owner_inputs_ && !owner_inputs_->empty()))) {
         // The old pair-ready may have supplied this unrelated ring's only
         // reverse-completion witness. Do not use an owner edge as its proof
         // or weaken binary validation; retry the normal collective analysis.
@@ -2292,6 +2327,7 @@ private:
   MultiBufferOwnerMap multi_buffer_owners_;
   ConflictHintList root_conflicts_;
   const std::vector<OwnerResultPlan> *owner_results_;
+  const std::vector<OwnerResultPlan> *owner_inputs_;
   const std::vector<UnitFlagStreamPlan> *unit_streams_;
   const std::vector<UnitFlagBoundary> *unit_boundaries_;
   SyncSiteRegistry site_registry_;
@@ -3158,26 +3194,30 @@ void InsertStatement(IRStructure *node, Stmt stmt, bool at_beginning,
   }
 }
 
-// Result readiness has an owner selector in addition to the existing storage
-// epoch. It deliberately has no all-participant closure projection or flag
-// reuse: each owner/GM-slot pair owns one result ID. The normal collective
-// reader release proves consumption before this slot and ID can be reused.
-struct OwnerResultEvent {
+// Readiness has an owner selector in addition to the existing storage epoch.
+// It has no all-participant closure projection or flag reuse: each owner/GM
+// slot owns one ID. Ordinary reader release proves consumption before reuse.
+struct OwnerCompletionEvent {
   SyncInsertionSite producer;
   SyncInsertionSite consumer;
   PrimExpr producer_id;
   PrimExpr consumer_id;
+  // A V-to-C input still uses mode2: one real owner publication plus one
+  // early contribution from the other physical AIV, after old-slot release.
+  std::optional<SyncInsertionSite> empty_participant;
+  PrimExpr empty_id;
 };
 
-std::optional<std::vector<OwnerResultEvent>>
-AllocateOwnerResultEvents(const std::vector<OwnerResultPlan> &plans,
-                          const SyncSiteRegistry &site_registry,
-                          const std::vector<SyncPoint> &sync_points,
-                          const std::vector<FlagAllocation> &allocations,
-                          const CrossCoreFlagReservation &reservation,
-                          const EpochDomainRegistry &domains) {
-  if (plans.empty())
-    return std::vector<OwnerResultEvent>{};
+std::optional<std::vector<OwnerCompletionEvent>>
+AllocateOwnerCompletionEvents(const std::vector<OwnerResultPlan> &plans,
+                              const std::vector<OwnerResultPlan> &inputs,
+                              const SyncSiteRegistry &site_registry,
+                              const std::vector<SyncPoint> &sync_points,
+                              const std::vector<FlagAllocation> &allocations,
+                              const CrossCoreFlagReservation &reservation,
+                              const EpochDomainRegistry &domains) {
+  if (plans.empty() && inputs.empty())
+    return std::vector<OwnerCompletionEvent>{};
   if (reservation.has_unbounded_id)
     return std::nullopt;
   std::array<bool, 16> used{};
@@ -3195,9 +3235,8 @@ AllocateOwnerResultEvents(const std::vector<OwnerResultPlan> &plans,
     for (int offset = 0; offset < allocation.num_versions; ++offset)
       used[allocation.base_id + offset] = true;
   }
-  std::vector<OwnerResultEvent> result;
-  for (const OwnerResultPlan &plan : plans) {
-    int width = 2 * plan.num_slots;
+  std::vector<OwnerCompletionEvent> result;
+  auto reserve = [&](int width) {
     int base = -1;
     for (int candidate = 16 - width; candidate >= 0; --candidate) {
       bool free = true;
@@ -3208,10 +3247,15 @@ AllocateOwnerResultEvents(const std::vector<OwnerResultPlan> &plans,
         break;
       }
     }
+    if (base >= 0)
+      for (int offset = 0; offset < width; ++offset)
+        used[base + offset] = true;
+    return base;
+  };
+  for (const OwnerResultPlan &plan : plans) {
+    int base = reserve(2 * plan.num_slots);
     if (base < 0)
       return std::nullopt;
-    for (int offset = 0; offset < width; ++offset)
-      used[base + offset] = true;
     const EpochDomain &domain =
         domains.Domain(domains.DomainForStorage(plan.storage, plan.epoch));
     SyncInsertionSite producer(plan.producer->GetChildOnPathFrom(plan.epoch),
@@ -3231,7 +3275,39 @@ AllocateOwnerResultEvents(const std::vector<OwnerResultPlan> &plans,
         plan.sid * plan.num_slots + plan.consumer_slot + base;
     result.push_back({std::move(producer), std::move(consumer),
                       cast(DataType::Int(32), producer_id),
-                      cast(DataType::Int(32), consumer_id)});
+                      cast(DataType::Int(32), consumer_id), std::nullopt,
+                      PrimExpr()});
+  }
+  for (const OwnerResultPlan &plan : inputs) {
+    int base = reserve(2 * plan.num_slots);
+    if (base < 0)
+      return std::nullopt;
+    const EpochDomain &domain =
+        domains.Domain(domains.DomainForStorage(plan.storage, plan.epoch));
+    IRStructure *producer_begin = plan.producer->GetChildOnPathFrom(plan.epoch);
+    SyncInsertionSite producer(producer_begin, plan.producer, false,
+                               kCoreVector, domain, nullptr, true);
+    SyncInsertionSite consumer(plan.consumer->GetChildOnPathFrom(plan.epoch),
+                               plan.consumer, true, kCoreCube, domain,
+                               plan.owner, true);
+    // Use the exact ordinary producer entry whose old-slot completion was
+    // proved by HasOwnerInputRelease, rather than hoisting over that release.
+    SyncInsertionSite empty =
+        site_registry.Sites()[site_registry.FindSiteId(SyncInsertionSiteKey{
+            producer_begin, plan.producer, true, kCoreVector, domain.id})];
+    producer.guard = producer.guard && plan.producer_activation;
+    consumer.guard = consumer.guard && plan.consumer_activation;
+    empty.guard = empty.guard && plan.producer_activation;
+    PrimExpr producer_id =
+        plan.sid * plan.num_slots + plan.producer_slot + base;
+    PrimExpr consumer_id = plan.owner->control->loop_var * plan.num_slots +
+                           plan.consumer_slot + base;
+    PrimExpr empty_id =
+        (1 - plan.sid) * plan.num_slots + plan.producer_slot + base;
+    result.push_back({std::move(producer), std::move(consumer),
+                      cast(DataType::Int(32), producer_id),
+                      cast(DataType::Int(32), consumer_id), std::move(empty),
+                      cast(DataType::Int(32), empty_id)});
   }
   return result;
 }
@@ -3244,17 +3320,41 @@ public:
                    AscendArchitecture architecture,
                    const CrossCoreSyncContract &cross_core_contract,
                    const std::vector<Var> &lane_variables,
-                   const std::vector<OwnerResultEvent> &owner_results)
+                   const std::vector<OwnerCompletionEvent> &owner_events)
       : site_registry_(site_registry), sync_points_(sync_points),
         allocations_(allocations), architecture_(architecture),
         cross_core_contract_(cross_core_contract),
-        lane_variables_(lane_variables), owner_results_(owner_results) {}
+        lane_variables_(lane_variables), owner_events_(owner_events) {}
 
   void Run(std::vector<std::shared_ptr<IRStructure>> &root) {
     InsertSyncPoints();
-    for (const OwnerResultEvent &event : owner_results_) {
+    for (const OwnerCompletionEvent &event : owner_events_) {
       ICHECK(architecture_ == AscendArchitecture::kDav2201);
       ICHECK_EQ(cross_core_contract_.num_aiv_subcores, 2);
+      if (event.empty_participant.has_value()) {
+        const SyncInsertionSite &entry = event.empty_participant.value();
+        Stmt contribution =
+            MakeAscendCrossCoreSetFlag(2, "PIPE_MTE3", event.empty_id);
+        if (!ShouldElidePerCoreTaskSyncGuard(entry.path_end, kCoreVector,
+                                             entry.GetGuard()))
+          contribution =
+              WrapWithGuard(std::move(contribution), entry.GetGuard());
+        // InsertStatement(at_beginning=true) prepends. This contribution must
+        // instead follow every ordinary release/acquire already at the entry,
+        // since their completion proves reuse of this owner/slot counter.
+        GetSyncInsertionExtraInfo(entry.path_end)
+            ->Before()[kCoreVector]
+            .push_back(std::move(contribution));
+        InsertStatement(
+            event.producer.path_end,
+            MakeAscendCrossCoreSetFlag(2, "PIPE_MTE3", event.producer_id),
+            false, kCoreVector, event.producer.GetGuard());
+        InsertStatement(
+            event.consumer.path_end,
+            MakeAscendCrossCoreWaitFlag(2, "PIPE_MTE2", event.consumer_id),
+            true, kCoreCube, event.consumer.GetGuard());
+        continue;
+      }
       InsertStatement(
           event.producer.path_end,
           MakeAscendCrossCoreSetFlag(2, "PIPE_FIX", event.producer_id), false,
@@ -3450,7 +3550,7 @@ private:
   AscendArchitecture architecture_;
   const CrossCoreSyncContract &cross_core_contract_;
   const std::vector<Var> &lane_variables_;
-  const std::vector<OwnerResultEvent> &owner_results_;
+  const std::vector<OwnerCompletionEvent> &owner_events_;
 };
 
 // ============================================================================
@@ -3515,23 +3615,31 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
   CrossCoreFlagReservation cross_core_flag_reservation =
       CollectExplicitCrossCoreFlags(kernel_body, cross_core_contract);
   std::vector<OwnerResultPlan> owner_results;
+  std::vector<OwnerResultPlan> owner_inputs;
   if (cross_core_contract.collective &&
       cross_core_contract.num_aiv_subcores == 2) {
     owner_results = AnalyzeOwnerResults(
         root, scheduled_tir.metadata.kernel_root,
         scheduled_tir.metadata.manual_buffer_versions, lane_variables);
+    owner_inputs = AnalyzeOwnerInputs(
+        root, scheduled_tir.metadata.kernel_root,
+        scheduled_tir.metadata.manual_buffer_versions, lane_variables);
   }
   std::unique_ptr<SyncAnalyzer> analyzer;
   std::unique_ptr<FlagAllocator> flag_allocator;
-  std::optional<std::vector<OwnerResultEvent>> owner_events;
+  std::optional<std::vector<OwnerCompletionEvent>> owner_events;
   for (;;) {
     flag_allocator.reset();
     analyzer = std::make_unique<SyncAnalyzer>(
         multi_buffer_plan, domains, target_info.architecture,
         scheduled_tir.metadata.manual_buffer_versions,
         scheduled_tir.metadata.root_conflict_hints, groups, &owner_results,
-        &unit_streams, &unit_boundaries);
+        &owner_inputs, &unit_streams, &unit_boundaries);
     if (!analyzer->Analyze(root)) {
+      if (!owner_inputs.empty()) {
+        owner_inputs.clear();
+        continue;
+      }
       if (analyzer->NeedsUnitFallback()) {
         ICHECK(unit_fallback.has_value());
         return InsertKernelSync(kernel_body, std::move(unit_fallback.value()),
@@ -3539,6 +3647,16 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
       }
       ICHECK(!owner_results.empty());
       owner_results.clear();
+      continue;
+    }
+    if (!owner_inputs.empty() &&
+        std::any_of(owner_results.begin(), owner_results.end(),
+                    [&](const OwnerResultPlan &plan) {
+                      return !analyzer->HasOwnerResultRelease(plan);
+                    })) {
+      // A new optional input cut must not discard an already admissible
+      // result protocol by removing one of its ordinary release witnesses.
+      owner_inputs.clear();
       continue;
     }
     size_t candidate_count = owner_results.size();
@@ -3550,12 +3668,26 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
         owner_results.end());
     if (owner_results.size() != candidate_count)
       continue;
+    candidate_count = owner_inputs.size();
+    owner_inputs.erase(std::remove_if(owner_inputs.begin(), owner_inputs.end(),
+                                      [&](const OwnerResultPlan &plan) {
+                                        return !analyzer->HasOwnerInputRelease(
+                                            plan);
+                                      }),
+                       owner_inputs.end());
+    if (owner_inputs.size() != candidate_count)
+      continue;
     flag_allocator = std::make_unique<FlagAllocator>(
         analyzer->SiteRegistry(), analyzer->SyncPoints(),
         analyzer->ReusablePairs(), cross_core_flag_reservation,
         cross_core_contract);
-    if (!flag_allocator->Plan(!owner_results.empty() || !unit_streams.empty(),
+    if (!flag_allocator->Plan(!owner_results.empty() || !owner_inputs.empty() ||
+                                  !unit_streams.empty(),
                               !unit_streams.empty())) {
+      if (!owner_inputs.empty()) {
+        owner_inputs.clear();
+        continue;
+      }
       if (!owner_results.empty()) {
         owner_results.clear();
         continue;
@@ -3567,11 +3699,16 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
       return InsertKernelSync(kernel_body, std::move(unit_fallback.value()),
                               target, lane_variables, false);
     }
-    owner_events = AllocateOwnerResultEvents(
-        owner_results, analyzer->SiteRegistry(), analyzer->SyncPoints(),
-        flag_allocator->Allocations(), cross_core_flag_reservation, domains);
+    owner_events = AllocateOwnerCompletionEvents(
+        owner_results, owner_inputs, analyzer->SiteRegistry(),
+        analyzer->SyncPoints(), flag_allocator->Allocations(),
+        cross_core_flag_reservation, domains);
     if (owner_events.has_value())
       break;
+    if (!owner_inputs.empty()) {
+      owner_inputs.clear();
+      continue;
+    }
     // Owner specialization is optional. A kernel requiring the remaining
     // result IDs keeps the normal collective implementation instead.
     ICHECK(!owner_results.empty());

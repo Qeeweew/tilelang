@@ -18,9 +18,10 @@
 
 namespace tvm::tl::ascend {
 
-// A result belonging to one physical AIV owner. This is a proof result, not a
-// dependency edge: callers must independently prove the input-read release
-// before replacing a collective completion protocol.
+// An owner-indexed transfer. For results the AIC producer traverses owners and
+// the AIV consumer selects SID; for inputs those roles are reversed. This is a
+// geometry/activation proof, not a dependency edge: callers must independently
+// prove the read-completion release before replacing a collective protocol.
 struct OwnerResultPlan {
   Var storage;
   TaskNode *producer;
@@ -478,10 +479,9 @@ inline bool Regions(const Endpoint &endpoint, ControlNode *epoch,
   return Enumerate(loops, 0, {}, region, endpoint.occurrence.bindings, result);
 }
 
-inline std::optional<OwnerResultPlan> Prove(const Var &storage, int slots,
-                                            const Endpoint &producer,
-                                            const Endpoint &consumer,
-                                            const Var &sid) {
+inline std::optional<OwnerResultPlan>
+Prove(const Var &storage, int slots, const Endpoint &producer,
+      const Endpoint &consumer, const Var &sid, bool vector_to_cube = false) {
   const auto &write = producer.occurrence.copy;
   const auto &read = consumer.occurrence.copy;
   Buffer canonical = write->dst;
@@ -493,8 +493,8 @@ inline std::optional<OwnerResultPlan> Prove(const Var &storage, int slots,
   std::vector<int64_t> shape;
   if (!Injective(canonical, &shape))
     return std::nullopt;
-  // FIX exports a matrix plane. Leading singleton axes are shared keys;
-  // neither owner nor ring storage may alias the matrix axes themselves.
+  // Both directions transfer a matrix plane. Leading singleton axes are
+  // shared keys; owner and ring storage cannot alias the matrix axes.
   if (shape.size() < 4)
     return std::nullopt;
 
@@ -520,7 +520,8 @@ inline std::optional<OwnerResultPlan> Prove(const Var &storage, int slots,
   int64_t epoch_end = *epoch_min + *epoch_extent;
   Var iteration = epoch->control->loop_var;
 
-  for (ControlNode *owner : producers) {
+  const auto &owner_controls = vector_to_cube ? consumers : producers;
+  for (ControlNode *owner : owner_controls) {
     if (owner == epoch || !owner->IsWithin(epoch) ||
         owner->control->kind != ForKind::kSerial ||
         owner->ContainsLoopBreak() ||
@@ -539,8 +540,10 @@ inline std::optional<OwnerResultPlan> Prove(const Var &storage, int slots,
       continue;
 
     std::vector<Region> writes, reads;
-    if (!Regions(producer, epoch, owner, write->dst_range, &writes) ||
-        !Regions(consumer, epoch, nullptr, read->src_range, &reads) ||
+    if (!Regions(producer, epoch, vector_to_cube ? nullptr : owner,
+                 write->dst_range, &writes) ||
+        !Regions(consumer, epoch, vector_to_cube ? owner : nullptr,
+                 read->src_range, &reads) ||
         writes.empty() || reads.empty() ||
         2 * (writes.size() + reads.size()) > kProofLimit)
       continue;
@@ -552,21 +555,27 @@ inline std::optional<OwnerResultPlan> Prove(const Var &storage, int slots,
     analyzer.Bind(sid, Range::FromMinExtent(0, 2), true);
 
     int owner_axis = -1;
+    Var write_owner = vector_to_cube ? sid : owner_var;
+    Var read_owner = vector_to_cube ? owner_var : sid;
     for (size_t axis = 0; axis < shape.size(); ++axis) {
       bool matches = shape[axis] == 2;
       for (const Region &rect : writes)
         matches &= analyzer.CanProveEqual(rect[axis]->extent, 1) &&
-                   analyzer.CanProveEqual(rect[axis]->min, owner_var);
+                   analyzer.CanProveEqual(rect[axis]->min, write_owner);
       for (const Region &rect : reads)
         matches &= analyzer.CanProveEqual(rect[axis]->extent, 1) &&
-                   analyzer.CanProveEqual(rect[axis]->min, sid);
+                   analyzer.CanProveEqual(rect[axis]->min, read_owner);
       if (matches)
         owner_axis = owner_axis == -1 ? static_cast<int>(axis) : -2;
     }
     if (owner_axis < 0 || owner_axis >= static_cast<int>(shape.size()) - 2)
       continue;
 
-    for (int distance = 1; distance < slots; ++distance) {
+    // Owner inputs specialize only the same finite activation. Results retain
+    // their established positive producer-to-consumer epoch distance.
+    int first_distance = vector_to_cube ? 0 : 1;
+    int end_distance = vector_to_cube ? 1 : slots;
+    for (int distance = first_distance; distance < end_distance; ++distance) {
       Bindings shift{{iteration, iteration + distance}};
       PrimExpr epoch_bounds =
           iteration >= make_const(iteration.dtype(), *epoch_min) &&
@@ -600,8 +609,12 @@ inline std::optional<OwnerResultPlan> Prove(const Var &storage, int slots,
         PrimExpr p = writes[0][axis]->min;
         PrimExpr c = reads[0][axis]->min;
         bool matches = Uses(p, iteration) && Uses(c, iteration) &&
-                       !Uses(p, owner_var) && !Uses(c, sid) &&
+                       !Uses(p, write_owner) && !Uses(c, read_owner) &&
                        proof.CanProveEqual(p, Substitute(c, shift));
+        // The other core's selector cannot define an input storage clock.
+        // Keep the existing result admission unchanged.
+        if (vector_to_cube)
+          matches &= !Uses(p, read_owner) && !Uses(c, write_owner);
         for (const Region &rect : writes)
           matches &= proof.CanProveEqual(rect[axis]->extent, 1) &&
                      proof.CanProveEqual(rect[axis]->min, p);
@@ -726,16 +739,10 @@ inline std::optional<OwnerResultPlan> Prove(const Var &storage, int slots,
   return std::nullopt;
 }
 
-} // namespace owner_result_detail
-
-// Called only by the 2201 path after MixedKernel(sids=2) and private-UB
-// validation. Any unsupported shape/control/storage use keeps the existing
-// collective protocol: this analysis never makes a malformed proof fatal.
 inline std::vector<OwnerResultPlan>
-AnalyzeOwnerResults(const std::vector<std::shared_ptr<IRStructure>> &root,
-                    const SBlock &kernel_root, const BufferVersionMap &manual,
-                    const std::vector<Var> &lanes) {
-  using namespace owner_result_detail;
+AnalyzeOwnerTransfers(const std::vector<std::shared_ptr<IRStructure>> &root,
+                      const SBlock &kernel_root, const BufferVersionMap &manual,
+                      const std::vector<Var> &lanes, bool vector_to_cube) {
   std::vector<OwnerResultPlan> plans;
   if (lanes.size() != 1 || !kernel_root.defined())
     return plans;
@@ -754,10 +761,12 @@ AnalyzeOwnerResults(const std::vector<std::shared_ptr<IRStructure>> &root,
     }
     if (writers.size() != 1 || readers.size() != 1 ||
         writers[0] == readers[0] ||
-        !writers[0]->UsesOnlyPipe(ResourcePipe::kFixpipe) ||
+        !writers[0]->UsesOnlyPipe(vector_to_cube ? ResourcePipe::kMTE3
+                                                 : ResourcePipe::kFixpipe) ||
         !readers[0]->UsesOnlyPipe(ResourcePipe::kMTE2) ||
-        writers[0]->GetCoreMask() != kCoreCube ||
-        readers[0]->GetCoreMask() != kCoreVector)
+        writers[0]->GetCoreMask() !=
+            (vector_to_cube ? kCoreVector : kCoreCube) ||
+        readers[0]->GetCoreMask() != (vector_to_cube ? kCoreCube : kCoreVector))
       continue;
     CopyBody source, destination;
     source.Walk(writers[0]->stmt, TaskBindings(writers[0]), {}, Bool(true));
@@ -768,23 +777,70 @@ AnalyzeOwnerResults(const std::vector<std::shared_ptr<IRStructure>> &root,
       continue;
     const AscendCopy &write = source.copies[0].copy;
     const AscendCopy &read = destination.copies[0].copy;
-    if (!IsL0CBuffer(write->src) || !IsGlobalBuffer(write->dst) ||
-        !write->dst->data.same_as(storage) || !IsGlobalBuffer(read->src) ||
-        !read->src->data.same_as(storage) || !IsSharedBuffer(read->dst) ||
-        !ContainsAivPrivateData(private_members, read->dst->data) ||
-        read->data_select != 0 || read->transpose != 0 || read->nd2nz != 0 ||
-        write->dual_dst_ctl != 0)
+    if (!IsGlobalBuffer(write->dst) || !write->dst->data.same_as(storage) ||
+        !IsGlobalBuffer(read->src) || !read->src->data.same_as(storage))
       continue;
+    if (vector_to_cube) {
+      // This proof specializes ordinary private UB exports consumed by L1
+      // input copies. Hints carrying another hardware route or completion
+      // contract are not implicitly granted owner-input semantics.
+      if (!IsSharedBuffer(write->src) ||
+          !ContainsAivPrivateData(private_members, write->src->data) ||
+          !IsL1Buffer(read->dst))
+        continue;
+      bool ordinary = true;
+      for (const AscendCopy &copy : {write, read}) {
+        ordinary &= copy->data_select == 0 && copy->transpose == 0 &&
+                    copy->nd2nz == 0 && copy->dual_dst_ctl == 0 &&
+                    !copy->mx_sf_data.defined() && !copy->root_fixpipe_config &&
+                    !copy->pad_value.defined() &&
+                    is_zero(copy->unit_flag_ctl) && is_zero(copy->sub_blockid);
+      }
+      if (!ordinary)
+        continue;
+    } else if (!IsL0CBuffer(write->src) || !IsSharedBuffer(read->dst) ||
+               !ContainsAivPrivateData(private_members, read->dst->data) ||
+               read->data_select != 0 || read->transpose != 0 ||
+               read->nd2nz != 0 || write->dual_dst_ctl != 0) {
+      continue;
+    }
     StorageAudit audit(write->dst);
     audit(kernel_root->body);
     if (!audit.valid)
       continue;
     Endpoint producer{writers[0], std::move(source.copies[0])};
     Endpoint consumer{readers[0], std::move(destination.copies[0])};
-    if (auto plan = Prove(storage, slots, producer, consumer, lanes[0]))
+    if (auto plan =
+            Prove(storage, slots, producer, consumer, lanes[0], vector_to_cube))
       plans.push_back(std::move(plan.value()));
   }
   return plans;
+}
+
+} // namespace owner_result_detail
+
+// Called only by the 2201 path after MixedKernel(sids=2) and private-UB
+// validation. Any unsupported shape/control/storage use keeps the existing
+// collective protocol: this analysis never makes a malformed proof fatal.
+inline std::vector<OwnerResultPlan>
+AnalyzeOwnerResults(const std::vector<std::shared_ptr<IRStructure>> &root,
+                    const SBlock &kernel_root, const BufferVersionMap &manual,
+                    const std::vector<Var> &lanes) {
+  return owner_result_detail::AnalyzeOwnerTransfers(root, kernel_root, manual,
+                                                    lanes, false);
+}
+
+// An input's SID-selected private UB writes and owner-traversed AIC reads have
+// identical finite activations. No event is synthesized here. The caller must
+// retain the ordinary collective read-completion/reuse relation and prove a
+// once-per-activation producer-BEGIN cut after that release before adding the
+// complementary empty participant of an owner-indexed mode2 publication.
+inline std::vector<OwnerResultPlan>
+AnalyzeOwnerInputs(const std::vector<std::shared_ptr<IRStructure>> &root,
+                   const SBlock &kernel_root, const BufferVersionMap &manual,
+                   const std::vector<Var> &lanes) {
+  return owner_result_detail::AnalyzeOwnerTransfers(root, kernel_root, manual,
+                                                    lanes, true);
 }
 
 } // namespace tvm::tl::ascend

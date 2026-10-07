@@ -151,9 +151,15 @@ facts. They do not permit an empty AIV owner to skip collective completion.
 
 For explicitly indexed independent queries, `InsertSync` can prove a narrower
 [owner result completion](ascend_2201_owner_results.md) from typed FIX/GM/UB
-regions. It publishes a complete Cube result per owner and GM slot, retaining
-ordinary collective input-ready and reader-release protocols. These owner
-edges do not enter the all-participant closure or buffer-alias lifetime proof.
+regions. It publishes a complete Cube result per owner and GM slot. For
+ordinary private-UB-to-GM inputs consumed by an AIC owner traversal in the same
+activation, it can use owner/slot IDs with staggered mode-2 participation:
+the other AIV arrives after old-slot release, and the owner arrives after its
+complete MTE3 export. AIC still receives both physical AIV contributions.
+Ordinary paired reader release is retained and independently proves reuse.
+These owner edges do not enter the all-participant closure or buffer-alias
+lifetime proof. Unsupported geometry or unavailable IDs keeps collective
+input readiness.
 
 Common buffer-owner inference can recognize a full GEMM definition on the
 first iteration of a guaranteed static descendant loop. Only positive,

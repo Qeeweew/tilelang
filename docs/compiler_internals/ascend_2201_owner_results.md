@@ -73,14 +73,48 @@ old own result wait
 Thus the consumed owner stream never needs more than one outstanding token per
 ID. GM slots and result IDs remain separate concepts; their correspondence is
 proved from region coordinates, not inferred from a shared loop phase.
-P-input readiness, other GM hazards, and collective release retain their
-existing contracts and validation.
+Other GM hazards and collective release retain their existing contracts and
+validation. Owner-input readiness has the additional contract below.
 
 Result IDs are allocated from the remaining 16 cross-core base slots, excluding
 explicit reservations and generic allocations. No result ID is shared with
 another protocol. Insufficient IDs, an unproved release, or loss of a generic
 local binary reverse-completion proof causes a retry with ordinary collective
 completion. The original binary and collective diagnostics remain in force.
+
+## Staggered owner-input readiness
+
+The reverse path can expose the same independent query planes: each AIV
+exports private UB to `input[group, sid, slot, ...]`, and AIC traverses owners
+and copies each plane into L1. The shared geometry proof admits only identical
+finite source/consumer activations at distance zero, at least two manually
+declared GM slots, ordinary typed copies, and complete rectangular coverage.
+
+2201 Vector-to-Cube mode 2 still requires both AIV participants. An input ID
+therefore receives two real arrivals, rather than a fictitious private
+notification:
+
+- The other AIV contributes at its ordinary producer-entry cut, after all
+  existing waits at that cut. This may be the first row-block export, and is
+  guarded to execute once per active epoch.
+- The owning AIV contributes after its final MTE3 export for the complete
+  plane. AIC waits once before the corresponding owner's first GM read.
+
+Each owner/slot uses an exclusive ID. Before selecting this protocol, ordinary
+completion analysis must independently prove that all prior AIC input reads
+retire before either AIV's producer entry can reuse the slot. The original
+paired reader-release synchronization remains in place. Consequently both
+arrivals for a reused ID follow consumption of its previous wait; an early
+arrival cannot match a publication from another generation.
+
+Only the exact owner-input RAW is replaced. These events never enter the
+all-participant completion closure or prove unrelated buffer reuse. There are
+no inactive-epoch, root seed, or drain contributions for this input protocol.
+Unproved release, incompatible geometry, loss of ordinary completion proofs,
+or insufficient cross-core IDs retains the paired input-ready protocol.
+Input specialization is dropped before sacrificing an existing owner-result
+or closed-unit-stream selection. It does not reorder the AIC owner traversal
+or guarantee a throughput improvement for symmetric producers.
 
 ## Hardware scope
 
