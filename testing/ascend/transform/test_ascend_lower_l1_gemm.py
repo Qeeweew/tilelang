@@ -60,6 +60,73 @@ def _constant(expression):
     return int(tvm.arith.Analyzer().simplify(expression))
 
 
+def _executed_unit_flags(module, bindings=None):
+    """Read native MAD controls in executable order, including a separate tail."""
+    result = []
+
+    def value(expression, environment):
+        expression = tvm.arith.Analyzer().simplify(tirx.stmt_functor.substitute(expression, environment))
+        if isinstance(expression, tirx.IntImm):
+            return int(expression)
+        if isinstance(expression, tirx.Select):
+            branch = expression.true_value if value(expression.condition, {}) else expression.false_value
+            return value(branch, {})
+        if isinstance(expression, tirx.Call) and isinstance(expression.op, tvm.ir.Op):
+            if expression.op.name == "tirx.bitwise_and":
+                return value(expression.args[0], {}) & value(expression.args[1], {})
+        raise AssertionError(f"Unresolved native control expression: {expression}")
+
+    def visit(statement, environment):
+        if isinstance(statement, tirx.SBlockRealize):
+            visit(statement.block.body, environment)
+        elif isinstance(statement, tirx.SeqStmt):
+            for child in statement.seq:
+                visit(child, environment)
+        elif isinstance(statement, tirx.For):
+            start = value(statement.min, environment)
+            stop = start + value(statement.extent, environment)
+            for iteration in range(start, stop):
+                visit(statement.body, {**environment, statement.loop_var: tirx.IntImm(statement.loop_var.dtype, iteration)})
+        elif isinstance(statement, tirx.Evaluate):
+            call = statement.value
+            if isinstance(call, tirx.Call) and isinstance(call.op, tvm.ir.Op) and call.op.name == "tl.tileop.gemm":
+                control = call.annotations.get("unit_flag_ctrl")
+                result.append(None if control is None else value(control, environment))
+        else:
+            raise AssertionError(f"Unexpected native K statement: {type(statement).__name__}")
+
+    visit(module["main"].body, {} if bindings is None else bindings)
+    return result
+
+
+@pytest.mark.parametrize("k", [64, 134, 256, 262, 1024, 1030], ids=["single", "one-and-tail", "loop", "loop-and-tail", "long-loop", "long-loop-and-tail"])
+@pytest.mark.parametrize("control", [None, 0, 1, 2, 3], ids=["absent", "disabled", "raw-1", "check-only", "check-and-set"])
+def test_native_k_chunks_keep_check_until_the_terminal_control(k, control):
+    after = transform.AscendLowerL1Gemm()(_program(128, 128, k, unit_flag=control))
+    actual = _executed_unit_flags(after)
+    assert len(actual) == math.ceil(k / 128)
+    # Retain CHECK independently of the chunk's clear bit. Raw 1 exercises
+    # bit projection only; this does not establish native backend support for
+    # that terminal encoding. CHECK-only stays active across logical GEMMs.
+    nonterminal = {None: None, 0: 0, 1: 0, 2: 2, 3: 2}[control]
+    assert actual == [nonterminal] * (len(actual) - 1) + [control]
+    if control is None:
+        assert all("unit_flag_ctrl" not in mad.annotations for mad in _calls(after, "tl.tileop.gemm"))
+
+
+@pytest.mark.parametrize("k", [64, 134, 256, 262])
+def test_conditional_unit_protocol_retains_check_only_when_enabled(k):
+    enabled = tirx.Var("unit_enabled", "bool")
+    control = tirx.Select(enabled, tirx.IntImm("int32", 3), tirx.IntImm("int32", 0))
+    before = _program(128, 128, k, unit_flag=control)
+    original = before["main"]
+    before = tvm.IRModule({"main": tirx.PrimFunc([enabled], original.body).with_attr("target", original.attrs["target"])})
+    after = transform.AscendLowerL1Gemm()(before)
+    count = math.ceil(k / 128)
+    assert _executed_unit_flags(after, {enabled: tirx.IntImm("bool", False)}) == [0] * count
+    assert _executed_unit_flags(after, {enabled: tirx.IntImm("bool", True)}) == [2] * (count - 1) + [3]
+
+
 @pytest.mark.parametrize("k", [1536, 24576])
 def test_sub_k_trip_count_does_not_expand_compiler_ir(k):
     after = transform.AscendLowerL1Gemm()(_program(128, 96, k))
@@ -94,7 +161,7 @@ def test_static_tail_has_its_own_compact_allocation_and_terminal_completion():
     full, tail = _calls(after, "tl.tileop.gemm")
     assert int(full.args[7]) == 128
     assert int(tail.args[7]) == 6
-    assert _constant(full.annotations["unit_flag_ctrl"]) == 0
+    assert _constant(full.annotations["unit_flag_ctrl"]) == 2
     assert _constant(tail.annotations["unit_flag_ctrl"]) == 3
     assert _constant(tail.args[9]) == 0
     assert int(tail.args[2].args[1]) == 3
@@ -124,7 +191,7 @@ def test_accumulator_clear_and_completion_apply_at_whole_gemm_boundaries(clear):
         actual_clear = _constant(tirx.stmt_functor.substitute(mad.args[9], substitute))
         completion = _constant(tirx.stmt_functor.substitute(mad.annotations["unit_flag_ctrl"], substitute))
         assert actual_clear == int(clear and iteration == 0)
-        assert completion == (3 if iteration == 7 else 0)
+        assert completion == (3 if iteration == 7 else 2)
 
 
 def test_logical_matrix_tails_preserve_geometry_with_padded_storage():
@@ -191,7 +258,7 @@ def test_native_sub_k_loops_preserve_enclosing_pipeline_intent(automatic):
     for iteration in (0, 1):
         substitutions = {native.loop_var: tirx.IntImm("int32", iteration)}
         assert _constant(tirx.stmt_functor.substitute(mad.args[9], substitutions)) == int(iteration == 0)
-        assert _constant(tirx.stmt_functor.substitute(mad.annotations["unit_flag_ctrl"], substitutions)) == (3 if iteration == 1 else 0)
+        assert _constant(tirx.stmt_functor.substitute(mad.annotations["unit_flag_ctrl"], substitutions)) == (3 if iteration == 1 else 2)
 
 
 def test_explicit_inner_pipeline_is_an_automatic_inheritance_boundary():
@@ -239,7 +306,7 @@ def test_nn_tail_preserves_k_n_regions_and_compact_padded_storage():
     assert int(tail.args[6]) == 97
     assert _constant(tail.args[9]) == 0
     assert int(tail.args[2].args[1]) == 3
-    assert _constant(full.annotations["unit_flag_ctrl"]) == 0
+    assert _constant(full.annotations["unit_flag_ctrl"]) == 2
     assert _constant(tail.annotations["unit_flag_ctrl"]) == 3
     _, source_origin, source_extents = _region(_calls(after, "tl.tileop.ascend_copy")[-1].args[0])
     assert tuple(int(value) for value in source_origin) == (1056, 16)

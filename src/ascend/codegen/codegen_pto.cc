@@ -4112,12 +4112,31 @@ void CodeGenTileLangPTO::EmitAscendMad(const CallNode *op) {
     EndScope(accumulate_scope);
   };
 
-  auto emit_for_unit_flag = [&](auto &&self,
-                                const PrimExpr &unit_flag_expr) -> void {
+  auto emit_for_unit_flag = [&](auto &&self, const PrimExpr &unit_flag_expr,
+                                bool check_only) -> void {
     int64_t unit_flag_ctrl = 0;
     if (TryGetConstInt(unit_flag_expr, &unit_flag_ctrl)) {
+      if (check_only) {
+        ICHECK(unit_flag_ctrl == 0 || unit_flag_ctrl == 2 || unit_flag_ctrl == 3)
+            << "PTO " << op_name
+            << " unsupported unit_flag_ctrl=" << unit_flag_ctrl;
+        unit_flag_ctrl &= 2;
+      }
       emit_for_clear_accum(unit_flag_ctrl);
       return;
+    }
+
+    // L1 K lowering retains only CHECK on nonterminal chunks. Carry that
+    // projection through the existing conditional emitter, rather than
+    // expanding the TIR Select tree or accepting arbitrary dynamic controls.
+    if (const auto *call = unit_flag_expr.as<CallNode>();
+        call != nullptr && call->op.same_as(tirx::builtin::bitwise_and()) &&
+        call->args.size() == 2U) {
+      int64_t mask = 0;
+      if (TryGetConstInt(call->args[1], &mask) && mask == 2) {
+        self(self, call->args[0], true);
+        return;
+      }
     }
 
     PrimExpr condition;
@@ -4138,7 +4157,8 @@ void CodeGenTileLangPTO::EmitAscendMad(const CallNode *op) {
     } else {
       LOG(FATAL) << "PTO " << op_name
                  << " supports dynamic unit_flag_ctrl only as Select/"
-                    "if_then_else expressions whose leaves are 0, 2, or 3, "
+                    "if_then_else expressions and the internal CHECK mask "
+                    "(expression & 2), whose leaves are 0, 2, or 3, "
                     "got "
                  << unit_flag_expr;
     }
@@ -4146,17 +4166,17 @@ void CodeGenTileLangPTO::EmitAscendMad(const CallNode *op) {
     PrintIndent();
     stream << "if " << PrintCondition(condition) << ":\n";
     int true_scope = BeginScope();
-    self(self, true_value);
+    self(self, true_value, check_only);
     EndScope(true_scope);
     PrintIndent();
     stream << "else:\n";
     int false_scope = BeginScope();
-    self(self, false_value);
+    self(self, false_value, check_only);
     EndScope(false_scope);
   };
 
   arith::Analyzer analyzer;
-  emit_for_unit_flag(emit_for_unit_flag, analyzer.Simplify(op->args[6]));
+  emit_for_unit_flag(emit_for_unit_flag, analyzer.Simplify(op->args[6]), false);
 }
 
 void CodeGenTileLangPTO::EmitAscendCopyMatrixCcToGm(const CallNode *op) {

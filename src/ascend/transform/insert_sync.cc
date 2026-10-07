@@ -1489,8 +1489,9 @@ private:
 
     std::vector<SyncPoint> sync_points;
     for (const DepInfo &dep : deps) {
+      std::string storage_scope;
       if (dep.storage.has_value()) {
-        std::string storage_scope = GetPtrStorageScope(dep.storage.value());
+        storage_scope = GetPtrStorageScope(dep.storage.value());
         if (storage_scope == "local" || storage_scope == "local.var" ||
             storage_scope == "local.fragment") {
           continue;
@@ -1569,9 +1570,16 @@ private:
         std::string consumer_pipe =
             GetResourcePipeName(consumer->GetPipeMask());
         std::string hard_event = GetHardEvent(producer_pipe, consumer_pipe);
-        bool fix_unit_flag = hard_event.find("FIX") != std::string::npos &&
-                             (HasUnitFlagCtrl(producer->stmt) ||
-                              HasUnitFlagCtrl(consumer->stmt));
+        // Preserve the legacy unit-flag replacement only for L0C data
+        // handshakes between MAD and FIX. Unit flags do not establish SPR
+        // state, other storage hazards, or complete owner lifetimes.
+        bool fix_unit_flag =
+            dep.kind == DependencyKind::kData && dep.storage.has_value() &&
+            (storage_scope == "shared.l0c" ||
+             storage_scope == "shared.l0c.dyn") &&
+            (hard_event == "M_FIX" || hard_event == "FIX_M") &&
+            (HasUnitFlagCtrl(producer->stmt) ||
+             HasUnitFlagCtrl(consumer->stmt));
         for (CoreMask producer_core : expand_cores(producer->GetCoreMask())) {
           for (CoreMask consumer_core : expand_cores(consumer->GetCoreMask())) {
             if (owner_results_ && dep.kind == DependencyKind::kData &&
@@ -1590,7 +1598,8 @@ private:
               // unrelated GM hazard or prove a collective allocation lifetime.
               continue;
             }
-            if (producer_core == consumer_core && fix_unit_flag)
+            if (producer_core == kCoreCube && consumer_core == kCoreCube &&
+                fix_unit_flag)
               continue;
             if (info != nullptr && info->UsesCounter() && !within_owner &&
                 IsCounterDependencyCovered(*info, producer, producer_core,

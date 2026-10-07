@@ -189,6 +189,14 @@ private:
     return std::min(tile_k, Align16(gemm->k_));
   }
 
+  PrimExpr NonterminalUnitFlag(const PrimExpr &terminal) {
+    // CANN's CHECK bit protects every native K chunk. Only the terminal
+    // chunk may additionally SET the result for FIX: 3 -> 2, 2 -> 2,
+    // 1 -> 0, 0 -> 0. Preserve conditional CHECK without expanding Selects.
+    return analyzer_.Simplify(
+        bitwise_and(terminal, make_const(terminal.dtype(), 2)));
+  }
+
   Stmt MakeChunk(const Call &original, const Gemm &gemm, const Buffer &a_l0,
                  const Buffer &b_l0, PrimExpr k_start, int64_t k_extent,
                  PrimExpr clear_accum, bool is_last,
@@ -225,9 +233,14 @@ private:
                       is_one(clear_accum) ? kAccessWrite : kAccessReadWrite));
     writer->args.Set(7, IntImm(DataType::Int(32), k_extent));
     writer->args.Set(9, clear_accum);
-    // Completion belongs to the whole L1 GEMM, not an intermediate sub-K.
-    if (!is_last)
-      writer->annotations.Set("unit_flag_ctrl", IntImm(DataType::Int(32), 0));
+    // Completion belongs to the whole L1 GEMM, but each intermediate sub-K
+    // retains CHECK when the original operation participates in that protocol.
+    if (!is_last) {
+      if (auto terminal = original->annotations.Get("unit_flag_ctrl"))
+        writer->annotations.Set(
+            "unit_flag_ctrl",
+            NonterminalUnitFlag(Downcast<PrimExpr>(terminal.value())));
+    }
     return SeqStmt({a_copy, b_copy, Evaluate(mad)});
   }
 
@@ -301,8 +314,9 @@ private:
               Downcast<PrimExpr>(original->annotations.at("unit_flag_ctrl"));
           mad_call.CopyOnWrite()->annotations.Set(
               "unit_flag_ctrl",
-              Select(sub_k == make_const(sub_k.dtype(), full_chunks - 1),
-                     terminal, IntImm(DataType::Int(32), 0)));
+              analyzer_.Simplify(
+                  Select(sub_k == make_const(sub_k.dtype(), full_chunks - 1),
+                         terminal, NonterminalUnitFlag(terminal))));
           chunk.CopyOnWrite()->seq.Set(2, Evaluate(mad_call));
           body = chunk;
         }

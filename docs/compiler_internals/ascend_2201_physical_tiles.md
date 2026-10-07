@@ -113,6 +113,22 @@ read/write effects must still establish each FIX completion before an
 overlapping MAD overwrite. Admitting a region neither inserts a separate
 synchronization mechanism nor chooses this storage policy automatically.
 
+## Explicit unit controls
+
+The default native path uses unit control zero and ordinary completion events.
+For an explicitly annotated L1 GEMM, K lowering retains the CHECK bit on every
+nonterminal native MAD and preserves the original control on the final MAD,
+including a separate K tail. Thus control 3 becomes `2, ..., 2, 3`; control 2
+remains 2 throughout. An absent annotation stays absent. This does not publish
+an intermediate K result or change which sub-K clears the accumulator.
+
+The existing explicit unit-control path can replace only AIC MAD/FIX data
+handshakes on L0C. It must not suppress register configuration, GM hazards,
+owner exclusion or other storage completion. This path does not validate a
+complete producer/export stream: numeric controls alone do not prove matching
+C regions, safe initial reuse, finite drain or physical layout state. Automatic
+selection of that protocol requires a separate validated contract.
+
 ## Supported boundary
 
 The rewrite targets 2201 FP16/BF16 L1 inputs, FP32 accumulation and FP32 GM

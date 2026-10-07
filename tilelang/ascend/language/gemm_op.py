@@ -179,12 +179,16 @@ def gemm(
     """TileLang GEMM operator, with the Ascend unit-flag hint.
 
     Same semantics as the common :func:`tilelang.language.gemm_op.gemm`.
-    ``unit_flag_ctrl`` records the Cube unit-flag control on the tile op, which
-    the Ascend lowering pairs with the following accumulator drain; ``None``
-    omits the annotation and lowers as 0.
+    ``unit_flag_ctrl`` records the native Cube unit-flag control on the tile op;
+    ``None`` omits the annotation and lowers as 0. Explicit nonzero controls
+    require a matching accumulator export and completion protocol. This keyword
+    alone does not establish that protocol.
 
     On Ascend, L0 operand regions specify the effective MAD M/N/K. Their
     trailing matrix dimensions must start at zero and describe a compact tile.
+    On dav-2201, C may also select an aligned column region of a canonical L0C
+    allocation, provided it covers the allocation's full padded M dimension.
+    The MAD and its export must use the same C region.
     L0 allocations and producer copies may be padded for hardware alignment;
     for example, a transposed FP32 load can copy K32 while GEMM consumes
     ``A[:, :24]`` and ``B[:, :24]``. Copy regions must cover the physical
