@@ -22,26 +22,36 @@ output is compact with a 32-byte aligned region base. Retained output axes have
 extent/capacity 1. Partial views, padded row pitches, unsupported layouts,
 dynamic/empty owners, and `clear=False` keep the existing reduction plan.
 
-For `512 <= C <= 4096` with `C % 512 == 0`, the preferred candidate is a
-two-level native reduction. A count-mode call consumes the compact `R*C`
-input and produces `R*(C/64)` consecutive FP32 partials. Its default source
-stride is eight 32-byte blocks, and its destination stride is one element:
-each group of 64 input elements produces one partial, without crossing a row
-boundary. Scratch has the ordinary row-major shape `[R,C/64]`.
+For `512 <= C <= 4096` with `C % 512 == 0`, the preferred candidate uses
+three native tasks. Two count-mode BlockReduce operations compact each group
+of eight FP32 elements, producing `[R,C/8]` and then `[R,C/64]` in independent
+compiler-owned UB buffers. Both input counts are multiples of 64, so the plan
+requires no partial count repeat or unknown tail-write behavior. These are the
+installed CANN 9.1 `asc_datablock_reduce_sum` / `asc_datablock_reduce_max`
+interfaces, which issue `vcgadd` / `vcgmax`. Their default destination repeat
+stride is **one 32-byte block**, unlike WholeReduce's one-element stride.
 
-A second normal-mask call reduces each scratch row. Its active lane count is
-`P=C/64`, repeat count is R, source repeat stride is `P/8` 32-byte blocks,
-and destination stride is one element. P is in 8..64 and divisible by eight,
-so every scratch row begins at a 32-byte boundary. No padding is read. For
-`16x1024`, this emits two native tasks and 1024 bytes of scratch, replacing
-16 native chunk reductions and 15 ordinary combine nodes. This is an
-instruction-count observation, not a measured latency estimate.
+The final normal-mask WholeReduce consumes `[R,P]`, where `P=C/64`, and writes
+one result per row. Its active lane count is P, repeat count is R, source
+repeat stride is `P/8` 32-byte blocks, and destination stride is one element.
+P is in 8..64 and divisible by eight; every scratch row begins at a 32-byte
+boundary and no padding is read. For `16x1024`, the two disjoint scratch
+allocations total 9216 bytes. Operation counts describe the plan; they are
+not a latency model.
 
-This candidate charges its complete aligned scratch against the same root
-allocation and manual-version facts as the other plan. It retains the same
-physical compactness, private owner, region-base alignment and fallback
-requirements. If the width or capacity contract does not admit it, the
-existing chunk candidate remains available.
+When the larger allocation does not fit the common root budget, the same
+compact domain retains the two-level candidate: a count-mode WholeReduce
+consumes `R*C` elements and produces `[R,C/64]`, followed by the same masked
+row reduction. This uses 1024 bytes for `16x1024`. WholeReduce's default source
+repeat stride is eight 32-byte blocks and its destination stride is one
+element; each group of 64 inputs produces one partial without crossing rows.
+
+Both candidates charge their complete aligned scratch against the same root
+allocation and manual-version facts. Already selected scratch remains charged
+when selecting subsequent reductions. They retain the same physical
+compactness, private owner, region-base alignment and fallback requirements.
+If neither allocation or the width contract is admissible, the existing chunk
+candidate remains available.
 
 In that candidate, each 64-column chunk lowers to one normal-mask native WholeReduce across all
 owned rows. For width C and R rows, the native arguments are:
@@ -64,8 +74,8 @@ and `vcmax(..., ONLY_VALUE)` respectively, without a hidden barrier.
 To bound IR expansion, the candidate is selected only when its native operation
 count, `2*chunks-1` including ordinary binary combines, does not exceed the
 existing per-row tree's `R*levels` native reductions. This is a conservative
-structural heuristic, not measured latency. When the preferred two-level
-candidate is unavailable, a single wide row therefore keeps the shorter
+structural heuristic, not measured latency. When the preferred compact
+candidates are unavailable, a single wide row therefore keeps the shorter
 existing tree. Width 64 retains its existing single count-mode call.
 
 Selection also requires conservative UB headroom. The common physical
@@ -93,7 +103,7 @@ noncompact original row view. The existing row/column linearity proof and the
 candidate's row-pitch proof jointly establish the physical rectangle before
 selection; unsupported layouts retain the existing plan or its established
 legality diagnostic.
-The two-level candidate writes the user's output directly through a native
+Both compact candidates write the user's output directly through a native
 row operation, so it also proves the original destination's compact row pitch
 and aligned base independently of an inferred layout.
 
@@ -105,6 +115,15 @@ Only R valid results are written/read. The extra padded capacity is not treated
 as initialized data. Ordinary Parallel Add/Max nodes form a balanced combine
 tree over corresponding row partials and write the compact output. There is no
 per-row scalar readback or store in the selected path.
+
+Each `datablock_reduce_{sum,max}` call has three typed IR operands: exact
+write and read `tl.access_ptr` effects, and a positive uint32 input count in
+complete 64-lane repeats. The input span is exactly count elements and the
+output is count/8 elements. The late native boundary checks compact FP32 UB
+storage, aligned bases, independent storage, access masks and backing bounds.
+Each level is a separate schedulable task; ordinary dependency and sync
+analysis must complete its producer before the next level starts and complete
+scratch readers before storage is reused.
 
 `repeat_reduce_{sum,max}_rows_f32` has five typed IR operands: destination
 region, source region, uint8 row repeats, uint16 source row stride in 32-byte
@@ -134,8 +153,9 @@ expansion; the diagnostic requests ordinary expressions or Stage boundaries.
 
 ## Numerical contract and validation boundary
 
-Sum uses FP32 native 64-lane partial reductions followed by either a masked
-native partial-row reduction or explicit balanced FP32 Add nodes. It neither
+Sum uses either two levels of native eight-element block sums followed by a
+masked partial-row sum, native 64-lane partial sums followed by that masked
+sum, or native chunks followed by explicit balanced FP32 Add nodes. It neither
 widens to FP64 nor fuses rounding nodes. Its tree
 can differ from the prior per-row partial tree, so numerical validation must
 use an appropriate FP32 error tolerance rather than demand bit equality to

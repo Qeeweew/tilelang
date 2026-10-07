@@ -51,6 +51,10 @@ def _count(mod, kind="sum"):
     return calls(mod, "tl.ascend_membase.repeat_reduce_" + suffix)
 
 
+def _datablock(mod, kind="sum"):
+    return calls(mod, "tl.ascend_membase.datablock_reduce_" + kind)
+
+
 @pytest.mark.parametrize("kind", ["sum", "max"])
 @pytest.mark.parametrize("ring_shape", [(2, 128), (16,)], ids=["explicit_slots", "count_only_flat"])
 def test_independent_manual_ring_keeps_static_dense_rows(kind, ring_shape):
@@ -137,14 +141,27 @@ def test_unknown_manual_owner_footprint_keeps_existing_plan(columns):
 def test_new_partials_and_vector_combine_keep_validated_private_ownership(kind, columns):
     before, owners = _program(kind=kind, columns=columns, private=True)
     reduced = transform.AscendLowerVectorReduce()(before)
-    two_level = columns == 1024
-    assert len(_strided(reduced, kind)) == (1 if two_level else 3)
-    partials = _strided(reduced, kind)[0].args[1 if two_level else 0].args[0].buffer
-    assert tuple(int(extent) for extent in partials.shape) == ((3, 16) if two_level else (3, 8))
+    wide = columns == 1024
+    assert len(_strided(reduced, kind)) == (1 if wide else 3)
+    partials = _strided(reduced, kind)[0].args[1 if wide else 0].args[0].buffer
+    assert tuple(int(extent) for extent in partials.shape) == ((3, 16) if wide else (3, 8))
+    assert len(_datablock(reduced, kind)) == (2 if wide else 0)
+    if wide:
+        first, second = _datablock(reduced, kind)
+        blocks = first.args[0].args[0].buffer
+        assert tuple(int(extent) for extent in blocks.shape) == (3, 128)
+        assert second.args[1].args[0].buffer.same_as(blocks)
+        assert second.args[0].args[0].buffer.same_as(partials)
+        assert not blocks.data.same_as(partials.data)
+        for call, written, read in ((first, 384, 3072), (second, 48, 384)):
+            assert [int(value) for value in call.args[0].args[1:]] == [written, 2]
+            assert [int(value) for value in call.args[1].args[1:]] == [read, 1]
+            assert int(call.args[2]) == read
     lowered = transform.AscendLowerVectorTiles()(reduced)
-    assert len(_strided(lowered, kind)) == (1 if two_level else 3)
-    assert len(_count(lowered, kind)) == (1 if two_level else 0)
-    assert len(calls(lowered, "tl.ascend_membase." + ("add" if kind == "sum" else "max"))) == (0 if two_level else 2)
+    assert len(_strided(lowered, kind)) == (1 if wide else 3)
+    assert len(_count(lowered, kind)) == 0
+    assert len(_datablock(lowered, kind)) == (2 if wide else 0)
+    assert len(calls(lowered, "tl.ascend_membase." + ("add" if kind == "sum" else "max"))) == (0 if wide else 2)
     members = lowered["main"].body.block.annotations[PRIVATE]
     assert all(any(member.same_as(buffer.data) for member in members)
                for buffer in lowered["main"].body.block.alloc_buffers)
@@ -164,6 +181,7 @@ def test_two_level_partials_and_manual_slot_padding_are_charged_exactly(kind, fi
     before, owners = _program(kind=kind, columns=1024, ring_shape=(2, 1),
                               filler_bytes=filler_bytes)
     after = transform.AscendLowerVectorReduce()(before)
+    assert not _datablock(after, kind)
     assert len(_strided(after, kind)) == (1 if fits else 0)
     assert [int(call.args[-1]) for call in _count(after, kind)] == ([3072] if fits else [1024, 16])
     assert int(after["main"].body.block.annotations["tl.manual_multi_buffer"][owners[2].data]) == 2
@@ -183,5 +201,47 @@ def test_two_level_partials_keep_the_shared_manual_owner_maximum_footprint(padde
     mod = kernel(before["main"].body.block.body, buffers=owners, annotations=annotations)
     mod["main"] = mod["main"].with_attr("target", tvm.target.Target(TARGET))
     after = transform.AscendLowerVectorReduce()(mod)
+    assert not _datablock(after)
     assert len(_strided(after)) == (0 if padded_alias else 1)
     assert [int(call.args[-1]) for call in _count(after)] == ([1024, 16] if padded_alias else [3072])
+
+
+@pytest.mark.parametrize("kind", ["sum", "max"])
+@pytest.mark.parametrize("fits", [False, True])
+def test_datablock_scratch_and_manual_slot_padding_select_the_exact_capacity_plan(kind, fits):
+    # Three stages require disjoint 1536B datablocks and 192B partials.
+    # Two manual 4B slots occupy 64B. Losing one 32B unit must retain the
+    # smaller 192B two-level plan, not a scalar row fallback.
+    owner_bytes, ring_bytes, scratch_bytes = 3 * 1024 * 4 + 32, 64, 1536 + 192
+    filler_bytes = 196608 - owner_bytes - ring_bytes - scratch_bytes
+    if not fits:
+        filler_bytes += 32
+    before, owners = _program(kind=kind, columns=1024, ring_shape=(2, 1),
+                              filler_bytes=filler_bytes)
+    after = transform.AscendLowerVectorReduce()(before)
+    assert len(_strided(after, kind)) == 1
+    assert len(_datablock(after, kind)) == (2 if fits else 0)
+    assert [int(call.args[-1]) for call in _count(after, kind)] == ([] if fits else [3072])
+    partials = _strided(after, kind)[0].args[1].args[0].buffer
+    assert tuple(int(value) for value in partials.shape) == (3, 16)
+    assert [int(value) for value in _strided(after, kind)[0].args[2:]] == [3, 2, 16]
+    assert int(after["main"].body.block.annotations["tl.manual_multi_buffer"][owners[2].data]) == 2
+
+
+@pytest.mark.parametrize("padded_alias", [False, True])
+def test_datablock_headroom_charges_a_shared_manual_owner_once_at_its_maximum(padded_alias):
+    filler_bytes = 196608 - (3 * 1024 * 4 + 32 + 64) - (1536 + 192)
+    before, owners = _program(columns=1024, ring_shape=(16,), filler_bytes=filler_bytes)
+    ring = owners[2]
+    alias = tirx.decl_buffer((16,), "float32", "ring_alias", scope="shared.dyn", data=ring.data)
+    annotations = dict(before["main"].body.block.annotations.items())
+    annotations["layout_map"] = {
+        ring: Layout([16], lambda i: [i]),
+        alias: Layout([16], lambda i: [i + (8 if padded_alias else 0)]),
+    }
+    mod = kernel(before["main"].body.block.body, buffers=owners, annotations=annotations)
+    mod["main"] = mod["main"].with_attr("target", tvm.target.Target(TARGET))
+    after = transform.AscendLowerVectorReduce()(mod)
+    assert len(_strided(after)) == 1
+    assert len(_datablock(after)) == (0 if padded_alias else 2)
+    assert [int(call.args[-1]) for call in _count(after)] == ([3072] if padded_alias else [])

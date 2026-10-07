@@ -53,6 +53,20 @@ TVM_REGISTER_OP("tl.ascend_membase.repeat_reduce_max_only_value")
     .set_attr<TGlobalSymbol>("TGlobalSymbol",
                              "asc_repeat_reduce_max_only_value");
 
+// Complete FP32 datablocks contract eight source elements to one result.
+// The bounded dense-row plan below uses only full 256B count repeats, so
+// every output block and both typed access_ptr extents are exact.
+TVM_REGISTER_OP("tl.ascend_membase.datablock_reduce_sum")
+    .set_num_inputs(3)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque))
+    .set_attr<TGlobalSymbol>("TGlobalSymbol", "asc_datablock_reduce_sum");
+TVM_REGISTER_OP("tl.ascend_membase.datablock_reduce_max")
+    .set_num_inputs(3)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque))
+    .set_attr<TGlobalSymbol>("TGlobalSymbol", "asc_datablock_reduce_max");
+
 // Normal-mask repeats retain exact [rows, valid_lanes] source regions.
 // Unlike the count overload, the physical row stride and active lanes are
 // independently represented. No inactive lane is part of the memory effect.
@@ -316,14 +330,21 @@ private:
         analyzer_.CanProveEqual(
             floormod(raw_dst_base[0], make_const(raw_dst_base[0].dtype(), 8)),
             make_zero(raw_dst_base[0].dtype()));
-    // The count overload writes one compact partial per contiguous 64 input
-    // elements. Complete rows therefore produce [rows, chunks] without
-    // crossing a logical row. A second normal-mask instruction can reduce
-    // those rows directly when their pitch is a whole 32B block and at most
-    // one VL. Keep all other widths on the established plan below.
-    if (input_count >= 512 && input_count <= 4096 && input_count % 512 == 0 &&
-        native_dst_compact &&
-        HasMultiVLHeadroom(op->src, op->dst, count * chunks * 4)) {
+    // Full datablock count repeats compact each group of eight elements.
+    // For these widths both count stages end on complete 256B repeats and
+    // preserve row boundaries: [R,C] -> [R,C/8] -> [R,C/64]. Prefer this
+    // uniform three-stage candidate only when both disjoint scratch buffers
+    // fit. Otherwise retain the established whole-repeat two-level plan,
+    // whose smaller partial allocation has the same final [R,C/64] view.
+    const bool compact_wide_rows = input_count >= 512 && input_count <= 4096 &&
+                                   input_count % 512 == 0 && native_dst_compact;
+    const bool use_datablocks =
+        compact_wide_rows &&
+        HasMultiVLHeadroom(op->src, op->dst,
+                           count * (input_count / 8 + chunks) * 4);
+    if (compact_wide_rows &&
+        (use_datablocks ||
+         HasMultiVLHeadroom(op->src, op->dst, count * chunks * 4))) {
       Require(task_depth_ == 0,
               "this reduction expands to multiple dependency-bearing tasks; "
               "use T.Stage rather than an opaque T.Task/PerCoreTask wrapper");
@@ -333,16 +354,43 @@ private:
                                     "membase_reduce_partials_" +
                                         std::to_string(next_temporary_++),
                                     "shared.dyn");
-      scratch_.push_back(partials);
       BufferLoad partial_base(partials, {0, 0});
-      const Op &count_intrinsic = Op::Get(
-          op->type->IsSum() ? "tl.ascend_membase.repeat_reduce_sum"
-                            : "tl.ascend_membase.repeat_reduce_max_only_value");
-      Stmt first =
-          Evaluate(Call(DataType::Void(), count_intrinsic,
-                        {Ptr(partial_base, count * chunks, kAccessWrite),
-                         Ptr(src_base, count * input_count, kAccessRead),
-                         make_const(DataType::UInt(32), count * input_count)}));
+      Array<Stmt> tasks;
+      if (use_datablocks) {
+        const int64_t block_columns = input_count / 8;
+        Buffer blocks = decl_buffer(
+            {make_const(DataType::Int(32), count),
+             make_const(DataType::Int(32), block_columns)},
+            DataType::Float(32),
+            "membase_reduce_datablocks_" + std::to_string(next_temporary_++),
+            "shared.dyn");
+        scratch_.push_back(blocks);
+        BufferLoad block_base(blocks, {0, 0});
+        const Op &count_intrinsic = Op::Get(
+            op->type->IsSum() ? "tl.ascend_membase.datablock_reduce_sum"
+                              : "tl.ascend_membase.datablock_reduce_max");
+        tasks.push_back(Evaluate(
+            Call(DataType::Void(), count_intrinsic,
+                 {Ptr(block_base, count * block_columns, kAccessWrite),
+                  Ptr(src_base, count * input_count, kAccessRead),
+                  make_const(DataType::UInt(32), count * input_count)})));
+        tasks.push_back(Evaluate(
+            Call(DataType::Void(), count_intrinsic,
+                 {Ptr(partial_base, count * chunks, kAccessWrite),
+                  Ptr(block_base, count * block_columns, kAccessRead),
+                  make_const(DataType::UInt(32), count * block_columns)})));
+      } else {
+        const Op &count_intrinsic =
+            Op::Get(op->type->IsSum()
+                        ? "tl.ascend_membase.repeat_reduce_sum"
+                        : "tl.ascend_membase.repeat_reduce_max_only_value");
+        tasks.push_back(Evaluate(
+            Call(DataType::Void(), count_intrinsic,
+                 {Ptr(partial_base, count * chunks, kAccessWrite),
+                  Ptr(src_base, count * input_count, kAccessRead),
+                  make_const(DataType::UInt(32), count * input_count)})));
+      }
+      scratch_.push_back(partials);
       PrimExpr partial_region =
           Call(DataType::Handle(), tl::region(),
                {partial_base, make_const(DataType::Int(32), kAccessRead),
@@ -352,13 +400,13 @@ private:
           dst_base, make_const(DataType::Int(32), kAccessWrite)};
       for (const Range &range : dst_ranges)
         destination_args.push_back(range->extent);
-      Stmt second = Evaluate(
+      tasks.push_back(Evaluate(
           Call(DataType::Void(), intrinsic,
                {Call(DataType::Handle(), tl::region(), destination_args),
                 partial_region, make_const(DataType::UInt(8), count),
                 make_const(DataType::UInt(16), chunks / 8),
-                make_const(DataType::UInt(8), chunks)}));
-      return SeqStmt({first, second});
+                make_const(DataType::UInt(8), chunks)})));
+      return MakeSeq(tasks);
     }
 
     int64_t levels = 0, remaining = input_count;

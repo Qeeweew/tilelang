@@ -5,7 +5,7 @@ from tilelang import tvm
 from tilelang.ascend import transform
 from tvm import tirx
 
-from testing.ascend._ir import calls, kernel, nodes, region
+from testing.ascend._ir import calls, kernel, nodes, region, seq
 
 
 def _lower(mod):
@@ -140,3 +140,81 @@ def test_compound_reduction_cannot_hide_in_one_opaque_task():
 def test_3510_reduction_retains_upstream_vf_path():
     before, _, _ = _reduce(arch="dav-3510")
     tvm.ir.assert_structural_equal(_lower(before), before)
+
+
+@pytest.mark.parametrize("kind", ["sum", "max"])
+@pytest.mark.parametrize("rows,columns", [(1, 512), (16, 1024), (3, 1536), (2, 4096), (64, 512)])
+def test_dense_datablock_stages_have_exact_compact_effects_and_separate_tasks(kind, rows, columns):
+    before, source, destination = _reduce(kind, count=columns, rows=rows)
+    after = _lower(before)
+    name = "tl.ascend_membase.datablock_reduce_" + kind
+    first, second = calls(after, name)
+    suffix = "sum" if kind == "sum" else "max"
+    (last,) = calls(after, "tl.ascend_membase.repeat_reduce_" + suffix + "_rows_f32")
+    blocks, partials = (call.args[0].args[0].buffer for call in (first, second))
+    assert tuple(int(value) for value in blocks.shape) == (rows, columns // 8)
+    assert tuple(int(value) for value in partials.shape) == (rows, columns // 64)
+    assert not blocks.data.same_as(partials.data)
+    for call, src, dst, count, produced in (
+        (first, source, blocks, rows * columns, rows * columns // 8),
+        (second, blocks, partials, rows * columns // 8, rows * columns // 64),
+    ):
+        assert call.op.get_attr("TGlobalSymbol") == "asc_datablock_reduce_" + kind
+        assert len(call.args) == 3 and str(call.args[2].dtype) == "uint32"
+        assert int(call.args[2]) == count and count % 64 == 0
+        for access, buffer, extent, mask in ((call.args[0], dst, produced, 2), (call.args[1], src, count, 1)):
+            assert access.op.name == "tl.access_ptr"
+            assert access.args[0].buffer.same_as(buffer)
+            assert [int(value) for value in access.args[0].indices] == [0, 0]
+            assert [int(value) for value in access.args[1:]] == [extent, mask]
+            assert buffer.dtype == "float32" and buffer.scope() in ("shared", "shared.dyn")
+    assert last.args[0].args[0].buffer.same_as(destination)
+    assert last.args[1].args[0].buffer.same_as(partials)
+    assert [int(value) for value in last.args[1].args[2:]] == [rows, columns // 64]
+    assert [int(value) for value in last.args[2:]] == [rows, columns // 512, columns // 64]
+    assert not nodes(after, tirx.Bind) and not nodes(after, tirx.For)
+    materialized = transform.MaterializeScheduleUnits()(transform.AscendLowerVectorTiles()(after))
+    tasks = [node for node in nodes(materialized, tirx.AttrStmt) if node.attr_key == "tl.ascend_task"]
+    assert len(tasks) == 3
+    assert [len(calls(task, name)) for task in tasks] == [1, 1, 0]
+
+
+def _capacity_program(before, *, extra_buffers=(), body=None):
+    root = before["main"].body.block
+    mod = kernel(root.body if body is None else body, buffers=[*root.alloc_buffers, *extra_buffers])
+    mod["main"] = mod["main"].with_attr("target", before["main"].attrs["target"])
+    return mod
+
+
+@pytest.mark.parametrize("kind", ["sum", "max"])
+def test_datablock_headroom_falls_back_to_the_smaller_two_level_native_plan(kind):
+    before, _, _ = _reduce(kind, count=1024, rows=16)
+    # Root source/output=65536+64B. Leave exactly the old 1024B partials,
+    # rather than the candidate's disjoint 8192+1024B scratch allocation.
+    filler = tirx.decl_buffer(((196608 - 65536 - 64 - 1024) // 4,), "float32", "filler", scope="shared.dyn")
+    after = _lower(_capacity_program(before, extra_buffers=[filler]))
+    assert not calls(after, "tl.ascend_membase.datablock_reduce_" + kind)
+    whole = "tl.ascend_membase.repeat_reduce_" + ("sum" if kind == "sum" else "max_only_value")
+    (first,) = calls(after, whole)
+    assert int(first.args[2]) == 16384
+    (last,) = calls(after, "tl.ascend_membase.repeat_reduce_" + kind + "_rows_f32")
+    assert tuple(int(value) for value in last.args[1].args[0].buffer.shape) == (16, 16)
+
+
+def test_datablock_scratch_is_charged_before_the_next_reduce_selects_its_plan():
+    before, _, _ = _reduce(count=1024, rows=16)
+    second_output = tirx.decl_buffer((16,), "float32", "second_output", scope="shared.dyn")
+    original = calls(before, "tl.tileop.reduce")[0]
+    args = list(original.args)
+    args[1] = region(second_output, 2)
+    body = seq(tirx.Evaluate(original), tirx.Evaluate(tirx.Call("handle", original.op, args)))
+    # Reserve exactly one 9216B candidate and one 1024B fallback. Two
+    # candidates must not both consume the same remaining-root budget.
+    filler_bytes = 196608 - 65536 - 2 * 64 - 9216 - 1024
+    filler = tirx.decl_buffer((filler_bytes // 4,), "float32", "filler", scope="shared.dyn")
+    after = _lower(_capacity_program(before, extra_buffers=[second_output, filler], body=body))
+    assert len(calls(after, "tl.ascend_membase.datablock_reduce_sum")) == 2
+    assert len(calls(after, "tl.ascend_membase.repeat_reduce_sum")) == 1
+    assert len(calls(after, "tl.ascend_membase.repeat_reduce_sum_rows_f32")) == 2
+    scratch = after["main"].body.block.alloc_buffers[-3:]
+    assert sum(int(buffer.shape[0]) * int(buffer.shape[1]) * 4 for buffer in scratch) == 10240

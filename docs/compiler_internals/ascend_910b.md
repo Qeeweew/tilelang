@@ -275,8 +275,10 @@ base keeps the native alignment requirement; internally adjacent scalar
 results use stride one. This path needs no reduction scratch or per-row scalar
 readback. Wider compact FP32 rows whose width is a multiple of 64 can use
 normal-mask native chunks across all static owned rows, followed by an ordinary
-balanced Add/Max tree. Exact chunk regions, compiler partials and combine scratch
-remain visible to scheduling; a conservative UB headroom check retains the
+balanced Add/Max tree. Compact widths 512..4096 in multiples of 512 prefer
+two BlockReduce compactions and a masked row reduction; a smaller two-level
+WholeReduce plan remains available when the larger scratch does not fit.
+Exact regions, compiler partials and combine scratch remain visible to scheduling; a conservative UB headroom check retains the
 original plan when this expansion cannot be admitted. Dynamic/empty owners,
 partial or strided layouts and clear-false reductions retain the ordinary row
 plan. See [the 2201 reduction contract](ascend_2201_reduce.md) for stride units,

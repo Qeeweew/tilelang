@@ -1346,9 +1346,74 @@ private:
     return IRMutatorWithAnalyzer::VisitStmt_(lowered.get());
   }
 
+  // Count-mode BlockReduce consumes complete 64-lane FP32 repeats and writes
+  // eight compact block partials per repeat. Keep the exact pointer effects
+  // through scheduling; validate the native ABI once before physical remap.
+  Stmt LowerBlockReducePointers(const EvaluateNode *op, const CallNode *call) {
+    ICHECK_EQ(call->args.size(), 3U)
+        << "FP32 block reduce expects three operands";
+    const auto *count = call->args[2].as<IntImmNode>();
+    ICHECK(count && call->args[2].dtype() == DataType::UInt(32) &&
+           count->value > 0 && count->value % 64 == 0)
+        << "FP32 block reduce requires a positive uint32 count in complete "
+           "64-lane repeats";
+    for (size_t i = 0; i < 2; ++i) {
+      const auto *pointer = call->args[i].as<CallNode>();
+      ICHECK(pointer && pointer->op.same_as(tl::access_ptr()) &&
+             pointer->args.size() == 3)
+          << "FP32 block reduce requires typed tl.access_ptr operands";
+      const auto *base = pointer->args[0].as<BufferLoadNode>();
+      const int mask = i == 0 ? kAccessWrite : kAccessRead;
+      const int64_t elements = i == 0 ? count->value / 8 : count->value;
+      ICHECK(base && base->buffer->dtype == DataType::Float(32) &&
+             IsSharedBuffer(base->buffer) &&
+             base->buffer->axis_separators.empty())
+          << "FP32 block reduce operands require FP32 UB storage";
+      ICHECK(is_const_int(pointer->args[2], mask))
+          << "FP32 block reduce pointer access mask differs from its operand";
+      ICHECK(is_const_int(pointer->args[1], elements))
+          << "FP32 block reduce pointer extent must match its exact count "
+             "input or block-partial output";
+      const Buffer &buffer = base->buffer;
+      ICHECK_EQ(base->indices.size(), buffer->shape.size());
+      PrimExpr capacity = make_const(DataType::Int(64), 1);
+      for (size_t axis = buffer->shape.size(); axis-- > 0;) {
+        if (!buffer->strides.empty())
+          ICHECK(analyzer_->CanProveEqual(buffer->strides[axis], capacity))
+              << "FP32 block reduce requires compact physical storage";
+        ICHECK(CanProveAscendRangeInBounds(
+            base->indices[axis], make_const(base->indices[axis].dtype(), 1),
+            buffer->shape[axis], analyzer_))
+            << "FP32 block reduce base must lie inside its backing";
+        capacity = capacity * cast(DataType::Int(64), buffer->shape[axis]);
+      }
+      auto offsets = buffer->ElemOffset(base->indices);
+      ICHECK(offsets.size() == 1 &&
+             analyzer_->CanProveEqual(
+                 floormod(offsets[0], make_const(offsets[0].dtype(), 8)),
+                 make_zero(offsets[0].dtype())))
+          << "FP32 block reduce operands require 32-byte aligned bases";
+      ICHECK(CanProveAscendRangeInBounds(
+          cast(DataType::Int(64), offsets[0] - buffer->elem_offset),
+          make_const(DataType::Int(64), elements), capacity, analyzer_))
+          << "FP32 block reduce pointer span must lie inside its backing";
+    }
+    const auto *destination =
+        call->args[0].as<CallNode>()->args[0].as<BufferLoadNode>();
+    const auto *source =
+        call->args[1].as<CallNode>()->args[0].as<BufferLoadNode>();
+    ICHECK(!destination->buffer->data.same_as(source->buffer->data))
+        << "FP32 block reduce requires independent input/output storage";
+    return IRMutatorWithAnalyzer::VisitStmt_(op);
+  }
+
   Stmt VisitStmt_(const EvaluateNode *op) final {
     const CallNode *call = op->value.as<CallNode>();
     if (call) {
+      if (const auto *native = call->op.as<OpNode>();
+          native && (native->name == "tl.ascend_membase.datablock_reduce_sum" ||
+                     native->name == "tl.ascend_membase.datablock_reduce_max"))
+        return LowerBlockReducePointers(op, call);
       if (const auto *native = call->op.as<OpNode>();
           native && (native->name == "tl.ascend_membase.sub_rows_f32" ||
                      native->name == "tl.ascend_membase.mul_rows_f32" ||

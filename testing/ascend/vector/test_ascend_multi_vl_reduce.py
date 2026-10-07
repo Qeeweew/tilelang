@@ -444,48 +444,56 @@ def test_ordinary_dsl_source_establishes_masks_and_vector_completion(kind):
 
 @pytest.mark.parametrize("kind", ["sum", "max"])
 @pytest.mark.parametrize("rows,columns", [(1, 512), (16, 1024), (3, 1536), (2, 4096)])
-def test_compact_wide_rows_have_two_native_levels_and_no_combine_tree(kind, rows, columns):
+def test_compact_wide_rows_have_three_native_levels_and_no_combine_tree(kind, rows, columns):
     before, source, destination = _program(kind=kind, rows=rows, columns=columns)
     after = _lower(before, vector=True)
-    count_name = PREFIX + ("sum" if kind == "sum" else "max_only_value")
-    (first,) = calls(after, count_name)
-    (second,) = _strided(after, kind)
-    target, origin = first.args[:2]
-    assert target.op.name == origin.op.name == "tl.access_ptr"
-    partials = target.args[0].buffer
+    count_name = "tl.ascend_membase.datablock_reduce_" + kind
+    first, second = calls(after, count_name)
+    (last,) = _strided(after, kind)
+    blocks, partials = (call.args[0].args[0].buffer for call in (first, second))
+    _equal(blocks.shape, [rows, columns // 8])
     _equal(partials.shape, [rows, columns // 64])
-    _equal(target.args[0].indices, [0, 0])
-    _equal([target.args[1], origin.args[1], first.args[2]],
-           [rows * (columns // 64), rows * columns, rows * columns])
-    assert [int(target.args[2]), int(origin.args[2])] == [2, 1]
-    assert origin.args[0].buffer.same_as(source)
-    _equal(origin.args[0].indices, [0, 0])
-    output, inputs = second.args[:2]
+    assert not blocks.data.same_as(partials.data)
+    for call, src, dst, read, written in (
+        (first, source, blocks, rows * columns, rows * columns // 8),
+        (second, blocks, partials, rows * columns // 8, rows * columns // 64),
+    ):
+        target, origin = call.args[:2]
+        assert target.op.name == origin.op.name == "tl.access_ptr"
+        assert target.args[0].buffer.same_as(dst)
+        assert origin.args[0].buffer.same_as(src)
+        _equal(target.args[0].indices, [0, 0])
+        _equal(origin.args[0].indices, [0, 0])
+        _equal([target.args[1], origin.args[1], call.args[2]], [written, read, read])
+        assert [int(target.args[2]), int(origin.args[2])] == [2, 1]
+        assert str(call.args[2].dtype) == "uint32"
+    output, inputs = last.args[:2]
     assert output.op.name == inputs.op.name == "tl.region"
     assert output.args[0].buffer.same_as(destination)
     assert inputs.args[0].buffer.same_as(partials)
     _equal(output.args[2:], [rows])
     _equal(inputs.args[2:], [rows, columns // 64])
-    assert [str(arg.dtype) for arg in second.args[2:]] == ["uint8", "uint16", "uint8"]
-    assert [int(arg) for arg in second.args[2:]] == [rows, columns // 512, columns // 64]
-    assert len(after["main"].body.block.alloc_buffers) == 3
+    assert [str(arg.dtype) for arg in last.args[2:]] == ["uint8", "uint16", "uint8"]
+    assert [int(arg) for arg in last.args[2:]] == [rows, columns // 512, columns // 64]
+    assert len(after["main"].body.block.alloc_buffers) == 4
     assert not nodes(after, tirx.Bind) and not nodes(after, tirx.For)
     assert not calls(after, "tl.ascend_membase.add")
     assert not calls(after, "tl.ascend_membase.max")
     units = transform.MaterializeScheduleUnits()(after)
     tasks = [task for task in nodes(units, tirx.AttrStmt) if task.attr_key == "tl.ascend_task"]
-    assert len(tasks) == 2
-    assert len(calls(tasks[0], count_name)) == 1 and len(_strided(tasks[1], kind)) == 1
+    assert len(tasks) == 3
+    assert [len(calls(task, count_name)) for task in tasks] == [1, 1, 0]
+    assert len(_strided(tasks[2], kind)) == 1
 
 
 @pytest.mark.parametrize("kind", ["sum", "max"])
 @pytest.mark.parametrize("retain_axis", [False, True])
-def test_two_level_plan_keeps_nonzero_origins_and_retained_output_axis(kind, retain_axis):
+def test_three_level_plan_keeps_nonzero_origins_and_retained_output_axis(kind, retain_axis):
     before, source, destination = _program(
         kind=kind, rows=3, columns=1024, source_row=2, output_row=8,
         retain_axis=retain_axis, index_dtype="int64")
     after = _lower(before)
-    (first,) = calls(after, PREFIX + ("sum" if kind == "sum" else "max_only_value"))
+    first, intermediate = calls(after, "tl.ascend_membase.datablock_reduce_" + kind)
     (second,) = _strided(after, kind)
     _equal(first.args[1].args[0].indices, [2, 0])
     _equal(second.args[0].args[0].indices, [8, 0] if retain_axis else [8])
@@ -493,9 +501,12 @@ def test_two_level_plan_keeps_nonzero_origins_and_retained_output_axis(kind, ret
     target = tvm.target.Target(TARGET)
     with target:
         pointers = tilelang.transform.LowerAccessPtr()(transform.AscendLowerTileOp()(after))
-    (lowered_first,) = calls(pointers, first.op.name)
+    lowered_first, lowered_intermediate = calls(pointers, first.op.name)
     (lowered_second,) = _strided(pointers, kind)
     _equal([lowered_first.args[1].args[2], lowered_first.args[1].args[3]], [2048, 3072])
+    _equal([lowered_first.args[0].args[2], lowered_first.args[0].args[3]], [0, 384])
+    _equal([lowered_intermediate.args[0].args[2], lowered_intermediate.args[0].args[3]], [0, 48])
+    _equal([lowered_intermediate.args[1].args[2], lowered_intermediate.args[1].args[3]], [0, 384])
     _equal([lowered_second.args[0].args[2], lowered_second.args[0].args[3]], [8, 3])
     _equal([lowered_second.args[1].args[2], lowered_second.args[1].args[3]], [0, 48])
     assert lowered_second.args[0].args[1].same_as(destination.data)
@@ -539,6 +550,7 @@ def test_two_level_scratch_is_charged_across_consecutive_reductions():
     filler = tirx.decl_buffer(((196608 - owner_bytes - 352) // 4,),
                               "float32", "filler", scope="shared.dyn")
     after = _lower(_root_program(before, extra_buffers=[second_output, filler], body=body))
+    assert not calls(after, "tl.ascend_membase.datablock_reduce_sum")
     assert len(_strided(after)) == 1
     assert [int(call.args[-1]) for call in calls(after, PREFIX + "sum")] == [3072, 1024, 16]
 
