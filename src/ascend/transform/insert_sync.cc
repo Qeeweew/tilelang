@@ -78,6 +78,8 @@ using ffi::GetRef;
 
 namespace {
 
+constexpr int kIntraCoreFlagLimit = 8;
+
 // One logical version is one physical collective counter on dav-2201. On
 // dav-3510, mode 4 addresses an independent Cube-side counter for each AIV.
 // Allocation, steady-state issue, and finite fill/drain use this same contract.
@@ -307,6 +309,15 @@ using CounterSyncSignature =
 // keys in different owners identify one shared physical counter channel.
 using CounterChannelKey = std::pair<CounterSyncSignature, int>;
 
+// A local hard event is a binary flag, unlike a cross-core counter. A carried
+// edge src(i) -> dst(i+d) uses producer-epoch IDs and only d initial tokens.
+// A reusable ring has width d+r, where dst(i) completes before src(i+r).
+// A finite non-reusing clock instead reserves one ID per real/initial epoch.
+struct LocalBinaryFlagPlan {
+  int distance;
+  PrimExpr trip_count;
+};
+
 struct SyncPoint {
   DepEdge edge;
   DependencyKind dependency_kind;
@@ -316,6 +327,7 @@ struct SyncPoint {
   int counter_group_id;
   size_t allocation_index;
   std::optional<CounterChannelKey> counter_channel;
+  std::optional<LocalBinaryFlagPlan> local_binary_plan;
 
   SyncPoint(DepEdge edge, DependencyKind dependency_kind, int num_versions,
             ControlNode *flag_loop)
@@ -705,12 +717,12 @@ public:
            Contains(DepEdge(src, dst, distance, true));
   }
 
-  int MinDistance(size_t src, size_t dst) const {
+  int MinDistance(size_t src, size_t dst, bool require_strict = false) const {
     int result = std::numeric_limits<int>::max();
     if (src >= outgoing_.size())
       return result;
     for (const DepEdge &edge : outgoing_[src]) {
-      if (edge.dst == dst)
+      if (edge.dst == dst && (!require_strict || edge.strict))
         result = std::min(result, edge.distance);
     }
     return result;
@@ -1021,6 +1033,30 @@ private:
     return closure.Contains(DepEdge(src, dst, 0, true)) ||
            (HasImplicitCompletionOrder(src, dst) &&
             closure.Contains(DepEdge(src, dst, 0, false)));
+  }
+
+  int MinCompletionDistance(const DepClosure &closure, size_t src,
+                            size_t dst) const {
+    // strict records a real completion relation somewhere in the composed
+    // path; weak segments around it need not each be synchronization edges.
+    return closure.MinDistance(src, dst, !HasImplicitCompletionOrder(src, dst));
+  }
+
+  std::optional<int> FiniteLocalBinaryWidth(ControlNode *loop,
+                                            const PrimExpr &trip_count,
+                                            int distance) const {
+    if (distance < 0 || distance > kIntraCoreFlagLimit)
+      return std::nullopt;
+    arith::Analyzer analyzer;
+    loop->task->outer_ctx.Populate(analyzer);
+    arith::ConstIntBound bound = analyzer.const_int_bound(trip_count);
+    if (bound->max_value < 0 ||
+        bound->max_value > kIntraCoreFlagLimit - distance) {
+      return std::nullopt;
+    }
+    // All real producer epochs and the negative initial epochs have distinct
+    // residues. Width one also represents an empty distance-zero stream.
+    return std::max<int>(1, static_cast<int>(bound->max_value) + distance);
   }
 
   bool SameIterationHappensBefore(ControlNode *scope, size_t src,
@@ -1635,8 +1671,118 @@ private:
         continue;
       bool is_innermost = loop == sync_point.flag_loop;
       int innermost_num_versions = is_innermost ? sync_point.num_versions : 1;
+      bool local_binary = architecture_ == AscendArchitecture::kDav2201 &&
+                          !site_registry_.IsCrossCore(sync_point);
       int min_distance =
-          closure.MinDistance(sync_point.edge.dst, sync_point.edge.src);
+          local_binary
+              ? MinCompletionDistance(closure, sync_point.edge.dst,
+                                      sync_point.edge.src)
+              : closure.MinDistance(sync_point.edge.dst, sync_point.edge.src);
+
+      if (local_binary && sync_point.edge.distance > 0) {
+        // Weak MTE/FIX issue edges alone do not establish that a previous
+        // WaitFlag has cleared the bit before its next SetFlag completes.
+        int reverse_completion = min_distance;
+        int distance = sync_point.edge.distance;
+        // Preserve the existing persistent protocol when every ring slot is
+        // an initial token and the consumer completes before the next set.
+        if (reverse_completion == 0 && distance == innermost_num_versions)
+          continue;
+
+        // A shifted lexical phase currently has a single, unconditional root
+        // clock. Re-seeding an inner loop at each entry is unsafe: a local
+        // drain only blocks its destination pipe, not the next source seed.
+        ICHECK(is_innermost && sync_point.counter_group_id == 0 &&
+               loop != nullptr && loop->GetParentControl() == nullptr &&
+               !loop->HasConditions() && !loop->BodyHasLoopBreak())
+            << "dav-2201 local binary flag: shifted carried events require "
+               "an unconditional outermost lexical loop";
+        const ConstrSet &loop_context = loop->GetLoopBodyContext();
+        ICHECK(loop_context.CanProve(site_registry_.Domain(src).active_guard) &&
+               loop_context.CanProve(site_registry_.Domain(dst).active_guard))
+            << "dav-2201 local binary flag: shifted carried events require "
+               "an unconditional active-epoch sequence";
+        const ForNode *for_node = loop->control.get();
+        PrimExpr step = for_node->step.has_value()
+                            ? for_node->step.value()
+                            : IntImm(for_node->extent.dtype(), 1);
+        ICHECK(loop->task->outer_ctx.CanProve(step > make_zero(step.dtype())))
+            << "dav-2201 local binary flag: loop step must be positive";
+        ICHECK(SideEffect(for_node->min) == CallEffectKind::kPure &&
+               SideEffect(for_node->extent) == CallEffectKind::kPure &&
+               SideEffect(step) == CallEffectKind::kPure)
+            << "dav-2201 local binary flag: loop bounds must be immutable";
+        PrimExpr trip_count = max(ceildiv(for_node->extent, step),
+                                  make_zero(for_node->extent.dtype()));
+        ICHECK(sync_point.flag_iteration.dtype().is_int() &&
+               trip_count.dtype().is_int())
+            << "dav-2201 local binary flag: shifted epoch clocks require "
+               "signed integer iteration and trip-count types";
+        if (reverse_completion == std::numeric_limits<int>::max()) {
+          std::optional<int> finite_width =
+              FiniteLocalBinaryWidth(loop, trip_count, distance);
+          ICHECK(finite_width.has_value())
+              << "dav-2201 local binary flag: no reverse completion path for "
+              << src.pipe << "->" << dst.pipe
+              << "; the whole lexical clock also exceeds the finite "
+                 "non-reusing event capacity";
+          sync_point.num_versions = *finite_width;
+        } else {
+          ICHECK_LE(reverse_completion,
+                    std::numeric_limits<int>::max() - distance);
+          sync_point.num_versions = distance + reverse_completion;
+        }
+        sync_point.local_binary_plan =
+            LocalBinaryFlagPlan{distance, trip_count};
+        continue;
+      }
+
+      if (local_binary && sync_point.edge.distance == 0) {
+        // A finite root lexical clock can reserve one ID per producer epoch,
+        // without a reverse dependency. One inner trip-count bound does not
+        // establish this for a repeated outer owner or a mutable counter.
+        if (min_distance == std::numeric_limits<int>::max() && is_innermost &&
+            sync_point.counter_group_id == 0 && loop != nullptr &&
+            loop->GetParentControl() == nullptr) {
+          const ForNode *for_node = loop->control.get();
+          PrimExpr step = for_node->step.has_value()
+                              ? for_node->step.value()
+                              : IntImm(for_node->extent.dtype(), 1);
+          bool whole_clock =
+              SideEffect(for_node->min) == CallEffectKind::kPure &&
+              SideEffect(for_node->extent) == CallEffectKind::kPure &&
+              SideEffect(step) == CallEffectKind::kPure &&
+              loop->task->outer_ctx.CanProve(step > make_zero(step.dtype()));
+          if (whole_clock) {
+            PrimExpr trip_count = max(ceildiv(for_node->extent, step),
+                                      make_zero(for_node->extent.dtype()));
+            if (std::optional<int> width =
+                    FiniteLocalBinaryWidth(loop, trip_count, 0)) {
+              sync_point.num_versions = *width;
+              sync_point.local_binary_plan = LocalBinaryFlagPlan{0, trip_count};
+              continue;
+            }
+          }
+        }
+        ICHECK_NE(min_distance, std::numeric_limits<int>::max())
+            << "dav-2201 local binary flag: no reverse completion path for "
+            << src.pipe << "->" << dst.pipe;
+        ICHECK_GT(min_distance, 0)
+            << "dav-2201 local binary flag: nonpositive reverse completion "
+               "distance for "
+            << src.pipe << "->" << dst.pipe;
+        if (is_innermost) {
+          sync_point.num_versions = min_distance;
+        } else {
+          // The owner clock does not advance within a descendant loop. Its
+          // repeated uses of one ID need completion before the next child
+          // iteration, irrespective of the owner's physical storage width.
+          ICHECK_LE(min_distance, 1)
+              << "dav-2201 local binary flag: reverse completion is too loose "
+                 "for a descendant loop sharing its owner's clock";
+        }
+        continue;
+      }
 
       // If the loop trip count is no larger than the ring, no version is
       // reused.
@@ -1682,6 +1828,10 @@ private:
                 bool allow_mixed_iter) const {
     const SyncPoint &lhs_sync = sync_points_[lhs.sync_point_id];
     const SyncPoint &rhs_sync = sync_points_[rhs.sync_point_id];
+    // Existing reuse proofs compare equal event phases. Keep a shifted local
+    // binary channel exclusive rather than sharing its partial seed/drain.
+    if (lhs_sync.local_binary_plan || rhs_sync.local_binary_plan)
+      return false;
     if (!site_registry_.UsesFlag(lhs_sync) ||
         !site_registry_.UsesFlag(rhs_sync) ||
         !site_registry_.HasCompatibleFlagKind(lhs_sync, rhs_sync)) {
@@ -1831,9 +1981,14 @@ struct FlagInfo {
   PrimExpr flag_var;
   std::string hardevent;
   int mode;
+  // Local binary rings may seed and drain different producer-epoch residues.
+  PrimExpr drain_flag_var = PrimExpr();
 };
 
 using FlagInfoList = std::vector<FlagInfo>;
+
+PrimExpr MakeFlagEventId(const PrimExpr &iteration, int num_versions,
+                         int base_id);
 
 struct CrossCoreFlagReservation {
   // Inclusive ranges of flag IDs used explicitly by the source kernel, for
@@ -2189,6 +2344,22 @@ private:
     int base_id = allocation.base_id;
 
     if (!site_registry_.IsCrossCore(sync_point)) {
+      if (sync_point.local_binary_plan) {
+        ICHECK_EQ(allocation.sync_points.size(), 1U);
+        const LocalBinaryFlagPlan &plan = *sync_point.local_binary_plan;
+        for (int token = 0; token < plan.distance; ++token) {
+          int epoch = token - plan.distance;
+          int residue =
+              (epoch % allocation.num_versions + allocation.num_versions) %
+              allocation.num_versions;
+          PrimExpr last_epoch =
+              plan.trip_count + IntImm(plan.trip_count.dtype(), epoch);
+          flag_infos_.push_back(FlagInfo{
+              src.core, Integer(base_id + residue), hard_event, 0,
+              MakeFlagEventId(last_epoch, allocation.num_versions, base_id)});
+        }
+        return;
+      }
       for (int version = 0; version < allocation.num_versions; ++version) {
         flag_infos_.push_back(
             FlagInfo{src.core, Integer(base_id + version), hard_event, 0});
@@ -2229,7 +2400,6 @@ private:
     }
   }
 
-  static constexpr int kIntraCoreFlagLimit = 8;
   static constexpr int kCrossCoreFlagLimit = 16;
 
   const SyncSiteRegistry &site_registry_;
@@ -2530,7 +2700,16 @@ private:
 
       InsertStatement(src.path_end, MakeAscendSetFlag(hard_event, event_id),
                       false, src.core, producer_guard);
-      InsertStatement(dst.path_end, MakeAscendWaitFlag(hard_event, event_id),
+      PrimExpr wait_id = event_id;
+      if (sync_point.local_binary_plan) {
+        PrimExpr producer_epoch =
+            sync_point.flag_iteration -
+            IntImm(sync_point.flag_iteration.dtype(),
+                   sync_point.local_binary_plan->distance);
+        wait_id =
+            MakeFlagEventId(producer_epoch, sync_point.num_versions, base_id);
+      }
+      InsertStatement(dst.path_end, MakeAscendWaitFlag(hard_event, wait_id),
                       true, dst.core, consumer_guard);
     }
   }
@@ -2681,9 +2860,11 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
     if (info.mode == 0) {
       prefix.push_back(MakeSyncTaskNode(
           MakeAscendSetFlag(info.hardevent, info.flag_var), info.core_mask, 0));
-      suffix.push_back(
-          MakeSyncTaskNode(MakeAscendWaitFlag(info.hardevent, info.flag_var),
-                           info.core_mask, 0));
+      suffix.push_back(MakeSyncTaskNode(
+          MakeAscendWaitFlag(info.hardevent, info.drain_flag_var.defined()
+                                                 ? info.drain_flag_var
+                                                 : info.flag_var),
+          info.core_mask, 0));
     } else if (info.mode == 1) {
       prefix.push_back(MakeSyncTaskNode(
           MakeAscendCrossCoreSetFlag(cross_core_contract.Mode(), info.hardevent,
