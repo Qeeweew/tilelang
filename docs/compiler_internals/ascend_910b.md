@@ -255,8 +255,14 @@ wide can use one batched count instruction. Proven tight source rows and
 contiguous destination results retain exact typed effects. The destination
 base keeps the native alignment requirement; internally adjacent scalar
 results use stride one. This path needs no reduction scratch or per-row scalar
-readback. Dynamic rows, partial or strided layouts, other widths and clear-false
-reductions retain the ordinary row plan.
+readback. Wider compact FP32 rows whose width is a multiple of 64 can use
+normal-mask native chunks across all static owned rows, followed by an ordinary
+balanced Add/Max tree. Exact chunk regions, compiler partials and combine scratch
+remain visible to scheduling; a conservative UB headroom check retains the
+original plan when this expansion cannot be admitted. Dynamic/empty owners,
+partial or strided layouts and clear-false reductions retain the ordinary row
+plan. See [the 2201 reduction contract](ascend_2201_reduce.md) for stride units,
+selection bounds, memory effects and numerical limits.
 
 Low-precision sum output remains diagnosed: FP32 accumulation followed by one
 narrowing does not preserve low-precision intermediate rounding. The promoted

@@ -1234,6 +1234,90 @@ private:
     return IRMutatorWithAnalyzer::VisitStmt_(lowered.get());
   }
 
+  // A strided WholeReduce reads one 64-element chunk of each physical row.
+  // Keep that exact rectangle through dependency/version planning; only this
+  // late mechanical conversion needs a pointer span covering the row gaps.
+  Stmt LowerRowReduceRegions(const EvaluateNode *op, const CallNode *call) {
+    ICHECK_EQ(call->args.size(), 4U);
+    const auto *rows = call->args[2].as<IntImmNode>();
+    const auto *stride = call->args[3].as<IntImmNode>();
+    ICHECK(rows && rows->value > 0 && rows->value <= 255 &&
+           call->args[2].dtype() == DataType::UInt(8) && stride &&
+           stride->value > 8 && stride->value <= 65535 &&
+           stride->value % 8 == 0 &&
+           call->args[3].dtype() == DataType::UInt(16))
+        << "FP32 row reduce requires positive uint8 rows and a uint16 "
+           "whole-VL source row stride";
+    Array<PrimExpr> args = call->args;
+    for (size_t i = 0; i < 2; ++i) {
+      const auto *region = call->args[i].as<CallNode>();
+      ICHECK(region && region->op.same_as(tl::region()))
+          << "FP32 row reduce requires exact typed tl.region operands";
+      BufferRegion access = NormalizeToBufferRegion(call->args[i]);
+      const int mask = i == 0 ? kAccessWrite : kAccessRead;
+      ICHECK(is_const_int(region->args[1], mask));
+      ICHECK(access->buffer->dtype == DataType::Float(32) &&
+             IsSharedBuffer(access->buffer));
+      const size_t rank = access->region.size();
+      const size_t trailing = i == 0 ? 1 : 2;
+      ICHECK_GE(rank, trailing);
+      for (size_t axis = 0; axis < rank; ++axis)
+        ICHECK(CanProveAscendRangeInBounds(
+            access->region[axis]->min, access->region[axis]->extent,
+            access->buffer->shape[axis], analyzer_))
+            << "FP32 row reduce region must lie inside its backing";
+      for (size_t axis = 0; axis + trailing < rank; ++axis)
+        ICHECK(is_one(access->region[axis]->extent))
+            << "FP32 row reduce leading/version axes must be singleton";
+      if (!access->buffer->strides.empty()) {
+        ICHECK(is_one(access->buffer->strides.back()))
+            << "FP32 row reduce requires contiguous input/output elements";
+        if (i == 1)
+          ICHECK(analyzer_->CanProveEqual(
+              access->buffer->strides[rank - 2],
+              make_const(access->buffer->strides[rank - 2].dtype(),
+                         stride->value * 8)))
+              << "FP32 row reduce source pitch differs from its stride";
+      }
+      PrimExpr span;
+      if (i == 0) {
+        ICHECK(is_const_int(access->region.back()->extent, rows->value));
+        span = access->region.back()->extent;
+      } else {
+        ICHECK(is_const_int(access->region[rank - 2]->extent, rows->value) &&
+               is_const_int(access->region.back()->extent, 64) &&
+               is_const_int(access->buffer->shape.back(), stride->value * 8))
+            << "FP32 row reduce source must be an exact [rows, 64] chunk "
+               "of its physical row width";
+        ICHECK(analyzer_->CanProveEqual(
+            floormod(access->region.back()->min,
+                     make_const(access->region.back()->min.dtype(), 64)),
+            make_zero(access->region.back()->min.dtype())))
+            << "FP32 row reduce source column must start at a whole VL";
+        DataType dtype = access->region[rank - 2]->extent.dtype();
+        span = (access->region[rank - 2]->extent - make_const(dtype, 1)) *
+                   make_const(dtype, stride->value * 8) +
+               make_const(dtype, 64);
+      }
+      Array<PrimExpr> indices;
+      for (const Range &range : access->region)
+        indices.push_back(range->min);
+      Array<PrimExpr> offsets = access->buffer->ElemOffset(indices);
+      ICHECK(offsets.size() == 1 &&
+             analyzer_->CanProveEqual(
+                 floormod(offsets[0], make_const(offsets[0].dtype(), 8)),
+                 make_zero(offsets[0].dtype())))
+          << "FP32 row reduce operands require 32-byte aligned bases";
+      args.Set(i, Call(DataType::Handle(), tl::access_ptr(),
+                       {BufferLoad(access->buffer, indices), span,
+                        make_const(DataType::Int(32), mask)}));
+    }
+    Evaluate lowered(
+        Call(call->dtype, call->op, args, call->annotations, call->span),
+        op->span);
+    return IRMutatorWithAnalyzer::VisitStmt_(lowered.get());
+  }
+
   Stmt VisitStmt_(const EvaluateNode *op) final {
     const CallNode *call = op->value.as<CallNode>();
     if (call) {
@@ -1242,6 +1326,11 @@ private:
                      native->name == "tl.ascend_membase.mul_rows_f32" ||
                      native->name == "tl.ascend_membase.div_rows_f32"))
         return LowerRowBinaryRegions(op, call);
+      if (const auto *native = call->op.as<OpNode>();
+          native &&
+          (native->name == "tl.ascend_membase.repeat_reduce_sum_rows_f32" ||
+           native->name == "tl.ascend_membase.repeat_reduce_max_rows_f32"))
+        return LowerRowReduceRegions(op, call);
     }
     // Do not analysis the call node to the global function.
     if (call && call->op.as<GlobalVarNode>())

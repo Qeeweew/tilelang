@@ -2049,6 +2049,37 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     return;
   }
   if (const auto *callee = op->op.as<OpNode>();
+      callee &&
+      (callee->name == "tl.ascend_membase.repeat_reduce_sum_rows_f32" ||
+       callee->name == "tl.ascend_membase.repeat_reduce_max_rows_f32")) {
+    ICHECK(is_dav2201_) << "FP32 strided row reduce requires dav-2201";
+    ICHECK_EQ(op->args.size(), 4U);
+    const auto *rows = op->args[2].as<IntImmNode>();
+    const auto *stride = op->args[3].as<IntImmNode>();
+    ICHECK(rows && rows->value > 0 && rows->value <= 255 && stride &&
+           stride->value > 8 && stride->value <= 65535 &&
+           stride->value % 8 == 0);
+    const char *name =
+        callee->name == "tl.ascend_membase.repeat_reduce_sum_rows_f32"
+            ? "asc_repeat_reduce_sum"
+            : "asc_repeat_reduce_max_only_value";
+    std::string dst = PrintExpr(op->args[0]);
+    std::string src = PrintExpr(op->args[1]);
+    std::string repeats = PrintExpr(op->args[2]);
+    std::string row_stride = PrintExpr(op->args[3]);
+    // The six-argument overload performs one complete FP32 VL per repeat.
+    // Its destination repeat stride is in elements; source strides are 32B
+    // blocks. Count-mode predecessors do not restore a full normal mask.
+    PrintIndent();
+    stream << "asc_set_mask_norm();\n";
+    PrintIndent();
+    stream << "asc_set_vector_mask(~uint64_t(0), ~uint64_t(0));\n";
+    PrintIndent();
+    stream << name << "(" << dst << ", " << src << ", " << repeats
+           << ", uint16_t(1), uint16_t(1), " << row_stride << ");\n";
+    return;
+  }
+  if (const auto *callee = op->op.as<OpNode>();
       callee && callee->name == "tl.ascend_membase.brcb_f32") {
     ICHECK(is_dav2201_) << "FP32 Brcb requires dav-2201";
     ICHECK_EQ(op->args.size(), 3U);

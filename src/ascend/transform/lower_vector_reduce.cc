@@ -14,6 +14,7 @@
 #include <tvm/tirx/transform.h>
 
 #include <limits>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -21,6 +22,8 @@
 #include "ascend/op/utils.h"
 #include "ascend/target_utils.h"
 #include "ascend/transform/attr.h"
+#include "ascend/transform/buffer_version.h"
+#include "ascend/transform/storage_footprint.h"
 #include "op/builtin.h"
 #include "op/reduce.h"
 #include "op/utils.h"
@@ -49,6 +52,17 @@ TVM_REGISTER_OP("tl.ascend_membase.repeat_reduce_max_only_value")
     .set_attr<TGlobalSymbol>("TGlobalSymbol",
                              "asc_repeat_reduce_max_only_value");
 
+// Normal-mask repeats retain exact [rows, 64] source regions. Unlike the
+// count overload, their source row stride is independently represented.
+TVM_REGISTER_OP("tl.ascend_membase.repeat_reduce_sum_rows_f32")
+    .set_num_inputs(4)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+TVM_REGISTER_OP("tl.ascend_membase.repeat_reduce_max_rows_f32")
+    .set_num_inputs(4)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
 namespace {
 
 class VectorReduceLowerer : public StmtExprMutator {
@@ -61,6 +75,7 @@ public:
         AscendArchitecture::kDav2201)
       return func;
     VectorReduceLowerer lowerer;
+    lowerer.ub_capacity_bytes_ = GetAscendTargetInfo(target.value()).ub_bytes;
     PrimFuncNode *writer = func.CopyOnWrite();
     writer->body = lowerer.VisitStmt(func->body);
     ICHECK(lowerer.scratch_.empty())
@@ -219,6 +234,177 @@ private:
                          {Ptr(dst_base, row_count->value, kAccessWrite),
                           Ptr(src_base, count, kAccessRead),
                           make_const(DataType::UInt(32), count)}));
+  }
+
+  Optional<Stmt> TryMultiVLNativeRows(const ReduceOp &reduce,
+                                      const BufferLoad &src,
+                                      const BufferLoad &dst,
+                                      const std::vector<Var> &rows,
+                                      int64_t input_count) {
+    const auto *op = reduce.get();
+    // Keep the established count-mode whole-VL path and all tail/dynamic
+    // cases. This is a normal-mask static repeat plan, not a count wrapper.
+    if (!op->clear || op->src->dtype != DataType::Float(32) ||
+        op->dst->dtype != DataType::Float(32) || rows.size() != 1 ||
+        op->src->shape.size() != 2 || input_count <= 64 ||
+        input_count % 64 != 0 || input_count / 8 > 65535 ||
+        !op->src->axis_separators.empty() || !op->dst->axis_separators.empty())
+      return std::nullopt;
+    const auto &src_ranges = op->srcRegion_->region;
+    const auto &dst_ranges = op->dstRegion_->region;
+    PrimExpr row_extent = analyzer_.Simplify(src_ranges[0]->extent);
+    const auto *row_count = row_extent.as<IntImmNode>();
+    if (!row_count || row_count->value <= 0 || row_count->value > 255 ||
+        !analyzer_.CanProveEqual(
+            op->src->shape.back(),
+            make_const(op->src->shape.back().dtype(), input_count)) ||
+        !is_zero(src_ranges.back()->min) ||
+        (dst_ranges.size() == 2 &&
+         (!is_one(op->dst->shape.back()) || !is_zero(dst_ranges.back()->min))))
+      return std::nullopt;
+    // The late native boundary consumes this original Buffer before layout
+    // remapping. Keep selection in that same compact physical-view domain.
+    if (!op->src->strides.empty() &&
+        (!is_one(op->src->strides.back()) ||
+         !analyzer_.CanProveEqual(
+             op->src->strides[0],
+             make_const(op->src->strides[0].dtype(), input_count))))
+      return std::nullopt;
+
+    const int64_t chunks = input_count / 64;
+    int64_t levels = 0, remaining = input_count;
+    do {
+      remaining = (remaining + 63) / 64;
+      ++levels;
+    } while (remaining > 1);
+    // Bound expansion by the ordinary row plan's native instruction count.
+    // This is a structural selection heuristic, not a measured time model:
+    // e.g. one wide row should keep its short two-level reduction tree.
+    if (2 * chunks - 1 > row_count->value * levels)
+      return std::nullopt;
+
+    Array<PrimExpr> src_indices, dst_indices;
+    for (const Range &range : src_ranges)
+      src_indices.push_back(range->min);
+    for (const Range &range : dst_ranges)
+      dst_indices.push_back(range->min);
+    BufferLoad src_base(op->src, src_indices), dst_base(op->dst, dst_indices);
+    PrimExpr src_offset = FlatOffset(src_base),
+             dst_offset = FlatOffset(dst_base);
+    auto raw_offsets = op->src->ElemOffset(src_indices);
+    if (!analyzer_.CanProveEqual(
+            FlatOffset(src),
+            src_offset + rows[0] * make_const(rows[0].dtype(), input_count)) ||
+        !analyzer_.CanProveEqual(FlatOffset(dst), dst_offset + rows[0]) ||
+        !analyzer_.CanProveEqual(
+            floormod(src_offset, make_const(src_offset.dtype(), 8)),
+            make_zero(src_offset.dtype())) ||
+        !analyzer_.CanProveEqual(
+            floormod(dst_offset, make_const(dst_offset.dtype(), 8)),
+            make_zero(dst_offset.dtype())) ||
+        raw_offsets.size() != 1 ||
+        !analyzer_.CanProveEqual(
+            floormod(raw_offsets[0], make_const(raw_offsets[0].dtype(), 8)),
+            make_zero(raw_offsets[0].dtype())))
+      return std::nullopt;
+
+    const int64_t count = row_count->value;
+    PrimExpr aligned_row_bytes = analyzer_.Simplify(ascend::AlignPrimExpr(
+        ascend::PackedBytesFromElems(make_const(DataType::Int(64), count), 32),
+        ascend::AscendScopeAlignBytes("shared.dyn")));
+    const auto *row_bytes = aligned_row_bytes.as<IntImmNode>();
+    ICHECK(row_bytes && row_bytes->value > 0);
+    const int64_t partial_bytes = chunks * row_bytes->value;
+    // VectorTiles emits at most one aligned row temporary per binary node.
+    // Charge even the final node, although its output normally is dst. Reserve
+    // these future allocations across subsequent reductions in the same root.
+    const int64_t combine_bytes = (chunks - 1) * row_bytes->value;
+    if (!HasMultiVLHeadroom(op->src, op->dst, partial_bytes + combine_bytes))
+      return std::nullopt;
+    Require(task_depth_ == 0,
+            "this reduction expands to multiple dependency-bearing tasks; "
+            "use T.Stage rather than an opaque T.Task/PerCoreTask wrapper");
+
+    const int64_t row_capacity = (count + 7) / 8 * 8;
+    Buffer partials = decl_buffer({make_const(DataType::Int(32), chunks),
+                                   make_const(DataType::Int(32), row_capacity)},
+                                  DataType::Float(32),
+                                  "membase_reduce_partials_" +
+                                      std::to_string(next_temporary_++),
+                                  "shared.dyn");
+    scratch_.push_back(partials);
+    future_combine_bytes_ += combine_bytes;
+    const Op &intrinsic = Op::Get(
+        op->type->IsSum() ? "tl.ascend_membase.repeat_reduce_sum_rows_f32"
+                          : "tl.ascend_membase.repeat_reduce_max_rows_f32");
+    Array<Stmt> tasks;
+    for (int64_t chunk = 0; chunk < chunks; ++chunk) {
+      Array<PrimExpr> source = src_indices;
+      source.Set(1, source[1] + make_const(source[1].dtype(), chunk * 64));
+      PrimExpr source_region =
+          Call(DataType::Handle(), tl::region(),
+               {BufferLoad(op->src, source),
+                make_const(DataType::Int(32), kAccessRead),
+                make_const(src_ranges[0]->extent.dtype(), count),
+                make_const(src_ranges[1]->extent.dtype(), 64)});
+      PrimExpr destination_region =
+          Call(DataType::Handle(), tl::region(),
+               {BufferLoad(partials, {make_const(DataType::Int(32), chunk), 0}),
+                make_const(DataType::Int(32), kAccessWrite),
+                make_const(DataType::Int(32), 1),
+                make_const(DataType::Int(32), count)});
+      tasks.push_back(
+          Evaluate(Call(DataType::Void(), intrinsic,
+                        {destination_region, source_region,
+                         make_const(DataType::UInt(8), count),
+                         make_const(DataType::UInt(16), input_count / 8)})));
+    }
+
+    // Each chunk performs the native 64-lane tree. Combine compact row
+    // vectors with an ordinary balanced tree, preserving typed FP32 nodes
+    // and their separate scheduling/completion boundaries in VectorTiles.
+    std::vector<PrimExpr> values;
+    for (int64_t chunk = 0; chunk < chunks; ++chunk)
+      values.push_back(BufferLoad(
+          partials, {make_const(DataType::Int(32), chunk), rows[0]}));
+    while (values.size() > 1) {
+      std::vector<PrimExpr> next;
+      for (size_t i = 0; i < values.size(); i += 2)
+        next.push_back(i + 1 == values.size() ? values[i]
+                       : op->type->IsSum()
+                           ? PrimExpr(Add(values[i], values[i + 1]))
+                           : PrimExpr(Max(values[i], values[i + 1])));
+      values = std::move(next);
+    }
+    tasks.push_back(For(rows[0], make_zero(rows[0].dtype()),
+                        make_const(rows[0].dtype(), count), ForKind::kParallel,
+                        BufferStore(op->dst, values[0], dst->indices)));
+    return MakeSeq(tasks);
+  }
+
+  bool HasMultiVLHeadroom(const Buffer &src, const Buffer &dst,
+                          int64_t candidate_bytes) {
+    if (!ub_owner_bytes_.has_value() || !ub_slots_.Get(src->data).has_value() ||
+        !ub_slots_.Get(dst->data).has_value())
+      return false;
+    int64_t remaining = ub_capacity_bytes_ - ub_owner_bytes_.value();
+    auto charge = [&](int64_t bytes) {
+      if (bytes < 0 || bytes > remaining)
+        return false;
+      remaining -= bytes;
+      return true;
+    };
+    if (!charge(future_combine_bytes_) || !charge(candidate_bytes))
+      return false;
+    for (const Buffer &buffer : scratch_) {
+      PrimExpr footprint = analyzer_.Simplify(ascend::AlignPrimExpr(
+          ascend::GetBufferSizeBytes(buffer, DataType::Int(64)),
+          ascend::AscendScopeAlignBytes(GetPtrStorageScope(buffer->data))));
+      const auto *bytes = footprint.as<IntImmNode>();
+      if (!bytes || !charge(bytes->value))
+        return false;
+    }
+    return true;
   }
 
   Stmt LowerReduce(const ReduceOp &reduce) {
@@ -382,6 +568,9 @@ private:
 
     if (auto batched = TryBatchNativeRows(reduce, src, dst, rows, input_count))
       return batched.value();
+    if (auto batched =
+            TryMultiVLNativeRows(reduce, src, dst, rows, input_count))
+      return batched.value();
 
     // Max needs twice the element alignment even in ONLY_VALUE mode. An
     // inferred padded output layout may satisfy that contract directly; a
@@ -479,6 +668,40 @@ private:
   Stmt VisitStmt_(const SBlockNode *op) final {
     bool root = op->name_hint == "tilelang_root";
     LayoutMap saved = layouts_;
+    auto saved_bytes = ub_owner_bytes_;
+    auto saved_slots = ub_slots_;
+    int64_t saved_combine_bytes = future_combine_bytes_;
+    if (root) {
+      // Reuse the common allocation/storage facts: owner aliases are charged
+      // once at their maximum footprint, including layout output and alignment.
+      // Unknown storage or explicit future versioning keeps the original plan.
+      ub_slots_ =
+          ascend::StorageFootprintCollector::SlotBytes(GetRef<SBlock>(op));
+      ub_owner_bytes_ = 0;
+      future_combine_bytes_ = 0;
+      for (const auto &[storage, footprint] : ub_slots_) {
+        if (ascend::AscendScopeAlignBytes(GetPtrStorageScope(storage)) != 32)
+          continue;
+        PrimExpr simplified = analyzer_.Simplify(footprint);
+        const auto *bytes = simplified.as<IntImmNode>();
+        if (!bytes || bytes->value < 0 ||
+            bytes->value > ub_capacity_bytes_ - ub_owner_bytes_.value()) {
+          ub_owner_bytes_ = std::nullopt;
+          break;
+        }
+        ub_owner_bytes_ = ub_owner_bytes_.value() + bytes->value;
+      }
+      for (const char *key : {kBufferVersionsMap, kManualMultiBuffer}) {
+        if (auto value = op->annotations.Get(key)) {
+          for (const auto &[storage, versions] :
+               value.value().cast<BufferVersionMap>()) {
+            if (versions > 1 && ascend::AscendScopeAlignBytes(
+                                    GetPtrStorageScope(storage)) == 32)
+              ub_owner_bytes_ = std::nullopt;
+          }
+        }
+      }
+    }
     if (auto map = op->annotations.Get(attr::kLayoutMap))
       layouts_ = map.value().cast<LayoutMap>();
     SBlock block = Downcast<SBlock>(StmtExprMutator::VisitStmt_(op));
@@ -489,12 +712,21 @@ private:
       scratch_.clear();
     }
     layouts_ = saved;
+    if (root) {
+      ub_owner_bytes_ = saved_bytes;
+      ub_slots_ = saved_slots;
+      future_combine_bytes_ = saved_combine_bytes;
+    }
     return block;
   }
 
   arith::Analyzer analyzer_;
   LayoutMap layouts_;
   Array<Buffer> scratch_;
+  ffi::Map<Var, PrimExpr> ub_slots_;
+  std::optional<int64_t> ub_owner_bytes_;
+  int64_t ub_capacity_bytes_{0};
+  int64_t future_combine_bytes_{0};
   int next_temporary_{0};
   int next_row_{0};
   int task_depth_{0};
