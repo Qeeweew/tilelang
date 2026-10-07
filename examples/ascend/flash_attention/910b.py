@@ -111,7 +111,12 @@ def flash_attention_fwd(
             next_maximum[i] = T.max(maximum[i], next_maximum[i])
             alpha[i] = T.exp(maximum[i] - next_maximum[i])
         for i, j in T.Parallel(block_q, block_kv):
-            scores[i, j] = T.exp(scores[i, j] - next_maximum[i])
+            # The unnormalized score is dead after row max. Expose its
+            # replacement before exp so this ordinary expression does not
+            # need another full score tile for the subtraction result.
+            scores[i, j] = scores[i, j] - next_maximum[i]
+        for i, j in T.Parallel(block_q, block_kv):
+            scores[i, j] = T.exp(scores[i, j])
             p[i, j] = T.cast(scores[i, j], dtype)
         T.reduce_sum(scores, row_sum, dim=1, clear=True)
         for i in T.Parallel(block_q):
