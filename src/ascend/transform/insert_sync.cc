@@ -59,6 +59,7 @@
 #include "./auto_schedule/dependency_analysis.h"
 #include "./auto_schedule/kernel_rewriter.h"
 #include "./auto_schedule/multi_buffer.h"
+#include "./auto_schedule/owner_result.h"
 #include "./auto_schedule/scheduled_tir.h"
 #include "./auto_schedule/task_analysis.h"
 #include "./auto_schedule/task_annotations.h"
@@ -158,7 +159,9 @@ struct SyncInsertionSite {
   PrimExpr guard{Bool(true)};
 
   SyncInsertionSite(IRStructure *path_begin, TaskNode *task, bool at_beginning,
-                    CoreMask core, const EpochDomain &domain)
+                    CoreMask core, const EpochDomain &domain,
+                    ControlNode *participant_loop = nullptr,
+                    bool active_tasks_only = false)
       : path_begin(path_begin), path_end(nullptr), at_beginning(at_beginning),
         core(core), pipe(GetResourcePipeName(task->GetPipeMask())),
         domain_id(domain.id) {
@@ -184,7 +187,11 @@ struct SyncInsertionSite {
     for (size_t path_index = 0; path_index < path.size(); ++path_index) {
       path_end = path[path_index];
       bool has_conditions = path_end->HasConditions();
-      if (has_conditions) {
+      if (has_conditions && active_tasks_only) {
+        // The owner plan proves the exact finite source/consumer activation.
+        // Unlike a seeded collective clock, it emits no inactive-epoch token.
+        append(path_end->GetConditionGuard());
+      } else if (has_conditions) {
         // Only a guard scope's direct child may absorb its active guard.
         if (path_end != path_begin || is_one(active_guard) ||
             path_begin->GetParent() != domain.owner)
@@ -210,6 +217,11 @@ struct SyncInsertionSite {
       if (path_end == path_begin && has_conditions)
         active_guard_is_enclosed = path_begin_guard_matches_active;
       const ForNode *for_node = control->control.get();
+      // An owner-result cut is reached once for each complete owner plane.
+      // Descendant physical-tile loops still contribute their final-iteration
+      // guard. Ordinary collective sites never pass participant_loop.
+      if (control == participant_loop)
+        continue;
       PrimExpr loop_var = for_node->loop_var;
       PrimExpr min = for_node->min;
       PrimExpr extent = for_node->extent;
@@ -856,7 +868,7 @@ std::string GetHardEvent(const std::string &producer_pipe,
 // SyncInsertionSite stores raw GetResourcePipeName values; the PIPE_ prefix
 // belongs only to names emitted for flags and barriers.
 bool HasImplicitSamePipeOrder(const std::string &pipe,
-                             AscendArchitecture architecture) {
+                              AscendArchitecture architecture) {
   return pipe == "S" || pipe == "M" ||
          (pipe == "V" && architecture != AscendArchitecture::kDav2201);
 }
@@ -866,17 +878,17 @@ bool HasImplicitSamePipeOrder(const std::string &pipe,
 // ============================================================================
 class SyncAnalyzer : public BufferAliasAnalysisContext {
 public:
-  explicit SyncAnalyzer(const MultiBufferPlan &multi_buffer_plan,
-                        const EpochDomainRegistry &domains,
-                        AscendArchitecture architecture,
-                        BufferVersionMap manual = {},
-                        ConflictHintList root_conflicts = {},
-                        L0StorageGroups storage_groups = L0StorageGroups())
+  explicit SyncAnalyzer(
+      const MultiBufferPlan &multi_buffer_plan,
+      const EpochDomainRegistry &domains, AscendArchitecture architecture,
+      BufferVersionMap manual = {}, ConflictHintList root_conflicts = {},
+      L0StorageGroups storage_groups = L0StorageGroups(),
+      const std::vector<OwnerResultPlan> *owner_results = nullptr)
       : storage_groups_(std::move(storage_groups)),
         multi_buffer_plan_(multi_buffer_plan), domains_(domains),
         architecture_(architecture), manual_(std::move(manual)),
         root_conflicts_(std::move(root_conflicts)),
-        site_registry_(domains) {
+        owner_results_(owner_results), site_registry_(domains) {
     for (const MultiBufferInfo &info : multi_buffer_plan_.Infos()) {
       ICHECK(!info.owners.empty());
       std::vector<ControlNode *> owners;
@@ -892,7 +904,7 @@ public:
   SyncAnalyzer(const SyncAnalyzer &) = delete;
   SyncAnalyzer &operator=(const SyncAnalyzer &) = delete;
 
-  void Analyze(const std::vector<std::shared_ptr<IRStructure>> &root) {
+  bool Analyze(const std::vector<std::shared_ptr<IRStructure>> &root) {
     disable_buffer_reuse_ =
         tvm::transform::PassContext::Current()
             ->GetConfig<Bool>(kDisableSharedMemoryReuse, Bool(false))
@@ -907,12 +919,14 @@ public:
     lifetime_orders_.clear();
     SyncAnalysisResult root_result = AnalyzeNodeList(nodes, /*loop=*/nullptr);
     scope_closures_.insert_or_assign(nullptr, std::move(root_result.closure));
+    if (owner_fallback_required_)
+      return false;
 
     // The contract's presence still enables sequential allocation downstream.
     // Synchronization and flag reuse above remain necessary in this mode.
     if (disable_buffer_reuse_) {
       buffer_aliases_ = {};
-      return;
+      return true;
     }
 
     BufferAliasAnalyzer buffer_alias_analyzer(*this, storage_groups_);
@@ -920,6 +934,7 @@ public:
     buffer_alias_analyzer.Analyze(root);
     buffer_alias_analyzer.Validate();
     buffer_aliases_ = buffer_alias_analyzer.GetAliases();
+    return true;
   }
 
   const SyncSiteRegistry &SiteRegistry() const { return site_registry_; }
@@ -931,6 +946,21 @@ public:
   }
 
   const BufferAliasMap &BufferAliases() const { return buffer_aliases_; }
+
+  bool HasOwnerResultRelease(const OwnerResultPlan &plan) const {
+    int domain = domains_.DomainForStorage(plan.storage, plan.epoch);
+    size_t read_end = site_registry_.FindSiteId(
+        SyncInsertionSiteKey{plan.consumer->GetChildOnPathFrom(plan.epoch),
+                             plan.consumer, false, kCoreVector, domain});
+    size_t write_begin = site_registry_.FindSiteId(
+        SyncInsertionSiteKey{plan.producer->GetChildOnPathFrom(plan.epoch),
+                             plan.producer, true, kCoreCube, domain});
+    const DepClosure &closure = scope_closures_.at(plan.epoch);
+    int distance = MinCompletionDistance(closure, read_end, write_begin);
+    // The ordinary collective release must retire all reads before this GM
+    // slot is written again. No owner-result edge contributes to this proof.
+    return distance <= plan.num_slots - plan.distance;
+  }
 
 private:
   std::vector<size_t> ResolveLifetimeEndpoints(const Var &storage,
@@ -1544,6 +1574,22 @@ private:
                               HasUnitFlagCtrl(consumer->stmt));
         for (CoreMask producer_core : expand_cores(producer->GetCoreMask())) {
           for (CoreMask consumer_core : expand_cores(consumer->GetCoreMask())) {
+            if (owner_results_ && dep.kind == DependencyKind::kData &&
+                dep.storage.has_value() && producer_core == kCoreCube &&
+                consumer_core == kCoreVector &&
+                std::any_of(
+                    owner_results_->begin(), owner_results_->end(),
+                    [&](const OwnerResultPlan &plan) {
+                      return plan.storage.same_as(dep.storage.value()) &&
+                             plan.producer == producer &&
+                             plan.consumer == consumer && plan.epoch == loop &&
+                             plan.distance == distance;
+                    })) {
+              // A qualified RAW is materialized as a per-owner result. Keep
+              // it out of the all-participant closure: it cannot discharge an
+              // unrelated GM hazard or prove a collective allocation lifetime.
+              continue;
+            }
             if (producer_core == consumer_core && fix_unit_flag)
               continue;
             if (info != nullptr && info->UsesCounter() && !within_owner &&
@@ -1634,8 +1680,9 @@ private:
             continue;
           int64_t distance = int64_t(a.path_begin->GetStage()) -
                              b.path_begin->GetStage() + (src < dst ? 0 : 1);
-          ICHECK(order.AddEdge(src, dst, std::max<int64_t>(distance, 0),
-                               HasImplicitSamePipeOrder(a.pipe, architecture_)));
+          ICHECK(
+              order.AddEdge(src, dst, std::max<int64_t>(distance, 0),
+                            HasImplicitSamePipeOrder(a.pipe, architecture_)));
         }
       }
     }
@@ -1809,8 +1856,7 @@ private:
   }
 
   void OptimizeFlagVersions(std::vector<SyncPoint> &sync_points,
-                            const DepClosure &closure,
-                            ControlNode *loop) const {
+                            const DepClosure &closure, ControlNode *loop) {
     for (SyncPoint &sync_point : sync_points) {
       const SyncInsertionSite &src = site_registry_.Src(sync_point);
       const SyncInsertionSite &dst = site_registry_.Dst(sync_point);
@@ -1853,6 +1899,15 @@ private:
                << site_registry_.Domain(dst).active_guard << "]";
         return detail.str();
       };
+
+      if (local_binary && min_distance == std::numeric_limits<int>::max() &&
+          owner_results_ && !owner_results_->empty()) {
+        // The old pair-ready may have supplied this unrelated ring's only
+        // reverse-completion witness. Do not use an owner edge as its proof
+        // or weaken binary validation; retry the normal collective analysis.
+        owner_fallback_required_ = true;
+        return;
+      }
 
       if (local_binary && sync_point.edge.distance > 0) {
         // Weak MTE/FIX issue edges alone do not establish that a previous
@@ -2149,6 +2204,7 @@ private:
   BufferVersionMap manual_;
   MultiBufferOwnerMap multi_buffer_owners_;
   ConflictHintList root_conflicts_;
+  const std::vector<OwnerResultPlan> *owner_results_;
   SyncSiteRegistry site_registry_;
   std::vector<SyncPoint> sync_points_;
   std::set<std::pair<size_t, size_t>> reusable_pairs_;
@@ -2159,6 +2215,7 @@ private:
       counter_channel_occurrences_;
   BufferAliasMap buffer_aliases_;
   bool disable_buffer_reuse_{false};
+  bool owner_fallback_required_{false};
 };
 
 // ============================================================================
@@ -2264,8 +2321,9 @@ private:
   CrossCoreFlagReservation reservation_;
 };
 
-CrossCoreFlagReservation CollectExplicitCrossCoreFlags(
-    const Stmt &kernel_body, const CrossCoreSyncContract &contract) {
+CrossCoreFlagReservation
+CollectExplicitCrossCoreFlags(const Stmt &kernel_body,
+                              const CrossCoreSyncContract &contract) {
   ExplicitCrossCoreFlagCollector collector(contract);
   return collector.Collect(kernel_body);
 }
@@ -2282,7 +2340,7 @@ public:
         cross_core_flag_reservation_(cross_core_flag_reservation),
         cross_core_contract_(cross_core_contract) {}
 
-  void Plan() {
+  bool Plan(bool allow_fallback = false) {
     allocations_.clear();
     flag_infos_.clear();
     GroupCounterChannels();
@@ -2424,6 +2482,8 @@ public:
         sync_point.allocation_index = allocations_.size();
         int base_id = 0;
         if (cross_core) {
+          if (cross_core_base < 0 && allow_fallback)
+            return false;
           ICHECK_GE(cross_core_base, 0)
               << "Ascend AutoSchedule cannot allocate "
               << sync_point.num_versions
@@ -2475,6 +2535,7 @@ public:
                "exclusive";
       }
     }
+    return true;
   }
 
   const std::vector<FlagAllocation> &Allocations() const {
@@ -2796,6 +2857,84 @@ void InsertStatement(IRStructure *node, Stmt stmt, bool at_beginning,
   }
 }
 
+// Result readiness has an owner selector in addition to the existing storage
+// epoch. It deliberately has no all-participant closure projection or flag
+// reuse: each owner/GM-slot pair owns one result ID. The normal collective
+// reader release proves consumption before this slot and ID can be reused.
+struct OwnerResultEvent {
+  SyncInsertionSite producer;
+  SyncInsertionSite consumer;
+  PrimExpr producer_id;
+  PrimExpr consumer_id;
+};
+
+std::optional<std::vector<OwnerResultEvent>>
+AllocateOwnerResultEvents(const std::vector<OwnerResultPlan> &plans,
+                          const SyncSiteRegistry &site_registry,
+                          const std::vector<SyncPoint> &sync_points,
+                          const std::vector<FlagAllocation> &allocations,
+                          const CrossCoreFlagReservation &reservation,
+                          const EpochDomainRegistry &domains) {
+  if (plans.empty())
+    return std::vector<OwnerResultEvent>{};
+  if (reservation.has_unbounded_id)
+    return std::nullopt;
+  std::array<bool, 16> used{};
+  for (const auto &[lo, hi] : reservation.explicit_id_ranges) {
+    if (hi - lo >= 15) {
+      used.fill(true);
+      break;
+    }
+    for (int64_t id = lo; id <= hi; ++id)
+      used[(id % 16 + 16) % 16] = true;
+  }
+  for (const FlagAllocation &allocation : allocations) {
+    if (!site_registry.IsCrossCore(sync_points[allocation.sync_points.front()]))
+      continue;
+    for (int offset = 0; offset < allocation.num_versions; ++offset)
+      used[allocation.base_id + offset] = true;
+  }
+  std::vector<OwnerResultEvent> result;
+  for (const OwnerResultPlan &plan : plans) {
+    int width = 2 * plan.num_slots;
+    int base = -1;
+    for (int candidate = 16 - width; candidate >= 0; --candidate) {
+      bool free = true;
+      for (int offset = 0; offset < width; ++offset)
+        free &= !used[candidate + offset];
+      if (free) {
+        base = candidate;
+        break;
+      }
+    }
+    if (base < 0)
+      return std::nullopt;
+    for (int offset = 0; offset < width; ++offset)
+      used[base + offset] = true;
+    const EpochDomain &domain =
+        domains.Domain(domains.DomainForStorage(plan.storage, plan.epoch));
+    SyncInsertionSite producer(plan.producer->GetChildOnPathFrom(plan.epoch),
+                               plan.producer, false, kCoreCube, domain,
+                               plan.owner, true);
+    SyncInsertionSite consumer(plan.consumer->GetChildOnPathFrom(plan.epoch),
+                               plan.consumer, true, kCoreVector, domain,
+                               nullptr, true);
+    // Include activation captured inside an atomic copy task as well as its
+    // enclosing control. The proof expands immutable Binds and excludes
+    // descendant-loop coordinates from these predicates.
+    producer.guard = producer.guard && plan.producer_activation;
+    consumer.guard = consumer.guard && plan.consumer_activation;
+    PrimExpr producer_id = plan.owner->control->loop_var * plan.num_slots +
+                           plan.producer_slot + base;
+    PrimExpr consumer_id =
+        plan.sid * plan.num_slots + plan.consumer_slot + base;
+    result.push_back({std::move(producer), std::move(consumer),
+                      cast(DataType::Int(32), producer_id),
+                      cast(DataType::Int(32), consumer_id)});
+  }
+  return result;
+}
+
 class SyncMaterializer {
 public:
   SyncMaterializer(const SyncSiteRegistry &site_registry,
@@ -2803,14 +2942,27 @@ public:
                    const std::vector<FlagAllocation> &allocations,
                    AscendArchitecture architecture,
                    const CrossCoreSyncContract &cross_core_contract,
-                   const std::vector<Var> &lane_variables)
+                   const std::vector<Var> &lane_variables,
+                   const std::vector<OwnerResultEvent> &owner_results)
       : site_registry_(site_registry), sync_points_(sync_points),
         allocations_(allocations), architecture_(architecture),
         cross_core_contract_(cross_core_contract),
-        lane_variables_(lane_variables) {}
+        lane_variables_(lane_variables), owner_results_(owner_results) {}
 
   void Run(std::vector<std::shared_ptr<IRStructure>> &root) {
     InsertSyncPoints();
+    for (const OwnerResultEvent &event : owner_results_) {
+      ICHECK(architecture_ == AscendArchitecture::kDav2201);
+      ICHECK_EQ(cross_core_contract_.num_aiv_subcores, 2);
+      InsertStatement(
+          event.producer.path_end,
+          MakeAscendCrossCoreSetFlag(2, "PIPE_FIX", event.producer_id), false,
+          kCoreCube, event.producer.GetGuard());
+      InsertStatement(
+          event.consumer.path_end,
+          MakeAscendCrossCoreWaitFlag(2, "PIPE_MTE2", event.consumer_id), true,
+          kCoreVector, event.consumer.GetGuard());
+    }
     MaterializeInsertions(root, nullptr);
   }
 
@@ -2997,6 +3149,7 @@ private:
   AscendArchitecture architecture_;
   const CrossCoreSyncContract &cross_core_contract_;
   const std::vector<Var> &lane_variables_;
+  const std::vector<OwnerResultEvent> &owner_results_;
 };
 
 // ============================================================================
@@ -3021,26 +3174,64 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
         << "InsertSync requires ResolveCore to assign every T.Task";
   }
   EpochDomainRegistry domains(root, multi_buffer_plan);
-  SyncAnalyzer analyzer(
-      multi_buffer_plan, domains, target_info.architecture,
-      scheduled_tir.metadata.manual_buffer_versions,
-      std::move(scheduled_tir.metadata.root_conflict_hints), groups);
-  scheduled_tir.metadata.root_conflict_hints = {};
-  analyzer.Analyze(root);
-  scheduled_tir.metadata.buffer_aliases = analyzer.BufferAliases();
-  scheduled_tir.metadata.has_buffer_aliases = true;
-
   CrossCoreFlagReservation cross_core_flag_reservation =
       CollectExplicitCrossCoreFlags(kernel_body, cross_core_contract);
-  FlagAllocator flag_allocator(
-      analyzer.SiteRegistry(), analyzer.SyncPoints(), analyzer.ReusablePairs(),
-      cross_core_flag_reservation, cross_core_contract);
-  flag_allocator.Plan();
-  SyncMaterializer(analyzer.SiteRegistry(), analyzer.SyncPoints(),
-                   flag_allocator.Allocations(), target_info.architecture,
-                   cross_core_contract, lane_variables)
+  std::vector<OwnerResultPlan> owner_results;
+  if (cross_core_contract.collective &&
+      cross_core_contract.num_aiv_subcores == 2) {
+    owner_results = AnalyzeOwnerResults(
+        root, scheduled_tir.metadata.kernel_root,
+        scheduled_tir.metadata.manual_buffer_versions, lane_variables);
+  }
+  std::unique_ptr<SyncAnalyzer> analyzer;
+  std::unique_ptr<FlagAllocator> flag_allocator;
+  std::optional<std::vector<OwnerResultEvent>> owner_events;
+  for (;;) {
+    flag_allocator.reset();
+    analyzer = std::make_unique<SyncAnalyzer>(
+        multi_buffer_plan, domains, target_info.architecture,
+        scheduled_tir.metadata.manual_buffer_versions,
+        scheduled_tir.metadata.root_conflict_hints, groups, &owner_results);
+    if (!analyzer->Analyze(root)) {
+      ICHECK(!owner_results.empty());
+      owner_results.clear();
+      continue;
+    }
+    size_t candidate_count = owner_results.size();
+    owner_results.erase(
+        std::remove_if(owner_results.begin(), owner_results.end(),
+                       [&](const OwnerResultPlan &plan) {
+                         return !analyzer->HasOwnerResultRelease(plan);
+                       }),
+        owner_results.end());
+    if (owner_results.size() != candidate_count)
+      continue;
+    flag_allocator = std::make_unique<FlagAllocator>(
+        analyzer->SiteRegistry(), analyzer->SyncPoints(),
+        analyzer->ReusablePairs(), cross_core_flag_reservation,
+        cross_core_contract);
+    if (!flag_allocator->Plan(!owner_results.empty())) {
+      owner_results.clear();
+      continue;
+    }
+    owner_events = AllocateOwnerResultEvents(
+        owner_results, analyzer->SiteRegistry(), analyzer->SyncPoints(),
+        flag_allocator->Allocations(), cross_core_flag_reservation, domains);
+    if (owner_events.has_value())
+      break;
+    // Owner specialization is optional. A kernel requiring the remaining
+    // result IDs keeps the normal collective implementation instead.
+    ICHECK(!owner_results.empty());
+    owner_results.clear();
+  }
+  scheduled_tir.metadata.root_conflict_hints = {};
+  scheduled_tir.metadata.buffer_aliases = analyzer->BufferAliases();
+  scheduled_tir.metadata.has_buffer_aliases = true;
+  SyncMaterializer(analyzer->SiteRegistry(), analyzer->SyncPoints(),
+                   flag_allocator->Allocations(), target_info.architecture,
+                   cross_core_contract, lane_variables, owner_events.value())
       .Run(root);
-  FlagInfoList flag_infos = flag_allocator.TakeFlagInfos();
+  FlagInfoList flag_infos = flag_allocator->TakeFlagInfos();
 
   std::vector<std::shared_ptr<IRStructure>> prefix;
   std::vector<std::shared_ptr<IRStructure>> suffix;

@@ -143,6 +143,12 @@ native operations to automatic scheduling and completion analysis.
 The original `cthread` variable, extent and `vector_count` remain lexical launch
 facts. They do not permit an empty AIV owner to skip collective completion.
 
+For explicitly indexed independent queries, `InsertSync` can prove a narrower
+[owner result completion](ascend_2201_owner_results.md) from typed FIX/GM/UB
+regions. It publishes a complete Cube result per owner and GM slot, retaining
+ordinary collective input-ready and reader-release protocols. These owner
+edges do not enter the all-participant closure or buffer-alias lifetime proof.
+
 Common buffer-owner inference can recognize a full GEMM definition on the
 first iteration of a guaranteed static descendant loop. Only positive,
 unguarded, unit-step descendants contribute their first coordinate; the
