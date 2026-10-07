@@ -2118,6 +2118,8 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
                                                            : "asc_div";
     // One full FP32 VL per row. A zero block stride reuses the same 32B
     // broadcast block eight times; its repeat stride advances one row block.
+    // CANN 9.1's strided vsub/vmul/vdiv overloads do not change mask state,
+    // so the entry setters also guarantee normal/full mask on return.
     PrintIndent();
     stream << "asc_set_mask_norm();\n";
     PrintIndent();
@@ -2129,12 +2131,6 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
            << stride->value << "), uint8_t("
            << (row_lhs->value ? 1 : stride->value) << "), uint8_t("
            << (row_lhs->value ? stride->value : 1) << "));\n";
-    // Leave normal/full mask explicitly defined for a following normal-mode
-    // instruction. Count-mode consumers define their own count mask.
-    PrintIndent();
-    stream << "asc_set_mask_norm();\n";
-    PrintIndent();
-    stream << "asc_set_vector_mask(~uint64_t(0), ~uint64_t(0));\n";
     return;
   }
   if (op->op.same_as(builtin::reinterpret())) {
