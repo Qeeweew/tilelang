@@ -88,14 +88,14 @@ inline std::optional<Call> Operation(const TaskNode *task) {
   return Downcast<Call>(evaluate->value);
 }
 
-inline bool StaticLoop(const ControlNode *loop, int64_t *count) {
+inline bool StaticLoopBounds(const ControlNode *loop, int64_t *count) {
   auto min = Constant(loop->control->min);
   auto extent = Constant(loop->control->extent);
   auto step = loop->control->step.has_value()
                   ? Constant(loop->control->step.value())
                   : std::optional<int64_t>(1);
   // Avoid pipeline offsets, skipped terminal iterations and counter clocks.
-  if (loop->HasConditions() || loop->GetStage() != 0 ||
+  if (loop->GetStage() != 0 ||
       loop->control->kind != ForKind::kSerial ||
       !min || *min != 0 || !extent || *extent <= 0 ||
       *extent > kMaxProofIterations || !step || *step != 1)
@@ -109,7 +109,103 @@ inline bool StaticLoop(const ControlNode *loop, int64_t *count) {
   return true;
 }
 
-inline bool FullC(const Buffer &buffer, const Array<Range> &ranges) {
+inline bool StaticLoop(const ControlNode *loop, int64_t *count) {
+  return !loop->HasConditions() && StaticLoopBounds(loop, count);
+}
+
+// A result's own activation guard may be moved to one lexical shell around
+// the entire stream and its six real boundary gates. Only immutable outer
+// loop values and their pure Bind snapshots are accepted. In particular, an
+// opaque call or a captured mutable load is not an activation proof, even if
+// an Analyzer could simplify a relation involving that value.
+inline bool StableActivationGuards(const ControlNode *result) {
+  if (!result->HasConditions())
+    return false;
+  std::unordered_set<const VarNode *> outer_vars;
+  for (const ControlNode *parent = result->GetParentControl(); parent;
+       parent = parent->GetParentControl())
+    outer_vars.insert(parent->control->loop_var.get());
+  std::unordered_set<const VarNode *> changing_vars;
+  for (const Var &var : result->GetWriteVars())
+    changing_vars.insert(var.get());
+  std::function<void(const ControlNode *)> collect_loops =
+      [&](const ControlNode *loop) {
+        changing_vars.insert(loop->control->loop_var.get());
+        for (const auto &child : loop->children)
+          if (child->IsControl())
+            collect_loops(static_cast<const ControlNode *>(child.get()));
+      };
+  collect_loops(result);
+
+  std::unordered_set<const VarNode *> resolving;
+  std::unordered_set<const VarNode *> stable_vars;
+  std::function<bool(const VarNode *)> stable_var;
+  class PureOuterExpression : public ExprVisitor {
+  public:
+    explicit PureOuterExpression(
+        const std::function<bool(const VarNode *)> &stable_var)
+        : stable_var_(stable_var) {}
+    bool valid{true};
+
+  private:
+    void VisitExpr_(const VarNode *op) final { valid &= stable_var_(op); }
+    void VisitExpr_(const CallNode *) final { valid = false; }
+    void VisitExpr_(const BufferLoadNode *) final { valid = false; }
+    void VisitExpr_(const ProducerLoadNode *) final { valid = false; }
+    void VisitExpr_(const ReduceNode *) final { valid = false; }
+    const std::function<bool(const VarNode *)> &stable_var_;
+  };
+  stable_var = [&](const VarNode *var) {
+    if (!var->dtype.is_int() && !var->dtype.is_uint() && !var->dtype.is_bool())
+      return false;
+    if (var->dtype.lanes() != 1 || changing_vars.count(var))
+      return false;
+    if (outer_vars.count(var) || stable_vars.count(var))
+      return true;
+    if (!resolving.insert(var).second)
+      return false;
+    const PrimExpr *definition = nullptr;
+    for (const Constr &constraint : result->task->outer_ctx.constrs_) {
+      if (constraint.kind != Constr::kBindValue ||
+          constraint.var.get() != var)
+        continue;
+      if (definition != nullptr)
+        return false;
+      definition = &constraint.value;
+    }
+    if (!definition)
+      return false;
+    PureOuterExpression expression(stable_var);
+    expression(*definition);
+    resolving.erase(var);
+    if (expression.valid)
+      stable_vars.insert(var);
+    return expression.valid;
+  };
+  for (const auto &guard : result->GetGuards()) {
+    // Do not move binding, assume or other attribute scopes with the guard.
+    if (!guard->IsCondition())
+      return false;
+    const PrimExpr &condition =
+        static_cast<const ConditionGuard *>(guard.get())->condition;
+    PureOuterExpression expression(stable_var);
+    expression(condition);
+    if (!expression.valid)
+      return false;
+  }
+  return true;
+}
+
+inline bool StaticResultLoop(const ControlNode *loop, int64_t *count) {
+  return StaticLoopBounds(loop, count) &&
+         (!loop->HasConditions() || StableActivationGuards(loop));
+}
+
+// A full-M, zero-origin column prefix of canonical NZ storage keeps base zero
+// and the backing M pitch. MAD's actual M and FIX's source stride therefore
+// agree even when the allocation has more columns. AnalyzeUnitFlagStreams
+// additionally requires every MAD and its unique FIX to use this same domain.
+inline bool AdmissibleCDomain(const Buffer &buffer, const Array<Range> &ranges) {
   if (!IsL0CBuffer(buffer) || buffer->dtype != DataType::Float(32) ||
       buffer->shape.size() != 2 || ranges.size() != 2 ||
       !buffer->strides.empty() || !buffer->axis_separators.empty() ||
@@ -117,14 +213,40 @@ inline bool FullC(const Buffer &buffer, const Array<Range> &ranges) {
     return false;
   for (size_t axis = 0; axis < 2; ++axis) {
     auto capacity = Constant(buffer->shape[axis]);
+    auto extent = Constant(ranges[axis]->extent);
     if (!capacity || *capacity <= 0 || *capacity % 16 != 0 ||
-        Constant(ranges[axis]->min) != 0 ||
-        Constant(ranges[axis]->extent) != capacity)
+        !extent || *extent <= 0 || *extent % 16 != 0 ||
+        Constant(ranges[axis]->min) != 0 || *extent > *capacity ||
+        (axis == 0 && *extent != *capacity))
       return false;
   }
   // dav-2201 has 128 KiB of FP32 accumulator storage. Division avoids
   // overflowing a product when a synthetic input bypasses resource planning.
   return *Constant(buffer->shape[0]) <= 32768 / *Constant(buffer->shape[1]);
+}
+
+// The ordinary L0 frontend may serialize allocation M/N for a region operand.
+// GemmMAD::_l0_operation_extents emits native M/N/K from the participating
+// regions. Prove its same three M/N/K equalities for the static stream domain.
+inline bool NativeMadMatchesC(const Gemm &gemm,
+                             const Array<Range> &domain) {
+  const auto &a = gemm->aRegion_->region;
+  const auto &b = gemm->bRegion_->region;
+  const auto &c = gemm->cRegion_->region;
+  if (a.size() < 2 || b.size() < 2 || c.size() != 2 || domain.size() != 2)
+    return false;
+  auto m = Constant(c[0]->extent);
+  auto n = Constant(c[1]->extent);
+  auto k = Constant(a.back()->extent); // transA is rejected by Collect.
+  if (!m || !n || !k || *m <= 0 || *n <= 0 || *k <= 0 ||
+      *m % 16 || *n % 16 || *k % 16 ||
+      m != Constant(domain[0]->extent) ||
+      n != Constant(domain[1]->extent) ||
+      Constant(a[a.size() - 2]->extent) != m ||
+      Constant(b[gemm->transB_ ? b.size() - 2 : b.size() - 1]->extent) != n ||
+      Constant(b[gemm->transB_ ? b.size() - 1 : b.size() - 2]->extent) != k)
+    return false;
+  return true;
 }
 
 // Raw pointers, scalar C accesses and any differently-shaped Buffer alias
@@ -309,7 +431,8 @@ inline bool Collect(ControlNode *result, std::vector<Mad> *mads,
               gemm->isWgmma_ || gemm->isTcgen05_ || gemm->kPack_ != 1 ||
               gemm->m_ <= 0 || gemm->n_ <= 0 ||
               gemm->k_ <= 0 || gemm->m_ % 16 || gemm->n_ % 16 ||
-              gemm->k_ % 16 || !FullC(gemm->c_, gemm->cRegion_->region)) {
+              gemm->k_ % 16 ||
+              !AdmissibleCDomain(gemm->c_, gemm->cRegion_->region)) {
             valid = false;
             return;
           }
@@ -330,7 +453,7 @@ inline bool Collect(ControlNode *result, std::vector<Mad> *mads,
                 typed->dst_block.has_value() ||
                 typed->pad_value.has_value() ||
                 typed->src_oob_safe_value.has_value() ||
-                !FullC(typed->src, typed->src_range) ||
+                !AdmissibleCDomain(typed->src, typed->src_range) ||
                 typed->dst_range.size() < 2 ||
                 (typed->dst->dtype != DataType::Float(32) &&
                  typed->dst->dtype != DataType::Float(16) &&
@@ -391,7 +514,7 @@ inline std::vector<UnitFlagStreamPlan> AnalyzeUnitFlagStreams(
     std::vector<Mad> mads;
     TaskNode *fix = nullptr;
     std::optional<AscendCopy> copy;
-    bool selected = StaticLoop(result, &result_count) &&
+    bool selected = StaticResultLoop(result, &result_count) &&
                     Collect(result, &mads, &fix, &copy);
     if (selected) {
       Buffer c = mads.front().gemm->c_;
@@ -435,8 +558,7 @@ inline std::vector<UnitFlagStreamPlan> AnalyzeUnitFlagStreams(
       selected &= audit.valid;
       for (const Mad &mad : mads)
         selected &= mad.gemm->c_.same_as(c) &&
-                    mad.gemm->m_ == Constant(c->shape[0]) &&
-                    mad.gemm->n_ == Constant(c->shape[1]);
+                    NativeMadMatchesC(mad.gemm, copy.value()->src_range);
       std::vector<TaskNode *> tasks;
       CollectAllTaskNodes(result, tasks);
       for (TaskNode *task : tasks) {

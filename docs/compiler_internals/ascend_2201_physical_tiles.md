@@ -129,11 +129,17 @@ The 3510 explicit compatibility path is separate from the 2201 selector.
 ## Closed 2201 unit streams
 
 After scheduling and core resolution, `InsertSync` can select a serial result
-loop containing ordinary native-L0 GEMMs followed by one complete C-to-GM
-export per result. C must be the actual rank-two FP32 allocation with canonical
-compact NZ layout, aligned M/N and one fixed physical slot. A/B are FP16 or
-BF16. The finite native-K chain clears C exactly once at its start and
-accumulates thereafter. The selector assigns MAD controls `2, ..., 2, 3` and
+loop containing ordinary native-L0 GEMMs followed by one complete result
+export from C to GM. C must be the actual rank-two FP32 allocation with
+canonical compact NZ layout, aligned M/N and one fixed physical slot. Each
+result starts at zero in both dimensions and retains the complete backing M;
+its aligned N may be smaller than the allocation N. Every MAD and the export
+must use exactly that same effective domain. Keeping the full M preserves the
+canonical NZ pitch; the full allocation still counts against the 128 KiB
+capacity. The native MAD/FIX dimensions come from the effective operand
+regions, rather than treating allocation N as the actual result width.
+A/B are FP16 or BF16. The finite native-K chain clears C exactly once at its
+start and accumulates thereafter. The selector assigns MAD controls `2, ..., 2, 3` and
 FIX control 3 atomically after validating the whole transaction.
 
 Only matching C RAW edges within that result and C WAR edges carried by that
@@ -159,11 +165,19 @@ exceeds the eight local hard-event IDs after safe reuse,
 `InsertSync` retries the untouched ordinary scheduled program. Unit data
 protection cannot establish GM or operand completion for flag reuse.
 
-Partial C regions, M/N tails, interleaved C writers, guarded terminal MAD/FIX,
-compound tasks, versioned C and nonzero stages retain their original path.
-An entire enclosing guard may enable or disable the stream; a guard on the
-result loop itself is not selected. Explicit direction or atomic-state control
-and opaque external calls also prevent automatic selection. These conservative
+Mismatched MAD/export domains, partial M or nonzero C origins, M/N tails,
+interleaved C writers, guarded terminal MAD/FIX, compound tasks, versioned C
+and nonzero stages retain their original path.
+An enclosing guard may enable or disable the stream. A condition directly on
+the result loop is also supported when it depends only on immutable outer
+loop values or their pure scalar Bind snapshots. In that case one lexical
+activation scope contains the complete entry/setup/result/drain/restore/exit
+transaction, so an inactive epoch issues none of its boundary events. Mutable
+loads, opaque calls, result/K loop variables and attribute guards do not qualify
+for this normalization. It preserves the original result and storage clocks;
+an unrelated unsupported binary-event pattern still takes the original fallback
+or diagnostic. Explicit direction or atomic-state control and opaque external
+calls also prevent automatic selection. These conservative
 boundaries do not require new user DSL and do not choose Python tiling policy
 or emulate 3510 RegBase/VF execution.
 

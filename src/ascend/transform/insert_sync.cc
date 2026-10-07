@@ -2912,11 +2912,65 @@ void InsertUnitFlagBoundaries(std::vector<std::shared_ptr<IRStructure>> &nodes,
       result.push_back(node);
       continue;
     }
+    // An activation condition must cover the complete direction transaction,
+    // including its terminal drain. Give that condition one lexical home;
+    // copying it onto six siblings would re-evaluate it and split the finite
+    // event domain. The selector proved that only immutable outer-loop values
+    // and pure snapshots occur here. The original fallback was cloned before
+    // either this shell or the selected controls were introduced.
+    std::shared_ptr<ControlNode> activation;
+    ControlNode *scope = parent;
+    if (plan->result_loop->HasConditions()) {
+      ICHECK(unit_flag_stream_detail::StableActivationGuards(plan->result_loop));
+      activation =
+          std::make_shared<ControlNode>(MakeSyncInsertionExtraInfo());
+      activation->task =
+          std::make_shared<TaskNode>(MakeSyncInsertionExtraInfo());
+      activation->task->SetParent(activation.get());
+      activation->SetParent(parent);
+      activation->SetStage(node->GetStage());
+      activation->control =
+          For(Var("unit_activation", DataType::Int(32)), Integer(0), Integer(1),
+              ForKind::kSerial, Evaluate(0));
+      activation->task->stmt = activation->control;
+      activation->task->outer_ctx = plan->result_loop->task->outer_ctx;
+      GuardList guards;
+      for (const auto &guard : plan->result_loop->GetGuards()) {
+        ICHECK(guard->IsCondition());
+        guards.push_back(guard->Clone());
+        const auto *condition =
+            static_cast<const ConditionGuard *>(guard.get());
+        ApplyTaskAccesses(AnalyzeTaskAccesses(Evaluate(condition->condition)),
+                          activation->task.get());
+      }
+      activation->SetGuards(std::move(guards));
+      plan->result_loop->SetGuards({});
+      // Guard reads now belong to the shell control, while the original
+      // result control retains only its original bounds/step reads. Existing
+      // task contexts still describe the same condition, now an ancestor.
+      TaskNode *loop_task = plan->result_loop->task.get();
+      loop_task->SetReadRegions({});
+      loop_task->SetWriteRegions({});
+      loop_task->SetReadVars({});
+      loop_task->SetWriteVars({});
+      ApplyTaskAccesses(
+          AnalyzeTaskAccesses(Evaluate(plan->result_loop->control->min)),
+          loop_task);
+      ApplyTaskAccesses(
+          AnalyzeTaskAccesses(Evaluate(plan->result_loop->control->extent)),
+          loop_task);
+      if (plan->result_loop->control->step.defined())
+        ApplyTaskAccesses(
+            AnalyzeTaskAccesses(
+                Evaluate(plan->result_loop->control->step.value())),
+            loop_task);
+      scope = activation.get();
+    }
     auto make_site = [&](ResourcePipe pipe, const Stmt &body) {
       auto task = MakeSyncTaskNode(body, kCoreCube, node->GetStage());
       task->SetPipeMask(PipeMask(pipe));
       task->outer_ctx = plan->result_loop->task->outer_ctx;
-      task->SetParent(parent);
+      task->SetParent(scope);
       return task;
     };
     auto entry = make_site(ResourcePipe::kCube, Evaluate(0));
@@ -2932,25 +2986,35 @@ void InsertUnitFlagBoundaries(std::vector<std::shared_ptr<IRStructure>> &nodes,
                                 {StringImm("m")})));
     restore->AddSpecialWrite(SpecialRegister::kMmadDirection);
     auto exit = make_site(ResourcePipe::kCube, Evaluate(0));
-    boundaries->push_back({parent, entry.get(), entry.get(), setup.get(),
+    boundaries->push_back({scope, entry.get(), entry.get(), setup.get(),
                            setup.get(), UnitFlagBoundaryRole::kEntry});
-    boundaries->push_back({parent, setup.get(), setup.get(), node.get(),
+    boundaries->push_back({scope, setup.get(), setup.get(), node.get(),
                            plan->mads.front(), UnitFlagBoundaryRole::kSetup});
     // The entry M_S also retires MADs from the preceding activation. Carry
     // that real completion to FIX explicitly: the selected MAD/FIX unit
     // relation is C data protection, not a whole-pipe completion witness for
     // an enclosing owner/epoch's carried RAW dependency.
-    boundaries->push_back({parent, setup.get(), setup.get(), node.get(),
+    boundaries->push_back({scope, setup.get(), setup.get(), node.get(),
                            plan->fix, UnitFlagBoundaryRole::kFixSetup});
-    boundaries->push_back({parent, node.get(), plan->fix, drain.get(),
+    boundaries->push_back({scope, node.get(), plan->fix, drain.get(),
                            drain.get(), UnitFlagBoundaryRole::kDrain});
-    boundaries->push_back({parent, drain.get(), drain.get(), restore.get(),
+    boundaries->push_back({scope, drain.get(), drain.get(), restore.get(),
                            restore.get(), UnitFlagBoundaryRole::kRestore});
     // AutoSchedule ran before this state transition was introduced. Make the
     // restored direction visible to subsequent, unselected MADs as well.
-    boundaries->push_back({parent, restore.get(), restore.get(), exit.get(),
+    boundaries->push_back({scope, restore.get(), restore.get(), exit.get(),
                            exit.get(), UnitFlagBoundaryRole::kExit});
-    result.insert(result.end(), {entry, setup, node, drain, restore, exit});
+    if (activation) {
+      activation->children = {entry, setup, node, drain, restore, exit};
+      for (size_t i = 0; i < activation->children.size(); ++i) {
+        activation->children[i]->SetIndex(i);
+        activation->children[i]->SetParent(activation.get());
+      }
+      activation->InitializeLoopBodyContext();
+      result.push_back(std::move(activation));
+    } else {
+      result.insert(result.end(), {entry, setup, node, drain, restore, exit});
+    }
   }
   for (size_t i = 0; i < result.size(); ++i) {
     result[i]->SetIndex(i);

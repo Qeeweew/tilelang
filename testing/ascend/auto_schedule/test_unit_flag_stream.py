@@ -33,9 +33,10 @@ _SCALAR_VALUES = object()
 
 
 def _fixture(*, kind="ordinary", native_k=3, whole_guard=False, prepared_inputs=False,
-             repeated_readback=False, arch="dav-2201"):
+             repeated_readback=False, c_backing_n=32, c_n_origin=0,
+             activation_guard=None, persistent_inputs=False, arch="dav-2201"):
     """Final scheduled native-L0 tasks, without solver/lowering prerequisites."""
-    epochs = 4 if whole_guard else 3
+    epochs = 4 if whole_guard or activation_guard else 3
     e, owner, result, k, reader = [tirx.Var(name, "int32")
                                    for name in ("epoch", "owner", "result", "native_k", "reader")]
     read_epoch, read_owner = (tirx.Var(name, "int32") for name in ("read_epoch", "read_owner"))
@@ -46,16 +47,22 @@ def _fixture(*, kind="ordinary", native_k=3, whole_guard=False, prepared_inputs=
     b_l1 = tirx.decl_buffer((32, 16), "float16", name="b_l1", scope="shared.l1")
     a = tirx.decl_buffer((32, 16), "float16", name="a", scope="shared.l0a")
     b = tirx.decl_buffer((32, 16), "float16", name="b", scope="shared.l0b")
-    c_shape = (2, 32, 32) if kind == "manual-version" else (32, 32)
+    c_shape = (2, 32, c_backing_n) if kind == "manual-version" else (32, c_backing_n)
     c = tirx.decl_buffer(c_shape, "float32", name="accum", scope="shared.l0c")
     other = tirx.decl_buffer((32, 32), "float32", name="other", scope="shared.l0c") if kind == "interleaved-C" else None
     feedback = tirx.decl_buffer((32, 32), "float32", name="feedback", scope="shared.l1")
     counter = tirx.decl_buffer((1,), "int32", name="input_epoch", scope="local.var") if prepared_inputs else None
     assert counter is None or native_k > 1
     stage = 1 if kind == "stage" else 0
+    phase_snapshot = tirx.Var("phase_active", "bool")
+
+    def phase_predicate(epoch):
+        return tirx.And(epoch >= 1, epoch < 3)
 
     def c_region(buffer=c):
         ranges = [tvm.ir.Range.from_min_extent(0, extent) for extent in (32, 32)]
+        if buffer.same_as(c):
+            ranges[-1] = tvm.ir.Range.from_min_extent(c_n_origin, 32)
         if len(buffer.shape) == 3:
             ranges.insert(0, tvm.ir.Range.from_min_extent(result % 2, 1))
         return tirx.BufferRegion(buffer, ranges)
@@ -85,7 +92,7 @@ def _fixture(*, kind="ordinary", native_k=3, whole_guard=False, prepared_inputs=
         producer = unit(tirx.For(k, 0, native_k, tirx.ForKind.SERIAL, k_body, annotations=k_annotations), core=None, stage=stage)
 
     width = 16 if kind == "partial-C" else 32
-    source_indices = [result % 2, 0, 0] if len(c.shape) == 3 else [0, 0]
+    source_indices = [result % 2, 0, c_n_origin] if len(c.shape) == 3 else [0, c_n_origin]
     source_shape = [1, 32, width] if len(c.shape) == 3 else [32, width]
     export = unit(copy(c, output, src_indices=source_indices, src_shape=source_shape,
                        dst_indices=[e, owner, result, 0, 0], dst_shape=[1, 1, 1, 32, width],
@@ -95,31 +102,48 @@ def _fixture(*, kind="ordinary", native_k=3, whole_guard=False, prepared_inputs=
     transactions = [producer, export]
     if kind == "interleaved-C":
         transactions.insert(1, unit(mad(other, clear=True), core=2, stage=stage))
+    result_guard = (phase_snapshot if activation_guard == "snapshot" else phase_predicate(e)
+                    if activation_guard else e < 2 if kind == "result-guard" else None)
     result_loop = unit(tirx.For(result, 0, 4, tirx.ForKind.SERIAL, seq(*transactions)),
-                       core=None, stage=stage, guard=e < 2 if kind == "result-guard" else None)
+                       core=None, stage=stage, guard=result_guard)
 
     def readback(epoch_index, owner_index):
         return unit(tirx.For(reader, 0, 4, tirx.ForKind.SERIAL,
                              unit(copy(output, feedback, src_indices=[epoch_index, owner_index, reader, 0, 0],
                                        src_shape=[1, 1, 1, 32, 32]), core=2)), core=None,
-                    guard=epoch_index < 2 if kind == "result-guard" else None)
+                    guard=phase_predicate(epoch_index) if activation_guard else
+                          epoch_index < 2 if kind == "result-guard" else None)
+
+    def input_loads(epoch, own):
+        return [
+            unit(copy(a_gm, a_l1, src_indices=[epoch, own, 0, 0], src_shape=[1, 1, 32, 16]), core=2),
+            unit(copy(b_gm, b_l1, src_indices=[epoch, own, 0, 0], src_shape=[1, 1, 32, 16]), core=2),
+            *([unit(copy(a_l1, a), core=2), unit(copy(b_l1, b), core=2)] if native_k == 1 else []),
+        ]
 
     owner_body = seq(
-        unit(copy(a_gm, a_l1, src_indices=[e, owner, 0, 0], src_shape=[1, 1, 32, 16]), core=2),
-        unit(copy(b_gm, b_l1, src_indices=[e, owner, 0, 0], src_shape=[1, 1, 32, 16]), core=2),
-        *([unit(copy(a_l1, a), core=2), unit(copy(b_l1, b), core=2)] if native_k == 1 else []),
+        *([] if persistent_inputs else input_loads(e, owner)),
         result_loop, *([readback(e, owner)] if repeated_readback else []),
     )
     owners = unit(tirx.For(owner, 0, 2, tirx.ForKind.SERIAL, owner_body), core=None,
                   guard=e < 3 if whole_guard else None)
-    outer = unit(tirx.For(e, 0, epochs, tirx.ForKind.SERIAL, owners), core=None)
+    if activation_guard:
+        # One result stream directly under the phase clock, matching ordinary
+        # stage-guarded kernels. An extra owner loop would introduce a separate
+        # nested shifted binary clock unrelated to activation normalization.
+        owners = tirx.stmt_functor.substitute(owner_body, {owner: tirx.IntImm("int32", 0)})
+    epoch_body = (seq(unit(tirx.Bind(phase_snapshot, phase_predicate(e)), core=2), owners)
+                  if activation_guard == "snapshot" else owners)
+    outer = unit(tirx.For(e, 0, epochs, tirx.ForKind.SERIAL, epoch_body), core=None)
     # The default GM consumer is one post-producer root phase. It tests the
     # actual FIX->MTE2 data dependency without requiring a per-activation
     # binary channel to be reusable through the selected C-data protocol.
+    read_owners = (readback(read_epoch, 0) if activation_guard else
+                   unit(tirx.For(read_owner, 0, 2, tirx.ForKind.SERIAL,
+                                 readback(read_epoch, read_owner)), core=None,
+                        guard=read_epoch < 3 if whole_guard else None))
     post_readback = unit(tirx.For(read_epoch, 0, epochs, tirx.ForKind.SERIAL,
-                                 unit(tirx.For(read_owner, 0, 2, tirx.ForKind.SERIAL,
-                                               readback(read_epoch, read_owner)), core=None,
-                                      guard=read_epoch < 3 if whole_guard else None)), core=None)
+                                 read_owners), core=None)
     layouts = {a_l1: make_ascend_nz_layout(a_l1), b_l1: make_ascend_nz_layout(b_l1),
                a: make_ascend_l0a_2201_layout(a), b: make_ascend_major_k_layout(b),
                c: make_ascend_l0c_layout(c),
@@ -140,6 +164,8 @@ def _fixture(*, kind="ordinary", native_k=3, whole_guard=False, prepared_inputs=
     body = [setup]
     if counter is not None:
         body.append(unit(tirx.BufferStore(counter, 0, [0]), core=2))
+    if persistent_inputs:
+        body.extend(input_loads(0, 0))
     body.append(outer)
     if not repeated_readback:
         body.append(post_readback)
@@ -319,6 +345,118 @@ def test_selected_unit_stream_keeps_root_spr_gm_and_input_dependencies():
     for event in ("MTE2_MTE1", "MTE1_M", "M_MTE1"):
         assert any(_name(call) == _SET and call.args[0].value == event for call, _, _ in records), event
         assert any(_name(call) == _WAIT and call.args[0].value == event for call, _, _ in records), event
+
+
+@pytest.mark.parametrize("native_k", [1, 3], ids=["single-MAD", "native-K-chain"])
+@pytest.mark.parametrize("whole_guard", [False, True], ids=["unconditional", "whole-stream-guard"])
+def test_matching_zero_origin_full_m_subdomain_of_larger_c_selects_stream(native_k, whole_guard):
+    before, facts = _fixture(native_k=native_k, whole_guard=whole_guard, c_backing_n=64)
+    after = _insert(before)
+    records = _trace(after)
+    mads = [(call, env) for call, env, _ in records if _name(call) == _GEMM]
+    exports = [(call, env) for call, env, _ in records if _is_export(call, facts)]
+    assert len(mads) == 24 * native_k and len(exports) == 24
+    assert [_value(call.annotations["unit_flag_ctrl"], env) for call, env in mads] == ([2] * (native_k - 1) + [3]) * 24
+    for call, env in mads:
+        # The native builder serializes backing N, while its typed C region
+        # carries the effective MAD geometry. Both must remain intact.
+        assert _value(call.args[6], env) == 64
+        assert tuple(_value(index, env) for index in call.args[2].args[0].indices) == (0, 0)
+        assert tuple(_value(extent, env) for extent in call.args[2].args[2:]) == (32, 32)
+    for call, env in exports:
+        assert _value(call.annotations["unit_flag_ctrl"], env) == 3
+        assert tuple(_value(index, env) for index in call.args[0].args[0].indices) == (0, 0)
+        assert tuple(_value(extent, env) for extent in call.args[0].args[2:]) == (32, 32)
+    activations = {}
+    for index, (_, env, _) in enumerate(records):
+        if facts["epoch"] in env and facts["owner"] in env:
+            key = (_value(facts["epoch"], env), _value(facts["owner"], env))
+            activations.setdefault(key, []).append(index)
+    assert set(activations) == {(epoch, owner) for epoch in range(3) for owner in range(2)}
+    for positions in activations.values():
+        directions = [(i, records[i][0].args[0].value) for i in positions if _name(records[i][0]) == _DIRECTION]
+        assert [direction for _, direction in directions] == ["n", "m"]
+        setup, restore = directions[0][0], directions[1][0]
+        first_mad = min(i for i in positions if _name(records[i][0]) == _GEMM)
+        first_export = min(i for i in positions if _is_export(records[i][0], facts))
+        last_export = max(i for i in positions if _is_export(records[i][0], facts))
+        for event, start, end in (("M_S", min(positions) - 1, setup), ("S_M", setup, first_mad),
+                                  ("S_FIX", setup, first_export), ("FIX_M", last_export, restore),
+                                  ("M_S", last_export, restore), ("S_M", restore, max(positions) + 1)):
+            assert _matching_completion(records, event, start, end), (event, start, end)
+    totals = [Counter((call.args[0].value, _value(call.args[1], env))
+                      for call, env, _ in records if _name(call) == operation) for operation in (_SET, _WAIT)]
+    assert totals[0] == totals[1]
+
+
+
+@pytest.mark.parametrize("native_k", [1, 3], ids=["single-MAD", "native-K-chain"])
+@pytest.mark.parametrize("activation_guard", ["direct", "snapshot"])
+def test_result_activation_guard_covers_complete_unit_bracket(native_k, activation_guard):
+    before, facts = _fixture(native_k=native_k, c_backing_n=64,
+                             activation_guard=activation_guard, persistent_inputs=True)
+    after = _insert(before)
+    records = _trace(after)
+    selected = [(i, call, env) for i, (call, env, _) in enumerate(records)
+                if _name(call) == _GEMM or _is_export(call, facts) or _name(call) == _DIRECTION]
+    assert selected
+    assert {_value(facts["epoch"], env) for _, _, env in selected} == {1, 2}
+    assert len([call for _, call, _ in selected if _name(call) == _GEMM]) == 8 * native_k
+    assert len([call for _, call, _ in selected if _is_export(call, facts)]) == 8
+    for epoch in (1, 2):
+        positions = [i for i, _, env in selected if _value(facts["epoch"], env) == epoch]
+        directions = [(i, records[i][0].args[0].value) for i in positions
+                      if _name(records[i][0]) == _DIRECTION]
+        assert [value for _, value in directions] == ["n", "m"]
+        setup, restore = directions[0][0], directions[1][0]
+        first_mad = min(i for i in positions if _name(records[i][0]) == _GEMM)
+        first_fix = min(i for i in positions if _is_export(records[i][0], facts))
+        last_fix = max(i for i in positions if _is_export(records[i][0], facts))
+        whole = [i for i, (_, env, _) in enumerate(records)
+                 if facts["epoch"] in env and _value(facts["epoch"], env) == epoch]
+        for event, start, end in (("M_S", min(whole) - 1, setup),
+                                  ("S_M", setup, first_mad), ("S_FIX", setup, first_fix),
+                                  ("FIX_M", last_fix, restore), ("M_S", last_fix, restore),
+                                  ("S_M", restore, max(whole) + 1)):
+            assert _matching_completion(records, event, start, end), (event, epoch)
+    # Direction setters identify the transaction's lexical activation scope.
+    # Ancestor-clock seed/forward/drain events still execute in inactive
+    # epochs; those ordinary C/input/GM completion relations must survive.
+    shells = {loops[-1] for call, _, loops in records if _name(call) == _DIRECTION}
+    assert len(shells) == 1
+    (shell,) = shells
+    for call, env, loops in records:
+        if _name(call) in (_SET, _WAIT) and shell in loops:
+            assert _value(facts["epoch"], env) in (1, 2), "Inactive activation issued a boundary flag"
+    inactive_outer_events = {call.args[0].value for call, env, loops in records
+                             if _name(call) in (_SET, _WAIT) and shell not in loops
+                             and facts["epoch"] in env and _value(facts["epoch"], env) in (0, 3)}
+    assert {"M_FIX", "FIX_M", "FIX_MTE2"} <= inactive_outer_events
+    totals = [Counter((call.args[0].value, _value(call.args[1], env))
+                      for call, env, _ in records if _name(call) == operation) for operation in (_SET, _WAIT)]
+    assert totals[0] == totals[1]
+    mads = [(call, env) for call, env, _ in records if _name(call) == _GEMM]
+    assert [_value(call.annotations["unit_flag_ctrl"], env) for call, env in mads] == ([2] * (native_k - 1) + [3]) * 8
+
+
+def test_matching_nonzero_column_subdomain_keeps_ordinary_c_completion():
+    before, facts = _fixture(c_backing_n=64, c_n_origin=16)
+    after = _insert(before)
+    assert not calls(after, _DIRECTION)
+    for call in calls(after, _GEMM) + calls(after, _COPY):
+        assert "unit_flag_ctrl" not in call.annotations
+    records = _trace(after)
+    regions = [call.args[2] if _name(call) == _GEMM else call.args[0]
+               for call, _, _ in records if _name(call) == _GEMM or _is_export(call, facts)]
+    assert len(regions) == 24 * (facts["native_k"] + 1)
+    assert all(tuple(_value(index, {}) for index in region.args[0].indices) == (0, 16) for region in regions)
+    assert all(tuple(_value(extent, {}) for extent in region.args[2:]) == (32, 32) for region in regions)
+    for event in ("M_FIX", "FIX_M"):
+        assert calls(after, _SET) and any(call.args[0].value == event for call in calls(after, _SET))
+        assert calls(after, _WAIT) and any(call.args[0].value == event for call in calls(after, _WAIT))
+    totals = [Counter((call.args[0].value, _value(call.args[1], env))
+                      for call, env, _ in records if _name(call) == operation) for operation in (_SET, _WAIT)]
+    assert totals[0] == totals[1]
 
 
 def test_prepared_input_counters_preserve_their_real_clock_inside_selected_stream():
