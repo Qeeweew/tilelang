@@ -74,9 +74,22 @@ overwrite even when the enclosing scope's last MAD uses a different slot.
 
 This covers the overwritten slot, allowing preparation of that slot while a
 MAD still reads a different one. It establishes neither whole-panel completion
-nor phase retirement. Guarded activation, mutable counters, extra or partial
-accesses and cross-storage conflicts retain their existing protocols or target
-diagnostics. The two-allocation pool's selection rules above are unchanged.
+nor phase retirement. Extra or partial accesses and cross-storage conflicts
+retain their existing protocols or target diagnostics. The two-allocation
+pool's selection rules above are unchanged.
 This extension covers full L0 operand accesses; a sliced L1 panel reader
 requires its own last-read completion certificate and retains its existing
 parent protocol.
+
+A prepared counter can supply the same single-allocation certificate when
+it counts actually executed native iterations. InsertSync verifies one root
+initialization, one unguarded increment per iteration after the MAD, and no
+other counter accesses. The owner has a constant positive native trip count,
+one full L0 writer and one full MAD reader at stage zero, with retained readiness and
+per-slot release. A common guard or outer stage may activate or translate the
+whole owner, including its increment. Skipping that owner leaves the counter
+and slot credits intact. The current full write kills an incoming old value;
+the retained events cover the actual RAW, WAR and WAW obligations without
+inventing a parent completion relation. Independently guarded endpoints,
+counter resets or escapes, additional accesses and incomplete cycles do not
+qualify. This does not add support for shifted nested lexical event protocols.

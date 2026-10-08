@@ -996,6 +996,7 @@ public:
     for (const std::shared_ptr<IRStructure> &child : root)
       nodes.push_back(child.get());
 
+    root_nodes_ = nodes;
     site_registry_.Collect(nodes);
     trace_c_sites_.clear();
     scope_closures_.clear();
@@ -2085,6 +2086,301 @@ private:
     return lexical_domain;
   }
 
+  // Typed full writes and reads are one closed allocation lifetime. Keep
+  // this shared by iteration and counter proofs; a region hull cannot hide
+  // an extra scalar access, a view, or an independent partial operation.
+  bool ClosedFullMemoryAccesses(ControlNode *parent,
+                                const MultiBufferInfo &info, TaskNode *reader,
+                                TaskNode *writer, bool operand) const {
+    auto uses_storage = [&](const ObjectRef &expression) {
+      bool found = false;
+      PostOrderVisit(expression, [&](const ObjectRef &node) {
+        if (const auto *load = node.as<BufferLoadNode>())
+          found |= load->buffer->data.same_as(info.storage);
+        if (const auto *store = node.as<BufferStoreNode>())
+          found |= store->buffer->data.same_as(info.storage);
+        if (const auto *var = node.as<VarNode>())
+          found |= var == info.storage.get();
+      });
+      return found;
+    };
+    auto storage_region = [&](TaskNode *task,
+                              bool writing) -> Optional<BufferRegion> {
+      Stmt body = task->stmt;
+      while (const auto *attribute = body.as<AttrStmtNode>())
+        body = attribute->body;
+      const auto *evaluate = body.as<EvaluateNode>();
+      const auto *call = evaluate ? evaluate->value.as<CallNode>() : nullptr;
+      if (!call || !(call->op.same_as(AscendCopy::Get()) ||
+                     call->op.same_as(Copy::Get()) ||
+                     (operand && !writing && call->op.same_as(Gemm::Get())) ||
+                     ((!writing || operand) &&
+                      call->op.same_as(AscendCubeLoad3D::Get()))))
+        return std::nullopt;
+      // Typed regions declare the only storage accesses. A scalar load or
+      // data-pointer escape in an index, hint, or other argument is additional
+      // work even if its region hull happens to merge into the full tile.
+      for (const PrimExpr &argument : call->args) {
+        const auto *region_call = argument.as<CallNode>();
+        if (region_call && region_call->op.same_as(region())) {
+          BufferRegion bounds =
+              NormalizeToBufferRegion(GetRef<Call>(region_call));
+          for (const Range &range : bounds->region)
+            if (uses_storage(range->min) || uses_storage(range->extent))
+              return std::nullopt;
+        } else if (uses_storage(argument)) {
+          return std::nullopt;
+        }
+      }
+      for (const auto &[key, value] : call->annotations) {
+        auto expression = value.as<PrimExpr>();
+        if (!expression || uses_storage(*expression))
+          return std::nullopt;
+      }
+      TileOperator operation = ParseOperator(GetRef<Call>(call));
+      BufferRegion source, destination;
+      if (operand && !writing) {
+        const auto *gemm = operation.as<GemmNode>();
+        if (!gemm)
+          return std::nullopt;
+        bool a = gemm->a_->data.same_as(info.storage);
+        bool b = gemm->b_->data.same_as(info.storage);
+        if (a == b || gemm->c_->data.same_as(info.storage))
+          return std::nullopt;
+        source = a ? gemm->aRegion_ : gemm->bRegion_;
+        destination = gemm->cRegion_;
+      } else if (const auto *copy = operation.as<CopyNode>()) {
+        source = BufferRegion(copy->src, copy->src_range);
+        destination = BufferRegion(copy->dst, copy->dst_range);
+      } else if (const auto *load = operation.as<AscendCubeLoad3DNode>()) {
+        source = load->src;
+        destination = load->dst;
+      } else {
+        return std::nullopt;
+      }
+      if (operand) {
+        bool l0_operand =
+            (writing ? destination : source)->buffer.scope() == "shared.l0a" ||
+            (writing ? destination : source)->buffer.scope() == "shared.l0b";
+        if (!l0_operand ||
+            (writing ? source->buffer.scope() != "shared.l1"
+                     : destination->buffer.scope() != "shared.l0c"))
+          return std::nullopt;
+      } else if (writing ? (source->buffer.scope() != "global" ||
+                            destination->buffer.scope() != "shared.l1")
+                         : (source->buffer.scope() != "shared.l1" ||
+                            (destination->buffer.scope() != "shared.l0a" &&
+                             destination->buffer.scope() != "shared.l0b")))
+        return std::nullopt;
+      BufferRegion result = writing ? destination : source;
+      if (!result->buffer->data.same_as(info.storage) ||
+          result->region.size() != result->buffer->shape.size())
+        return std::nullopt;
+      for (size_t axis = 0; axis < result->region.size(); ++axis)
+        if (!is_zero(result->region[axis]->min) ||
+            !ffi::StructuralEqual()(result->region[axis]->extent,
+                                    result->buffer->shape[axis]))
+          return std::nullopt;
+      return result;
+    };
+    auto read = storage_region(reader, false);
+    auto write = storage_region(writer, true);
+    if (!read || !write || !read.value()->buffer.same_as(write.value()->buffer))
+      return false;
+    std::function<bool(IRStructure *)> closed_accesses =
+        [&](IRStructure *node) {
+          if (node->GuardsTouchStorage(info.storage))
+            return false;
+          if (node->IsTask())
+            return node == reader || node == writer ||
+                   !uses_storage(static_cast<TaskNode *>(node)->stmt);
+          auto *control = static_cast<ControlNode *>(node);
+          if (uses_storage(control->control->min) ||
+              uses_storage(control->control->extent) ||
+              (control->control->step.has_value() &&
+               uses_storage(control->control->step.value())))
+            return false;
+          return std::all_of(control->children.begin(), control->children.end(),
+                             [&](const auto &nested) {
+                               return closed_accesses(nested.get());
+                             });
+        };
+    return closed_accesses(parent);
+  }
+
+  // A counter is a kernel-wide ordinal of actual complete owner
+  // activations. Unlike a lexical radix, skipping the whole owner does not
+  // advance it. Reconstructed metadata alone does not prove this property.
+  bool ClosedOperandCounter(const MultiBufferInfo &info, ControlNode *owner,
+                            TaskNode *reader) const {
+    for (const MultiBufferInfo &other : multi_buffer_plan_.Infos()) {
+      if (!other.UsesCounter() ||
+          !other.counter->data.same_as(info.counter->data))
+        continue;
+      if (!other.counter.same_as(info.counter) || other.owners.size() != 1 ||
+          other.owners.front().loop != owner ||
+          !is_one(other.owners.front().active_guard))
+        return false;
+    }
+    int initializers = 0, advances = 0;
+    bool valid = true;
+    auto touches = [&](const ObjectRef &value) {
+      return resource_epoch_detail::Touches(value, info.counter->data);
+    };
+    std::function<void(IRStructure *)> visit = [&](IRStructure *node) {
+      if (node->GuardsTouchStorage(info.counter->data))
+        valid = false;
+      if (node->IsControl()) {
+        auto *control = static_cast<ControlNode *>(node);
+        const For &loop = control->control;
+        if (touches(loop->min) || touches(loop->extent) ||
+            (loop->step.has_value() && touches(loop->step.value())))
+          valid = false;
+        for (const auto &child : control->children)
+          visit(child.get());
+        return;
+      }
+      auto *task = static_cast<TaskNode *>(node);
+      if (!touches(task->stmt))
+        return;
+      if (task->HasGuards() || task->IsPerCoreTask() || task->GetStage() != 0 ||
+          task->GetCoreMask() != kCoreCube ||
+          !task->UsesOnlyPipe(ResourcePipe::kScalar)) {
+        valid = false;
+        return;
+      }
+      if (task->GetParent() == owner && task->GetIndex() > reader->GetIndex() &&
+          IsCanonicalCounterAdvance(task, info.counter)) {
+        ++advances;
+        return;
+      }
+      Stmt body = task->stmt;
+      while (const auto *wrapper = body.as<AttrStmtNode>()) {
+        if (wrapper->attr_key != attr::kAscendTask)
+          break;
+        body = wrapper->body;
+      }
+      const auto *store = body.as<BufferStoreNode>();
+      if (!task->GetParent() &&
+          task->GetIndex() < owner->GetOutermostControl()->GetIndex() &&
+          store && store->buffer.same_as(info.counter) &&
+          store->indices.size() == 1 && is_zero(store->indices[0]) &&
+          !store->predicate.has_value() && is_zero(store->value)) {
+        ++initializers;
+        return;
+      }
+      valid = false;
+    };
+    for (IRStructure *node : root_nodes_)
+      visit(node);
+    return valid && initializers == 1 && advances == 1;
+  }
+
+  // All three ancestor memory obligations use the same retained operand
+  // cycle. A full current write kills the incoming old value (RAW); the real
+  // ready and per-slot release also cover WAW and WAR. This removes no
+  // phase-completion edge and does not project a counter into a parent clock.
+  bool IsParentCounterOperandCovered(const DepInfo &dep,
+                                     const MultiBufferInfo &info,
+                                     TaskNode *producer, TaskNode *consumer,
+                                     ControlNode *parent) const {
+    if (architecture_ != AscendArchitecture::kDav2201 || !parent ||
+        dep.kind != DependencyKind::kData || dep.distance != -1 ||
+        dep.cross_storage_conflict || !info.UsesCounter() ||
+        info.num_versions <= 1 || info.owners.size() != 1 ||
+        !is_one(info.owners.front().active_guard))
+      return false;
+    ControlNode *owner = info.owners.front().loop;
+    if (owner == parent || !owner->IsWithin(parent) ||
+        dep.prod_node != owner->GetChildOnPathFrom(parent) ||
+        dep.cons_node != dep.prod_node || owner->GetStage() < 0 ||
+        !resource_epoch_detail::PositiveStaticLoop(owner))
+      return false;
+    for (ControlNode *ancestor = owner->GetParentControl(); ancestor;
+         ancestor = ancestor->GetParentControl())
+      if (ancestor->BodyHasLoopBreak())
+        return false;
+    TaskNode *writer = nullptr, *reader = nullptr;
+    for (const auto &child : owner->children) {
+      bool writes = child->WritesStorage(info.storage);
+      bool reads = child->ReadsStorage(info.storage);
+      if (!writes && !reads)
+        continue;
+      if (!child->IsTask() || child->GetStage() != 0 || child->HasGuards() ||
+          static_cast<TaskNode *>(child.get())->IsPerCoreTask() ||
+          static_cast<TaskNode *>(child.get())->GetCoreMask() != kCoreCube ||
+          (writes && (writer || reads)) || (reads && reader))
+        return false;
+      if (writes)
+        writer = static_cast<TaskNode *>(child.get());
+      else
+        reader = static_cast<TaskNode *>(child.get());
+    }
+    if (!writer || !reader || writer->GetIndex() >= reader->GetIndex() ||
+        !writer->UsesOnlyPipe(ResourcePipe::kMTE1) ||
+        !reader->UsesOnlyPipe(ResourcePipe::kCube) ||
+        !((producer == writer && consumer == reader) ||
+          (producer == reader && consumer == writer) ||
+          (producer == writer && consumer == writer)) ||
+        !ClosedFullMemoryAccesses(parent, info, reader, writer, true) ||
+        !ClosedOperandCounter(info, owner, reader))
+      return false;
+    auto operation = l0ab_phase_reuse_detail::Operation(reader);
+    if (!operation || !(*operation)->op.same_as(Gemm::Get()) ||
+        HasUnitFlagCtrl(reader->stmt))
+      return false;
+    Gemm mad((*operation)->args, (*operation)->annotations);
+    if (mad->mbar_.defined() || mad->wgWait_ || mad->isWgmma_ || mad->isTcgen05_)
+      return false;
+    auto closure = scope_closures_.find(owner);
+    if (closure == scope_closures_.end())
+      return false;
+    PrimExpr clock = MultiBufferIteration(info);
+    bool ready = false, released = false;
+    for (const SyncPoint &point : sync_points_) {
+      const auto &src = site_registry_.Src(point);
+      const auto &dst = site_registry_.Dst(point);
+      const EpochDomain &domain = site_registry_.Domain(src);
+      if (point.flag_loop != owner ||
+          point.dependency_kind != DependencyKind::kData ||
+          !point.edge.strict || !point.counter_channel.has_value() ||
+          point.counter_group_id != info.counter_group_id ||
+          point.num_versions != info.num_versions ||
+          point.IsPrivateGmHandoff() || point.local_binary_plan ||
+          point.single_iteration_binary_plan ||
+          point.unit_boundary != UnitFlagBoundaryRole::kNone ||
+          !ffi::StructuralEqual()(point.flag_iteration, clock) ||
+          src.EpochDomainId() != dst.EpochDomainId() || !domain.IsCounter() ||
+          domain.owner != owner || !domain.counter.same_as(info.counter) ||
+          !is_one(domain.active_guard) || src.core != kCoreCube ||
+          dst.core != kCoreCube || src.path_begin != src.path_end ||
+          dst.path_begin != dst.path_end || !src.path_end->IsTask() ||
+          !dst.path_end->IsTask() ||
+          static_cast<TaskNode *>(src.path_end)->IsPerCoreTask() ||
+          static_cast<TaskNode *>(dst.path_end)->IsPerCoreTask() ||
+          src.path_end->GetParent() != owner ||
+          dst.path_end->GetParent() != owner || !is_one(src.GetGuard()) ||
+          !is_one(dst.GetGuard()))
+        continue;
+      ready |= point.edge.distance == 0 && src.pipe == "MTE1" &&
+               dst.pipe == "M" && dst.path_end == reader;
+      released |= point.edge.distance == info.num_versions && src.pipe == "M" &&
+                  dst.pipe == "MTE1" && src.path_end == reader &&
+                  MinCompletionDistance(closure->second, point.edge.dst,
+                                        point.edge.src) == 0;
+    }
+    int domain = domains_.DomainForStorage(info.storage, owner);
+    auto site = [&](TaskNode *task, bool beginning) {
+      return site_registry_.FindSiteId(
+          SyncInsertionSiteKey{task, task, beginning, kCoreCube, domain});
+    };
+    return ready && released &&
+           MinCompletionDistance(closure->second, site(writer, false),
+                                 site(reader, true)) == 0 &&
+           MinCompletionDistance(closure->second, site(reader, false),
+                                 site(writer, true)) <= info.num_versions;
+  }
+
   // Discharge a storage WAR, not a whole-loop completion relation. With a
   // closed serial iteration-owner nest, equal physical slots across parent
   // iterations have delta = d*T + k_cons - k_prod > 0, divisible by W, where
@@ -2162,120 +2458,7 @@ private:
     // Explicit child/endpoint guards remain rejected;
     // their active sequence would require a separate epoch certificate.
 
-    auto uses_storage = [&](const ObjectRef &expression) {
-      bool found = false;
-      PostOrderVisit(expression, [&](const ObjectRef &node) {
-        if (const auto *load = node.as<BufferLoadNode>())
-          found |= load->buffer->data.same_as(info.storage);
-        if (const auto *store = node.as<BufferStoreNode>())
-          found |= store->buffer->data.same_as(info.storage);
-        if (const auto *var = node.as<VarNode>())
-          found |= var == info.storage.get();
-      });
-      return found;
-    };
-    auto storage_region = [&](TaskNode *task,
-                              bool writing) -> Optional<BufferRegion> {
-      Stmt body = task->stmt;
-      while (const auto *attribute = body.as<AttrStmtNode>())
-        body = attribute->body;
-      const auto *evaluate = body.as<EvaluateNode>();
-      const auto *call = evaluate ? evaluate->value.as<CallNode>() : nullptr;
-      if (!call || !(call->op.same_as(AscendCopy::Get()) ||
-                     call->op.same_as(Copy::Get()) ||
-                     (operand && !writing && call->op.same_as(Gemm::Get())) ||
-                     ((!writing || operand) &&
-                      call->op.same_as(AscendCubeLoad3D::Get()))))
-        return std::nullopt;
-      // Typed regions declare the only storage accesses. A scalar load or
-      // data-pointer escape in an index, hint, or other argument is additional
-      // work even if its region hull happens to merge into the full tile.
-      for (const PrimExpr &argument : call->args) {
-        const auto *region_call = argument.as<CallNode>();
-        if (region_call && region_call->op.same_as(region())) {
-          BufferRegion bounds =
-              NormalizeToBufferRegion(GetRef<Call>(region_call));
-          for (const Range &range : bounds->region)
-            if (uses_storage(range->min) || uses_storage(range->extent))
-              return std::nullopt;
-        } else if (uses_storage(argument)) {
-          return std::nullopt;
-        }
-      }
-      for (const auto &[key, value] : call->annotations) {
-        auto expression = value.as<PrimExpr>();
-        if (!expression || uses_storage(*expression))
-          return std::nullopt;
-      }
-      TileOperator operation = ParseOperator(GetRef<Call>(call));
-      BufferRegion source, destination;
-      if (operand && !writing) {
-        const auto *gemm = operation.as<GemmNode>();
-        if (!gemm)
-          return std::nullopt;
-        bool a = gemm->a_->data.same_as(info.storage);
-        bool b = gemm->b_->data.same_as(info.storage);
-        if (a == b || gemm->c_->data.same_as(info.storage))
-          return std::nullopt;
-        source = a ? gemm->aRegion_ : gemm->bRegion_;
-        destination = gemm->cRegion_;
-      } else if (const auto *copy = operation.as<CopyNode>()) {
-        source = BufferRegion(copy->src, copy->src_range);
-        destination = BufferRegion(copy->dst, copy->dst_range);
-      } else if (const auto *load = operation.as<AscendCubeLoad3DNode>()) {
-        source = load->src;
-        destination = load->dst;
-      } else {
-        return std::nullopt;
-      }
-      if (operand) {
-        bool l0_operand =
-            (writing ? destination : source)->buffer.scope() == "shared.l0a" ||
-            (writing ? destination : source)->buffer.scope() == "shared.l0b";
-        if (!l0_operand ||
-            (writing ? source->buffer.scope() != "shared.l1"
-                     : destination->buffer.scope() != "shared.l0c"))
-          return std::nullopt;
-      } else if (writing ? (source->buffer.scope() != "global" ||
-                     destination->buffer.scope() != "shared.l1")
-                  : (source->buffer.scope() != "shared.l1" ||
-                     (destination->buffer.scope() != "shared.l0a" &&
-                      destination->buffer.scope() != "shared.l0b")))
-        return std::nullopt;
-      BufferRegion result = writing ? destination : source;
-      if (!result->buffer->data.same_as(info.storage) ||
-          result->region.size() != result->buffer->shape.size())
-        return std::nullopt;
-      for (size_t axis = 0; axis < result->region.size(); ++axis)
-        if (!is_zero(result->region[axis]->min) ||
-            !ffi::StructuralEqual()(result->region[axis]->extent,
-                                    result->buffer->shape[axis]))
-          return std::nullopt;
-      return result;
-    };
-    auto read = storage_region(reader, false);
-    auto write = storage_region(writer, true);
-    if (!read || !write || !read.value()->buffer.same_as(write.value()->buffer))
-      return false;
-    std::function<bool(IRStructure *)> closed_accesses =
-        [&](IRStructure *node) {
-          if (node->GuardsTouchStorage(info.storage))
-            return false;
-          if (node->IsTask())
-            return node == reader || node == writer ||
-                   !uses_storage(static_cast<TaskNode *>(node)->stmt);
-          auto *control = static_cast<ControlNode *>(node);
-          if (uses_storage(control->control->min) ||
-              uses_storage(control->control->extent) ||
-              (control->control->step.has_value() &&
-               uses_storage(control->control->step.value())))
-            return false;
-          return std::all_of(control->children.begin(), control->children.end(),
-                             [&](const auto &nested) {
-                               return closed_accesses(nested.get());
-                             });
-        };
-    if (!closed_accesses(parent))
+    if (!ClosedFullMemoryAccesses(parent, info, reader, writer, operand))
       return false;
 
     PrimExpr clock = MultiBufferIteration(info);
@@ -2506,7 +2689,9 @@ private:
         if (pool_member && !pool_local_release)
           continue;
         if (info != nullptr) {
-          if (IsParentVersionedWarCovered(dep, *info, producer, consumer, loop) ||
+          if (IsParentCounterOperandCovered(dep, *info, producer, consumer,
+                                            loop) ||
+              IsParentVersionedWarCovered(dep, *info, producer, consumer, loop) ||
               IsParentOperandWriteCovered(dep, *info, producer, consumer, loop))
             continue;
         }
@@ -4037,6 +4222,7 @@ private:
   BufferVersionMap manual_;
   MultiBufferOwnerMap multi_buffer_owners_;
   ConflictHintList root_conflicts_;
+  std::vector<IRStructure *> root_nodes_;
   const std::vector<OwnerResultPlan> *owner_results_;
   const std::vector<OwnerResultPlan> *owner_inputs_;
   const std::vector<UnitFlagStreamPlan> *unit_streams_;

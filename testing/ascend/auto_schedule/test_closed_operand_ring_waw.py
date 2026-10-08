@@ -45,7 +45,7 @@ def test_closed_operands_keep_all_physical_hazards_without_parent_barriers(stage
 
 
 @pytest.mark.parametrize("kind,versions", [("ordinary", 1), ("extra-reader", 2),
-                                          ("partial-reader", 2), ("counter", 2)])
+                                          ("partial-reader", 2), ("reset-counter", 2)])
 def test_missing_closed_operand_certificate_retains_parent_waw_fence(kind, versions):
     before, facts = _fixture("b", 3, kind=kind, outer_stage=1, versions=versions)
     physical = _lower_assigned(before)

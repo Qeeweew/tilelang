@@ -37,7 +37,7 @@ def test_uniform_child_stage_preserves_slots_payload_and_finite_completion(stage
 
 
 @pytest.mark.parametrize("kind,versions", [("ordinary", 1), ("extra-reader", 2),
-                                          ("partial-reader", 2), ("counter", 2)])
+                                          ("partial-reader", 2), ("reset-counter", 2)])
 def test_staging_does_not_erase_unqualified_parent_obligations(kind, versions):
     before, facts = _fixture("b", 3, kind=kind, outer_stage=1, versions=versions)
     counts = _check_physical_lifetime(_lower_assigned(before), facts)

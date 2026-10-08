@@ -64,9 +64,9 @@ def _fixture(side="b", trips=3, *, kind="ordinary", load3d=False, outer_stage=0,
     c = tirx.decl_buffer((32, 32), "float32", name="accum", scope="shared.l0c")
     readers = 2 if kind == "extra-reader" else 1
     output = tirx.decl_buffer((3, 2, 3, trips, readers, 32, 32), "float32", name="Output")
-    clock = tirx.decl_buffer((1,), "int32", name="operand_clock", scope="local.var") if kind == "counter" else None
-    # Keep this negative on the already-supported ordinary counter path; it
-    # tests certificate rejection rather than nested shifted-counter support.
+    clock = tirx.decl_buffer((1,), "int32", name="operand_clock", scope="local.var") if kind in ("counter", "reset-counter") else None
+    # A prepared counter advances only at actual complete native owners.
+    # The reset variant deliberately violates the kernel-wide clock contract.
     read_stage = 0 if clock is not None or versions == 1 else 1
     target = tvm.target.Target({"kind": "ascend", "arch": "dav-2201"})
     layouts = {**{cache: make_ascend_major_k_layout(cache) for cache in caches.values()},
@@ -153,7 +153,8 @@ def _fixture(side="b", trips=3, *, kind="ordinary", load3d=False, outer_stage=0,
     metadata = {"layout_map": layouts, "tl.buffer_versions_map": {operands[s].data: versions for s in selected}}
     if clock is None:
         metadata["tl.buffer_version_mode"] = {operands[s].data: "iteration" for s in selected}
-    mod = kernel(seq(*prologue, outer), buffers=buffers,
+    epilogue = [unit(tirx.BufferStore(clock, 0, [0]), core=2)] if kind == "reset-counter" else []
+    mod = kernel(seq(*prologue, outer, *epilogue), buffers=buffers,
                  params=[*inputs.values(), *fixed.values(), output] + ([epoch_count] if runtime_epochs else []),
                  annotations=metadata)
     mod["main"] = mod["main"].with_attr("target", target)
@@ -316,8 +317,8 @@ def test_runtime_root_count_keeps_the_actual_ancestor_slot_protocol(epochs, trip
 
 @pytest.mark.parametrize("side,kind", [
     ("a", "partial-reader"), ("b", "partial-reader"), ("b", "extra-reader"),
-    ("a", "view"), ("b", "counter"),
-], ids=["partial-a", "partial-b", "extra-mad", "distinct-view", "counter"])
+    ("a", "view"), ("b", "reset-counter"),
+], ids=["partial-a", "partial-b", "extra-mad", "distinct-view", "reset-counter"])
 def test_unqualified_operand_parent_keeps_its_ordinary_memory_protocol(side, kind):
     before, facts = _fixture(side, kind=kind)
     counts = _check_physical_lifetime(_lower(before), facts)
