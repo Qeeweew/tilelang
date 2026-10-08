@@ -29,10 +29,11 @@ def test_uniform_child_stage_preserves_slots_payload_and_finite_completion(stage
     counts = _check_physical_lifetime(_lower_assigned(before), facts)
     for epoch in range(3):
         for owner in range(2):
-            # This invocation has no wider-owner boundary. Only actual W2
-            # child-slot acquisitions/releases remain, even after fill/drain.
-            assert counts[epoch, owner, stage + 1, "wait"] == trips
-            assert counts[epoch, owner, stage + 1, "set"] == trips
+            # Every enclosing serial invocation is covered by the same real
+            # W2 acquisitions/releases, including translated fill/drain.
+            for row in range(3):
+                assert counts[epoch, owner, stage + row, "wait"] == trips
+                assert counts[epoch, owner, stage + row, "set"] == trips
 
 
 @pytest.mark.parametrize("kind,versions", [("ordinary", 1), ("extra-reader", 2),

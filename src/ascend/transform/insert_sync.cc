@@ -2086,8 +2086,9 @@ private:
   }
 
   // Discharge a storage WAR, not a whole-loop completion relation. With a
-  // direct T-trip iteration owner, equal physical slots across parent
-  // iterations have delta = d*T + k_cons - k_prod > 0, divisible by W.
+  // closed serial iteration-owner nest, equal physical slots across parent
+  // iterations have delta = d*T + k_cons - k_prod > 0, divisible by W, where
+  // T is the product of the constant inner trip counts.
   // Consequently delta >= W, and the retained child release protects each
   // actual overwritten slot, including an odd T. Its last read need not
   // complete before the next parent's first write (those slots may differ).
@@ -2109,23 +2110,47 @@ private:
           writer->GetPipeMask() != PipeMask(ResourcePipe::kMTE2))))
       return false;
     ControlNode *child = info.owners.front().loop;
-    auto finite_loop = [](ControlNode *loop, bool allow_outer_stage = false) {
+    auto finite_loop = [&](ControlNode *loop, bool allow_outer_stage = false,
+                           bool allow_dynamic_trip = false) {
       const ForNode *node = loop->control.get();
       const auto *extent = node->extent.as<IntImmNode>();
       PrimExpr step = node->step.has_value() ? node->step.value()
                                              : IntImm(node->extent.dtype(), 1);
-      return (loop->GetStage() == 0 ||
-              (allow_outer_stage && loop->GetStage() >= 0)) &&
-             loop->GetGuards().empty() &&
-             !loop->BodyHasLoopBreak() && node->kind == ForKind::kSerial &&
-             is_zero(node->min) && is_one(step) && extent && extent->value > 0;
+      if ((loop->GetStage() != 0 &&
+           !(allow_outer_stage && loop->GetStage() >= 0)) ||
+          !loop->GetGuards().empty() || loop->BodyHasLoopBreak() ||
+          node->kind != ForKind::kSerial || !is_zero(node->min) || !is_one(step))
+        return false;
+      if (extent)
+        return extent->value > 0;
+      // A persistent output count may depend on a kernel parameter or block
+      // coordinate, but not a loop coordinate or mutable snapshot. Its value
+      // does not enter the stride between two iterations of this parent.
+      if (!allow_dynamic_trip || loop->GetParentControl() != nullptr ||
+          !StableLocalBinaryBoundary(node->extent, loop))
+        return false;
+      PrimExpr count = owner_result_detail::Expand(
+          node->extent, owner_result_detail::TaskBindings(loop->task.get()));
+      return loop->task->outer_ctx.CanProve(count >= make_zero(count.dtype()));
     };
-    if (child->GetParentControl() != parent || dep.prod_node != child ||
-        dep.cons_node != child || reader->GetParent() != child ||
-        writer->GetParent() != child || !finite_loop(parent) ||
-        !finite_loop(child, operand) ||
-        child->control->extent.as<IntImmNode>()->value < info.num_versions ||
+    if (child == parent || !child->IsWithin(parent) ||
+        reader->GetParent() != child || writer->GetParent() != child ||
+        !finite_loop(parent, false, operand) ||
         !reader->GetGuards().empty() || !writer->GetGuards().empty())
+      return false;
+    IRStructure *projection = child->GetChildOnPathFrom(parent);
+    if (dep.prod_node != projection || dep.cons_node != projection)
+      return false;
+    if (!operand && child->GetParentControl() != parent)
+      return false;
+    // Every invocation traverses the same complete inner rectangle. Keep
+    // guards/counters/nonconstant inner trips outside this certificate, and
+    // validate the entire path rather than treating IsWithin as a proof.
+    for (ControlNode *inner = child; inner != parent;
+         inner = inner->GetParentControl())
+      if (!finite_loop(inner, operand))
+        return false;
+    if (child->control->extent.as<IntImmNode>()->value < info.num_versions)
       return false;
 
     // A child's outer stage translates this entire owner invocation by the

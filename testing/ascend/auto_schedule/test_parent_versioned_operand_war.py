@@ -1,4 +1,4 @@
-"""A retained native-MAD slot ring covers one direct parent's operand WAR.
+"""A retained native-MAD slot ring covers a closed serial ancestor's WAR.
 
 The oracle uses materialized operand slots, actual mutable counter stores,
 and real whole-pipeline event completions. Native unit readiness supplies no
@@ -46,8 +46,9 @@ def _blocks(argument, env):
 
 
 def _fixture(side="b", trips=3, *, kind="ordinary", load3d=False, outer_stage=0,
-             versions=2):
+             versions=2, runtime_epochs=False):
     e, owner, row, k = [tirx.Var(name, "int32") for name in ("epoch", "owner", "row_part", "chunk")]
+    epoch_count = tirx.Var("epoch_count", "int32") if runtime_epochs else None
     selected = ("a", "b") if side == "both" else (side,)
     shapes = {"a": (32, 16), "b": (16, 32)}
     inputs = {s: tirx.decl_buffer((3, 2, 3, trips, *shape), "float16", name="Input" + s.upper())
@@ -135,7 +136,8 @@ def _fixture(side="b", trips=3, *, kind="ordinary", load3d=False, outer_stage=0,
     stage_zero = [unit(tirx.Evaluate(0), core=2)] if outer_stage else []
     rows = unit(tirx.For(row, 0, 3, tirx.ForKind.SERIAL, seq(*stage_zero, *fills, chunks)), core=None)
     owners = unit(tirx.For(owner, 0, 2, tirx.ForKind.SERIAL, rows), core=None)
-    outer = unit(tirx.For(e, 0, 3, tirx.ForKind.SERIAL, owners), core=None)
+    outer = unit(tirx.For(e, 0, tirx.Max(epoch_count, 0) if runtime_epochs else 3,
+                         tirx.ForKind.SERIAL, owners), core=None)
     prologue = [unit(tirx.Evaluate(tirx.Call("void", tvm.ir.Op.get("tl.ascend_set_fixpipe_config"), [])), core=2),
                 # This regression needs actual MAD whole-completion edges.
                 # Automatic C unit-stream selection is tested independently.
@@ -152,7 +154,8 @@ def _fixture(side="b", trips=3, *, kind="ordinary", load3d=False, outer_stage=0,
     if clock is None:
         metadata["tl.buffer_version_mode"] = {operands[s].data: "iteration" for s in selected}
     mod = kernel(seq(*prologue, outer), buffers=buffers,
-                 params=[*inputs.values(), *fixed.values(), output], annotations=metadata)
+                 params=[*inputs.values(), *fixed.values(), output] + ([epoch_count] if runtime_epochs else []),
+                 annotations=metadata)
     mod["main"] = mod["main"].with_attr("target", target)
     with target:
         if clock is None:
@@ -161,7 +164,8 @@ def _fixture(side="b", trips=3, *, kind="ordinary", load3d=False, outer_stage=0,
     return mod, {"selected": selected, "operands": operands, "shapes": shapes,
                  "read_stage": read_stage, "outer_stage": outer_stage,
                  "trips": trips, "readers": readers, "load3d": load3d,
-                 "versions": versions, "rows": 2 if kind == "guarded-child" else 3}
+                 "versions": versions, "rows": 2 if kind == "guarded-child" else 3,
+                 "epoch_count": epoch_count}
 
 
 def _lower(before):
@@ -264,10 +268,11 @@ def _check_physical_lifetime(mod, facts):
             require(3 * configuration[0] + 2, 3 * load + 1)
     else:
         assert not configuration and not native_loads
-    assert mad_count == 3 * 2 * facts["rows"] * facts["trips"] * facts["readers"]
+    epochs = facts.get("epochs", 3)
+    assert mad_count == epochs * 2 * facts["rows"] * facts["trips"] * facts["readers"]
     assert export_count == mad_count
-    assert len(fills) == len(facts["selected"]) * 3 * 2 * facts["rows"] * facts["trips"]
-    if facts["trips"] % 2 and facts["versions"] == 2:
+    assert len(fills) == len(facts["selected"]) * epochs * 2 * facts["rows"] * facts["trips"]
+    if epochs and facts["trips"] % 2 and facts["versions"] == 2:
         for s in facts["selected"]:
             assert fills[s, 0, 0, 0, 0] != fills[s, 0, 0, 1, 0], "An odd child cannot reset its physical slot clock"
     return counts
@@ -277,15 +282,36 @@ def _check_physical_lifetime(mod, facts):
     ("a", 3, False), ("a", 4, False), ("b", 3, False), ("b", 4, False),
     ("both", 3, False), ("both", 4, False), ("a", 3, True), ("b", 3, True),
 ], ids=["a-odd", "a-even", "b-odd", "b-even", "merged-odd", "merged-even", "a-load3d", "b-load3d"])
-def test_operand_slot_release_covers_only_the_direct_parent_war(side, trips, load3d):
+def test_operand_slot_release_covers_closed_serial_ancestor_war(side, trips, load3d):
     before, facts = _fixture(side, trips, load3d=load3d)
     counts = _check_physical_lifetime(_lower(before), facts)
     for epoch in range(3):
         for owner in range(2):
-            assert counts[epoch, owner, 1, "wait"] == trips
-            assert counts[epoch, owner, 1, "set"] == trips
-            assert counts[epoch, owner, 0, "wait"] > trips, "The wider owner/epoch obligations remain"
-            assert counts[epoch, owner, 2, "set"] > trips
+            for row in range(3):
+                assert counts[epoch, owner, row, "wait"] == trips
+                assert counts[epoch, owner, row, "set"] == trips
+
+
+@pytest.mark.parametrize("epochs", [0, 1, 3], ids=["empty-root", "single-root", "reentered-root"])
+@pytest.mark.parametrize("trips", [3, 4], ids=["odd-inner", "even-inner"])
+def test_runtime_root_count_keeps_the_actual_ancestor_slot_protocol(epochs, trips):
+    before, facts = _fixture("both", trips, outer_stage=1, runtime_epochs=True)
+    physical = _lower(before)
+    function = physical["main"]
+    physical = tvm.IRModule({"main": function.with_body(tirx.stmt_functor.substitute(
+        function.body, {facts["epoch_count"]: tirx.const(epochs, "int32")}))})
+    counts = _check_physical_lifetime(physical, {**facts, "epochs": epochs})
+    for epoch in range(epochs):
+        for owner in range(2):
+            for row in range(1, 4):
+                assert counts[epoch, owner, row, "wait"] == trips
+                assert counts[epoch, owner, row, "set"] == trips
+    root_ring = Counter(_name(call) for call, _, loops in _trace(physical, core=2, lane=0)
+                        if _name(call) in ("tl.ascend_set_flag", "tl.ascend_wait_flag")
+                        and call.args[0].value == _WAR and not loops)
+    # Even an empty runtime parent consumes its two initial credits at the
+    # final drain; no synthetic parent completion is needed or counted.
+    assert root_ring == {"tl.ascend_set_flag": 2, "tl.ascend_wait_flag": 2}
 
 
 @pytest.mark.parametrize("side,kind", [

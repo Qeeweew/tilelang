@@ -54,16 +54,29 @@ Dav-3510 does not select this pool.
 ## Parent obligations for one operand ring
 
 A single allocation's retained load-to-MAD ready event and whole-MAD-to-load
-slot release can also cover its direct parent's operand WAR and repeated-load
-WAW. This requires one complete typed writer and reader, a closed positive
-serial owner, multiple versions and actual completion paths for that storage.
-A common outer stage on the child translates its physical clock and both event
-endpoints together. With child extent `T`, width `W` and stage offset `s`, the
-clock remains `(parent - s) * T + child`, with physical slot `clock % W`.
-An odd `T` must rotate slots across invocations rather than reset them.
+slot release can also cover enclosing operand WAR and repeated-load WAW.
+This requires one complete typed writer and reader, multiple versions and
+actual completion paths for that storage. Every intervening serial control
+must traverse a closed rectangle with constant positive inner trip counts,
+without guards, breaks or additional storage accesses. The enclosing scope's
+two dependency endpoints must project to the same child containing that ring.
+An outermost scope may have a proven nonnegative, kernel-invariant dynamic
+trip count; that count does not enter its inner ring's iteration stride.
+
+Synchronization and materialization retain the same prepared flattened clock.
+For an output loop, `P` K-panels and `T` native operand loads per panel, it is
+`output * P * T + panel * T + native`, with physical slot `clock % W`.
+A common outer stage translates the affected invocation and both event
+endpoints together. Odd trip products must rotate slots across invocations
+rather than reset them. Equal slots in successive enclosing invocations differ
+by a positive multiple of `W`, so the actual slot release protects the next
+overwrite even when the enclosing scope's last MAD uses a different slot.
 
 This covers the overwritten slot, allowing preparation of that slot while a
 MAD still reads a different one. It establishes neither whole-panel completion
 nor phase retirement. Guarded activation, mutable counters, extra or partial
 accesses and cross-storage conflicts retain their existing protocols or target
 diagnostics. The two-allocation pool's selection rules above are unchanged.
+This extension covers full L0 operand accesses; a sliced L1 panel reader
+requires its own last-read completion certificate and retains its existing
+parent protocol.

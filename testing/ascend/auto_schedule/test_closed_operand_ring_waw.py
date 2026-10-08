@@ -39,12 +39,9 @@ def test_closed_operands_keep_all_physical_hazards_without_parent_barriers(stage
     before, facts = _fixture(side, trips, outer_stage=stage, load3d=load3d)
     physical = _lower_assigned(before)
     _check_physical_lifetime(physical, facts)
-    # Wider owners remain unqualified; only the direct parent's middle
-    # invocation is used for this no-barrier performance contract.
-    middle = [record for record in _mte1_barriers(physical)
-              if any(var.name == "row_part" and value == stage + 1
-                     for var, value, _ in record[1])]
-    assert not middle
+    # A closed ancestor chain has the same slot RAW+WAR certificate. No
+    # invocation needs an extra whole-MTE1 WAW fence.
+    assert not _mte1_barriers(physical)
 
 
 @pytest.mark.parametrize("kind,versions", [("ordinary", 1), ("extra-reader", 2),

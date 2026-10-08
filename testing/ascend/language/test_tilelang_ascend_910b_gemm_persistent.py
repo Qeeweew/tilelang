@@ -101,45 +101,87 @@ def test_none_keeps_the_original_nonpersistent_launch_and_lowered_source(example
 
 
 @pytest.mark.parametrize("cache_a", [False, True], ids=["streamed-a", "reload-cached-a"])
-def test_persistent_outputs_retire_fix_before_c_is_cleared_again(example, cache_a):
+@pytest.mark.parametrize("tile_k,output_tiles,num_cores", [(192, 3, 1), (256, 2, 1), (192, 5, 2)],
+                         ids=["odd-three-outputs", "even-two-outputs", "dynamic-uneven-owners"])
+def test_persistent_outputs_retire_fix_without_whole_operand_retirement(
+        example, cache_a, tile_k, output_tiles, num_cores):
     from testing.ascend.auto_schedule.test_l0ab_phase_reuse import _lower
+
+    # An odd total native count changes the ring's slot phase across outputs.
+    # Uneven ownership keeps the factory's actual kernel-invariant dynamic
+    # output extent; both physical blocks are replayed independently below.
+    program = example.gemm(128, output_tiles * 256, 3 * tile_k, tile_n=256,
+                           tile_k=tile_k, num_cores=num_cores, cache_a=cache_a)
+    _, snapshots = _lower(program)
+    for block in range(num_cores):
+        def select_block(node):
+            if (isinstance(node, tirx.AttrStmt) and node.attr_key == "thread_extent"
+                    and isinstance(node.node, tirx.IterVar) and node.node.thread_tag == "blockIdx.x"):
+                return tirx.stmt_functor.substitute(
+                    node.body, {node.node.var: tirx.const(block, node.node.var.dtype)})
+
+        function = snapshots["tl.LowerScheduledTIR"]["main"]
+        physical = tvm.IRModule({"main": function.with_body(tirx.stmt_functor.ir_transform(
+            function.body, None, select_block))})
+        rounds = (output_tiles - block + num_cores - 1) // num_cores
+        _check_persistent_completions(physical, rounds, tile_k)
+
+
+def _check_persistent_completions(physical, rounds, tile_k):
     from testing.ascend.auto_schedule.test_nested_local_protocols import _prove_completions
     from testing.ascend.auto_schedule.test_owner_result_completion import _name, _trace
     from testing.ascend.auto_schedule.test_staged_parent_operand_war import _native_slot_trace
 
-    # Three outputs per physical core, each with 3 panels x 3 native K64
-    # MMADs. The odd operand count also changes the ring's slot phase between
-    # outputs; the accumulator is reused only after its actual FIX completes.
-    program = example.gemm(128, 768, 576, tile_n=256, tile_k=192, num_cores=1, cache_a=cache_a)
-    _, snapshots = _lower(program)
-    physical = snapshots["tl.LowerScheduledTIR"]
     trace, _, _ = _native_slot_trace(physical)
     require = _prove_completions(trace)  # All physical L1/L0A/L0B hazards and binary seed/drain.
     actual = list(_trace(physical, core=2, lane=0))
     assert len(actual) == len(trace)
-    mads, exports, root_ring = {}, {}, Counter()
+    mads, exports, loads, root_ring = {}, {}, {}, Counter()
     for index, (call, env, loops) in enumerate(actual):
         coordinates = {var.name: value for var, value, _ in loops}
         output = coordinates.get("iteration")
         if _name(call) == "tl.tileop.gemm":
-            assert output in range(3)
+            assert output in range(rounds)
             mads.setdefault(output, []).append((index, bool(_value(call.args[9], env))))
+        elif trace[index].pipe == "MTE1" and trace[index].kind == "copy":
+            assert output in range(rounds)
+            loads.setdefault(output, []).append(index)
         elif trace[index].pipe == "FIX" and trace[index].kind == "copy":
-            assert output in range(3) and output not in exports
+            assert output in range(rounds) and output not in exports
             exports[output] = index
         elif _name(call) in ("tl.ascend_set_flag", "tl.ascend_wait_flag") and output is None:
             if call.args[0].value == "M_MTE1":
                 root_ring[_name(call), _value(call.args[1], env)] += 1
-    assert set(mads) == set(exports) == {0, 1, 2}
-    for output in range(3):
-        assert len(mads[output]) == 9
-        assert [clear for _, clear in mads[output]] == [True] + [False] * 8
+    assert set(mads) == set(exports) == set(loads) == set(range(rounds))
+    native_count = 3 * (tile_k // 64)
+    for output in range(rounds):
+        assert len(mads[output]) == native_count
+        assert [clear for _, clear in mads[output]] == [True] + [False] * (native_count - 1)
         # Native M accumulation uses its established same-pipe ordering.
         # The risk introduced here is across output epochs and across pipes:
         # last MAD must finish before FIX, and FIX before the next C clear.
         require(3 * mads[output][-1][0] + 2, 3 * exports[output] + 1)
-        if output < 2:
+        if output + 1 < rounds:
             require(3 * exports[output] + 2, 3 * mads[output + 1][0][0] + 1)
+            previous, following = mads[output][-1][0], loads[output + 1][0]
+            assert not set(trace[previous].reads).intersection(trace[following].writes)
+            # A distinct next-output slot can be loaded while the previous
+            # output's final MAD/FIX still runs. This is a completion-path
+            # contract, not an assertion about a particular event number.
+            with pytest.raises(AssertionError, match="Missing completion path"):
+                require(3 * previous + 2, 3 * following + 1)
+    assert not any(command.kind == "barrier" and command.pipe == "MTE1" for command in trace)
+    assert set(root_ring) == {(operation, slot) for operation in ("tl.ascend_set_flag", "tl.ascend_wait_flag")
+                              for slot in (0, 1)}
     for slot in (0, 1):
         assert root_ring["tl.ascend_set_flag", slot] == 1
         assert root_ring["tl.ascend_wait_flag", slot] == 1
+    # Preserve every token, but publish the first MAD's operand release too
+    # early. The independent physical-memory oracle must reject that graph.
+    first_mad = mads[0][0][0]
+    release = next(index for index in range(first_mad + 1, len(trace))
+                   if trace[index].kind == "set" and trace[index].flag[0] == "M_MTE1")
+    corrupted = list(trace)
+    corrupted.insert(first_mad, corrupted.pop(release))
+    with pytest.raises(AssertionError, match="Missing completion path"):
+        _prove_completions(corrupted)
