@@ -89,13 +89,20 @@ struct ParallelNest {
   For outer;
   int depth;
   std::vector<ElementAccess> accesses;
+  ConstrSet context;
 };
 
-class KernelIntentCollector : public StmtExprVisitor {
+struct ScopedCall {
+  Call call;
+  ConstrSet context;
+};
+
+class KernelIntentCollector : public ConstrVisitor {
 public:
   std::vector<ParallelNest> nests;
-  std::vector<Call> copies, reductions;
+  std::vector<ScopedCall> copies, reductions;
   Map<Var, PrimExpr> bindings;
+  std::unordered_set<const VarNode *> local_vars;
 
 private:
   void VisitStmt_(const SBlockNode *op) final {
@@ -104,7 +111,15 @@ private:
       TVM_FFI_THROW(ValueError)
           << "dav-2201 AIV private domain: private declarations belong on the "
              "kernel root";
+    for (const IterVar &iv : op->iter_vars)
+      local_vars.insert(iv->var.get());
     StmtExprVisitor::VisitStmt_(op);
+  }
+  void VisitStmt_(const AttrStmtNode *op) final {
+    if (op->attr_key == tirx::attr::thread_extent ||
+        op->attr_key == s_tir::attr::virtual_thread)
+      local_vars.insert(Downcast<IterVar>(op->node)->var.get());
+    ConstrVisitor::VisitStmt_(op);
   }
   void VisitStmt_(const ForNode *op) final {
     bool parallel = op->kind == ForKind::kParallel;
@@ -119,22 +134,25 @@ private:
       }
       ElementAccessCollector collector;
       collector(op->body);
-      nests.push_back({GetRef<For>(op), depth, std::move(collector.accesses)});
+      nests.push_back({GetRef<For>(op), depth, std::move(collector.accesses),
+                       GetConstrSet()});
     }
+    local_vars.insert(op->loop_var.get());
     parallel_depth_ += parallel;
-    StmtExprVisitor::VisitStmt_(op);
+    ConstrVisitor::VisitStmt_(op);
     parallel_depth_ -= parallel;
   }
   void VisitExpr_(const CallNode *op) final {
     if (IsAscendCopyCall(op))
-      copies.push_back(GetRef<Call>(op));
+      copies.push_back({GetRef<Call>(op), GetConstrSet()});
     else if (op->op.same_as(ReduceOp::Get()))
-      reductions.push_back(GetRef<Call>(op));
-    StmtExprVisitor::VisitExpr_(op);
+      reductions.push_back({GetRef<Call>(op), GetConstrSet()});
+    ConstrVisitor::VisitExpr_(op);
   }
   void VisitStmt_(const BindNode *op) final {
+    local_vars.insert(op->var.get());
     bindings.Set(op->var, Substitute(op->value, bindings));
-    StmtExprVisitor::VisitStmt_(op);
+    ConstrVisitor::VisitStmt_(op);
   }
   int parallel_depth_{0};
 };
@@ -526,8 +544,9 @@ public:
   RowOwnership(const SBlock &root, const ConstrSet &outer_ctx,
                Array<Var> private_members = {},
                Optional<Var> sid = std::nullopt)
-      : private_members_(std::move(private_members)), sid_(std::move(sid)) {
-    outer_ctx.Populate(analyzer_);
+      : outer_ctx_(outer_ctx), private_members_(std::move(private_members)),
+        sid_(std::move(sid)) {
+    PopulateFacts(outer_ctx_, &analyzer_, true);
     mixed_ = ascend::HasAscendCubeIntent(root->body);
     for (const Buffer &buffer : root->alloc_buffers) {
       if (IsSharedBuffer(buffer))
@@ -565,10 +584,12 @@ public:
       changed = false;
       for (const auto &nest : intent_.nests)
         changed |= ConnectNest(nest);
-      for (const Call &call : intent_.copies)
-        changed |= ConnectCopy(AscendCopy(call->args, call->annotations));
-      for (const Call &call : intent_.reductions)
-        changed |= ConnectReduce(ReduceOp(call->args, call->annotations));
+      for (const auto &site : intent_.copies)
+        changed |=
+            ConnectCopy(AscendCopy(site.call->args, site.call->annotations));
+      for (const auto &site : intent_.reductions)
+        changed |=
+            ConnectReduce(ReduceOp(site.call->args, site.call->annotations));
     } while (changed);
 
     bool has_row_nest = private_members_.empty() && !intent_.nests.empty();
@@ -581,33 +602,41 @@ public:
             "component; express a dense row/column Parallel nest");
     for (const auto &nest : intent_.nests)
       ConnectNest(nest);
-    // GM boundaries establish the component's actual valid rows. Validate
-    // internal UB copies only after all those boundaries, independently of
-    // statement order: a row-state cache update may precede the first load.
-    std::vector<AscendCopy> owned_copies;
-    for (const Call &call : intent_.copies) {
-      AscendCopy copy(call->args, call->annotations);
-      if (Find(copy->src) >= 0 && Find(copy->dst) >= 0)
-        owned_copies.push_back(copy);
-      else
-        EstablishCopyDomain(copy);
+    // A boundary may have been simplified under its lexical guard. Build a
+    // globally clipped intersection first, then prove it agrees with EACH
+    // occurrence in that occurrence's context, never the intersection of
+    // guards.
+    for (const auto &site : intent_.copies)
+      EstablishCopyDomain(AscendCopy(site.call->args, site.call->annotations),
+                          site.context, true);
+    for (auto &component : owned_)
+      if (component.valid_rows.has_value())
+        component.valid_rows = analyzer_.Simplify(component.valid_rows.value());
+    for (const auto &site : intent_.copies)
+      EstablishCopyDomain(AscendCopy(site.call->args, site.call->annotations),
+                          site.context, false);
+    for (const auto &nest : intent_.nests) {
+      int id = NestOwner(nest.outer.get());
+      if (id >= 0)
+        CheckDomainScope(Component(id), nest.context);
     }
-    for (const AscendCopy &copy : owned_copies)
-      EstablishCopyDomain(copy);
-    for (const Call &call : intent_.reductions) {
-      ReduceOp reduce(call->args, call->annotations);
+    for (const auto &site : intent_.reductions) {
+      ReduceOp reduce(site.call->args, site.call->annotations);
       int id = Find(reduce->src);
       if (id < 0)
         continue;
       int axis = owned_[id].axis;
       const auto &component = Component(id);
+      CheckDomainScope(component, site.context);
+      arith::Analyzer scoped;
+      PopulateContext(site.context, &scoped);
       PrimExpr extent = reduce->srcRegion_->region[axis]->extent;
       Require(
-          analyzer_.CanProveEqual(extent,
-                                  reduce->dstRegion_->region[axis]->extent) &&
-              (analyzer_.CanProveEqual(extent, Integer(component.rows)) ||
+          scoped.CanProveEqual(extent,
+                               reduce->dstRegion_->region[axis]->extent) &&
+              (scoped.CanProveEqual(extent, Integer(component.rows)) ||
                (component.valid_rows.has_value() &&
-                analyzer_.CanProveEqual(extent, component.valid_rows.value()))),
+                scoped.CanProveEqual(extent, component.valid_rows.value()))),
           "owned reductions must use the full logical or established "
           "valid row domain on both operands");
     }
@@ -784,7 +813,50 @@ private:
     return changed;
   }
 
-  void EstablishCopyDomain(const AscendCopy &copy) {
+  static void PopulateFacts(const ConstrSet &context, arith::Analyzer *analyzer,
+                            bool rewrite_domain = false) {
+    for (const Constr &fact : context.constrs_) {
+      if (fact.kind == Constr::kConstr &&
+          SideEffect(fact.value) > CallEffectKind::kPure)
+        continue;
+      // A proof-only analyzer may freshen a mutable definition through Constr.
+      // The domain rewriter must instead retain its original SSA variable:
+      // a fresh proof placeholder is not a variable defined in the output IR.
+      if (rewrite_domain &&
+          ((fact.kind == Constr::kBindValue &&
+            SideEffect(fact.value) > CallEffectKind::kPure) ||
+           (fact.kind == Constr::kBindRange &&
+            (SideEffect(fact.range->min) > CallEffectKind::kPure ||
+             SideEffect(fact.range->extent) > CallEffectKind::kPure))))
+        continue;
+      fact.Populate(*analyzer);
+    }
+  }
+
+  void PopulateContext(const ConstrSet &context, arith::Analyzer *scoped) {
+    PopulateFacts(outer_ctx_, scoped);
+    PopulateFacts(context, scoped);
+  }
+
+  void CheckDomainScope(const OwnedStorage &component,
+                        const ConstrSet &context) {
+    if (!component.valid_rows.has_value())
+      return;
+    for (const Var &var : UndefinedVars(component.valid_rows.value())) {
+      if (!intent_.local_vars.count(var.get()))
+        continue;
+      bool available = false;
+      for (const Constr &fact : context.constrs_)
+        available |= fact.kind != Constr::kConstr && fact.var.same_as(var);
+      Require(
+          available,
+          "the common valid row domain must be in scope at every component "
+          "use; loop-local or branch-local boundary domains are unsupported");
+    }
+  }
+
+  void EstablishCopyDomain(const AscendCopy &copy, const ConstrSet &context,
+                           bool collect) {
     if (IsPrivate(copy->src) || IsPrivate(copy->dst))
       return;
     int source = Find(copy->src), destination = Find(copy->dst);
@@ -804,16 +876,20 @@ private:
     Require(analyzer_.CanProveEqual(ub_ranges[axis]->min, Integer(0)),
             "owned copy regions must start at logical row zero");
     if (source >= 0 && destination >= 0) {
+      if (collect)
+        return;
       Require(analyzer_.CanProveEqual(copy->dst_range[axis]->min, Integer(0)),
               "owned UB copy destinations must start at row zero");
       const auto &component = Component(id);
+      CheckDomainScope(component, context);
+      arith::Analyzer scoped;
+      PopulateContext(context, &scoped);
       PrimExpr extent = ub_ranges[axis]->extent;
-      Require(
-          analyzer_.CanProveEqual(extent, Integer(component.rows)) ||
-              (component.valid_rows.has_value() &&
-               analyzer_.CanProveEqual(extent, component.valid_rows.value())),
-          "owned UB copies must use the full logical or established valid "
-          "row domain on both operands");
+      Require(scoped.CanProveEqual(extent, Integer(component.rows)) ||
+                  (component.valid_rows.has_value() &&
+                   scoped.CanProveEqual(extent, component.valid_rows.value())),
+              "owned UB copies must use the full logical or established valid "
+              "row domain on both operands");
       return;
     }
     const Buffer &other = ub_source ? copy->dst : copy->src;
@@ -833,6 +909,10 @@ private:
             "of applying automatic row partition again");
     }
     PrimExpr valid = ub_ranges[axis]->extent;
+    Require(SideEffect(valid) <= CallEffectKind::kPure &&
+                SideEffect(other->shape[gm_axis]) <= CallEffectKind::kPure &&
+                SideEffect(gm_ranges[gm_axis]->min) <= CallEffectKind::kPure,
+            "the common valid row domain cannot read mutable state");
     Require(!UsesAnyRowLoop(valid),
             "whole-tile copies must remain outside the owner row traversal");
     // A frontend tile can extend past the GM tail. The valid region, rather
@@ -843,16 +923,28 @@ private:
             min(min(valid, make_const(valid.dtype(), owned_[id].rows)),
                 other->shape[gm_axis] - gm_ranges[gm_axis]->min)));
     size_t leading = gm_ranges.size() - ub_ranges.size();
-    for (size_t i = 0; i < leading; ++i)
+    for (size_t i = 0; i < leading; ++i) {
+      Require(SideEffect(gm_ranges[i]->extent) <= CallEffectKind::kPure,
+              "the common valid row domain cannot read mutable state");
       valid =
           analyzer_.Simplify(valid * cast(valid.dtype(), gm_ranges[i]->extent));
+    }
+    Require(SideEffect(valid) <= CallEffectKind::kPure,
+            "the common valid row domain cannot read mutable state");
     OwnedStorage &component = owned_[Leader(id)];
-    if (component.valid_rows.has_value())
-      Require(analyzer_.CanProveEqual(component.valid_rows.value(), valid),
-              "connected GM copies disagree on the actual valid row domain; "
-              "pass the same valid region through every handover");
-    else
-      component.valid_rows = valid;
+    if (collect) {
+      component.valid_rows = component.valid_rows.has_value()
+                                 ? min(component.valid_rows.value(), valid)
+                                 : valid;
+      return;
+    }
+    CheckDomainScope(component, context);
+    arith::Analyzer scoped;
+    PopulateContext(context, &scoped);
+    Require(scoped.CanProveEqual(component.valid_rows.value(), valid),
+            "connected GM copies disagree on the actual valid row domain "
+            "in their own lexical contexts; pass the same valid region "
+            "through every handover");
   }
 
   bool UsesAnyRowLoop(const PrimExpr &expr) const {
@@ -863,6 +955,7 @@ private:
   }
 
   arith::Analyzer analyzer_;
+  ConstrSet outer_ctx_;
   Array<Var> private_members_;
   Optional<Var> sid_;
   bool mixed_{false};

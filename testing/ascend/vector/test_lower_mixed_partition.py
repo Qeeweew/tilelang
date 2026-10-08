@@ -493,3 +493,170 @@ def test_conflicting_valid_copy_domains_are_rejected():
     before = tvm.IRModule({"main": before["main"].with_body(tirx.SBlockRealize([], True, root))})
     with pytest.raises(ValueError, match="disagree on the actual valid row domain"):
         _lower(before)
+
+
+def _guarded_workspace_program(kind="single"):
+    """A simplified workspace is full only while the second query is present."""
+    rows, width = 16, 32
+    workspace = tirx.decl_buffer((rows, width), "float32", name="workspace")
+    output = tirx.decl_buffer((65, width), "float32", name="output")
+    x, y = [tirx.decl_buffer((rows, width), "float32", name=name, scope="shared.dyn") for name in ("x", "y")]
+    group = tirx.Var("query_pair", "int32")
+    i, j = tirx.Var("row", "int32"), tirx.Var("col", "int32")
+    math = _parallel(tirx.BufferStore(y, x[i, j] + 1, [i, j]), (i, rows), (j, width))
+    load = copy(workspace, x)
+    export = copy(y, output, dst_indices=[group * 32 + 16, 0], dst_shape=[rows, width])
+    cube, buffers = _cube()
+    params = [workspace, output]
+    if kind == "single":
+        body = tirx.IfThenElse(group < 2, seq(load, math, export), None)
+    elif kind == "equivalent":
+        body = seq(
+            tirx.IfThenElse(group < 2, load, None),
+            tirx.IfThenElse(2 > group, math, None),
+            tirx.IfThenElse(group <= 1, export, None),
+        )
+    elif kind == "shared-call":
+        # Deliberately reuse the SAME Call node. The first occurrence must not
+        # borrow the second occurrence's guard and disappear from validation.
+        body = seq(
+            tirx.IfThenElse(group >= 2, load, None),
+            tirx.IfThenElse(group < 2, seq(load, math, export), None),
+        )
+    elif kind == "mutable":
+        state = tirx.decl_buffer((1,), "int32", name="state")
+        params.append(state)
+        guard = tirx.And(state[0] == group, state[0] < 2)
+        body = tirx.IfThenElse(guard, seq(load, math, export), None)
+    elif kind in ("local-bind", "escaped-bind"):
+        valid = tirx.Var("local_valid", "int32")
+        load = copy(workspace, x, src_shape=[valid, width], dst_shape=[valid, width])
+        inside = seq(tirx.Bind(valid, rows), load, math)
+        body = (
+            tirx.IfThenElse(group < 2, seq(tirx.Bind(valid, rows), load, math, export), None)
+            if kind == "local-bind"
+            else seq(tirx.IfThenElse(group < 2, inside, None), export)
+        )
+    else:
+        raise AssertionError(kind)
+    before = _target(kernel(seq(cube, body), buffers=[*buffers, x, y], params=params))
+    grid = tirx.IterVar(tvm.ir.Range(0, 3), group, tirx.IterVar.ThreadIndex, "blockIdx.x")
+    before = tvm.IRModule({"main": before["main"].with_body(tirx.AttrStmt(grid, "thread_extent", 3, before["main"].body))})
+    return before, group
+
+
+@pytest.mark.parametrize("kind", ["single", "equivalent", "local-bind"])
+def test_guard_simplified_workspace_uses_a_common_clipped_domain(kind):
+    before, group = _guarded_workspace_program(kind)
+    after = _lower(before)
+    sid = _sid(after)
+    # The original presence guards survive; partitioning never hides an empty
+    # AIV's collective completion inside a new owner-specific branch.
+    assert len(nodes(after, tirx.IfThenElse)) == len(nodes(before, tirx.IfThenElse))
+    transfers = calls(after, "tl.tileop.ascend_copy")
+    assert len(transfers) == 2
+    for tile in range(3):
+        for owner in range(2):
+            replacements = {group: tirx.IntImm("int32", tile), sid: tirx.IntImm("int32", owner)}
+            if kind == "local-bind":
+                valid = next(bind.var for bind in nodes(after, tirx.Bind) if bind.var.name == "local_valid")
+                replacements[valid] = tirx.IntImm("int32", 16)
+            expected = 8 if tile < 2 else 0
+            for transfer in transfers:
+                for buffer, _, extents in _regions(transfer):
+                    assert _constant(extents[0], replacements) == expected
+                    if buffer.scope() == "shared.dyn":
+                        assert tuple(int(size) for size in buffer.shape) == (8, 32)
+
+
+@pytest.mark.parametrize("kind", ["shared-call", "mutable"])
+def test_boundary_proofs_do_not_borrow_another_occurrences_guard(kind):
+    before, _ = _guarded_workspace_program(kind)
+    with pytest.raises(ValueError, match="disagree on the actual valid row domain"):
+        _lower(before)
+
+
+def test_common_boundary_domain_cannot_escape_its_definition_scope():
+    before, _ = _guarded_workspace_program("escaped-bind")
+    with pytest.raises(ValueError, match="must be in scope at every component use"):
+        _lower(before)
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+def test_different_guarded_boundary_domains_are_rejected_in_each_own_context(overlap):
+    rows, width = 16, 32
+    a, c = [tirx.decl_buffer((rows, width), "float32", name=name) for name in ("A", "C")]
+    x = tirx.decl_buffer((rows, width), "float32", name="x", scope="shared.dyn")
+    active = tirx.Var("active", "int32")
+    i, j = tirx.Var("row", "int32"), tirx.Var("col", "int32")
+    math = _parallel(tirx.BufferStore(x, x[i, j] + 1, [i, j]), (i, rows), (j, width))
+    load = copy(a, x)
+    store = copy(x, c, src_shape=[8, width], dst_shape=[8, width])
+    # In the disjoint case combining then/else guards would prove anything.
+    guarded = (
+        tirx.IfThenElse(active > 0, seq(load, store), None)
+        if overlap
+        else tirx.IfThenElse(active > 0, load, store)
+    )
+    cube, buffers = _cube()
+    before = _target(kernel(seq(cube, guarded, math), buffers=[*buffers, x], params=[a, c, active]))
+    with pytest.raises(ValueError, match="disagree on the actual valid row domain"):
+        _lower(before)
+
+
+def test_mutable_outer_kernel_guards_do_not_prove_boundary_domains_equal():
+    rows, width = 16, 32
+    a, c = [tirx.decl_buffer((rows, width), "float32", name=name) for name in ("A", "C")]
+    state = tirx.decl_buffer((1,), "int32", name="state")
+    valid = tirx.Var("valid", "int32")
+    x = tirx.decl_buffer((rows, width), "float32", name="x", scope="shared.dyn")
+    i, j = tirx.Var("row", "int32"), tirx.Var("col", "int32")
+    cube, buffers = _cube()
+    body = seq(
+        cube,
+        copy(a, x, src_shape=[valid, width], dst_shape=[valid, width]),
+        _parallel(tirx.BufferStore(x, x[i, j] + 1, [i, j]), (i, rows), (j, width)),
+        copy(x, c, src_shape=[8, width], dst_shape=[8, width]),
+    )
+    before = _target(kernel(body, buffers=[*buffers, x], params=[a, c, state, valid]))
+    # These reads are separated by a write. Treating both as one premise would
+    # incorrectly derive valid == 8, even though valid may be 16 at runtime.
+    guarded = tirx.IfThenElse(
+        state[0] == valid,
+        seq(tirx.BufferStore(state, 8, [0]), tirx.IfThenElse(state[0] == 8, before["main"].body, None)),
+        None,
+    )
+    before = tvm.IRModule({"main": before["main"].with_body(guarded)})
+    with pytest.raises(ValueError, match="disagree on the actual valid row domain"):
+        _lower(before)
+
+
+def test_outer_mutable_snapshot_remains_a_defined_ir_variable():
+    rows, width = 5, 32
+    a, c = [tirx.decl_buffer((64, width), "float32", name=name) for name in ("A", "C")]
+    state = tirx.decl_buffer((1,), "int32", name="state")
+    valid = tirx.Var("captured_valid", "int32")
+    x = tirx.decl_buffer((rows, width), "float32", name="x", scope="shared.dyn")
+    i, j = tirx.Var("row", "int32"), tirx.Var("col", "int32")
+    cube, buffers = _cube()
+    shape = [valid, width]
+    body = seq(
+        cube,
+        copy(a, x, src_shape=shape, dst_shape=shape),
+        _parallel(tirx.BufferStore(x, x[i, j] + 1, [i, j]), (i, rows), (j, width)),
+        copy(x, c, src_shape=shape, dst_shape=shape),
+    )
+    before = _target(kernel(body, buffers=[*buffers, x], params=[a, c, state]))
+    before = tvm.IRModule({"main": before["main"].with_body(seq(tirx.Bind(valid, state[0]), before["main"].body))})
+    after = _lower(before)
+    assert not tirx.analysis.undefined_vars(after["main"].body, after["main"].params)
+    sid = _sid(after)
+    for transfer in calls(after, "tl.tileop.ascend_copy"):
+        for _, _, extents in _regions(transfer):
+            # A fresh analyzer placeholder has no runtime definition. Every
+            # extent must use the original snapshot and the new owner only.
+            assert all(var.same_as(valid) or var.same_as(sid) for var in tirx.analysis.undefined_vars(extents[0]))
+            for actual, expected in ((0, (0, 0)), (2, (2, 0)), (5, (3, 2))):
+                for owner in (0, 1):
+                    replacements = {valid: tirx.IntImm("int32", actual), sid: tirx.IntImm("int32", owner)}
+                    assert _constant(extents[0], replacements) == expected[owner]

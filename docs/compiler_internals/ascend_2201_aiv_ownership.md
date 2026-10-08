@@ -9,6 +9,15 @@ domain between the two AIVs. `AscendLowerMixedPartition` establishes the
 private row capacities, valid regions and GM offsets. This remains the
 default for ordinary GEMM-to-vector kernels and attention tiles.
 
+Connected GM boundaries must agree on one valid row domain. Their geometric
+intersection provides the component domain, and each boundary must prove
+equality in its own lexical context. This retains facts used by earlier
+conditional simplification without treating different guards as interchangeable.
+The shared domain must be in scope at every component use; loop-local and
+branch-local values cannot escape their defining scope. Repeated mutable reads
+cannot establish a stable domain. Empty AIV payloads retain collective
+completion.
+
 ## Complete local domains
 
 Some algorithms assign a different complete query tile to each AIV. These
