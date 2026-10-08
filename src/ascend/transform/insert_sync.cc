@@ -1853,6 +1853,8 @@ private:
     RemoveNestedCoveredLocalProtocols(local_sync_points, child_sync_points,
                                       result.closure, max_distance, loop);
     OptimizeSyncPoints(local_sync_points, result.closure, max_distance, loop);
+    CompleteCounterBinaryPoints(local_sync_points, result.closure, max_distance,
+                                loop);
     if (loop != nullptr)
       OptimizeFlagVersions(local_sync_points, result.closure, loop);
     if (owner_fallback_required_ || unit_fallback_required_)
@@ -3063,6 +3065,138 @@ private:
       emit.push_back(std::move(sync_point));
     }
     sync_points = std::move(emit);
+  }
+
+  bool IsCanonicalCounterAdvance(const TaskNode *task,
+                                 const Buffer &counter) const {
+    Stmt body = task->stmt;
+    while (const auto *wrapper = body.as<AttrStmtNode>()) {
+      if (wrapper->attr_key != attr::kAscendTask)
+        return false;
+      body = wrapper->body;
+    }
+    const auto *store = body.as<BufferStoreNode>();
+    if (!store || !store->buffer.same_as(counter) ||
+        store->indices.size() != 1 || !is_zero(store->indices[0]) ||
+        store->predicate.has_value())
+      return false;
+    const auto *add = store->value.as<AddNode>();
+    const auto *load = add ? add->a.as<BufferLoadNode>() : nullptr;
+    return load && load->buffer.same_as(counter) && load->indices.size() == 1 &&
+           is_zero(load->indices[0]) && !load->predicate.has_value() &&
+           is_one(add->b);
+  }
+
+  void CompleteCounterBinaryPoints(std::vector<SyncPoint> &sync_points,
+                                   DepClosure &closure, int max_distance,
+                                   ControlNode *loop) const {
+    if (architecture_ != AscendArchitecture::kDav2201 || !loop ||
+        loop->GetStage() != 0 || loop->BodyHasLoopBreak())
+      return;
+    const ConstrSet &context = loop->GetLoopBodyContext();
+    int lexical_domain = domains_.UnconditionalLexicalDomain(loop);
+    std::vector<SyncPoint> completions;
+    std::set<std::pair<size_t, size_t>> emitted;
+    for (const SyncPoint &point : sync_points) {
+      const SyncInsertionSite &src = site_registry_.Src(point);
+      const SyncInsertionSite &dst = site_registry_.Dst(point);
+      const EpochDomain &domain = site_registry_.Domain(src);
+      if (point.IsPrivateGmHandoff() || point.counter_group_id == 0 ||
+          point.flag_loop != loop || point.edge.distance != 0 ||
+          point.dependency_kind != DependencyKind::kData ||
+          src.core != kCoreVector || dst.core != src.core || src.pipe != "S" ||
+          dst.pipe != "V" || !domain.IsCounter() || domain.owner != loop ||
+          !context.CanProve(domain.active_guard) ||
+          MinCompletionDistance(closure, point.edge.dst, point.edge.src) !=
+              std::numeric_limits<int>::max())
+        continue;
+      // Stay inside one unconditional owner activation. A singleton child
+      // may be entered repeatedly by an ancestor; neither its trip bound nor
+      // the local.var increment itself is a Vector completion witness.
+      auto flat = [&](const SyncInsertionSite &site) {
+        return site.path_begin == site.path_end && site.path_end->IsTask() &&
+               site.path_begin->GetParent() == loop &&
+               site.path_begin->GetStage() == 0 &&
+               static_cast<TaskNode *>(site.path_end)->GetCoreMask() ==
+                   kCoreVector &&
+               context.CanProve(site.path_begin->GetConditionGuard()) &&
+               context.CanProve(site.GetGuard());
+      };
+      if (!flat(src) || !flat(dst))
+        continue;
+      const auto *clock = point.flag_iteration.as<BufferLoadNode>();
+      if (!clock || !clock->buffer.same_as(domain.counter) ||
+          clock->indices.size() != 1 || !is_zero(clock->indices[0]) ||
+          clock->predicate.has_value())
+        continue;
+
+      TaskNode *advance = nullptr;
+      bool exact_advance = true;
+      for (const auto &child : loop->children) {
+        if (!child->WritesStorage(domain.counter->data))
+          continue;
+        if (advance || !child->IsTask()) {
+          exact_advance = false;
+          break;
+        }
+        advance = static_cast<TaskNode *>(child.get());
+      }
+      if (!exact_advance || !advance || advance->GetCoreMask() != kCoreVector ||
+          !advance->UsesOnlyPipe(ResourcePipe::kScalar) ||
+          advance->GetStage() != 0 ||
+          advance->GetIndex() <= dst.path_begin->GetIndex() ||
+          !context.CanProve(advance->GetConditionGuard()) ||
+          !IsCanonicalCounterAdvance(advance, domain.counter))
+        continue;
+
+      // Protect every reader in this exact counter group, not just an early
+      // consumer whose ready flag survived optimization. Vector issue order
+      // alone cannot certify that a later independent read has completed.
+      std::vector<TaskNode *> readers;
+      bool exact_readers = true;
+      for (const auto &child : loop->children) {
+        bool reads_group = false;
+        for (const MultiBufferInfo &info : multi_buffer_plan_.Infos()) {
+          if (info.counter_group_id == point.counter_group_id &&
+              info.counter.same_as(domain.counter) && info.FindOwner(loop) &&
+              child->ReadsStorage(info.storage)) {
+            reads_group = true;
+            break;
+          }
+        }
+        if (!reads_group)
+          continue;
+        if (!child->IsTask() || child->GetStage() != 0 ||
+            child->GetIndex() >= advance->GetIndex() ||
+            !child->UsesOnlyPipe(ResourcePipe::kVector) ||
+            static_cast<TaskNode *>(child.get())->GetCoreMask() !=
+                kCoreVector ||
+            !context.CanProve(child->GetConditionGuard())) {
+          exact_readers = false;
+          break;
+        }
+        readers.push_back(static_cast<TaskNode *>(child.get()));
+      }
+      if (!exact_readers || readers.empty())
+        continue;
+      size_t acquire = site_registry_.FindSiteId(SyncInsertionSiteKey{
+          advance, advance, true, dst.core, lexical_domain});
+      for (TaskNode *reader : readers) {
+        size_t release = site_registry_.FindSiteId(SyncInsertionSiteKey{
+            reader, reader, false, dst.core, lexical_domain});
+        if (!emitted.emplace(release, acquire).second)
+          continue;
+        // Emit a real V->S completion immediately before the canonical tick.
+        // Scalar admission then gates the next S writer, including ancestor
+        // re-entry. Its own binary lifetime must still be proved through the
+        // retained S->V ready edge below; no reuse edge is assumed here.
+        completions.emplace_back(DepEdge(release, acquire, 0, true),
+                                 DependencyKind::kData, 1, loop);
+      }
+    }
+    OptimizeSyncPoints(completions, closure, max_distance, loop);
+    for (SyncPoint &point : completions)
+      sync_points.push_back(std::move(point));
   }
 
   std::optional<PrimExpr>

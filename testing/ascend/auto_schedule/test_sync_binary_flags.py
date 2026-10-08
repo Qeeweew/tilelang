@@ -1,11 +1,13 @@
-"""Local DMA flags are binary state, including pipeline fill and drain.
+"""Local flags are binary state, including pipeline fill and drain.
 
 The finite oracle models DMA/flag completion in each pipe, not source issue
 order between pipes. Set->wait edges discharge one notification. A completed
 wait must independently precede the next set of that ID; the oracle never
 adds that reuse edge on behalf of InsertSync. Typed DMA epochs must also have
 RAW and overwrite-completion paths. This is a CPU protocol proof for these
-finite fixtures, not a device or general instruction-latency model.
+finite fixtures, not a device or general instruction-latency model. The mask
+fixtures also model blocking Scalar admission and Vector flag completion;
+independent Vector arithmetic has no implicit completion-order edge.
 """
 
 from __future__ import annotations
@@ -31,7 +33,7 @@ class _Completion:
     slot: tuple | None = None
 
 
-def _completion_trace(mod, parameters=None):
+def _completion_trace(mod, parameters=None, *, scalar_vector=False):
     """Execute finite controls and retain asynchronous DMA completion nodes."""
     result, values, scalar_memory = [], dict(parameters or {}), {}
     analyzer = tvm.arith.Analyzer()
@@ -86,9 +88,14 @@ def _completion_trace(mod, parameters=None):
             if branch is not None:
                 visit(branch)
         elif isinstance(statement, tirx.BufferStore):
-            assert statement.buffer.scope() == "local.var"
-            key = statement.buffer.data, tuple(integer(index) for index in statement.indices)
-            scalar_memory[key] = integer(statement.value)
+            if statement.buffer.scope() == "local.var":
+                key = statement.buffer.data, tuple(integer(index) for index in statement.indices)
+                if scalar_vector and isinstance(statement.value, tirx.Add):
+                    result.append(_Completion("S", "tick", slot=(statement.buffer.data, 0)))
+                scalar_memory[key] = integer(statement.value)
+            else:
+                assert scalar_vector and statement.buffer.scope() == "shared.dyn"
+                result.append(_Completion("S", "mask_write", slot=slot(statement.buffer[tuple(statement.indices)])))
         elif isinstance(statement, tirx.Evaluate):
             call = statement.value
             if isinstance(call, tirx.IntImm):
@@ -105,6 +112,8 @@ def _completion_trace(mod, parameters=None):
                                           operation, (event, event_id)))
             elif name == "tl.ascend_pipe_barrier":
                 result.append(_Completion(str(call.args[0].value).removeprefix("PIPE_"), "barrier"))
+            elif scalar_vector and name == "tl.ascend_membase.select_bits":
+                result.append(_Completion("V", "mask_read", slot=slot(call.args[3].args[0])))
             else:
                 assert name == "tl.tileop.ascend_copy", f"Unexpected instruction in DMA fixture: {name}"
                 source, destination = (argument.args[0] for argument in call.args)
@@ -126,10 +135,23 @@ def _prove_binary_protocol(trace):
     """Check every completion ordering, without inserting missing reuse edges."""
     successors = [set() for _ in trace]
     last_pipe, sets, waits = {}, defaultdict(list), defaultdict(list)
+    vector_commands, vector_admission = [], []
     for index, node in enumerate(trace):
-        if node.pipe in last_pipe:
-            # DMA pipe FIFO completion is the existing MTE contract. This
-            # oracle deliberately contains no V arithmetic issue-order rule.
+        if node.pipe == "V":
+            if node.kind in ("set", "barrier"):
+                # PIPE_V notification/barrier completes preceding commands.
+                for previous in vector_commands:
+                    successors[previous].add(index)
+            else:
+                # A wait/barrier gates later commands. Two independent
+                # arithmetic reads need not complete in their issue order.
+                for previous in vector_admission:
+                    successors[previous].add(index)
+            vector_commands.append(index)
+            if node.kind in ("wait", "barrier"):
+                vector_admission.append(index)
+        elif node.pipe in last_pipe:
+            # DMA completion FIFO and blocking Scalar admission.
             successors[last_pipe[node.pipe]].add(index)
         last_pipe[node.pipe] = index
         if node.kind in ("set", "wait"):
@@ -320,6 +342,121 @@ def test_counter_clock_distance_zero_protocol_remains_binary():
     before["main"] = before["main"].with_attr("target", tvm.target.Target({"kind": "ascend", "arch": "dav-2201"}))
     trace = _completion_trace(_lower_protocol(before, prepared=True))
     _prove_data_epochs(trace, _prove_binary_protocol(trace), [(0,), (2,)])
+
+
+def _counter_mask_program(*, tick="canonical", readers=1, versions=2):
+    """Prepared pass input with a 0/1-row owner repeatedly entered by outer.
+
+    The mask has one counter clock shared by its two scalar words. There are
+    seventeen outer iterations, including holes in owner activation, so a finite
+    eight-ID root allocation cannot substitute for a real reusable protocol.
+    """
+    mask = tirx.decl_buffer((2,), "uint64", name="mask", scope="shared.dyn")
+    counter = tirx.decl_buffer((1,), "int32", name="mask_epoch", scope="local.var")
+    other = tirx.decl_buffer((1,), "int32", name="other_epoch", scope="local.var")
+    left, right = [tirx.decl_buffer((16,), "float32", name=name, scope="shared.dyn")
+                   for name in ("left", "right")]
+    outputs = [tirx.decl_buffer((17, 16), "float32", name=f"output{reader}", scope="shared.dyn")
+               for reader in range(readers)]
+    outer, row, sid = [tirx.Var(name, "int32") for name in ("outer", "row", "sid")]
+    pointer = lambda load, count, effect: tirx.Call(
+        "handle", tvm.ir.Op.get("tl.access_ptr"), [load, count, effect])
+    consumers = [unit(tirx.Evaluate(tirx.Call("void", tvm.ir.Op.get("tl.ascend_membase.select_bits"), [
+        pointer(output[outer, 0], 16, 2), pointer(left[0], 16, 1),
+        pointer(right[0], 16, 1), pointer(mask[0], 2, 1), tirx.IntImm("uint32", 16)])))
+        for output in outputs]
+    selected_counter = other if tick == "other-group" else counter
+    advance_value = selected_counter[0] + (2 if tick == "add-two" else 1)
+    if tick == "reset":
+        advance_value = tirx.const(0, "int32")
+    advance = unit(tirx.BufferStore(selected_counter, advance_value, [0]),
+                   core=2 if tick == "wrong-core" else 1,
+                   stage=1 if tick == "shifted" else 0,
+                   guard=outer % 2 == 0 if tick == "guard-mismatch" else None)
+    tasks = [unit(tirx.BufferStore(mask, tirx.Cast("uint64", outer + 1), [0])),
+             unit(tirx.BufferStore(mask, tirx.const(0, "uint64"), [1]))]
+    tasks += [advance, *consumers] if tick == "early" else [*consumers, advance]
+    owner = tirx.For(row, 0, tirx.max(0, 1 - sid * 8), tirx.ForKind.SERIAL, seq(*tasks), annotations={
+        "multi_buffer_eligible": [mask.data],
+        "tl.multi_buffer_counter_map": {mask.data: counter},
+        "tl.storage_epoch_guard_map": {mask.data: tirx.const(True, "bool")},
+    })
+    body = seq(unit(tirx.BufferStore(counter, 0, [0])), unit(tirx.BufferStore(other, 0, [0])),
+               unit(tirx.For(outer, 0, 17, tirx.ForKind.SERIAL,
+                             unit(owner, core=None, guard=outer % 3 != 1)), core=None))
+    thread = tirx.IterVar(tvm.ir.Range(0, 2), sid, tirx.IterVar.ThreadIndex, "cthread")
+    mod = kernel(body, buffers=[mask, counter, other, left, right, *outputs],
+                 annotations={"tl.buffer_versions_map": {mask.data: versions}})
+    mod["main"] = mod["main"].with_body(tirx.AttrStmt(thread, "thread_extent", 2, mod["main"].body))
+    mod["main"] = mod["main"].with_attr("target", tvm.target.Target({"kind": "ascend", "arch": "dav-2201"}))
+    return mod, sid
+
+
+def _prove_mask_epochs(trace, precedes, activations, readers, *, expected_ticks):
+    latest_writes, pending_reads = {}, defaultdict(list)
+    reads = ticks = writes = 0
+    current_reads = []
+    retirement_waits = [index for index, node in enumerate(trace)
+                        if node.kind == "wait" and node.flag[0] == "V_S"]
+    for index, node in enumerate(trace):
+        if node.kind == "mask_write":
+            writes += 1
+            for prior in pending_reads.pop(node.slot, []):
+                assert precedes(prior, index), "Mask overwritten before its Vector reader completes"
+            latest_writes[node.slot] = index
+        elif node.kind == "mask_read":
+            reads += 1
+            current_reads.append(index)
+            assert any(precedes(index, wait) for wait in retirement_waits), "Vector reader has no real Scalar retirement wait"
+            for word in range(2):
+                cell = node.slot[0], node.slot[1] + word
+                assert cell in latest_writes and precedes(latest_writes[cell], index), "Mask read before Scalar write completion"
+                pending_reads[cell].append(index)
+        elif node.kind == "tick":
+            ticks += 1
+            assert len(current_reads) == readers
+            assert all(precedes(reader, index) for reader in current_reads), "Counter advanced before every Vector reader completes"
+            current_reads.clear()
+    assert (writes, reads, ticks) == (2 * activations, readers * activations, expected_ticks)
+
+
+@pytest.mark.parametrize("sid_value", [0, 1], ids=["one-row", "empty-row"])
+@pytest.mark.parametrize("readers", [1, 2])
+@pytest.mark.parametrize("versions", [1, 2])
+def test_counter_mask_completion_gates_repeated_owner_and_every_reader(sid_value, readers, versions):
+    before, sid = _counter_mask_program(readers=readers, versions=versions)
+    snapshot = tvm.ir.save_json(before)
+    with tvm.transform.PassContext(config={"tl.disable_shared_memory_reuse": True}):
+        inserted = transform.InsertSync()(before)
+        logical = transform.LowerScheduledTIR()(inserted)
+        lowered = transform.LowerScheduledTIR()(transform.MaterializeMultiBuffer()(inserted))
+    assert tvm.ir.save_json(before) == snapshot
+    activations = sum(outer % 3 != 1 for outer in range(17)) if sid_value == 0 else 0
+    logical_trace = _completion_trace(logical, {sid: sid_value}, scalar_vector=True)
+    _prove_mask_epochs(logical_trace, _prove_binary_protocol(logical_trace),
+                       activations, readers, expected_ticks=activations)
+    trace = _completion_trace(lowered, {sid: sid_value}, scalar_vector=True)
+    precedes = _prove_binary_protocol(trace)
+    # A unit-version counter is legitimately elided; its real Scalar wait
+    # must remain and close every active notification and mask read.
+    _prove_mask_epochs(trace, precedes, activations, readers,
+                       expected_ticks=activations if versions > 1 else 0)
+    if activations:
+        for event in ("S_V", "V_S"):
+            assert any(node.kind == "set" and node.flag[0] == event for node in trace)
+        without_completion = [node for node in trace if node.flag is None or node.flag[0] != "V_S"]
+        with pytest.raises(AssertionError, match="set again before its prior wait completes"):
+            _prove_binary_protocol(without_completion)
+
+
+@pytest.mark.parametrize("tick", ["add-two", "reset", "other-group", "wrong-core", "guard-mismatch", "shifted", "early"])
+def test_counter_mask_completion_rejects_noncanonical_or_mismatched_tick(tick):
+    before, _ = _counter_mask_program(tick=tick)
+    snapshot = tvm.ir.save_json(before)
+    with pytest.raises(tvm.error.InternalError, match="dav-2201 local binary flag: no reverse completion path for S->V"):
+        with tvm.transform.PassContext(config={"tl.disable_shared_memory_reuse": True}):
+            transform.InsertSync()(before)
+    assert tvm.ir.save_json(before) == snapshot
 
 
 def test_shifted_nested_owner_is_rejected_before_unsafe_local_reseeding():

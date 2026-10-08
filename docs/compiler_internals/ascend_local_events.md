@@ -129,6 +129,17 @@ it cannot be approximated by re-seeding each lexical loop entry. A local
 drain blocks its destination pipe and does not prevent the source pipe from
 executing a later seed.
 
+A counter increment is Scalar work, not evidence that Vector readers have
+finished. For a stage-zero counter owner with unconditional direct tasks,
+`InsertSync` can complete a retained same-epoch `S -> V` dependency by emitting
+a real `V -> S` handshake before its unique canonical `counter[0] += 1`.
+Every reader of that counter group must be a preceding Vector task on the
+same concrete core. The existing completion and binary event reuse proofs
+must then accept both directions. Conditional tasks, mismatched counters,
+other pipes or stages, and noncanonical advances remain outside this repair.
+An inner owner with zero or one iteration may be entered repeatedly by an
+ancestor; its local trip bound alone never permits unchecked event reuse.
+
 Unsupported clock or completion relations are diagnosed before emitting an
 unproved binary protocol. CPU regressions check actual finite task epochs,
 storage reuse, and wait-consumption-before-next-set paths independently of
