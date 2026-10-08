@@ -4,7 +4,10 @@
  * namespace, spilling excess blocks to the shared asc_lock/asc_unlock mutex
  * pool.
  *
- * A set_flag/wait_flag event-pair (hard_event) owns only 8 event_id slots. A
+ * A set_flag/wait_flag event-pair (hard_event) owns only 8 event_id slots per
+ * physical core. On dav-2201, concrete CUBE/VECTOR regions are normalized
+ * independently. If any call for an event has unknown/shared ownership, that
+ * entire event retains the conservative function-wide union. A
  * sparse layout may use at most 8 slots while still containing an out-of-range
  * id, so every such layout is compacted into [0,8). When a hard_event's sync
  * points need more than 8 slots in total, dav-3510 can spill to the shared
@@ -42,14 +45,17 @@
 #include <tvm/tirx/transform.h>
 
 #include <algorithm>
+#include <map>
 #include <optional>
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "ascend/op/builtin.h"
 #include "ascend/target_utils.h"
+#include "core_mask.h"
 #include "transform/common/constr_visitor.h"
 
 namespace tvm {
@@ -114,8 +120,16 @@ struct BlockAssign {
 };
 
 using EventIdBounds = std::pair<int64_t, int64_t>;
+// An unassigned core denotes the original conservative function-wide union,
+// never an additional physical bank.
+using FlagNamespace = std::pair<std::string, CoreMask>;
+struct FlagCallRange {
+  EventIdBounds bounds;
+  FlagNamespace name_space;
+};
 using FlagCallRanges =
-    std::unordered_map<const CallNode *, std::vector<EventIdBounds>>;
+    std::unordered_map<const CallNode *, std::vector<FlagCallRange>>;
+using FlagAssignments = std::map<FlagNamespace, std::vector<BlockAssign>>;
 
 // Populate the complete lexical context so const_int_bound resolves dynamic
 // event_ids through enclosing loops, flat Bind declarations, branch guards,
@@ -139,25 +153,53 @@ EventIdBounds EventIdRange(const ConstrSet &constraints, const std::string &he,
 // flags can start allocating past them.
 class FlagUsageCollector : public ConstrVisitor {
 public:
-  std::unordered_map<std::string, std::vector<EventIdBounds>> ranges;
-  std::vector<std::string> order; // first-encounter order
+  std::map<FlagNamespace, std::vector<EventIdBounds>> ranges;
+  std::vector<FlagNamespace> order; // first-encounter order
   // Preserve the exact range proven at each call site so Phase B does not
   // repeat the analysis in a different traversal context.
   FlagCallRanges call_ranges;
   // Highest buf_id reserved by gemm_l1 + 1 (0 if no gemm_l1 present).
   int64_t reserved_hwm = 0;
 
+  void FinalizeNamespaces(bool split_core_banks) {
+    std::unordered_set<std::string> shared_events;
+    for (const auto &usage : usages_) {
+      if (!IsConcreteCore(usage.core))
+        shared_events.insert(usage.hard_event);
+    }
+    for (const auto &usage : usages_) {
+      CoreMask core = split_core_banks && !shared_events.count(usage.hard_event)
+                          ? usage.core
+                          : kCoreUnassigned;
+      FlagNamespace name_space{usage.hard_event, core};
+      call_ranges[usage.call].push_back({usage.bounds, name_space});
+      auto [it, inserted] = ranges.try_emplace(name_space);
+      if (inserted)
+        order.push_back(name_space);
+      it->second.push_back(usage.bounds);
+    }
+  }
+
+  void VisitStmt_(const SBlockNode *op) final {
+    CoreMask saved = current_core_;
+    CoreMask block_core = op->name_hint == "CUBE"     ? kCoreCube
+                          : op->name_hint == "VECTOR" ? kCoreVector
+                                                      : kCoreUnassigned;
+    if (block_core != kCoreUnassigned) {
+      current_core_ = saved == kCoreUnassigned || saved == block_core
+                          ? block_core
+                          : kCoreBroadcast;
+    }
+    // Ordinary nested blocks inherit ownership. Conflicting core wrappers
+    // remain ambiguous instead of being treated as a third independent bank.
+    ConstrVisitor::VisitStmt_(op);
+    current_core_ = saved;
+  }
+
   void VisitExpr_(const CallNode *op) final {
     if (std::optional<std::string> he = GetFlagHardEvent(op)) {
       EventIdBounds range = EventIdRange(GetConstrSet(), *he, op->args[1]);
-      call_ranges[op].push_back(range);
-      auto it = ranges.find(*he);
-      if (it == ranges.end()) {
-        order.push_back(*he);
-        ranges[*he] = {range};
-      } else {
-        it->second.push_back(range);
-      }
+      usages_.push_back({op, *he, current_core_, range});
     } else {
       ReserveGemmL1Bufs(op);
     }
@@ -165,6 +207,15 @@ public:
   }
 
 private:
+  struct FlagUsage {
+    const CallNode *call;
+    std::string hard_event;
+    CoreMask core;
+    EventIdBounds bounds;
+  };
+  std::vector<FlagUsage> usages_;
+  CoreMask current_core_{kCoreUnassigned};
+
   // gemm_l1 templates internally occupy buf_ids [buf_offset, buf_offset+1].
   void ReserveGemmL1Bufs(const CallNode *op) {
     int arg_idx;
@@ -240,9 +291,7 @@ std::vector<bool> KnapsackKeep(const std::vector<Block> &blocks) {
 // Phase B: rewrite each flag call per its block assignment.
 class FlagToBufRewriter : public StmtExprMutator {
 public:
-  explicit FlagToBufRewriter(
-      std::unordered_map<std::string, std::vector<BlockAssign>> assign,
-      FlagCallRanges call_ranges)
+  explicit FlagToBufRewriter(FlagAssignments assign, FlagCallRanges call_ranges)
       : assign_(std::move(assign)), call_ranges_(std::move(call_ranges)) {}
 
   Stmt VisitStmt_(const EvaluateNode *op) final {
@@ -255,11 +304,6 @@ public:
       return StmtExprMutator::VisitStmt_(op);
 
     const std::string &he = Downcast<StringImm>(call->args[0])->value;
-    auto it = assign_.find(he);
-    // hard_events that fit within 8 flag slots are untouched.
-    if (it == assign_.end())
-      return StmtExprMutator::VisitStmt_(op);
-
     PrimExpr event_id = call->args[1];
     auto range_it = call_ranges_.find(call);
     ICHECK(range_it != call_ranges_.end())
@@ -267,7 +311,13 @@ public:
     size_t &range_index = call_range_indices_[call];
     ICHECK_LT(range_index, range_it->second.size())
         << "RewriteFlagToBuf: exhausted collected ranges for flag call";
-    const EventIdBounds &range = range_it->second[range_index++];
+    const FlagCallRange &usage = range_it->second[range_index++];
+    auto it = assign_.find(usage.name_space);
+    // Consume every occurrence, including unchanged ones: the same CallNode
+    // can be shared by different core regions or lexical loop contexts.
+    if (it == assign_.end())
+      return StmtExprMutator::VisitStmt_(op);
+    const EventIdBounds &range = usage.bounds;
     const BlockAssign *b = nullptr;
     for (const auto &ba : it->second) {
       if (ba.lo <= range.first && range.second <= ba.hi) {
@@ -304,14 +354,19 @@ private:
              {StringImm(pipe), buf_id, IntImm(DataType::Int(32), mode)}));
   }
 
-  std::unordered_map<std::string, std::vector<BlockAssign>> assign_;
+  FlagAssignments assign_;
   FlagCallRanges call_ranges_;
   std::unordered_map<const CallNode *, size_t> call_range_indices_;
 };
 
 PrimFunc RewriteFlagToBufFn(PrimFunc f) {
+  auto target = f->GetAttr<Target>(tvm::attr::kTarget);
+  bool split_core_banks =
+      target.has_value() && GetAscendTargetInfo(target.value()).architecture ==
+                                AscendArchitecture::kDav2201;
   FlagUsageCollector collector;
   collector(f->body);
+  collector.FinalizeNamespaces(split_core_banks);
   if (collector.order.empty())
     return f;
 
@@ -319,18 +374,18 @@ PrimFunc RewriteFlagToBufFn(PrimFunc f) {
   // asc_lock/asc_unlock only under __NPU_ARCH__ == 3510. Sparse compaction is
   // legal on both targets, but dav-2201 cannot lower a true flag overflow to
   // mutexes. Unbound single-pass inputs retain the upstream dav-3510 default.
-  auto target = f->GetAttr<Target>(tvm::attr::kTarget);
   bool supports_mutex_spill =
       !target.has_value() || GetAscendTargetInfo(target.value()).architecture ==
                                  AscendArchitecture::kDav3510;
 
-  std::unordered_map<std::string, std::vector<BlockAssign>> assign;
+  FlagAssignments assign;
   // Start spilled buf_id allocation past the slots gemm_l1 already reserves.
   int mutex_running = static_cast<int>(collector.reserved_hwm);
   bool has_spill = false;
   std::ostringstream layout;
-  for (const std::string &he : collector.order) {
-    std::vector<Block> blocks = CoalesceBlocks(collector.ranges[he]);
+  for (const FlagNamespace &name_space : collector.order) {
+    const std::string &he = name_space.first;
+    std::vector<Block> blocks = CoalesceBlocks(collector.ranges[name_space]);
     int64_t total = 0;
     bool already_legal = true;
     for (const auto &b : blocks) {
@@ -350,7 +405,12 @@ PrimFunc RewriteFlagToBufFn(PrimFunc f) {
       TVM_FFI_THROW(ValueError)
           << "RewriteFlagToBuf: dav-2201 hard_event '" << he << "' requires "
           << total << " local event slots from ranges " << ranges.str()
+          << (name_space.second == kCoreCube ? " in CUBE bank"
+              : name_space.second == kCoreVector
+                  ? " in VECTOR bank"
+                  : " in conservative core union")
           << "; limit is " << kFlagSlotsPerPair
+          << ". This is the allocated layout, not a minimum slot requirement"
           << ". Mutex spill requires dav-3510 asc_lock/asc_unlock support.";
     }
 
@@ -380,7 +440,7 @@ PrimFunc RewriteFlagToBufFn(PrimFunc f) {
         mutex_running += static_cast<int>(b.size());
       }
     }
-    assign[he] = std::move(he_assign);
+    assign[name_space] = std::move(he_assign);
   }
 
   if (assign.empty())

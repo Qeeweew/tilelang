@@ -3809,11 +3809,13 @@ public:
                 const std::set<std::pair<size_t, size_t>> &reusable_pairs,
                 const CrossCoreFlagReservation &cross_core_flag_reservation,
                 const CrossCoreSyncContract &cross_core_contract,
-                const std::vector<L0OperandSlotPool> &operand_pools)
+                const std::vector<L0OperandSlotPool> &operand_pools,
+                AscendArchitecture architecture)
       : site_registry_(site_registry), sync_points_(sync_points),
         reusable_pairs_(reusable_pairs),
         cross_core_flag_reservation_(cross_core_flag_reservation),
-        cross_core_contract_(cross_core_contract), operand_pools_(operand_pools) {}
+        cross_core_contract_(cross_core_contract), operand_pools_(operand_pools),
+        architecture_(architecture) {}
 
   bool Plan(bool allow_fallback = false,
             bool require_intra_core_capacity = false) {
@@ -3826,10 +3828,11 @@ public:
     operand_pool_bases_.clear();
     // Physical pools span the kernel. Their credits are exclusive and never
     // borrow an ordinary logical ring's binary IDs or completion closure.
+    const std::string operand_domain = LocalFlagDomain(kCoreCube, "M_MTE1");
     for (const auto &pool : operand_pools_) {
-      operand_pool_bases_.push_back(next_intra_core_id["M_MTE1"]);
-      next_intra_core_id["M_MTE1"] += pool.slots;
-      required_ids["M_MTE1"] += pool.slots;
+      operand_pool_bases_.push_back(next_intra_core_id[operand_domain]);
+      next_intra_core_id[operand_domain] += pool.slots;
+      required_ids[operand_domain] += pool.slots;
     }
     bool needs_cross_core_flag = false;
     for (size_t index = 0; index < sync_points_.size(); ++index) {
@@ -4135,11 +4138,22 @@ private:
     return counter_channel_size_[representative] > 1;
   }
 
+  std::string LocalFlagDomain(CoreMask core, const std::string &hard_event) const {
+    // Site collection expands Broadcast tasks into concrete execution cores.
+    // dav-2201 local flags belong to independent AIC/AIV banks; this does not
+    // grant any additional lifetime reuse within either bank.
+    ICHECK(IsConcreteCore(core));
+    if (architecture_ != AscendArchitecture::kDav2201)
+      return hard_event; // Preserve the dav-3510 allocation contract.
+    return std::string(core == kCoreCube ? "CUBE:" : "VECTOR:") + hard_event;
+  }
+
   std::string FlagDomain(const SyncPoint &sync_point) const {
     if (site_registry_.IsCrossCore(sync_point))
       return "Cube-Vector";
-    return GetHardEvent(site_registry_.Src(sync_point).pipe,
-                        site_registry_.Dst(sync_point).pipe);
+    const SyncInsertionSite &src = site_registry_.Src(sync_point);
+    return LocalFlagDomain(
+        src.core, GetHardEvent(src.pipe, site_registry_.Dst(sync_point).pipe));
   }
 
   void AppendCrossIterFlagInfo(const FlagAllocation &allocation) {
@@ -4217,6 +4231,7 @@ private:
   const CrossCoreFlagReservation &cross_core_flag_reservation_;
   const CrossCoreSyncContract &cross_core_contract_;
   const std::vector<L0OperandSlotPool> &operand_pools_;
+  AscendArchitecture architecture_;
   std::vector<int> operand_pool_bases_;
   std::vector<FlagAllocation> allocations_;
   FlagInfoList flag_infos_;
@@ -5469,7 +5484,7 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
     flag_allocator = std::make_unique<FlagAllocator>(
         analyzer->SiteRegistry(), analyzer->SyncPoints(),
         analyzer->ReusablePairs(), cross_core_flag_reservation,
-        cross_core_contract, operand_pools);
+        cross_core_contract, operand_pools, target_info.architecture);
     if (!flag_allocator->Plan(!owner_results.empty() || !owner_inputs.empty() ||
                                   !unit_streams.empty() ||
                                   !operand_pools.empty(),

@@ -44,9 +44,15 @@ The diagnostic describes the current allocation, not a proven minimum.
 Compaction removes sparse numbering; sharing IDs between distinct channels
 requires a completion/lifetime proof in `InsertSync`, including seed and drain
 tokens. Summing separately allocated rings cannot prove they all overlap.
-For directions usable by both AIC and AIV, the current allocator conservatively
-reserves their whole-function union; it does not yet exploit the independent
-physical banks to reduce that reservation.
+On dav-2201, local allocation uses both the concrete execution core and the
+hard-event direction. The two AIV lanes run the same allocation in their
+independent private banks. Final normalization preserves this distinction
+inside the established `CUBE` and `VECTOR` blocks; it does not require a
+lifetime-sharing proof between physically independent banks. If any call of
+one hard-event direction lacks an unambiguous core block, normalization keeps
+the conservative whole-function union for that direction, so common code and
+core-specific code cannot receive inconsistent renamings. The dav-3510 mutex
+spill policy retains its existing namespace and reservation rules.
 
 ## A carried edge
 
