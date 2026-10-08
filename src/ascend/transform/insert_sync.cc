@@ -60,6 +60,7 @@
 #include "./auto_schedule/dependency_analysis.h"
 #include "./auto_schedule/kernel_rewriter.h"
 #include "./auto_schedule/l0ab_phase_reuse.h"
+#include "./auto_schedule/l0_operand_slot_pool.h"
 #include "./auto_schedule/multi_buffer.h"
 #include "./auto_schedule/owner_result.h"
 #include "./auto_schedule/scheduled_tir.h"
@@ -373,6 +374,9 @@ struct SyncPoint {
   std::optional<LocalBinaryFlagPlan> local_binary_plan;
   std::optional<SingleIterationBinaryPlan> single_iteration_binary_plan;
   UnitFlagBoundaryRole unit_boundary{UnitFlagBoundaryRole::kNone};
+  // Emitted by the selected physical pool, not this logical-storage ring.
+  // Only an exact child-generation edge can enter the ordinary closure.
+  bool operand_pool_release{false};
 
   SyncPoint(DepEdge edge, DependencyKind dependency_kind, int num_versions,
             ControlNode *flag_loop)
@@ -924,13 +928,15 @@ public:
       const std::vector<OwnerResultPlan> *owner_results = nullptr,
       const std::vector<OwnerResultPlan> *owner_inputs = nullptr,
       const std::vector<UnitFlagStreamPlan> *unit_streams = nullptr,
-      const std::vector<UnitFlagBoundary> *unit_boundaries = nullptr)
+      const std::vector<UnitFlagBoundary> *unit_boundaries = nullptr,
+      const std::vector<L0OperandSlotPool> *operand_pools = nullptr)
       : storage_groups_(std::move(storage_groups)),
         multi_buffer_plan_(multi_buffer_plan), domains_(domains),
         architecture_(architecture), manual_(std::move(manual)),
         root_conflicts_(std::move(root_conflicts)),
         owner_results_(owner_results), owner_inputs_(owner_inputs),
         unit_streams_(unit_streams), unit_boundaries_(unit_boundaries),
+        operand_pools_(operand_pools),
         site_registry_(domains),
         trace_c_lifetimes_(
             runtime::detail::VerboseLoggingEnabled(__FILE__, 1)) {
@@ -967,6 +973,28 @@ public:
     scope_closures_.insert_or_assign(nullptr, std::move(root_result.closure));
     if (owner_fallback_required_ || unit_fallback_required_)
       return false;
+    if (operand_pools_) {
+      for (const auto &pool : *operand_pools_) {
+        for (const auto *member : {&pool.first, &pool.second}) {
+          ControlNode *scope = member->generation;
+          int domain = domains_.DomainForStorage(member->buffer->data, scope);
+          size_t writer = site_registry_.FindSiteId(SyncInsertionSiteKey{
+              member->writer->GetChildOnPathFrom(scope), member->writer, false,
+              kCoreCube, domain});
+          size_t reader = site_registry_.FindSiteId(SyncInsertionSiteKey{
+              member->reader->GetChildOnPathFrom(scope), member->reader, true,
+              kCoreCube, domain});
+          auto closure = scope_closures_.find(scope);
+          if (closure == scope_closures_.end() ||
+              site_registry_.Sites()[writer].path_end != member->writer ||
+              site_registry_.Sites()[reader].path_end != member->reader ||
+              MinCompletionDistance(closure->second, writer, reader) != 0) {
+            operand_pool_fallback_required_ = true;
+            return false;
+          }
+        }
+      }
+    }
     for (const SyncPoint &point : sync_points_) {
       ICHECK(!point.single_iteration_binary_plan ||
              point.single_iteration_binary_plan->validated)
@@ -986,6 +1014,13 @@ public:
     buffer_alias_analyzer.Analyze(root);
     buffer_alias_analyzer.Validate();
     buffer_aliases_ = buffer_alias_analyzer.GetAliases();
+    // Slot credits prove byte separation independently of whole-allocation
+    // generation closure. Do not manufacture a phase-END -> phase-START edge:
+    // an old disjoint slot and FIX may still execute after the new first load.
+    if (operand_pools_)
+      for (const auto &pool : *operand_pools_)
+        AddBufferAlias(&buffer_aliases_, pool.first.buffer->data,
+                       pool.second.buffer->data);
     return true;
   }
 
@@ -999,6 +1034,9 @@ public:
 
   const BufferAliasMap &BufferAliases() const { return buffer_aliases_; }
   bool NeedsUnitFallback() const { return unit_fallback_required_; }
+  bool NeedsOperandPoolFallback() const {
+    return operand_pool_fallback_required_;
+  }
 
   bool HasOwnerResultRelease(const OwnerResultPlan &plan) const {
     int domain = domains_.DomainForStorage(plan.storage, plan.epoch);
@@ -1032,6 +1070,45 @@ public:
   }
 
 private:
+  const L0OperandSlotMember *PoolMemoryObligationMember(
+      const DepInfo &dep, TaskNode *source, TaskNode *destination,
+      ControlNode *loop) const {
+    if (!operand_pools_ || dep.kind != DependencyKind::kData)
+      return nullptr;
+    for (const auto &pool : *operand_pools_) {
+      for (const auto *member : {&pool.first, &pool.second}) {
+        if (dep.storage && dep.storage.value().same_as(member->buffer->data) &&
+            source == member->reader && destination == member->writer)
+          return member;
+        // A repeated enclosing control also reports old-generation writes
+        // against a later generation's reader. The unique full overwrite
+        // kills that incoming value; its retained same-generation RAW ready
+        // and the physical credit protect the actual read and overwrite.
+        // This is an ancestor memory obligation, never a phase completion.
+        if (!dep.cross_storage_conflict && dep.storage &&
+            dep.storage.value().same_as(member->buffer->data) &&
+            source == member->writer && destination == member->reader &&
+            dep.distance < 0 && dep.prod_node == dep.cons_node && loop &&
+            loop != member->generation && member->generation->IsWithin(loop))
+          return member;
+        const auto &other = member == &pool.first ? pool.second : pool.first;
+        // An early alias hint conservatively creates RAW, WAW and WAR
+        // obligations between both logical allocations. The physical pool
+        // protects their intersecting bytes with the complete chain:
+        // old load -> old whole MAD -> credit -> new load -> new MAD.
+        // Keep each allocation's actual RAW ready edge. Only these exact
+        // cross-allocation access pairs are replaced; no phase-END relation
+        // follows from their independent slot lifetimes.
+        if (dep.cross_storage_conflict && !dep.storage &&
+            ((source == member->writer &&
+              (destination == other.writer || destination == other.reader)) ||
+             (source == member->reader && destination == other.writer)))
+          return member;
+      }
+    }
+    return nullptr;
+  }
+
   static std::string LifetimeNodeName(IRStructure *node) {
     if (node == nullptr)
       return "<root>";
@@ -1954,6 +2031,16 @@ private:
                                             counter_owner->loop));
       }
       for (const auto &[producer, consumer] : dep.task_pairs) {
+        const L0OperandSlotMember *pool_member =
+            PoolMemoryObligationMember(dep, producer, consumer, loop);
+        // Every physical overwritten interval consumes its last reader's
+        // credit. Only its own generation recurrence is also a whole-task
+        // completion relation; a parent/phase envelope is deliberately not.
+        bool pool_local_release =
+            pool_member && !dep.cross_storage_conflict &&
+            loop == pool_member->generation;
+        if (pool_member && !pool_local_release)
+          continue;
         if (info != nullptr &&
             IsParentVersionedWarCovered(dep, *info, producer, consumer, loop))
           continue;
@@ -2040,6 +2127,12 @@ private:
                 SyncInsertionSiteKey{dep.cons_node, consumer, true,
                                      consumer_core, pair_domain_id});
             DepEdge edge(producer_site, consumer_site, distance, true);
+            if (pool_local_release &&
+                (site_registry_.Sites()[producer_site].path_end != producer ||
+                 site_registry_.Sites()[consumer_site].path_end != consumer)) {
+              // No wider lexical completion follows from a slot credit.
+              continue;
+            }
             if (counter_info != nullptr) {
               PrimExpr iteration = BufferLoad(counter_info->counter,
                                               {IntImm(DataType::Int(32), 0)});
@@ -2050,6 +2143,7 @@ private:
               sync_points.emplace_back(std::move(edge), dep.kind, num_versions,
                                        flag_loop);
             }
+            sync_points.back().operand_pool_release = pool_local_release;
           }
         }
       }
@@ -2491,6 +2585,14 @@ private:
     std::stable_sort(sync_points.begin(), sync_points.end());
     std::vector<SyncPoint> emit;
     for (SyncPoint &sync_point : sync_points) {
+      if (sync_point.operand_pool_release) {
+        // This exact same-generation relation is implemented by the physical
+        // pool. It can close a retained load-ready flag's binary lifetime;
+        // no ordinary ring/separate seed is emitted for it.
+        SaturateDependencyEdge(closure, sync_point.edge, max_distance,
+                               projection_scope);
+        continue;
+      }
       // The real boundary gates jointly establish the closed stream and its
       // terminal flag lifetime. Retain their exact blocking Scalar cuts.
       if (sync_point.unit_boundary == UnitFlagBoundaryRole::kNone &&
@@ -3010,6 +3112,7 @@ private:
   const std::vector<OwnerResultPlan> *owner_inputs_;
   const std::vector<UnitFlagStreamPlan> *unit_streams_;
   const std::vector<UnitFlagBoundary> *unit_boundaries_;
+  const std::vector<L0OperandSlotPool> *operand_pools_;
   SyncSiteRegistry site_registry_;
   const bool trace_c_lifetimes_;
   mutable std::unordered_set<size_t> trace_c_sites_;
@@ -3024,6 +3127,7 @@ private:
   bool disable_buffer_reuse_{false};
   bool owner_fallback_required_{false};
   bool unit_fallback_required_{false};
+  bool operand_pool_fallback_required_{false};
 };
 
 // ============================================================================
@@ -3142,11 +3246,12 @@ public:
                 std::vector<SyncPoint> &sync_points,
                 const std::set<std::pair<size_t, size_t>> &reusable_pairs,
                 const CrossCoreFlagReservation &cross_core_flag_reservation,
-                const CrossCoreSyncContract &cross_core_contract)
+                const CrossCoreSyncContract &cross_core_contract,
+                const std::vector<L0OperandSlotPool> &operand_pools)
       : site_registry_(site_registry), sync_points_(sync_points),
         reusable_pairs_(reusable_pairs),
         cross_core_flag_reservation_(cross_core_flag_reservation),
-        cross_core_contract_(cross_core_contract) {}
+        cross_core_contract_(cross_core_contract), operand_pools_(operand_pools) {}
 
   bool Plan(bool allow_fallback = false,
             bool require_intra_core_capacity = false) {
@@ -3156,6 +3261,14 @@ public:
 
     std::map<std::string, int> required_ids;
     std::map<std::string, int> next_intra_core_id;
+    operand_pool_bases_.clear();
+    // Physical pools span the kernel. Their credits are exclusive and never
+    // borrow an ordinary logical ring's binary IDs or completion closure.
+    for (const auto &pool : operand_pools_) {
+      operand_pool_bases_.push_back(next_intra_core_id["M_MTE1"]);
+      next_intra_core_id["M_MTE1"] += pool.slots;
+      required_ids["M_MTE1"] += pool.slots;
+    }
     bool needs_cross_core_flag = false;
     for (size_t index = 0; index < sync_points_.size(); ++index) {
       const SyncPoint &sync_point = sync_points_[index];
@@ -3397,6 +3510,11 @@ public:
       if (allocation.cross_iter)
         AppendCrossIterFlagInfo(allocation);
     }
+    for (size_t index = 0; index < operand_pools_.size(); ++index)
+      for (int slot = 0; slot < operand_pools_[index].slots; ++slot)
+        flag_infos_.push_back(FlagInfo{kCoreCube,
+                                      Integer(operand_pool_bases_[index] + slot),
+                                      "M_MTE1", 0});
 
     for (const FlagAllocation &allocation : allocations_) {
       auto multi_owner = std::find_if(
@@ -3421,6 +3539,7 @@ public:
   }
 
   FlagInfoList TakeFlagInfos() { return std::move(flag_infos_); }
+  const std::vector<int> &OperandPoolBases() const { return operand_pool_bases_; }
 
 private:
   void GroupCounterChannels() {
@@ -3534,6 +3653,8 @@ private:
   const std::set<std::pair<size_t, size_t>> &reusable_pairs_;
   const CrossCoreFlagReservation &cross_core_flag_reservation_;
   const CrossCoreSyncContract &cross_core_contract_;
+  const std::vector<L0OperandSlotPool> &operand_pools_;
+  std::vector<int> operand_pool_bases_;
   std::vector<FlagAllocation> allocations_;
   FlagInfoList flag_infos_;
   std::vector<size_t> counter_channel_representative_;
@@ -4170,14 +4291,31 @@ public:
                    AscendArchitecture architecture,
                    const CrossCoreSyncContract &cross_core_contract,
                    const std::vector<Var> &lane_variables,
-                   const std::vector<OwnerCompletionEvent> &owner_events)
+                   const std::vector<OwnerCompletionEvent> &owner_events,
+                   const std::vector<L0OperandSlotPool> &operand_pools,
+                   const std::vector<int> &operand_pool_bases)
       : site_registry_(site_registry), sync_points_(sync_points),
         allocations_(allocations), architecture_(architecture),
         cross_core_contract_(cross_core_contract),
-        lane_variables_(lane_variables), owner_events_(owner_events) {}
+        lane_variables_(lane_variables), owner_events_(owner_events),
+        operand_pools_(operand_pools), operand_pool_bases_(operand_pool_bases) {}
 
   void Run(std::vector<std::shared_ptr<IRStructure>> &root) {
     InsertSyncPoints();
+    ICHECK_EQ(operand_pools_.size(), operand_pool_bases_.size());
+    for (size_t index = 0; index < operand_pools_.size(); ++index) {
+      const auto &pool = operand_pools_[index];
+      for (const auto *member : {&pool.first, &pool.second}) {
+        PrimExpr event = member->slot + Integer(operand_pool_bases_[index]);
+        // Each endpoint keeps its own task stage. MaterializeMultiBuffer and
+        // LowerScheduledTIR therefore shift the operand pointer and its credit
+        // by exactly the same prepared iteration/counter clock.
+        InsertStatement(member->writer, MakeAscendWaitFlag("M_MTE1", event),
+                        true, kCoreCube);
+        InsertStatement(member->reader, MakeAscendSetFlag("M_MTE1", event),
+                        false, kCoreCube, member->last_reader);
+      }
+    }
     for (const OwnerCompletionEvent &event : owner_events_) {
       ICHECK(architecture_ == AscendArchitecture::kDav2201);
       ICHECK_EQ(cross_core_contract_.num_aiv_subcores, 2);
@@ -4401,6 +4539,8 @@ private:
   const CrossCoreSyncContract &cross_core_contract_;
   const std::vector<Var> &lane_variables_;
   const std::vector<OwnerCompletionEvent> &owner_events_;
+  const std::vector<L0OperandSlotPool> &operand_pools_;
+  const std::vector<int> &operand_pool_bases_;
 };
 
 // ============================================================================
@@ -4460,6 +4600,13 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
   // reuse this tree without inserting another initialization consumer.
   if (target_info.architecture == AscendArchitecture::kDav2201)
     InsertRootLoad3DInitMarker(root, kernel_body);
+  std::vector<L0OperandSlotPool> operand_pools =
+      AnalyzeL0OperandSlotPools(scheduled_tir, multi_buffer_plan, target_info);
+  if (runtime::detail::VerboseLoggingEnabled(__FILE__, 1))
+    for (const auto &pool : operand_pools)
+      LOG(INFO) << "L0 operand slot pool " << pool.first.buffer->data << " / "
+                << pool.second.buffer->data << " slots=" << pool.slots
+                << " pitch_bytes=" << pool.slot_bytes;
   std::vector<TaskNode *> tasks;
   CollectAllTaskNodes(root, tasks);
   for (TaskNode *task : tasks) {
@@ -4489,8 +4636,13 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
         multi_buffer_plan, domains, target_info.architecture,
         scheduled_tir.metadata.manual_buffer_versions,
         scheduled_tir.metadata.root_conflict_hints, groups, &owner_results,
-        &owner_inputs, &unit_streams, &unit_boundaries);
+        &owner_inputs, &unit_streams, &unit_boundaries, &operand_pools);
     if (!analyzer->Analyze(root)) {
+      if (analyzer->NeedsOperandPoolFallback()) {
+        ICHECK(!operand_pools.empty());
+        operand_pools.clear();
+        continue;
+      }
       if (!owner_inputs.empty()) {
         owner_inputs.clear();
         continue;
@@ -4535,10 +4687,14 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
     flag_allocator = std::make_unique<FlagAllocator>(
         analyzer->SiteRegistry(), analyzer->SyncPoints(),
         analyzer->ReusablePairs(), cross_core_flag_reservation,
-        cross_core_contract);
+        cross_core_contract, operand_pools);
     if (!flag_allocator->Plan(!owner_results.empty() || !owner_inputs.empty() ||
-                                  !unit_streams.empty(),
-                              !unit_streams.empty())) {
+                                  !unit_streams.empty() || !operand_pools.empty(),
+                              !unit_streams.empty() || !operand_pools.empty())) {
+      if (!operand_pools.empty()) {
+        operand_pools.clear();
+        continue;
+      }
       if (!owner_inputs.empty()) {
         owner_inputs.clear();
         continue;
@@ -4599,7 +4755,8 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
   scheduled_tir.metadata.has_buffer_aliases = true;
   SyncMaterializer(analyzer->SiteRegistry(), analyzer->SyncPoints(),
                    flag_allocator->Allocations(), target_info.architecture,
-                   cross_core_contract, lane_variables, owner_events.value())
+                   cross_core_contract, lane_variables, owner_events.value(),
+                   operand_pools, flag_allocator->OperandPoolBases())
       .Run(root);
   FlagInfoList flag_infos = flag_allocator->TakeFlagInfos();
 
