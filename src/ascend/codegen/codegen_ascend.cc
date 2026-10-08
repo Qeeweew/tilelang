@@ -2145,7 +2145,12 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     const auto *rows = op->args[2].as<IntImmNode>();
     const auto *stride = op->args[3].as<IntImmNode>();
     const auto *lanes = op->args[4].as<IntImmNode>();
-    ICHECK(rows && rows->value > 0 && rows->value <= 255 && stride && lanes &&
+    // LowerRowReduceRegions proves the original active extent in [1, 255]
+    // under its nonempty guard before producing these exact access pointers.
+    // Codegen only preserves that uint8 scalar repeat; it must not require
+    // a constant after the native boundary has validated dynamic rows.
+    ICHECK(op->args[2].dtype() == DataType::UInt(8) &&
+           (!rows || (rows->value > 0 && rows->value <= 255)) && stride && lanes &&
            lanes->value >= 8 && lanes->value <= 64 && lanes->value % 8 == 0 &&
            stride->value >= lanes->value / 8 && stride->value <= 65535 &&
            (lanes->value == 64 ? stride->value % 8 == 0

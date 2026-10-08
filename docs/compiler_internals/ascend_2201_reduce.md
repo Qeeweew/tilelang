@@ -8,21 +8,25 @@ scratch or call a composite softmax algorithm.
 
 The architecture boundary remains dav-2201. The count-mode paths support
 arbitrary positive static reduced extents through partial reduction levels.
-Empty and dynamic row domains retain their ordinary row loops. Low-precision
+Unknown or incompatible dynamic row domains retain their ordinary row loops. Low-precision
 input promotion and `clear=False` keep their established typed-node boundaries;
 the multi-VL plan described below does not replace those paths.
 
-## Static FP32 multi-VL row plans
+## FP32 multi-VL row plans
 
 The selected domain is `clear=True`, FP32 source/output, a real two-dimensional
-compact source, static positive owned rows at most 255, and a complete trailing
+compact source, nonnegative owned rows with a proved positive maximum at most
+255, and a complete trailing
 row wider than 64 elements whose width is a multiple of 64. Columns and row bases
 must be 32-byte aligned. Source physical row pitch equals its logical width;
 output is compact with a 32-byte aligned region base. Retained output axes have
 extent/capacity 1. Partial views, padded row pitches, unsupported layouts,
-dynamic/empty owners, and `clear=False` keep the existing reduction plan.
+unknown row bounds, and `clear=False` keep the existing reduction plan.
+Bounded dynamic owners use their actual row count in effects and native repeats;
+an enclosing `rows > 0` guard prevents zero-repeat instructions. Scratch and
+structural candidate selection use the proved maximum, not a sampled row count.
 
-For `512 <= C <= 4096` with `C % 512 == 0`, the preferred candidate uses
+For static positive rows and `512 <= C <= 4096` with `C % 512 == 0`, the preferred candidate uses
 three native tasks. Two count-mode BlockReduce operations compact each group
 of eight FP32 elements, producing `[R,C/8]` and then `[R,C/64]` in independent
 compiler-owned UB buffers. Both input counts are multiples of 64, so the plan
@@ -40,7 +44,8 @@ allocations total 9216 bytes. Operation counts describe the plan; they are
 not a latency model.
 
 When the larger allocation does not fit the common root budget, the same
-compact domain retains the two-level candidate: a count-mode WholeReduce
+compact domain retains the two-level candidate; bounded dynamic rows also use
+this candidate instead of the static BlockReduce plan. A count-mode WholeReduce
 consumes `R*C` elements and produces `[R,C/64]`, followed by the same masked
 row reduction. This uses 1024 bytes for `16x1024`. WholeReduce's default source
 repeat stride is eight 32-byte blocks and its destination stride is one
@@ -141,13 +146,16 @@ effects. Version axes added later have singleton extents and independent
 storage bases. `AscendLowerTileOp` validates this native boundary and only then
 converts each exact source rectangle to its bounded pointer hull
 `(R-1)*row_stride*8+valid_lanes`, preserving the chunk and version origins. Code generation emits
-one native reduction per call. Ordinary task analysis/InsertSync provide the
+one native reduction per call. For dynamic rows, the validator proves the original
+region extent is in `[1,255]` under the nonempty guard and matches the uint8
+repeat exactly before narrowing. Ordinary task analysis/InsertSync provide the
 completion edge from every partial producer to its combine. No helper hides
 scratch, pipeline events or the complete row algorithm.
 
 All rows belong to the existing private UB owner. The pass does not introduce
-an SID axis or repartition rows. A dynamic owner count that can be zero uses the
-existing fallback, preserving the enclosing task and mixed-core completion.
+an SID axis or repartition rows. A bounded empty owner issues no reduction or
+combine; its enclosing mixed-core collective completion remains independent
+of the local nonempty guard.
 An explicit atomic Task/PerCoreTask cannot enclose this multi-instruction
 expansion; the diagnostic requests ordinary expressions or Stage boundaries.
 

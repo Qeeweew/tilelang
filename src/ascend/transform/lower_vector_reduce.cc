@@ -273,8 +273,9 @@ private:
                                       const std::vector<Var> &rows,
                                       int64_t input_count) {
     const auto *op = reduce.get();
-    // Keep the established count-mode whole-VL path and all tail/dynamic
-    // cases. This is a normal-mask static repeat plan, not a count wrapper.
+    // Keep the established count-mode whole-VL path and partial-column
+    // cases. Normal-mask repeats accept a bounded scalar row count; backing
+    // storage remains static while effects describe only the active rows.
     if (!op->clear || op->src->dtype != DataType::Float(32) ||
         op->dst->dtype != DataType::Float(32) || rows.size() != 1 ||
         op->src->shape.size() != 2 || input_count <= 64 ||
@@ -284,8 +285,9 @@ private:
     const auto &src_ranges = op->srcRegion_->region;
     const auto &dst_ranges = op->dstRegion_->region;
     PrimExpr row_extent = analyzer_.Simplify(src_ranges[0]->extent);
-    const auto *row_count = row_extent.as<IntImmNode>();
-    if (!row_count || row_count->value <= 0 || row_count->value > 255 ||
+    arith::ConstIntBound row_bound = analyzer_.const_int_bound(row_extent);
+    if (row_bound->min_value < 0 || row_bound->max_value <= 0 ||
+        row_bound->max_value > 255 ||
         !analyzer_.CanProveEqual(
             op->src->shape.back(),
             make_const(op->src->shape.back().dtype(), input_count)) ||
@@ -327,8 +329,16 @@ private:
             make_zero(raw_offsets[0].dtype())))
       return std::nullopt;
 
-    const int64_t count = row_count->value;
+    // Capacity and structural candidate selection use the proved maximum,
+    // never a speculative value of a private AIV's active extent.
+    const int64_t count = row_bound->max_value;
     const int64_t chunks = input_count / 64;
+    PrimExpr repeats = cast(DataType::UInt(8), row_extent);
+    auto active_plan = [&](Stmt plan) {
+      if (row_bound->min_value == 0)
+        plan = IfThenElse(row_extent > make_zero(row_extent.dtype()), plan);
+      return plan;
+    };
     const Op &intrinsic = Op::Get(
         op->type->IsSum() ? "tl.ascend_membase.repeat_reduce_sum_rows_f32"
                           : "tl.ascend_membase.repeat_reduce_max_rows_f32");
@@ -353,8 +363,10 @@ private:
     // whose smaller partial allocation has the same final [R,C/64] view.
     const bool compact_wide_rows = input_count >= 512 && input_count <= 4096 &&
                                    input_count % 512 == 0 && native_dst_compact;
+    // Datablock's late pointer boundary retains its static-count contract.
+    // Dynamic wide rows use the established two-level count/row plan below.
     const bool use_datablocks =
-        compact_wide_rows &&
+        compact_wide_rows && row_extent.as<IntImmNode>() &&
         HasMultiVLHeadroom(op->src, op->dst,
                            count * (input_count / 8 + chunks) * 4);
     if (compact_wide_rows &&
@@ -384,33 +396,48 @@ private:
         const Op &count_intrinsic = Op::Get(
             op->type->IsSum() ? "tl.ascend_membase.datablock_reduce_sum"
                               : "tl.ascend_membase.datablock_reduce_max");
-        tasks.push_back(Evaluate(
-            Call(DataType::Void(), count_intrinsic,
-                 {Ptr(block_base, count * block_columns, kAccessWrite),
-                  Ptr(src_base, count * input_count, kAccessRead),
-                  make_const(DataType::UInt(32), count * input_count)})));
-        tasks.push_back(Evaluate(
-            Call(DataType::Void(), count_intrinsic,
-                 {Ptr(partial_base, count * chunks, kAccessWrite),
-                  Ptr(block_base, count * block_columns, kAccessRead),
-                  make_const(DataType::UInt(32), count * block_columns)})));
+        tasks.push_back(Evaluate(Call(
+            DataType::Void(), count_intrinsic,
+            {Ptr(block_base,
+                 row_extent * make_const(row_extent.dtype(), block_columns),
+                 kAccessWrite),
+             Ptr(src_base,
+                 row_extent * make_const(row_extent.dtype(), input_count),
+                 kAccessRead),
+             cast(DataType::UInt(32),
+                  row_extent * make_const(row_extent.dtype(), input_count))})));
+        tasks.push_back(Evaluate(Call(
+            DataType::Void(), count_intrinsic,
+            {Ptr(partial_base,
+                 row_extent * make_const(row_extent.dtype(), chunks),
+                 kAccessWrite),
+             Ptr(block_base,
+                 row_extent * make_const(row_extent.dtype(), block_columns),
+                 kAccessRead),
+             cast(DataType::UInt(32),
+                  row_extent *
+                      make_const(row_extent.dtype(), block_columns))})));
       } else {
         const Op &count_intrinsic =
             Op::Get(op->type->IsSum()
                         ? "tl.ascend_membase.repeat_reduce_sum"
                         : "tl.ascend_membase.repeat_reduce_max_only_value");
-        tasks.push_back(Evaluate(
-            Call(DataType::Void(), count_intrinsic,
-                 {Ptr(partial_base, count * chunks, kAccessWrite),
-                  Ptr(src_base, count * input_count, kAccessRead),
-                  make_const(DataType::UInt(32), count * input_count)})));
+        tasks.push_back(Evaluate(Call(
+            DataType::Void(), count_intrinsic,
+            {Ptr(partial_base,
+                 row_extent * make_const(row_extent.dtype(), chunks),
+                 kAccessWrite),
+             Ptr(src_base,
+                 row_extent * make_const(row_extent.dtype(), input_count),
+                 kAccessRead),
+             cast(DataType::UInt(32),
+                  row_extent * make_const(row_extent.dtype(), input_count))})));
       }
       scratch_.push_back(partials);
       PrimExpr partial_region =
           Call(DataType::Handle(), tl::region(),
                {partial_base, make_const(DataType::Int(32), kAccessRead),
-                make_const(DataType::Int(32), count),
-                make_const(DataType::Int(32), chunks)});
+                row_extent, make_const(DataType::Int(32), chunks)});
       Array<PrimExpr> destination_args{
           dst_base, make_const(DataType::Int(32), kAccessWrite)};
       for (const Range &range : dst_ranges)
@@ -418,10 +445,10 @@ private:
       tasks.push_back(Evaluate(
           Call(DataType::Void(), intrinsic,
                {Call(DataType::Handle(), tl::region(), destination_args),
-                partial_region, make_const(DataType::UInt(8), count),
+                partial_region, repeats,
                 make_const(DataType::UInt(16), chunks / 8),
                 make_const(DataType::UInt(8), chunks)})));
-      return MakeSeq(tasks);
+      return active_plan(MakeSeq(tasks));
     }
 
     int64_t levels = 0, remaining = input_count;
@@ -467,18 +494,18 @@ private:
           Call(DataType::Handle(), tl::region(),
                {BufferLoad(op->src, source),
                 make_const(DataType::Int(32), kAccessRead),
-                make_const(src_ranges[0]->extent.dtype(), count),
+                row_extent,
                 make_const(src_ranges[1]->extent.dtype(), 64)});
       PrimExpr destination_region =
           Call(DataType::Handle(), tl::region(),
                {BufferLoad(partials, {make_const(DataType::Int(32), chunk), 0}),
                 make_const(DataType::Int(32), kAccessWrite),
                 make_const(DataType::Int(32), 1),
-                make_const(DataType::Int(32), count)});
+                row_extent});
       tasks.push_back(
           Evaluate(Call(DataType::Void(), intrinsic,
                         {destination_region, source_region,
-                         make_const(DataType::UInt(8), count),
+                         repeats,
                          make_const(DataType::UInt(16), input_count / 8),
                          make_const(DataType::UInt(8), 64)})));
     }
@@ -500,9 +527,9 @@ private:
       values = std::move(next);
     }
     tasks.push_back(For(rows[0], make_zero(rows[0].dtype()),
-                        make_const(rows[0].dtype(), count), ForKind::kParallel,
+                        row_extent, ForKind::kParallel,
                         BufferStore(op->dst, values[0], dst->indices)));
-    return MakeSeq(tasks);
+    return active_plan(MakeSeq(tasks));
   }
 
   bool HasMultiVLHeadroom(const Buffer &src, const Buffer &dst,

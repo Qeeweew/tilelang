@@ -1241,12 +1241,12 @@ private:
   // late mechanical conversion needs a pointer span covering the row gaps.
   Stmt LowerRowReduceRegions(const EvaluateNode *op, const CallNode *call) {
     ICHECK_EQ(call->args.size(), 5U) << "FP32 row reduce expects five operands";
-    const auto *rows = call->args[2].as<IntImmNode>();
+    const auto *static_rows = call->args[2].as<IntImmNode>();
     const auto *stride = call->args[3].as<IntImmNode>();
     const auto *lanes = call->args[4].as<IntImmNode>();
-    ICHECK(rows && rows->value > 0 && rows->value <= 255 &&
-           call->args[2].dtype() == DataType::UInt(8))
-        << "FP32 row reduce requires static uint8 rows in [1, 255]";
+    ICHECK(call->args[2].dtype() == DataType::UInt(8) &&
+           (!static_rows || (static_rows->value > 0 && static_rows->value <= 255)))
+        << "FP32 row reduce requires uint8 rows in [1, 255]";
     ICHECK(lanes && lanes->value >= 8 && lanes->value <= 64 &&
            lanes->value % 8 == 0 && call->args[4].dtype() == DataType::UInt(8))
         << "FP32 row reduce requires static uint8 valid lanes in [8, 64], "
@@ -1261,6 +1261,7 @@ private:
         << "FP32 row reduce requires a whole-VL stride for 64 lanes or "
            "a compact source row stride for partial lanes";
     Array<PrimExpr> args = call->args;
+    Optional<PrimExpr> rows;
     for (size_t i = 0; i < 2; ++i) {
       const auto *region = call->args[i].as<CallNode>();
       ICHECK(region && region->op.same_as(tl::region()))
@@ -1281,6 +1282,22 @@ private:
                                  is_one(access->region.back()->extent) &&
                                  is_zero(access->region.back()->min);
       const size_t row_axis = rank - (i == 1 || retained_axis ? 2 : 1);
+      PrimExpr active_rows = access->region[row_axis]->extent;
+      if (i == 0) {
+        // Check the original integer extent before narrowing to uint8. A
+        // cast alone cannot establish that 0/256 rows never issue. Dynamic
+        // plans carry their nonempty guard through scheduling to this point.
+        ICHECK(analyzer_->CanProve(active_rows > 0) &&
+               analyzer_->CanProve(active_rows <= 255) &&
+               analyzer_->CanProveEqual(
+                   call->args[2], cast(DataType::UInt(8), active_rows)))
+            << "FP32 row reduce requires proved active rows in [1, 255] "
+               "and an exact uint8 repeat count";
+        rows = active_rows;
+      } else {
+        ICHECK(analyzer_->CanProveEqual(active_rows, rows.value()))
+            << "FP32 row reduce source/destination active rows must match";
+      }
       for (size_t axis = 0; axis < rank; ++axis)
         ICHECK(CanProveAscendRangeInBounds(
             access->region[axis]->min, access->region[axis]->extent,
@@ -1302,13 +1319,9 @@ private:
       }
       PrimExpr span;
       if (i == 0) {
-        ICHECK(is_const_int(access->region[row_axis]->extent, rows->value))
-            << "FP32 row reduce destination must contain exactly rows "
-               "compact elements";
         span = access->region[row_axis]->extent;
       } else {
-        ICHECK(is_const_int(access->region[row_axis]->extent, rows->value) &&
-               is_const_int(access->region.back()->extent, lanes->value) &&
+        ICHECK(is_const_int(access->region.back()->extent, lanes->value) &&
                is_const_int(access->buffer->shape.back(), stride->value * 8))
             << "FP32 row reduce source must be an exact [rows, valid_lanes] "
                "chunk "

@@ -197,13 +197,16 @@ def test_noneligible_cases_keep_existing_count_mode_plan(options):
         assert any(loop.kind == tirx.ForKind.SERIAL for loop in nodes(after, tirx.For))
 
 
-def test_dynamic_private_row_extent_including_empty_owner_keeps_existing_plan():
+def test_dynamic_private_row_extent_including_empty_owner_uses_guarded_native_rows():
     extent = tirx.Var("owned_rows", "int32")
     before, _, _ = _program(row_extent=extent)
     after = _lower(before)
-    assert not _strided(after)
-    assert any(loop.extent.same_as(extent) for loop in nodes(after, tirx.For))
-    assert [int(call.args[-1]) for call in calls(after, PREFIX + "sum")] == [128, 2]
+    assert len(_strided(after)) == 2
+    assert not calls(after, PREFIX + "sum") and not nodes(after, tirx.Bind)
+    (guard,) = nodes(after, tirx.IfThenElse)
+    _equal([guard.condition], [extent > 0])
+    assert all(tvm.arith.Analyzer().can_prove_equal(call.args[2], tirx.Cast("uint8", extent))
+               for call in _strided(after))
 
 
 def test_explicit_atomic_task_cannot_hide_multi_instruction_reduce():
