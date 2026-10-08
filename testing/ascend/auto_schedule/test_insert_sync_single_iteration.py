@@ -1,8 +1,9 @@
-"""A guarded one-trip child still needs real binary flag reuse completion.
+"""Guarded epilogues still need real binary flag reuse completion.
 
 The ordinary DSL path is the small form of a final-output epilogue: periodic
 active outer epochs load F32, narrow it and store F16.
-One child iteration is not evidence that an event ID is used only once.
+An ordinary singleton is normalized away before scheduling; an explicitly
+annotated one retains its control domain. Both need actual completion proof.
 """
 
 from itertools import product
@@ -26,7 +27,7 @@ _SHAPE = (16, 16)
 _COUNT = 256
 
 
-def _periodic_cast(epochs, period):
+def _periodic_cast(epochs, period, preserve_child):
     @T.prim_func
     def main(Input: T.Tensor((epochs, 16, 16), "float32"),
              Output: T.Tensor((epochs, 16, 16), "float16")):
@@ -37,7 +38,7 @@ def _periodic_cast(epochs, period):
             for epoch in T.serial(epochs):
                 with T.Stage(0):
                     if epoch >= 2:
-                        for sub in T.serial(1):
+                        for sub in T.serial(1, annotations={"num_stages": 1} if preserve_child else {}):
                             if (epoch + 2) % period == period - 1:
                                 T.copy(Input[epoch, :, :], value)
                                 for row, column in T.Parallel(16, 16):
@@ -129,11 +130,12 @@ def _commands(mod):
 
 
 @pytest.mark.parametrize("epochs,period", [(12, 4), (15, 4), (11, 2)])
-def test_periodic_one_trip_epilogue_keeps_completion_and_binary_reuse(epochs, period):
-    source, snapshots = _lower(_periodic_cast(epochs, period))
+@pytest.mark.parametrize("preserve_child", [False, True], ids=["normalized", "annotated"])
+def test_periodic_one_trip_epilogue_keeps_completion_and_binary_reuse(epochs, period, preserve_child):
+    source, snapshots = _lower(_periodic_cast(epochs, period, preserve_child))
     scheduled = snapshots["tl.AutoSchedule"]
     assert any(loop.loop_var.name == "sub" and int(loop.extent) == 1
-               for loop in nodes(scheduled, tirx.For))
+               for loop in nodes(scheduled, tirx.For)) == preserve_child
     assert calls(scheduled, _CAST), "Use the real native cast lowering"
     trace = _commands(snapshots["tl.LowerScheduledTIR"])
     expected = {(epoch,) for epoch in range(2, epochs)

@@ -2,7 +2,7 @@
  * \file normalize_control_flow_for_schedule.cc
  * \brief Normalize control flow ahead of AutoSchedule.
  *
- * Three rewrites, applied in this order:
+ * Control rewrites before scheduling establishes loop/version ownership:
  *   1. while-rewrite: `while cond: BODY` becomes a bounded serial for loop
  *      `for w in range(0, 3): if (not cond): T.loop_break(); BODY`, tagged with
  * a `synthetic_while` annotation. This lets AutoSchedule's For->ControlNode
@@ -17,6 +17,10 @@
  *      expressions that access buffers into preceding Bind statements. This
  *      preserves their evaluate-on-entry semantics and gives dependency and
  *      lifetime analysis an ordinary Task endpoint for each access.
+ *   4. singleton-inline: an ordinary, unannotated serial loop of extent one
+ *      and unit step becomes its body with the induction variable replaced
+ *      by its entry-time minimum. Explicit scheduling and loop-control
+ *      boundaries retain their loops.
  */
 
 #include <tvm/ffi/reflection/registry.h>
@@ -30,6 +34,7 @@
 #include <string>
 #include <utility>
 
+#include "ascend/transform/attr.h"
 #include "ascend/transform/auto_schedule/kernel_rewriter.h"
 #include "ascend/transform/auto_schedule/task_analysis.h"
 #include "op/builtin.h"
@@ -40,6 +45,54 @@ namespace tl {
 using namespace tirx;
 using namespace ascend;
 using namespace ffi;
+
+namespace {
+
+// Removing a loop must not change the target of a break/continue, the loop
+// whose child list owns an explicit Stage, or an annotated scheduling domain.
+// Conservatively keep a singleton around nested semantic boundaries as well;
+// ordinary data operations, including atomic Tasks, can still be substituted.
+class SingletonBoundaryDetector : public StmtExprVisitor {
+public:
+  static bool Contains(const Stmt &body) {
+    SingletonBoundaryDetector detector;
+    detector(body);
+    return detector.found_;
+  }
+
+private:
+  void VisitExpr_(const CallNode *op) final {
+    if (op->op.same_as(tl::loop_break()) ||
+        op->op.same_as(builtin::break_loop()) ||
+        op->op.same_as(builtin::continue_loop())) {
+      found_ = true;
+      return;
+    }
+    StmtExprVisitor::VisitExpr_(op);
+  }
+
+  void VisitStmt_(const ForNode *op) final {
+    found_ |= !op->annotations.empty() || op->thread_binding.defined();
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const AttrStmtNode *op) final {
+    // Task metadata only groups operations; it is preserved by substitution.
+    // Other attributes may refer to their enclosing scheduling/control domain.
+    found_ |= op->attr_key != tl::attr::kAscendTask &&
+              op->attr_key != tl::attr::kAscendPerCoreTask;
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const SBlockNode *op) final {
+    found_ |= !op->annotations.empty() || !op->iter_vars.empty();
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  bool found_{false};
+};
+
+} // namespace
 
 class ControlFlowNormalizer : public StmtExprMutator {
 public:
@@ -190,19 +243,39 @@ private:
       step = VisitExpr(step.value());
     Stmt body = VisitStmt(op->body);
 
+    const bool inline_singleton =
+        op->kind == ForKind::kSerial && op->annotations.empty() &&
+        !op->thread_binding.defined() && is_one(extent) &&
+        (!step.defined() || is_one(step.value())) &&
+        SideEffect(min) <= CallEffectKind::kReadState &&
+        !SingletonBoundaryDetector::Contains(body);
+
     Array<Stmt> sequence;
-    auto snapshot_buffer_access = [&](PrimExpr expr) {
-      if (!HasTaskBufferAccess(Evaluate(expr)))
+    auto snapshot_buffer_access = [&](PrimExpr expr, bool force = false) {
+      if (!force && !HasTaskBufferAccess(Evaluate(expr)))
         return expr;
       Var snapshot("__loop_bound_" + std::to_string(loop_bound_counter_++),
                    expr.dtype());
       sequence.push_back(Bind(snapshot, std::move(expr)));
       return PrimExpr(snapshot);
     };
-    min = snapshot_buffer_access(std::move(min));
+    // A memory/state-dependent minimum must still be evaluated exactly once,
+    // even if the inlined body uses its induction variable more than once or
+    // writes the state from which the minimum was read.
+    const bool snapshot_min =
+        inline_singleton && SideEffect(min) > CallEffectKind::kPure;
+    min = snapshot_buffer_access(std::move(min), snapshot_min);
     extent = snapshot_buffer_access(std::move(extent));
     if (step.defined())
       step = snapshot_buffer_access(std::move(step.value()));
+
+    if (inline_singleton) {
+      body = Substitute(std::move(body), {{op->loop_var, min}});
+      if (sequence.empty())
+        return body;
+      sequence.push_back(std::move(body));
+      return SeqStmt::Flatten(sequence);
+    }
 
     For loop = GetRef<For>(op);
     ForNode *writer = loop.CopyOnWrite();
@@ -214,6 +287,16 @@ private:
       return loop;
     sequence.push_back(std::move(loop));
     return SeqStmt::Flatten(sequence);
+  }
+
+  Stmt VisitStmt_(const AttrStmtNode *op) final {
+    // Explicit atomic tasks and VF scopes are opaque leaves for scheduling.
+    // Normalizing their internal control would change the task contract.
+    if (op->attr_key == tl::attr::kAscendTask ||
+        op->attr_key == tl::attr::kAscendPerCoreTask ||
+        op->attr_key == "tl.simdvf_scope" || op->attr_key == "tl.simtvf_scope")
+      return GetRef<Stmt>(op);
+    return StmtExprMutator::VisitStmt_(op);
   }
 
   Stmt VisitStmt_(const SBlockNode *op) final {

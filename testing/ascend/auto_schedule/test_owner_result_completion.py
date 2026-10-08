@@ -210,6 +210,17 @@ def _trace(stmt, *, core, lane, env=None, loops=()):
             yield from _trace(branch, core=core, lane=lane, env=env, loops=loops)
     elif isinstance(stmt, tirx.Bind):
         env[stmt.var] = tirx.const(_value(stmt.value, env), stmt.var.dtype)
+    elif isinstance(stmt, tirx.AllocBuffer):
+        # A guarded Bind can become a mutable local scalar after its enclosing
+        # singleton is inlined. Execute its declared initialization; treating
+        # the allocation as an immutable definition would erase inactive
+        # epochs and conceal read-before-write errors in event conditions.
+        buffer = stmt.buffer
+        cell = _scalar_cell(buffer, [0] * len(buffer.shape), env)
+        assert str(buffer.dtype).startswith(("int", "uint", "bool"))
+        initial = stmt.annotations.get("tl.local_var_init")
+        assert initial is not None, f"Uninitialized fixture allocation: {stmt}"
+        env[_SCALAR_VALUES][cell] = int(tirx.const(_value(initial, env), buffer.dtype))
     elif isinstance(stmt, tirx.BufferStore):
         cell = _scalar_cell(stmt.buffer, stmt.indices, env)
         assert str(stmt.buffer.dtype).startswith(("int", "uint", "bool"))
