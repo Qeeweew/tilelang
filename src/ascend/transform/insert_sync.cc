@@ -3553,13 +3553,15 @@ private:
                  "non-reusing event capacity";
           sync_point.num_versions = *finite_width;
         } else {
-          if (GmHandoffNeedsFallback(
-                  reverse_completion <=
-                  std::numeric_limits<int>::max() - distance))
+          if (GmHandoffNeedsFallback(reverse_completion <=
+                                     std::numeric_limits<int>::max() -
+                                         distance))
             return;
           ICHECK_LE(reverse_completion,
                     std::numeric_limits<int>::max() - distance);
           sync_point.num_versions = distance + reverse_completion;
+          if (HasShiftedScalarWaitWidth(sync_point, loop))
+            sync_point.num_versions = 1;
         }
         sync_point.local_binary_plan =
             LocalBinaryFlagPlan{distance, trip_count};
@@ -3602,6 +3604,9 @@ private:
             << src.pipe << "->" << dst.pipe;
         if (is_innermost) {
           sync_point.num_versions = min_distance;
+          if (HasScalarAdmissionLexicalClock(sync_point, loop) &&
+              ComputeClosedScalarWaitPhase(sync_point, true))
+            sync_point.num_versions = 1;
         } else {
           // The owner clock does not advance within a descendant loop. Its
           // repeated uses of one ID need completion before the next child
@@ -3660,10 +3665,71 @@ private:
     IRStructure *last;
   };
 
+  bool HasScalarAdmissionLexicalClock(const SyncPoint &point,
+                                      ControlNode *loop) const {
+    if (architecture_ != AscendArchitecture::kDav2201 || !loop ||
+        point.flag_loop != loop || loop->GetParentControl() != nullptr ||
+        loop->HasConditions() || loop->BodyHasLoopBreak() ||
+        loop->control->kind != ForKind::kSerial ||
+        point.counter_group_id != 0 || point.IsPrivateGmHandoff() ||
+        point.local_binary_plan || point.single_iteration_binary_plan ||
+        point.unit_boundary != UnitFlagBoundaryRole::kNone)
+      return false;
+    const SyncInsertionSite &src = site_registry_.Src(point);
+    const SyncInsertionSite &dst = site_registry_.Dst(point);
+    if (src.core != kCoreVector || dst.core != src.core || src.pipe != "V" ||
+        dst.pipe != "S" || src.at_beginning || !dst.at_beginning ||
+        src.EpochDomainId() != dst.EpochDomainId())
+      return false;
+    const EpochDomain &domain = site_registry_.Domain(src);
+    if (domain.IsCounter() || domain.owner != loop)
+      return false;
+    const ForNode *node = loop->control.get();
+    PrimExpr step = node->step.has_value() ? node->step.value()
+                                           : IntImm(node->extent.dtype(), 1);
+    if (!point.flag_iteration.dtype().is_int() ||
+        SideEffect(node->min) != CallEffectKind::kPure ||
+        SideEffect(node->extent) != CallEffectKind::kPure ||
+        SideEffect(step) != CallEffectKind::kPure ||
+        !loop->task->outer_ctx.CanProve(step > make_zero(step.dtype())))
+      return false;
+    return loop->GetLoopBodyContext().CanProve(
+        point.flag_iteration == indexdiv(node->loop_var - node->min, step));
+  }
+
+  bool HasShiftedScalarWaitWidth(const SyncPoint &point,
+                                 ControlNode *loop) const {
+    if (point.edge.distance != 1 ||
+        !HasScalarAdmissionLexicalClock(point, loop))
+      return false;
+    const SyncInsertionSite &src = site_registry_.Src(point);
+    const SyncInsertionSite &dst = site_registry_.Dst(point);
+    if (src.path_begin != src.path_end || src.path_end != dst.path_begin ||
+        dst.path_begin != dst.path_end || !src.path_end->IsControl() ||
+        src.path_begin->GetParent() != loop || src.path_begin->GetStage() < 0)
+      return false;
+    // These are real sibling insertions around one Control, including when
+    // its body has zero trips. The old epoch's Scalar wait consumes the bit
+    // before dispatch can reach this epoch's V notification. Retain the exact
+    // shifted clock/activation validation and one seed/drain in the caller.
+    // This bounds flag lifetime; it supplies no new data-completion edge.
+    for (const SyncInsertionSite *site : {&src, &dst}) {
+      PrimExpr guard = owner_result_detail::Expand(
+          site->GetGuard(),
+          owner_result_detail::TaskBindings(
+              static_cast<ControlNode *>(site->path_end)->task.get()));
+      if (!StableLocalBinaryBoundary(guard, loop, true) ||
+          !loop->GetLoopBodyContext().CanProve(guard))
+        return false;
+    }
+    return true;
+  }
+
   std::optional<ClosedScalarWaitPhase>
-  ComputeClosedScalarWaitPhase(const SyncPoint &point) const {
+  ComputeClosedScalarWaitPhase(const SyncPoint &point,
+                               bool for_width = false) const {
     if (architecture_ != AscendArchitecture::kDav2201 || !point.flag_loop ||
-        point.edge.distance != 0 || point.num_versions != 1 ||
+        point.edge.distance != 0 || (!for_width && point.num_versions != 1) ||
         point.IsPrivateGmHandoff() || point.local_binary_plan ||
         point.single_iteration_binary_plan ||
         point.unit_boundary != UnitFlagBoundaryRole::kNone)
@@ -3685,6 +3751,12 @@ private:
         (dst.path_end->IsTask() &&
          static_cast<TaskNode *>(dst.path_end)->IsPerCoreTask()))
       return std::nullopt;
+    // Width reduction may use a common pipeline stage: the matching Scalar
+    // wait still executes before the next physical iteration can dispatch a
+    // new notification. Cross-channel phase sharing remains stage-zero only.
+    int stage = for_width ? src.path_begin->GetStage() : 0;
+    if (stage < 0 || dst.path_begin->GetStage() != stage)
+      return std::nullopt;
 
     auto stable = [&](const PrimExpr &guard, const TaskNode *task) {
       PrimExpr expanded = owner_result_detail::Expand(
@@ -3693,8 +3765,8 @@ private:
                  ? std::optional<PrimExpr>(std::move(expanded))
                  : std::nullopt;
     };
-    auto activation = [&](const SyncInsertionSite &site)
-        -> std::optional<PrimExpr> {
+    auto activation =
+        [&](const SyncInsertionSite &site) -> std::optional<PrimExpr> {
       PrimExpr guard = site.GetGuard();
       ffi::Map<Var, PrimExpr> entries;
       // The existing insertion-site constructor descends a control only
@@ -3703,7 +3775,7 @@ private:
       // site that stopped at a Control is already outside its loop/guard;
       // retain that real boundary, including execution for an empty loop.
       for (IRStructure *node : site.path_end->PathFrom(site.path_begin)) {
-        if (node->GetStage() != 0)
+        if (node->GetStage() != (node == site.path_begin ? stage : 0))
           return std::nullopt;
         if (node == site.path_end)
           break;

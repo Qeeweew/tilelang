@@ -571,6 +571,18 @@ Dynamic or empty children, shifted stages, mutable counters, extra endpoint
 guards and different active sequences retain separate synchronization. The
 2201 limit of eight local hard-event slots remains enforced.
 
+The local capacity is eight IDs per physical core and directed HardEvent;
+`V_S` and `S_V` use separate banks. Allocated ranges are not a proof of the
+minimum simultaneously pending notifications. A real `V_S` wait blocks Scalar
+dispatch, so a closed notify/wait pair in one physical activation needs one ID
+even when the reverse data-completion distance is larger. The same lifetime
+argument covers a distance-one wait-before-notify boundary around one control,
+with its one startup seed and final drain. InsertSync checks the actual sites,
+activation, stage and lexical clock before reducing that channel's width.
+Multiple startup seeds retain distinct IDs. These flag-lifetime certificates
+do not add data-completion edges or change storage versions; cross-channel
+sharing still needs its separate nonoverlap proof.
+
 A closed local lifetime may be summarized by an unconditional physical entry
 and exit outside its data guard. The lifetime analyzer checks both endpoint
 directions, zero local offsets, the unconditional parent lexical domain, and

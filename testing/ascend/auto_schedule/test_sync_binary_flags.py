@@ -13,7 +13,7 @@ independent Vector arithmetic has no implicit completion-order edge.
 from __future__ import annotations
 
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import pytest
 from tilelang import tvm
@@ -49,6 +49,20 @@ def _completion_trace(mod, parameters=None, *, scalar_vector=False):
                 return tirx.const(scalar_memory[(node.buffer.data, indices)], node.dtype)
 
         expression = tirx.stmt_functor.ir_transform(tirx.Evaluate(expression), None, scalar_load).value
+        expression = analyzer.simplify(expression)
+
+        def unsigned_residue(node):
+            # Analyzer retains unsigned Mod even with literal operands. Fold
+            # only these finite nonnegative residues and lossless event casts.
+            if (isinstance(node, (tirx.Mod, tirx.FloorMod)) and node.dtype == "uint32"
+                    and isinstance(node.a, tirx.IntImm) and isinstance(node.b, tirx.IntImm)):
+                assert int(node.a) >= 0 and int(node.b) > 0
+                return tirx.const(int(node.a) % int(node.b), node.dtype)
+            if isinstance(node, tirx.Cast) and node.dtype == "int32" and isinstance(node.value, tirx.IntImm):
+                assert -(1 << 31) <= int(node.value) < 1 << 31
+                return tirx.const(int(node.value), "int32")
+
+        expression = tirx.stmt_functor.ir_transform(tirx.Evaluate(expression), None, unsigned_residue).value
         expression = analyzer.simplify(expression)
         assert isinstance(expression, tirx.IntImm), f"Fixture control is not constant: {expression}"
         return int(expression)
@@ -95,7 +109,8 @@ def _completion_trace(mod, parameters=None, *, scalar_vector=False):
                 scalar_memory[key] = integer(statement.value)
             else:
                 assert scalar_vector and statement.buffer.scope() == "shared.dyn"
-                result.append(_Completion("S", "mask_write", slot=slot(statement.buffer[tuple(statement.indices)])))
+                kind = "mask_write" if statement.buffer.dtype == "uint64" else "scalar_write"
+                result.append(_Completion("S", kind, slot=slot(statement.buffer[tuple(statement.indices)])))
         elif scalar_vector and isinstance(statement, tirx.Bind):
             def scalar_read(node):
                 if isinstance(node, tirx.BufferLoad):
@@ -122,6 +137,9 @@ def _completion_trace(mod, parameters=None, *, scalar_vector=False):
             elif scalar_vector and name == "tl.ascend_membase.select_bits":
                 result.append(_Completion("V", "mask_read", slot=slot(call.args[3].args[0])))
             elif scalar_vector and name == "tl.ascend_membase.duplicate":
+                result.append(_Completion("V", "vector_write", slot=slot(call.args[0].args[0])))
+            elif scalar_vector and name == "tl.ascend_membase.copy_bits":
+                result.append(_Completion("V", "vector_read", slot=slot(call.args[1].args[0])))
                 result.append(_Completion("V", "vector_write", slot=slot(call.args[0].args[0])))
             else:
                 assert name == "tl.tileop.ascend_copy", f"Unexpected instruction in DMA fixture: {name}"
@@ -561,9 +579,10 @@ def _prove_scalar_read_epochs(trace, precedes, expected_reads, expected_writes):
 @pytest.mark.parametrize("read_placement", ["flat", "first-leaf", "lifted-entry"])
 def test_closed_scalar_wait_phases_share_across_storage_epochs_without_overlap(sid_value, guarded, read_placement):
     # An unconditional lifted entry needs no outer V_S carry channels. Its
-    # two local channels therefore need seven one-shot root IDs to create
-    # the same nine-slot pressure as the other prepared layouts.
-    root_pairs = 7 if read_placement == "lifted-entry" and not guarded else 3
+    # two local channels therefore need seven one-shot root IDs. Other layouts
+    # also have two single-bit outer carry channels, requiring five root IDs
+    # to retain nine-slot pressure after Scalar-admission width reduction.
+    root_pairs = 7 if read_placement == "lifted-entry" and not guarded else 5
     before, sid, storage = _scalar_wait_phases_program(
         guarded=guarded, read_placement=read_placement, root_pairs=root_pairs)
     snapshot = tvm.ir.save_json(before)
@@ -602,6 +621,120 @@ def test_closed_scalar_wait_phases_preserve_shifted_nested_carry_rejection():
         with tvm.transform.PassContext(config={"tl.disable_shared_memory_reuse": True}):
             transform.InsertSync()(before)
     assert tvm.ir.save_json(before) == snapshot
+
+
+def _scalar_admission_width_program(*, distance=0, read_stage=1, clock_dtype="int32"):
+    """Prepared typed inputs with independently chosen stages and storage rings."""
+    epoch = tirx.Var("admission_epoch", clock_dtype)
+    sid, row = tirx.Var("admission_sid", "int32"), tirx.Var("admission_row", "int32")
+    storage = tirx.decl_buffer((16,), "float32", name="admission_storage", scope="shared.dyn")
+    count = tirx.IntImm("uint32", 16)
+
+    def access(buffer, mask):
+        return tirx.Call("handle", tvm.ir.Op.get("tl.access_ptr"), [buffer[0], 16, mask])
+
+    write = unit(tirx.Evaluate(tirx.Call("void", tvm.ir.Op.get("tl.ascend_membase.duplicate"), [
+        access(storage, 2), tirx.const(1, "float32"), count])), stage=1 if distance == 0 else 0)
+    read = unit(tirx.Bind(tirx.Var("admission_scalar", "float32"), storage[0]))
+    buffers = [storage]
+    if distance == 0:
+        # Both endpoints use the same root epoch. A possibly empty reader
+        # forces the actual wait to its Control entry, outside the row loop.
+        body = seq(write, unit(tirx.For(row, 0, 2 * (1 - sid), tirx.ForKind.SERIAL, read),
+                               core=None, stage=read_stage))
+        versions, eligible = 2, [storage.data]
+    elif distance == 1:
+        # The mixed inner owner has a local RAW and a projected outer carried
+        # channel: its physical S wait is BEFORE the Control, V set AFTER it.
+        owner = tirx.For(row, 0, 2 * (1 - sid), tirx.ForKind.SERIAL, seq(write, read), annotations={
+            "multi_buffer_eligible": [storage.data],
+            "tl.storage_epoch_guard_map": {storage.data: tirx.const(True, "bool")},
+        })
+        body, versions, eligible = unit(owner, core=None), 1, []
+    else:
+        assert distance == 2
+        # Scalar writes slot e, then a stage-one Vector command reads it. Its
+        # WAR permission for e+2 starts with two distinct initial tokens.
+        temporary = tirx.decl_buffer((16,), "float32", name="admission_copy", scope="shared.dyn")
+        buffers.append(temporary)
+        body = seq(unit(tirx.BufferStore(storage, tirx.const(1, "float32"), [0])),
+                   unit(tirx.Evaluate(tirx.Call("void", tvm.ir.Op.get("tl.ascend_membase.copy_bits"), [
+                       access(temporary, 2), access(storage, 1), tirx.IntImm("uint32", 1)])), stage=1))
+        versions, eligible = 2, [storage.data]
+    loop = tirx.For(epoch, tirx.const(0, clock_dtype), tirx.const(17, clock_dtype),
+                   tirx.ForKind.SERIAL, body, annotations={
+                       "multi_buffer_eligible": eligible,
+                       "num_stages": max(2, read_stage + 1) if distance == 0 else 2,
+                   })
+    mod = kernel(unit(loop, core=None), buffers=buffers, annotations={
+        "tl.buffer_versions_map": {storage.data: versions},
+    })
+    thread = tirx.IterVar(tvm.ir.Range(0, 2), sid, tirx.IterVar.ThreadIndex, "cthread")
+    mod["main"] = mod["main"].with_body(tirx.AttrStmt(thread, "thread_extent", 2, mod["main"].body))
+    mod["main"] = mod["main"].with_attr("target", tvm.target.Target({"kind": "ascend", "arch": "dav-2201"}))
+    return mod, sid
+
+
+@pytest.mark.parametrize("sid_value", [0, 1], ids=["active", "empty-reader"])
+@pytest.mark.parametrize("read_stage,clock_dtype,expected_width", [
+    (1, "int32", 1), (2, "int32", 2), (1, "uint32", 2),
+], ids=["same-stage-one-bit", "two-notifies-before-wait", "unsigned-clock-conservative"])
+def test_scalar_admission_bounds_staged_distance_zero_width(sid_value, read_stage, clock_dtype, expected_width):
+    before, sid = _scalar_admission_width_program(read_stage=read_stage, clock_dtype=clock_dtype)
+    snapshot = tvm.ir.save_json(before)
+    trace = _completion_trace(_lower_protocol(before, prepared=True), {sid: sid_value}, scalar_vector=True)
+    assert tvm.ir.save_json(before) == snapshot
+    precedes = _prove_binary_protocol(trace)
+    _prove_scalar_read_epochs(trace, precedes, 34 if sid_value == 0 else 0, 17)
+    flags = {node.flag for node in trace if node.kind == "set" and node.flag[0] == "V_S"}
+    assert len(flags) == expected_width
+    if read_stage == 2:
+        # Preserve all counts while maliciously identifying the two live bits.
+        collapsed = [replace(node, flag=("V_S", 0)) if node.flag and node.flag[0] == "V_S" else node
+                     for node in trace]
+        with pytest.raises(AssertionError, match="may be set again"):
+            _prove_binary_protocol(collapsed)
+
+
+@pytest.mark.parametrize("sid_value", [0, 1], ids=["active", "empty-owner"])
+def test_scalar_admission_distance_one_control_has_one_seed_and_drain(sid_value):
+    before, sid = _scalar_admission_width_program(distance=1)
+    trace = _completion_trace(_lower_protocol(before, prepared=True), {sid: sid_value}, scalar_vector=True)
+    _prove_scalar_read_epochs(trace, _prove_binary_protocol(trace), 34 if sid_value == 0 else 0,
+                              34 if sid_value == 0 else 0)
+    # Empty owners still execute all outer Control boundaries. Distinguish the
+    # initial token from those notifications by using the first matching wait.
+    first_wait = next(index for index, node in enumerate(trace) if node.kind == "wait" and node.flag[0] == "V_S")
+    seeds = [node.flag for node in trace[:first_wait] if node.kind == "set" and node.flag[0] == "V_S"]
+    assert len(seeds) == 1
+    carried = seeds[0]
+    assert sum(node.kind == "set" and node.flag == carried for node in trace) == 18
+    assert sum(node.kind == "wait" and node.flag == carried for node in trace) == 18
+
+
+def test_scalar_admission_keeps_distance_two_initial_tokens_independent():
+    before, sid = _scalar_admission_width_program(distance=2)
+    trace = _completion_trace(_lower_protocol(before, prepared=True), {sid: 0}, scalar_vector=True)
+    precedes = _prove_binary_protocol(trace)
+    writes, reads, last_write, last_read = 0, 0, {}, {}
+    for index, node in enumerate(trace):
+        if node.kind == "scalar_write":
+            writes += 1
+            if node.slot in last_read:
+                assert precedes(last_read[node.slot], index), "Scalar overwrite before Vector read completes"
+            last_write[node.slot] = index
+        elif node.kind == "vector_read":
+            reads += 1
+            assert node.slot in last_write and precedes(last_write[node.slot], index), "Vector read before Scalar write completes"
+            last_read[node.slot] = index
+    assert (writes, reads) == (17, 17)
+    first_write = next(index for index, node in enumerate(trace) if node.kind == "scalar_write")
+    seeds = [node.flag for node in trace[:first_write] if node.kind == "set" and node.flag[0] == "V_S"]
+    assert len(seeds) == len(set(seeds)) == 2
+    collapsed = [replace(node, flag=("V_S", 0)) if node.flag and node.flag[0] == "V_S" else node
+                 for node in trace]
+    with pytest.raises(AssertionError, match="may be set again"):
+        _prove_binary_protocol(collapsed)
 
 
 def test_shifted_nested_owner_is_rejected_before_unsafe_local_reseeding():
