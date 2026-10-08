@@ -356,6 +356,21 @@ class AutoTuner:
         ):
             return None
 
+        native_build = None
+        if self._target_kind() == "ascend":
+            from tilelang.cache.kernel_cache import KernelCache
+
+            # Winner reload precedes elaboration and compilation, so the
+            # ordinary kernel-cache key cannot invalidate a stale winner.
+            # Development builds can keep the same public package version.
+            try:
+                native_build = KernelCache._get_tilelang_lib_stamp()
+            except OSError:
+                native_build = None
+            if not native_build:
+                # An unidentified build is not a reusable cache identity.
+                return None
+
         # extract parameters from the function signature
         op_parameters = []
         for _, default_value in parameters.items():
@@ -375,6 +390,8 @@ class AutoTuner:
             "compile_args": hash(self.compile_args),
             "profile_args": hash(self.profile_args),
         }
+        if native_build is not None:
+            key_data["tilelang_lib"] = native_build
         # Sort keys to ensure consistency
         key_string = json.dumps(key_data, sort_keys=True)
         return hashlib.sha256(key_string.encode()).hexdigest()
