@@ -241,11 +241,14 @@ def test_single_version_sibling_protocol_survives_reuse_and_lowering():
             T.annotate_buffer_versions({ub: (1, "auto")})
             for i in T.Pipelined(4, num_stages=2, annotations={"enable_offset": True}):
                 with T.Stage(0):
-                    for _first in T.serial(1):
+                    # This regression needs two independently owned pipeline
+                    # domains. An ordinary one-trip Serial is normalized away
+                    # before ownership; request each child domain explicitly.
+                    for _first in T.serial(1, annotations={"num_stages": 1}):
                         T.copy(A[2 * i, :], ub)
                         T.copy(ub, C[2 * i, :])
                 with T.Stage(1):
-                    for _second in T.serial(1):
+                    for _second in T.serial(1, annotations={"num_stages": 1}):
                         T.copy(A[2 * i + 1, :], ub)
                         T.copy(ub, C[2 * i + 1, :])
 

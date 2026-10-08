@@ -141,6 +141,10 @@ def Stage(stage: int):
     reordered. Nested automatic pipelines remain independent. Omitting this
     annotation retains the partial scheduling behavior described above.
 
+    An ordinary, unannotated ``T.serial(1)`` is inlined before schedule owners
+    are established. If a one-trip child must retain an independent version
+    domain, declare it explicitly with ``annotations={"num_stages": 1}``.
+
     ``T.Stage`` must wrap complete scheduler tasks. It must not appear inside
     ``T.Task``, ``T.SimtVF``, ``T.SimdVF``, an SBlock, or a parallel loop. In
     Python's multi-context form, put ``T.Stage`` first so it is the outer scope:
