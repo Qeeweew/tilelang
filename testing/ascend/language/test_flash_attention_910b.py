@@ -154,6 +154,19 @@ def test_variants_share_typed_math_and_pipeline_exposes_independent_rescale(exam
         transfers = calls(mod, "tl.tileop.ascend_copy")
         logical_bridges = [call for call in transfers if call.args[0].args[0].buffer.scope() == "shared.l0c"]
         assert len(logical_bridges) == 2
+        (score_bridge,) = [call for call in logical_bridges
+                           if call.args[1].args[0].buffer.name == "score_input"]
+        score_input = score_bridge.args[1].args[0].buffer
+        # The DMA destination is consumed only by scale/mask, not by the
+        # destructive softmax recurrence. There is no intervening UB copy.
+        assert not [store for store in nodes(mod, tirx.BufferStore)
+                    if store.buffer.data.same_as(score_input.data)]
+        input_consumers = [store for store in nodes(mod, tirx.BufferStore)
+                           if any(load.buffer.data.same_as(score_input.data)
+                                  for load in nodes(store.value, tirx.BufferLoad))]
+        assert input_consumers and all(store.buffer.name == "scores" for store in input_consumers)
+        assert not [call for call in transfers
+                    if call.args[0].args[0].buffer.data.same_as(score_input.data)]
         group = next(attr.node.var for attr in nodes(mod, tirx.AttrStmt) if attr.attr_key == "thread_extent" and attr.node.thread_tag == "blockIdx.x")
         valid_rows = logical_bridges[0].args[0].args[2]
         analyzer = tvm.arith.Analyzer()
@@ -213,6 +226,63 @@ def test_variants_share_typed_math_and_pipeline_exposes_independent_rescale(exam
     (pv_import_index,) = [i for i, stmt in enumerate(pipeline_body)
                          if any(call.args[1].args[0].buffer.name == "pv" for call in calls(stmt, "tl.tileop.ascend_copy"))]
     assert rescale_index < p_export_index < pv_import_index < update_index
+
+
+@pytest.mark.parametrize("variant", ["generic", "pipeline"])
+@pytest.mark.parametrize("causal,query_len,kv_len,block_kv", [
+    (False, 32, 128, 64),
+    (True, 33, 65, 16),
+], ids=["dense", "causal-gqa-tail-empty-owner"])
+def test_lowered_score_dma_input_has_only_scale_read_effects(example, variant, causal, query_len, kv_len, block_kv):
+    import tilelang
+    from tilelang import tvm
+    from tvm import tirx
+    from testing.ascend._ir import allocated_buffer, calls, nodes
+
+    snapshots = {}
+
+    @tvm.ir.instrument.pass_instrument
+    class Capture:
+        def run_after_pass(self, mod, info):
+            if info.name == "tl.AscendLowerVectorTiles":
+                snapshots[info.name] = mod
+
+    program = example.flash_attention_fwd(
+        1, 2, 1, query_len, kv_len, 16, variant=variant, causal=causal,
+        dtype="float16", tiling=example.FwdTiling(32, block_kv, 3),
+    )
+    with tvm.transform.PassContext(instruments=[Capture()]):
+        artifact = tilelang.lower(
+            program, target={"kind": "ascend", "arch": "dav-2201"},
+            enable_host_codegen=False, enable_device_compile=False,
+        )
+    assert artifact.kernel_source and "asc_mmad(" in artifact.kernel_source
+    native = snapshots["tl.AscendLowerVectorTiles"]
+    score_input = allocated_buffer(native, "score_input")
+    scores = allocated_buffer(native, "scores")
+    assert not score_input.data.same_as(scores.data)
+    # This is the actual native-effect IR after ownership and vector lowering,
+    # before allocation/scheduling. A later reduction cannot keep the DMA
+    # input live or silently turn it back into a destructive work buffer.
+    consumers = []
+    for call in nodes(native, tirx.Call):
+        if not isinstance(call.op, tvm.ir.Op) or not call.op.name.startswith("tl.ascend_membase."):
+            continue
+        pointers = [pointer for pointer in nodes(call, tirx.Call)
+                    if isinstance(pointer.op, tvm.ir.Op)
+                    and pointer.op.name in ("tl.access_ptr", "tl.region")
+                    and pointer.args[0].buffer.data.same_as(score_input.data)]
+        if pointers:
+            consumers.append(call)
+            assert call.op.name == "tl.ascend_membase.mul_scalar"
+            assert all(int(pointer.args[-1] if pointer.op.name == "tl.access_ptr" else pointer.args[1]) == 1
+                       for pointer in pointers)
+    assert consumers
+    (dma,) = [call for call in calls(native, "tl.tileop.ascend_copy")
+              if call.args[1].args[0].buffer.data.same_as(score_input.data)]
+    assert dma.args[0].args[0].buffer.scope() == "global"
+    assert not [call for call in calls(native, "tl.tileop.ascend_copy")
+                if call.args[0].args[0].buffer.data.same_as(score_input.data)]
 
 
 def _causal_frontend(example, *, variant, query_start=0, kv_len=65):

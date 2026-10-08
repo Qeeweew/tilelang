@@ -63,6 +63,7 @@ def flash_attention_fwd(
     are rounded to dtype. Both variants retain the same typed math while
     exposing different issue boundaries.
     """
+    default_tiling = tiling is None
     tiling = tiling or FwdTiling()
     scale = _contract(batch, query_heads, kv_heads, query_len, kv_len, head_dim, dtype, causal, query_start, softmax_scale, tiling)
     if variant not in ("generic", "pipeline"):
@@ -70,40 +71,47 @@ def flash_attention_fwd(
 
     from tilelang.ascend import language as T
 
-    block_q, block_kv = tiling.block_q, tiling.block_kv
-    max_stages = tiling.max_stages
     groups = query_heads // kv_heads
-    q_tiles = (query_len + block_q - 1) // block_q
+    packed_decode = query_len == 1
+    # With one query position, adjacent GQA heads are contiguous rows in
+    # BNSD storage. One head tile shares its K/V scan and useful Cube rows.
+    block_q = min(64, ((groups + 15) // 16) * 16) if packed_decode and default_tiling else tiling.block_q
+    block_kv, max_stages = tiling.block_kv, tiling.max_stages
+    logical_rows = groups if packed_decode else query_len
+    q_tiles = (logical_rows + block_q - 1) // block_q
     kv_tiles = (kv_len + block_kv - 1) // block_kv
 
     @T.macro
-    def kv_step(kv_tile, batch_id, query_head, kv_head, query_base, qrows, Q, K, V, q_l1, k_l1, v_l1, p_l1, score_acc, pv_acc, scores, p, pv, output, maximum, next_maximum, denominator, row_sum, alpha):
+    def kv_step(kv_tile, batch_id, query_head, kv_head, query_base, qrows, Q, K, V, q_l1, k_l1, v_l1, p_l1, score_acc, pv_acc, score_input, scores, p, pv, output, maximum, next_maximum, denominator, row_sum, alpha):
         key_base = kv_tile * block_kv
+        first_query = T.int64(query_start) if packed_decode else T.int64(query_start) + T.cast(query_base, "int64")
         T.copy(K[batch_id, kv_head, key_base : key_base + block_kv, :], k_l1)
         T.copy(V[batch_id, kv_head, key_base : key_base + block_kv, :], v_l1)
         T.gemm(q_l1, k_l1, score_acc, transpose_B=True, clear_accum=True)
         # The logical producer retains its complete allocation. Its actual
         # read region supplies the one valid row domain to the GM bridge and
         # both AIV owners, including a tail with an empty second owner.
-        T.copy(score_acc[0:qrows, :], scores)
+        # DMA input is read only by scale/mask. Destructive softmax work then
+        # uses scores, so its reductions do not extend this input's lifetime.
+        T.copy(score_acc[0:qrows, :], score_input)
         if not causal and kv_len % block_kv == 0:
             # Every key in each Python-selected tile belongs to the input.
             # Keep this dense case free of a redundant per-lane predicate.
             for i, j in T.Parallel(block_q, block_kv):
-                scores[i, j] = scores[i, j] * T.float32(scale)
+                scores[i, j] = score_input[i, j] * T.float32(scale)
         else:
             # Every row in this logical query group can see the complete KV
             # tile. Use the group's first query, independent of AIV ownership.
             # Subtraction is equivalent to key_base+B <= first_query+1 but
             # avoids an overflowing endpoint in the final Int64 KV tile.
-            if causal and (T.cast(key_base, "int64") <= T.int64(query_start) + T.cast(query_base, "int64") + T.int64(1) - T.int64(block_kv)):
+            if causal and (T.cast(key_base, "int64") <= first_query + T.int64(1) - T.int64(block_kv)):
                 for i, j in T.Parallel(block_q, block_kv):
-                    scores[i, j] = scores[i, j] * T.float32(scale)
+                    scores[i, j] = score_input[i, j] * T.float32(scale)
             else:
                 for i, j in T.Parallel(block_q, block_kv):
                     scores[i, j] = T.if_then_else(
-                        (key_base + j < kv_len) & ((not causal) | (key_base + j <= query_start + query_base + i)),
-                        scores[i, j] * T.float32(scale),
+                        (key_base + j < kv_len) & ((not causal) | (key_base + j <= first_query + (0 if packed_decode else i))),
+                        score_input[i, j] * T.float32(scale),
                         -T.infinity("float32"),
                     )
         T.reduce_max(scores, next_maximum, dim=1, clear=True)
@@ -148,17 +156,22 @@ def flash_attention_fwd(
         V: T.Tensor((batch, kv_heads, kv_len, head_dim), dtype),
         O: T.Tensor((batch, query_heads, query_len, head_dim), dtype),
     ):
-        with T.Kernel(batch * query_heads * q_tiles) as core:
-            batch_id = core // (query_heads * q_tiles)
-            query_head = core // q_tiles % query_heads
-            kv_head = query_head // groups
+        with T.Kernel(batch * (kv_heads if packed_decode else query_heads) * q_tiles) as core:
+            if packed_decode:
+                batch_id = core // (kv_heads * q_tiles)
+                kv_head = core // q_tiles % kv_heads
+                query_head = kv_head * groups
+            else:
+                batch_id = core // (query_heads * q_tiles)
+                query_head = core // q_tiles % query_heads
+                kv_head = query_head // groups
             query_base = core % q_tiles * block_q
-            qrows = T.min(block_q, query_len - query_base)
+            qrows = T.min(block_q, logical_rows - query_base)
             if causal:
                 # Exclusive largest visible key across this group's valid
                 # queries. Keep this group-uniform, including an empty AIV
                 # partition; it is unrelated to each SID's private row count.
-                visible_end = T.int64(query_start) + T.cast(query_base, "int64") + T.cast(qrows, "int64")
+                visible_end = T.int64(query_start + 1) if packed_decode else T.int64(query_start) + T.cast(query_base, "int64") + T.cast(qrows, "int64")
                 kv_width = T.int64(block_kv)
                 # Quotient plus remainder avoids visible_end + B - 1 overflow.
                 active_kv_tiles = T.min(T.int64(kv_tiles), visible_end // kv_width + T.cast(visible_end % kv_width != 0, "int64"))
@@ -173,6 +186,7 @@ def flash_attention_fwd(
             p_l1 = T.alloc_l1((block_q, block_kv), dtype)
             score_acc = T.alloc_l0c((block_q, block_kv), "float32")
             pv_acc = T.alloc_l0c((block_q, head_dim), "float32")
+            score_input = T.alloc_shared((block_q, block_kv), "float32")
             scores = T.alloc_shared((block_q, block_kv), "float32")
             p = T.alloc_shared((block_q, block_kv), dtype)
             pv = T.alloc_shared((block_q, head_dim), "float32")
@@ -184,20 +198,31 @@ def flash_attention_fwd(
             row_sum = T.alloc_shared((block_q,), "float32")
             alpha = T.alloc_shared((block_q,), "float32")
 
-            T.copy(Q[batch_id, query_head, query_base : query_base + block_q, :], q_l1)
+            if packed_decode:
+                # These views share the original parameter data; callers keep
+                # their BNSD tensors. Initialize unused physical Cube rows.
+                Q_heads = T.reshape(Q, (batch, query_heads, head_dim))
+                O_heads = T.reshape(O, (batch, query_heads, head_dim))
+                T.fill(q_l1, 0)
+                T.copy(Q_heads[batch_id, query_head + query_base : query_head + query_base + qrows, :], q_l1[0:qrows, :])
+            else:
+                T.copy(Q[batch_id, query_head, query_base : query_base + block_q, :], q_l1)
             T.fill(output, 0)
             T.fill(denominator, 0)
             T.fill(maximum, -T.infinity("float32"))
             if variant == "generic":
                 for kv_tile in T.serial(active_kv_tiles):
-                    kv_step(kv_tile, batch_id, query_head, kv_head, query_base, qrows, Q, K, V, q_l1, k_l1, v_l1, p_l1, score_acc, pv_acc, scores, p, pv, output, maximum, next_maximum, denominator, row_sum, alpha)
+                    kv_step(kv_tile, batch_id, query_head, kv_head, query_base, qrows, Q, K, V, q_l1, k_l1, v_l1, p_l1, score_acc, pv_acc, score_input, scores, p, pv, output, maximum, next_maximum, denominator, row_sum, alpha)
             else:
                 for kv_tile in T.Pipelined(active_kv_tiles, max_stages=max_stages):
-                    kv_step(kv_tile, batch_id, query_head, kv_head, query_base, qrows, Q, K, V, q_l1, k_l1, v_l1, p_l1, score_acc, pv_acc, scores, p, pv, output, maximum, next_maximum, denominator, row_sum, alpha)
+                    kv_step(kv_tile, batch_id, query_head, kv_head, query_base, qrows, Q, K, V, q_l1, k_l1, v_l1, p_l1, score_acc, pv_acc, score_input, scores, p, pv, output, maximum, next_maximum, denominator, row_sum, alpha)
 
             for i, j in T.Parallel(block_q, head_dim):
                 output_cast[i, j] = T.cast(output[i, j] / denominator[i], dtype)
-            T.copy(output_cast[0:qrows, :], O[batch_id, query_head, query_base : query_base + qrows, :])
+            if packed_decode:
+                T.copy(output_cast[0:qrows, :], O_heads[batch_id, query_head + query_base : query_head + query_base + qrows, :])
+            else:
+                T.copy(output_cast[0:qrows, :], O[batch_id, query_head, query_base : query_base + qrows, :])
 
     return main
 
