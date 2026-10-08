@@ -1944,22 +1944,33 @@ private:
           writer->GetPipeMask() != PipeMask(ResourcePipe::kMTE2))))
       return false;
     ControlNode *child = info.owners.front().loop;
-    auto finite_loop = [](ControlNode *loop) {
+    auto finite_loop = [](ControlNode *loop, bool allow_outer_stage = false) {
       const ForNode *node = loop->control.get();
       const auto *extent = node->extent.as<IntImmNode>();
       PrimExpr step = node->step.has_value() ? node->step.value()
                                              : IntImm(node->extent.dtype(), 1);
-      return loop->GetStage() == 0 && loop->GetGuards().empty() &&
+      return (loop->GetStage() == 0 ||
+              (allow_outer_stage && loop->GetStage() >= 0)) &&
+             loop->GetGuards().empty() &&
              !loop->BodyHasLoopBreak() && node->kind == ForKind::kSerial &&
              is_zero(node->min) && is_one(step) && extent && extent->value > 0;
     };
     if (child->GetParentControl() != parent || dep.prod_node != child ||
         dep.cons_node != child || reader->GetParent() != child ||
         writer->GetParent() != child || !finite_loop(parent) ||
-        !finite_loop(child) ||
+        !finite_loop(child, operand) ||
         child->control->extent.as<IntImmNode>()->value < info.num_versions ||
         !reader->GetGuards().empty() || !writer->GetGuards().empty())
       return false;
+
+    // A child's outer stage translates this entire owner invocation by the
+    // same parent epoch. It does not reset its flattened physical slot clock:
+    // (p - offset) * T + k advances by T at the next invocation, so equal slots
+    // still differ by a positive multiple of W. LowerScheduledTIR applies
+    // that translation to the retained ready/release events and both typed
+    // endpoints together (offset is stage minus the minimum sibling stage).
+    // Explicit child/endpoint guards remain rejected;
+    // their active sequence would require a separate epoch certificate.
 
     auto uses_storage = [&](const ObjectRef &expression) {
       bool found = false;
@@ -2138,6 +2149,32 @@ private:
                                   site(writer, true)) <= info.num_versions;
   }
 
+  // A repeated full operand load also has a parent WAW. Its exact slot's
+  // previous load completes before MAD can read it, and MAD's real release
+  // completes before the next overwrite. Reuse that same closed RAW+WAR
+  // certificate instead of issuing a wider MTE1 barrier. Merely finding the
+  // same writer in a descendant, or same-pipe issue order, proves nothing.
+  bool IsParentOperandWriteCovered(const DepInfo &dep,
+                                   const MultiBufferInfo &info,
+                                   TaskNode *producer, TaskNode *consumer,
+                                   ControlNode *parent) const {
+    if (producer != consumer ||
+        producer->GetPipeMask() != PipeMask(ResourcePipe::kMTE1) ||
+        !producer->WritesStorage(info.storage) || info.owners.size() != 1)
+      return false;
+    ControlNode *child = info.owners.front().loop;
+    TaskNode *reader = nullptr;
+    for (const auto &node : child->children) {
+      if (!node->IsTask() || !node->ReadsStorage(info.storage))
+        continue;
+      if (reader)
+        return false;
+      reader = static_cast<TaskNode *>(node.get());
+    }
+    return reader && reader->GetPipeMask() == PipeMask(ResourcePipe::kCube) &&
+           IsParentVersionedWarCovered(dep, info, reader, producer, parent);
+  }
+
   std::vector<SyncPoint>
   CollectSyncPoints(const std::vector<IRStructure *> &nodes,
                     ControlNode *loop) {
@@ -2278,9 +2315,11 @@ private:
             loop == pool_member->generation;
         if (pool_member && !pool_local_release)
           continue;
-        if (info != nullptr &&
-            IsParentVersionedWarCovered(dep, *info, producer, consumer, loop))
-          continue;
+        if (info != nullptr) {
+          if (IsParentVersionedWarCovered(dep, *info, producer, consumer, loop) ||
+              IsParentOperandWriteCovered(dep, *info, producer, consumer, loop))
+            continue;
+        }
         // A forced conflict between distinct storages requests ordering in
         // this scope. Its phase envelope also spans inactive epochs.
         // Emit a real boundary protocol in the lexical clock rather than an

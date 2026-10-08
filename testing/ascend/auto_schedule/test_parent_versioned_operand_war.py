@@ -45,7 +45,8 @@ def _blocks(argument, env):
     return tuple((buffer.data, *coordinates) for coordinates in product(*ranges))
 
 
-def _fixture(side="b", trips=3, *, kind="ordinary", load3d=False):
+def _fixture(side="b", trips=3, *, kind="ordinary", load3d=False, outer_stage=0,
+             versions=2):
     e, owner, row, k = [tirx.Var(name, "int32") for name in ("epoch", "owner", "row_part", "chunk")]
     selected = ("a", "b") if side == "both" else (side,)
     shapes = {"a": (32, 16), "b": (16, 32)}
@@ -65,7 +66,7 @@ def _fixture(side="b", trips=3, *, kind="ordinary", load3d=False):
     clock = tirx.decl_buffer((1,), "int32", name="operand_clock", scope="local.var") if kind == "counter" else None
     # Keep this negative on the already-supported ordinary counter path; it
     # tests certificate rejection rather than nested shifted-counter support.
-    read_stage = 0 if clock is not None else 1
+    read_stage = 0 if clock is not None or versions == 1 else 1
     target = tvm.target.Target({"kind": "ascend", "arch": "dav-2201"})
     layouts = {**{cache: make_ascend_major_k_layout(cache) for cache in caches.values()},
                operands["a"]: make_ascend_l0a_2201_layout(operands["a"]),
@@ -123,10 +124,16 @@ def _fixture(side="b", trips=3, *, kind="ordinary", load3d=False):
         annotations.update({"tl.multi_buffer_counter_map": {operands[side].data: clock},
                             "tl.storage_epoch_guard_map": {operands[side].data: tirx.const(True, "bool")}})
         tasks.append(unit(tirx.BufferStore(clock, clock[0] + 1, [0]), core=2))
-    chunks = unit(tirx.For(k, 0, trips, tirx.ForKind.SERIAL, seq(*tasks), annotations=annotations), core=None)
+    outer_guard = row < 2 if kind == "guarded-child" else None
+    chunks = unit(tirx.For(k, 0, trips, tirx.ForKind.SERIAL, seq(*tasks), annotations=annotations),
+                  core=None, stage=outer_stage, guard=outer_guard)
     fills = [unit(copy(inputs[s], caches[s], src_indices=[e, owner, row, 0, 0, 0],
-                       src_shape=[1, 1, 1, trips, *shapes[s]]), core=2) for s in selected]
-    rows = unit(tirx.For(row, 0, 3, tirx.ForKind.SERIAL, seq(*fills, chunks)), core=None)
+                       src_shape=[1, 1, 1, trips, *shapes[s]]), core=2,
+                  stage=outer_stage, guard=outer_guard) for s in selected]
+    # A stage-zero sibling makes this a real fill/drain translation of the
+    # whole child invocation, rather than an all-equal-stage no-op.
+    stage_zero = [unit(tirx.Evaluate(0), core=2)] if outer_stage else []
+    rows = unit(tirx.For(row, 0, 3, tirx.ForKind.SERIAL, seq(*stage_zero, *fills, chunks)), core=None)
     owners = unit(tirx.For(owner, 0, 2, tirx.ForKind.SERIAL, rows), core=None)
     outer = unit(tirx.For(e, 0, 3, tirx.ForKind.SERIAL, owners), core=None)
     prologue = [unit(tirx.Evaluate(tirx.Call("void", tvm.ir.Op.get("tl.ascend_set_fixpipe_config"), [])), core=2),
@@ -141,7 +148,7 @@ def _fixture(side="b", trips=3, *, kind="ordinary", load3d=False):
     if clock is not None:
         prologue.append(unit(tirx.BufferStore(clock, 0, [0]), core=2))
     buffers = [*caches.values(), *operands.values(), c] + ([clock] if clock is not None else [])
-    metadata = {"layout_map": layouts, "tl.buffer_versions_map": {operands[s].data: 2 for s in selected}}
+    metadata = {"layout_map": layouts, "tl.buffer_versions_map": {operands[s].data: versions for s in selected}}
     if clock is None:
         metadata["tl.buffer_version_mode"] = {operands[s].data: "iteration" for s in selected}
     mod = kernel(seq(*prologue, outer), buffers=buffers,
@@ -152,7 +159,9 @@ def _fixture(side="b", trips=3, *, kind="ordinary", load3d=False):
             mod = transform.PrepareMultiBuffer()(mod)
         mod = transform.ResolveCore()(mod)
     return mod, {"selected": selected, "operands": operands, "shapes": shapes,
-                 "read_stage": read_stage, "trips": trips, "readers": readers, "load3d": load3d}
+                 "read_stage": read_stage, "outer_stage": outer_stage,
+                 "trips": trips, "readers": readers, "load3d": load3d,
+                 "versions": versions, "rows": 2 if kind == "guarded-child" else 3}
 
 
 def _lower(before):
@@ -197,11 +206,17 @@ def _check_physical_lifetime(mod, facts):
                 pipe = "MTE1"
                 for s in facts["selected"]:
                     if dst.data.same_as(facts["operands"][s].data):
-                        assert tuple(map(int, dst.shape)) == (2, *facts["shapes"][s])
-                        assert dst_min[1:] == (0, 0)
-                        logical = tuple(coordinates[key] for key in ("epoch", "owner", "row_part", "chunk"))
+                        if facts["versions"] > 1:
+                            assert tuple(map(int, dst.shape)) == (facts["versions"], *facts["shapes"][s])
+                            slot, matrix_origin = dst_min[0], dst_min[1:]
+                        else:
+                            assert tuple(map(int, dst.shape)) == facts["shapes"][s]
+                            slot, matrix_origin = 0, dst_min
+                        assert matrix_origin == (0, 0)
+                        logical = (coordinates["epoch"], coordinates["owner"],
+                                   coordinates["row_part"] - facts["outer_stage"], coordinates["chunk"])
                         assert (s, *logical) not in fills
-                        fills[(s, *logical)] = dst_min[0]
+                        fills[(s, *logical)] = slot
                 if name == _LOAD3D:
                     native_loads.append(len(trace))
             else:
@@ -217,7 +232,8 @@ def _check_physical_lifetime(mod, facts):
         elif name == _GEMM:
             assert _value(call.args[9], env), "Independent results must really clear C"
             assert "unit_flag_ctrl" not in call.annotations, "Unit readiness must not replace whole MAD completion"
-            logical = tuple(coordinates[key] for key in ("epoch", "owner", "row_part")) + (
+            logical = (coordinates["epoch"], coordinates["owner"],
+                       coordinates["row_part"] - facts["outer_stage"]) + (
                 coordinates["chunk"] - facts["read_stage"],)
             reads = []
             for s, argument in zip(("a", "b"), call.args[:2]):
@@ -248,10 +264,10 @@ def _check_physical_lifetime(mod, facts):
             require(3 * configuration[0] + 2, 3 * load + 1)
     else:
         assert not configuration and not native_loads
-    assert mad_count == 3 * 2 * 3 * facts["trips"] * facts["readers"]
+    assert mad_count == 3 * 2 * facts["rows"] * facts["trips"] * facts["readers"]
     assert export_count == mad_count
-    assert len(fills) == len(facts["selected"]) * 3 * 2 * 3 * facts["trips"]
-    if facts["trips"] % 2:
+    assert len(fills) == len(facts["selected"]) * 3 * 2 * facts["rows"] * facts["trips"]
+    if facts["trips"] % 2 and facts["versions"] == 2:
         for s in facts["selected"]:
             assert fills[s, 0, 0, 0, 0] != fills[s, 0, 0, 1, 0], "An odd child cannot reset its physical slot clock"
     return counts

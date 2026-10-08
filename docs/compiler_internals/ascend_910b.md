@@ -522,8 +522,12 @@ and the actual retained RAW and full-ring release protocols. A MAD operand
 must be the same complete canonical Buffer as the load destination; its
 release is the real whole-MAD `M` completion, independent of partial C-ready
 unit flags. Other accesses, counters and unsupported domains
-retain the parent obligation. This coverage removes only the redundant storage
-WAR; it adds no whole-loop completion edge and cannot prove C phase reuse.
+retain the parent obligation. A uniform outer stage on the native operand's
+child translates this same slot clock and its events together. The closed
+ready/MAD/release chain also covers that writer's parent WAW self-dependency.
+This coverage removes only redundant storage obligations; it adds no whole-loop
+completion edge and cannot prove C phase reuse. See
+[operand slots](ascend_2201_operand_slots.md#parent-obligations-for-one-operand-ring).
 This distinction matters when two operand versions cross a row-part boundary:
 the next row part may overwrite a different slot before the previous part's
 last MAD completes, while every same-slot overwrite still consumes its own

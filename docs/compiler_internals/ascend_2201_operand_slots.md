@@ -50,3 +50,20 @@ MaterializeMultiBuffer and late allocation keep the original logical pitches
 and version expressions while assigning the proven shared base. Codegen emits
 the established loads, MADs and flags without repairing the storage plan.
 Dav-3510 does not select this pool.
+
+## Parent obligations for one operand ring
+
+A single allocation's retained load-to-MAD ready event and whole-MAD-to-load
+slot release can also cover its direct parent's operand WAR and repeated-load
+WAW. This requires one complete typed writer and reader, a closed positive
+serial owner, multiple versions and actual completion paths for that storage.
+A common outer stage on the child translates its physical clock and both event
+endpoints together. With child extent `T`, width `W` and stage offset `s`, the
+clock remains `(parent - s) * T + child`, with physical slot `clock % W`.
+An odd `T` must rotate slots across invocations rather than reset them.
+
+This covers the overwritten slot, allowing preparation of that slot while a
+MAD still reads a different one. It establishes neither whole-panel completion
+nor phase retirement. Guarded activation, mutable counters, extra or partial
+accesses and cross-storage conflicts retain their existing protocols or target
+diagnostics. The two-allocation pool's selection rules above are unchanged.
