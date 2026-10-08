@@ -172,6 +172,51 @@ def test_non_prefix_predicate_is_a_clear_boundary_diagnostic():
         transform.AscendLowerVectorTiles()(_program(predicate=lambda j, threshold: j % 2 == 0))
 
 
+@pytest.mark.parametrize("reverse", [False, True])
+def test_equality_at_proven_lower_boundary_preserves_one_lane_prefix(reverse):
+    def predicate(j, _):
+        column = tirx.Cast("int64", j) + tirx.IntImm("int64", 64)
+        boundary = tirx.IntImm("int64", 64)
+        return tirx.EQ(boundary, column) if reverse else tirx.EQ(column, boundary)
+
+    after = transform.AscendLowerVectorTiles()(_program(predicate=predicate))
+    assert len(calls(after, "tl.ascend_membase.select_bits")) == 1
+    stores = [store for store in nodes(after, tirx.BufferStore) if store.buffer.dtype == "uint64"]
+    for chunk in range(3):
+        assert [(_eval(store.value, after, chunk=chunk) & ((1 << 64) - 1)) for store in stores] == [int(chunk == 0), 0]
+
+
+@pytest.mark.parametrize("boundary", [17, 129])
+def test_equality_to_an_interior_or_last_lane_is_not_a_prefix(boundary):
+    with pytest.raises(ValueError, match="affine column prefixes"):
+        transform.AscendLowerVectorTiles()(_program(predicate=lambda j, _: tirx.EQ(j, boundary)))
+
+
+def test_boundary_equality_keeps_safe_operands_at_signed_extremes():
+    a, c = [tirx.decl_buffer((64,), "float32", name=name, scope="shared.dyn") for name in "ac"]
+    column = tirx.Var("column", "int32")
+    offset, boundary = (tirx.Var(name, "int64") for name in ("offset", "boundary"))
+    maximum = (1 << 63) - 1
+    condition = tirx.EQ(offset + tirx.Cast("int64", column), boundary)
+    value = tirx.Select(condition, a[column], tirx.const(float("-inf"), "float32"))
+    body = tirx.For(column, 0, 64, tirx.ForKind.PARALLEL, tirx.BufferStore(c, value, [column]))
+    # Both original equality operands are representable throughout the domain.
+    # Their difference need not fit Int64; lowering cannot introduce it.
+    guard = tirx.And(tirx.And(offset >= 0, offset <= maximum - 63), boundary <= 0)
+    mod = kernel(tirx.IfThenElse(guard, body, None), buffers=[a, c], params=[offset, boundary])
+    mod = tvm.IRModule({"main": mod["main"].with_attr("target", tvm.target.Target({"kind": "ascend", "arch": "dav-2201"}))})
+    after = transform.AscendLowerVectorTiles()(mod)
+    stores = [store for store in nodes(after, tirx.BufferStore) if store.buffer.dtype == "uint64"]
+    assert len(calls(after, "tl.ascend_membase.select_bits")) == 1
+    for start, bound, expected in ((0, 0, 1), (2, -(1 << 63), 0), (maximum - 63, -1, 0)):
+        substitutions = {offset: tirx.IntImm("int64", start), boundary: tirx.IntImm("int64", bound)}
+        for loop in nodes(after, tirx.For):
+            if loop.loop_var.name.startswith("membase_select_chunk_"):
+                substitutions[loop.loop_var] = tirx.IntImm(loop.loop_var.dtype, 0)
+        words = [tvm.arith.Analyzer().simplify(tirx.stmt_functor.substitute(store.value, substitutions)) for store in stores]
+        assert [(_constant_integer(word) & ((1 << 64) - 1)) for word in words] == [expected, 0]
+
+
 def test_bfloat_predicate_selection_requests_an_explicit_supported_precision():
     with pytest.raises(ValueError, match="promote BF16 values explicitly"):
         transform.AscendLowerVectorTiles()(_program("bfloat16"))

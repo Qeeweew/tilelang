@@ -1038,6 +1038,7 @@ private:
       return std::nullopt;
     PrimExpr a, b;
     int inclusive = 0;
+    bool boundary_equality = false;
     if (const auto *op = normalized.as<LTNode>()) {
       a = op->a;
       b = op->b;
@@ -1052,6 +1053,21 @@ private:
       a = op->b;
       b = op->a;
       inclusive = 1;
+    } else if (const auto *op = normalized.as<EQNode>()) {
+      // Under a bounded loop/branch, Simplify may turn a one-lane prefix
+      // into equality. Accept it only when one ordering is already proved;
+      // equality to an arbitrary interior lane is not a prefix mask.
+      if (analyzer_.CanProve(op->a >= op->b)) {
+        a = op->a;
+        b = op->b;
+      } else if (analyzer_.CanProve(op->b >= op->a)) {
+        a = op->b;
+        b = op->a;
+      } else {
+        return std::nullopt;
+      }
+      inclusive = 1;
+      boundary_equality = true;
     } else {
       return std::nullopt;
     }
@@ -1062,6 +1078,14 @@ private:
                                          make_const(a.dtype(), inclusive));
     if (!Invariant(cutoff))
       return std::nullopt;
+    if (boundary_equality) {
+      // The affine proof above and the proved ordering admit only the first
+      // lane or an empty prefix. Evaluate the original equality at the origin;
+      // emitting b-a+1 could overflow even when both original operands are safe.
+      return Select(Substitute(normalized, base_map_),
+                    make_const(active_count_.dtype(), 1),
+                    make_zero(active_count_.dtype()));
+    }
     return cutoff;
   }
 
