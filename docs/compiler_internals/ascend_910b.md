@@ -38,6 +38,15 @@ ordering. Native 2201 L0A uses ZZ order; it is distinct from L1's NZ layout.
 The input capability boundary diagnoses unsupported operations before layout
 inference or scheduling.
 
+The [ordinary GEMM example](../../examples/ascend/gemm_910b.py) chooses its
+output traversal in Python. Its default launches one logical block per output
+tile. Optional `num_cores` bounds the logical launch and distributes output
+tiles round robin through an ordinary serial loop with a per-core finite
+extent; it does not select a physical NPU. Both paths use the same automatic
+`T.Pipelined` K loop. `cache_a` remains private to each output tile and reloads
+for the next output. The compiler retains operand-slot completion and
+last-MAD-to-FIX/FIX-to-next-clear completion when physical storage is reused.
+
 L1 GEMM is expanded before layout inference into explicit L0 allocations,
 L1-to-L0 copies and ordinary L0 GEMM tasks. A bounded sub-K loop keeps IR size
 independent of K; a final partial chunk has its own compact allocation. The
