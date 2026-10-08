@@ -753,6 +753,69 @@ def _reduce_single_stage_loop_resources(n, iis, data_deps, resource_deps):
     return ordered, unordered
 
 
+def _loop_source_order_candidate(
+    iis, data_deps, resource_deps, owner_exclusion_deps,
+    pipe_order_deps, buffer_min_versions,
+):
+    """Construct one single-stage candidate without constraining free search.
+
+    Source-oriented resource and owner edges are choices for this witness,
+    not implied orders. A DAG gives earliest releases; the period covers
+    every cyclic wrap and recurrence at the physical minimum ring widths.
+    The caller must still check every original hard assertion.
+    """
+    n = len(iis)
+    edges = [dict() for _ in range(n)]
+
+    def edge(u, v, weight):
+        edges[u][v] = max(edges[u].get(v, weight), weight)
+
+    resources = sorted({(i, j) for i, j in resource_deps if i < j})
+    for u, v, distance, latency in data_deps:
+        if distance == 0:
+            edge(u, v, latency)
+    for u, v in resources:
+        edge(u, v, iis[u])
+    owners = []
+    for i, j, forward, reverse in owner_exclusion_deps:
+        if i > j:
+            i, j, forward, reverse = j, i, reverse, forward
+        edge(i, j, forward)
+        owners.append((i, j, reverse))
+    for u, v in pipe_order_deps:
+        edge(u, v, 0)
+
+    degrees = [0] * n
+    for row in edges:
+        for v in row:
+            degrees[v] += 1
+    ready = [i for i, degree in enumerate(degrees) if degree == 0]
+    starts = [0] * n
+    visited = 0
+    while ready:
+        u = ready.pop()
+        visited += 1
+        for v, weight in edges[u].items():
+            starts[v] = max(starts[v], starts[u] + weight)
+            degrees[v] -= 1
+            if degrees[v] == 0:
+                ready.append(v)
+    if visited != n:
+        return None
+
+    ii = max([1, *iis, *(start + 1 for start in starts)])
+    for u, v in resources:
+        ii = max(ii, starts[v] - starts[u] + iis[v])
+    for u, v, reverse in owners:
+        ii = max(ii, starts[v] - starts[u] + reverse)
+    for u, v, distance, latency in data_deps:
+        if distance < 0:
+            distance = buffer_min_versions[-distance - 1]
+        if distance > 0:
+            ii = max(ii, (latency + starts[u] - starts[v] + distance - 1) // distance)
+    return starts, ii
+
+
 def z3_schedule_loop_python(
     num_stages: int,
     latencies: list[int],
@@ -942,64 +1005,56 @@ def z3_schedule_loop_python(
     if verbose:
         print(f"[Python Z3 Loop] Binary search range: [{ii_lower}, {ii_upper})")
 
-    while ii_lower < ii_upper:
-        ii_mid = (ii_lower + ii_upper) // 2
-        if verbose:
-            print(f"[Python Z3 Loop] Testing II = {ii_mid}")
-
-        # Create solver for feasibility check
-        solver = z3.Solver(ctx=ctx)
-        if seed is not None:
-            solver.set("random_seed", seed)
-        solver.set("rlimit", 1000000)
+    def build_problem(ii):
+        assertions = []
 
         k_vars = [z3.Int(f"k_{i}", ctx) for i in range(n)]
         r_vars = [z3.Int(f"r_{i}", ctx) for i in range(n)]
-        start_vars = [k_vars[i] * ii_mid + r_vars[i] for i in range(n)]
+        start_vars = [k_vars[i] * ii + r_vars[i] for i in range(n)]
 
         for i in range(n):
-            solver.add(k_vars[i] >= 0)
+            assertions.append(k_vars[i] >= 0)
             if stage_horizon is not None and not manual_schedule:
-                solver.add(k_vars[i] < stage_horizon)
-            solver.add(r_vars[i] >= 0)
-            solver.add(r_vars[i] < ii_mid)
+                assertions.append(k_vars[i] < stage_horizon)
+            assertions.append(r_vars[i] >= 0)
+            assertions.append(r_vars[i] < ii)
 
         if manual_schedule:
             for i, stage in enumerate(manual_stages):
-                solver.add(k_vars[i] == stage)
+                assertions.append(k_vars[i] == stage)
         for previous, current in pipe_order_deps:
-            solver.add(r_vars[previous] <= r_vars[current])
+            assertions.append(r_vars[previous] <= r_vars[current])
 
         buffer_vars = [z3.Int(f"buf_{i}", ctx) for i in range(len(buffer_sizes))]
         for i in range(len(buffer_sizes)):
-            solver.add(buffer_vars[i] >= buffer_min_versions[i])
-            solver.add(buffer_vars[i] <= max(num_stages, buffer_min_versions[i]))
+            assertions.append(buffer_vars[i] >= buffer_min_versions[i])
+            assertions.append(buffer_vars[i] <= max(num_stages, buffer_min_versions[i]))
         for group in memory_groups:
             cap = group[0]
             idxs = group[1:]
             if idxs:
-                solver.add(z3.Sum([buffer_vars[i] * buffer_sizes[i] for i in idxs]) <= cap)
+                assertions.append(z3.Sum([buffer_vars[i] * buffer_sizes[i] for i in idxs]) <= cap)
 
         # Add data dependency constraints with distance
         for u, v, distance, latency in data_deps:
             if distance >= 0:
                 if verbose:
-                    print(f"[Python Z3 Loop] Data dependency: task {v} - task {u} >= {latency} - {ii_mid}*{distance}")
-                solver.add(start_vars[v] - start_vars[u] >= latency - ii_mid * distance)
+                    print(f"[Python Z3 Loop] Data dependency: task {v} - task {u} >= {latency} - {ii}*{distance}")
+                assertions.append(start_vars[v] - start_vars[u] >= latency - ii * distance)
             else:
                 buffer_var_id = -distance - 1  # Convert to 0-based index
                 if verbose:
                     print(
-                        f"[Python Z3 Loop] Data dependency with negative distance: task {v} - task {u} >= {latency} - {ii_mid}*buf_{buffer_var_id}"
+                        f"[Python Z3 Loop] Data dependency with negative distance: task {v} - task {u} >= {latency} - {ii}*buf_{buffer_var_id}"
                     )
-                solver.add(start_vars[v] - start_vars[u] >= latency - ii_mid * buffer_vars[buffer_var_id])
+                assertions.append(start_vars[v] - start_vars[u] >= latency - ii * buffer_vars[buffer_var_id])
 
         # Add resource dependency constraints
         # For tasks i and j that use same resource, they cannot execute simultaneously
         # We create ordering variable O_i,j (True means i before j, False means j before i)
         for previous, current in ordered_resources:
-            solver.add(r_vars[current] - r_vars[previous] >= iis[previous])
-            solver.add(r_vars[previous] - r_vars[current] + ii_mid >= iis[current])
+            assertions.append(r_vars[current] - r_vars[previous] >= iis[previous])
+            assertions.append(r_vars[previous] - r_vars[current] + ii >= iis[current])
         for i, j in unordered_resources:
             if i < j:  # Only consider each pair once
                 ii_i = iis[i]
@@ -1008,10 +1063,10 @@ def z3_schedule_loop_python(
                 # Create ordering variable
                 o_ij = z3.Bool(f"O_{i}_{j}", ctx)
 
-                solver.add(z3.Implies(o_ij, r_vars[j] - r_vars[i] >= ii_i))
-                solver.add(z3.Implies(o_ij, r_vars[i] - r_vars[j] + ii_mid >= ii_j))
-                solver.add(z3.Implies(z3.Not(o_ij), r_vars[i] - r_vars[j] >= ii_j))
-                solver.add(z3.Implies(z3.Not(o_ij), r_vars[j] - r_vars[i] + ii_mid >= ii_i))
+                assertions.append(z3.Implies(o_ij, r_vars[j] - r_vars[i] >= ii_i))
+                assertions.append(z3.Implies(o_ij, r_vars[i] - r_vars[j] + ii >= ii_j))
+                assertions.append(z3.Implies(z3.Not(o_ij), r_vars[i] - r_vars[j] >= ii_j))
+                assertions.append(z3.Implies(z3.Not(o_ij), r_vars[j] - r_vars[i] + ii >= ii_i))
 
                 if verbose:
                     print(f"[Python Z3 Loop] Resource dependency between {i} and {j}: ii_i={ii_i}, ii_j={ii_j}")
@@ -1023,10 +1078,10 @@ def z3_schedule_loop_python(
         # physical slot at their issue phases, not at their logical stages.
         for i, j, latency_i_j, latency_j_i in owner_exclusion_deps:
             i_before_j = z3.Bool(f"Owner_{i}_{j}", ctx)
-            solver.add(z3.Implies(i_before_j, r_vars[j] - r_vars[i] >= latency_i_j))
-            solver.add(z3.Implies(i_before_j, r_vars[i] - r_vars[j] + ii_mid >= latency_j_i))
-            solver.add(z3.Implies(z3.Not(i_before_j), r_vars[i] - r_vars[j] >= latency_j_i))
-            solver.add(z3.Implies(z3.Not(i_before_j), r_vars[j] - r_vars[i] + ii_mid >= latency_i_j))
+            assertions.append(z3.Implies(i_before_j, r_vars[j] - r_vars[i] >= latency_i_j))
+            assertions.append(z3.Implies(i_before_j, r_vars[i] - r_vars[j] + ii >= latency_j_i))
+            assertions.append(z3.Implies(z3.Not(i_before_j), r_vars[i] - r_vars[j] >= latency_j_i))
+            assertions.append(z3.Implies(z3.Not(i_before_j), r_vars[j] - r_vars[i] + ii >= latency_i_j))
             if verbose:
                 print(f"[Python Z3 Loop] Owner exclusion between {i} and {j}: latency_i_j={latency_i_j}, latency_j_i={latency_j_i}")
 
@@ -1036,7 +1091,7 @@ def z3_schedule_loop_python(
         # writes the buffer the Let reads. This keeps the cloned Let (prepended
         # to the loop body in u's stage) reading the pre-write buffer value.
         for u, w in stage_order_deps:
-            solver.add(k_vars[u] <= k_vars[w])
+            assertions.append(k_vars[u] <= k_vars[w])
             if verbose:
                 print(f"[Python Z3 Loop] Stage-order constraint: k_{u} <= k_{w}")
 
@@ -1051,10 +1106,24 @@ def z3_schedule_loop_python(
                 for a in range(len(group)):
                     for b in range(a + 1, len(group)):
                         ia, ib = group[a], group[b]
-                        solver.add(start_vars[ia] - start_vars[ib] < ii_mid)
-                        solver.add(start_vars[ib] - start_vars[ia] < ii_mid)
+                        assertions.append(start_vars[ia] - start_vars[ib] < ii)
+                        assertions.append(start_vars[ib] - start_vars[ia] < ii)
                 if verbose and len(group) > 1:
-                    print(f"[Python Z3 Loop] Offset disabled: resource bit {bit} tasks {group} span < {ii_mid}")
+                    print(f"[Python Z3 Loop] Offset disabled: resource bit {bit} tasks {group} span < {ii}")
+
+        return assertions, k_vars, r_vars, start_vars, buffer_vars
+
+    while ii_lower < ii_upper:
+        ii_mid = (ii_lower + ii_upper) // 2
+        if verbose:
+            print(f"[Python Z3 Loop] Testing II = {ii_mid}")
+
+        assertions, k_vars, r_vars, start_vars, buffer_vars = build_problem(ii_mid)
+        solver = z3.Solver(ctx=ctx)
+        if seed is not None:
+            solver.set("random_seed", seed)
+        solver.set("rlimit", 1000000)
+        solver.add(*assertions)
 
         # Check feasibility
         if verbose:
@@ -1069,7 +1138,7 @@ def z3_schedule_loop_python(
             best_k_vars = k_vars
             best_buffer_vars = buffer_vars
             best_r_vars = r_vars
-            best_assertions = solver.assertions()
+            best_assertions = assertions
             # Try smaller II
             ii_upper = ii_mid
         else:
@@ -1085,6 +1154,37 @@ def z3_schedule_loop_python(
             # A larger II is required after unsat, or tried as a bounded search
             # policy after unknown. The latter does not prove a lower bound.
             ii_lower = ii_mid + 1
+
+    used_structural_backup = False
+    if best_model is None and not manual_schedule:
+        candidate = _loop_source_order_candidate(
+            iis, data_deps, resource_deps, owner_exclusion_deps,
+            pipe_order_deps, buffer_min_versions,
+        )
+        if candidate is not None:
+            candidate_starts, candidate_ii = candidate
+            if candidate_ii < ii_upper:
+                assertions, k_vars, r_vars, start_vars, buffer_vars = build_problem(candidate_ii)
+                model = z3.Model(ctx=ctx)
+                for variable in k_vars:
+                    model.update_value(variable, z3.IntVal(0, ctx))
+                for variable, value in zip(r_vars, candidate_starts):
+                    model.update_value(variable, z3.IntVal(value, ctx))
+                for variable, value in zip(buffer_vars, buffer_min_versions):
+                    model.update_value(variable, z3.IntVal(value, ctx))
+                for i, j in resource_deps:
+                    if i < j:
+                        model.update_value(z3.Bool(f"O_{i}_{j}", ctx), z3.BoolVal(True, ctx))
+                for i, j, _, _ in owner_exclusion_deps:
+                    model.update_value(z3.Bool(f"Owner_{i}_{j}", ctx), z3.BoolVal(i < j, ctx))
+                if all(z3.is_true(model.eval(value, model_completion=False)) for value in assertions):
+                    best_ii, best_model = candidate_ii, model
+                    best_start_vars, best_k_vars = start_vars, k_vars
+                    best_r_vars, best_buffer_vars = r_vars, buffer_vars
+                    best_assertions = assertions
+                    used_structural_backup = True
+                    if verbose:
+                        print(f"[Python Z3 Loop] Structural backup selected II = {best_ii}; main search found no SAT")
 
     if best_model is None:
         if manual_schedule:
@@ -1109,6 +1209,8 @@ def z3_schedule_loop_python(
     else:
         if verbose:
             detail = "; minimality is unproven after unknown" if unknown_checks else ""
+            if used_structural_backup and not unknown_checks:
+                detail = "; structural backup; minimality is unproven"
             print(f"[Python Z3 Loop] Selected feasible II = {best_ii}{detail}")
 
         if prefetch_priority_pairs and enable_offset and not manual_schedule:
@@ -1183,7 +1285,7 @@ def z3_schedule_loop_python(
                 "num_stages": num_stages,
                 "num_tasks": n,
                 "selected_II": best_ii,
-                "minimality_proven": best_model is not None and not unknown_checks,
+                "minimality_proven": best_model is not None and not unknown_checks and not used_structural_backup,
                 "unknown_checks": unknown_checks,
                 "latencies": latencies,
                 "iis": iis,
