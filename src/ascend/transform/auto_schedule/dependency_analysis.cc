@@ -26,7 +26,7 @@
 
 #include <algorithm>
 #include <iterator>
-#include <set>
+#include <map>
 #include <utility>
 #include <vector>
 
@@ -210,6 +210,7 @@ AnalyzeDependencies(std::vector<IRStructure *> nodes, ControlNode *loop,
   struct RegionAccess {
     TaskNode *task;
     BufferRegion region;
+    DependencyAccessMode mode;
   };
   struct NodeAccesses {
     std::vector<RegionAccess> reads;
@@ -221,9 +222,11 @@ AnalyzeDependencies(std::vector<IRStructure *> nodes, ControlNode *loop,
     CollectAllTaskNodes(nodes[i], tasks);
     for (TaskNode *task : tasks) {
       for (const BufferRegion &region : task->GetReadRegions())
-        accesses[i].reads.push_back({task, region});
+        accesses[i].reads.push_back(
+            {task, region, DependencyAccessMode::kRead});
       for (const BufferRegion &region : task->GetWriteRegions())
-        accesses[i].writes.push_back({task, region});
+        accesses[i].writes.push_back(
+            {task, region, DependencyAccessMode::kWrite});
     }
   }
 
@@ -281,12 +284,16 @@ AnalyzeDependencies(std::vector<IRStructure *> nodes, ControlNode *loop,
         int distance;
         DependencyKind kind;
         bool cross_storage_conflict;
-        std::set<DependencyTaskPair> task_pairs;
+        // Preserve the original endpoint-pair ordering and deduplication while
+        // retaining every access conflict on that one record.
+        std::map<std::pair<TaskNode *, TaskNode *>, DependencyTaskPair>
+            task_pairs;
       };
       std::vector<PendingDependency> pending;
 
       auto add_pair = [&](const ffi::Optional<Var> &storage, int distance,
-                          TaskNode *producer, TaskNode *consumer,
+                          const RegionAccess &producer,
+                          const RegionAccess &consumer,
                           DependencyKind kind = DependencyKind::kData,
                           bool cross_storage_conflict = false) {
         auto existing = std::find_if(
@@ -300,7 +307,14 @@ AnalyzeDependencies(std::vector<IRStructure *> nodes, ControlNode *loop,
               {storage, distance, kind, cross_storage_conflict, {}});
           existing = std::prev(pending.end());
         }
-        existing->task_pairs.emplace(producer, consumer);
+        auto pair =
+            existing->task_pairs
+                .try_emplace(
+                    std::make_pair(producer.task, consumer.task),
+                    DependencyTaskPair{producer.task, consumer.task, {}, 0})
+                .first;
+        pair->second.memory_accesses.push_back(
+            {producer.region, consumer.region, producer.mode, consumer.mode});
       };
 
       auto consider = [&](const std::vector<RegionAccess> &lhs_accesses,
@@ -326,7 +340,7 @@ AnalyzeDependencies(std::vector<IRStructure *> nodes, ControlNode *loop,
                                        rhs.task->outer_ctx, rhs.region, loop, d,
                                        /*num_storage_owners=*/0,
                                        root_conflicts)) {
-                  add_pair(storage, d, lhs.task, rhs.task);
+                  add_pair(storage, d, lhs, rhs);
                   break;
                 }
               }
@@ -341,8 +355,7 @@ AnalyzeDependencies(std::vector<IRStructure *> nodes, ControlNode *loop,
                                      rhs.task->outer_ctx, rhs.region, loop,
                                      distance, get_num_storage_owners(storage),
                                      root_conflicts)) {
-                add_pair(storage, owner_exclusion ? 0 : distance, lhs.task,
-                         rhs.task,
+                add_pair(storage, owner_exclusion ? 0 : distance, lhs, rhs,
                          owner_exclusion ? DependencyKind::kOwnerExclusion
                                          : DependencyKind::kData,
                          // Different storages conflict only through a positive
@@ -364,10 +377,13 @@ AnalyzeDependencies(std::vector<IRStructure *> nodes, ControlNode *loop,
       for (PendingDependency &dep : pending) {
         if (dep.task_pairs.empty())
           continue;
+        std::vector<DependencyTaskPair> pairs;
+        pairs.reserve(dep.task_pairs.size());
+        for (auto &entry : dep.task_pairs)
+          pairs.push_back(std::move(entry.second));
         deps.push_back({nodes[i], nodes[j], std::move(dep.storage),
-                        std::vector<DependencyTaskPair>(dep.task_pairs.begin(),
-                                                        dep.task_pairs.end()),
-                        dep.distance, dep.kind, dep.cross_storage_conflict});
+                        std::move(pairs), dep.distance, dep.kind,
+                        dep.cross_storage_conflict});
       }
     }
   }
@@ -420,9 +436,9 @@ AnalyzeDependencies(std::vector<IRStructure *> nodes, ControlNode *loop,
           << " requires a preceding kernel-root configuration";
       std::vector<DependencyTaskPair> pairs;
       for (TaskNode *reader : state_reads[i])
-        pairs.emplace_back(initializer, reader);
+        pairs.push_back({initializer, reader, {}, mask});
       deps.push_back({nodes[initializer_node], nodes[i], std::nullopt,
-                     std::move(pairs), 0, DependencyKind::kData});
+                      std::move(pairs), 0, DependencyKind::kData});
     }
   }
   if (loop)

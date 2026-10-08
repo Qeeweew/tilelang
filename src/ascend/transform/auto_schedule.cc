@@ -347,10 +347,9 @@ int64_t GetTaskTimestamp(IRStructure *subtree_root, TaskNode *task,
 
 int64_t GetDependencyLatency(const DepInfo &dependency, bool reverse = false) {
   int64_t latency = 0;
-  for (const auto &[forward_producer, forward_consumer] :
-       dependency.task_pairs) {
-    TaskNode *producer = reverse ? forward_consumer : forward_producer;
-    TaskNode *consumer = reverse ? forward_producer : forward_consumer;
+  for (const auto &pair : dependency.task_pairs) {
+    TaskNode *producer = reverse ? pair.consumer : pair.producer;
+    TaskNode *consumer = reverse ? pair.producer : pair.consumer;
     IRStructure *producer_root =
         reverse ? dependency.cons_node : dependency.prod_node;
     IRStructure *consumer_root =
@@ -591,7 +590,9 @@ CollectHandoffIssuePreferences(const std::vector<IRStructure *> &nodes,
     }
     if (!dep.storage.has_value())
       continue;
-    for (const auto &[producer, consumer] : dep.task_pairs) {
+    for (const auto &pair : dep.task_pairs) {
+      TaskNode *producer = pair.producer;
+      TaskNode *consumer = pair.consumer;
       CoreMask pcore = TaskExecutionCore(producer);
       CoreMask ccore = TaskExecutionCore(consumer);
       if (!IsConcreteCore(pcore) || !IsConcreteCore(ccore) || pcore == ccore ||
@@ -703,7 +704,9 @@ std::vector<std::pair<int64_t, int64_t>> CollectPrefetchIssuePreferences(
          !profiled_children.count(nodes[j])) ||
         nodes[i]->ReadsStorage(storage) || nodes[j]->WritesStorage(storage))
       continue;
-    for (const auto &[producer, consumer] : dep.task_pairs) {
+    for (const auto &pair : dep.task_pairs) {
+      TaskNode *producer = pair.producer;
+      TaskNode *consumer = pair.consumer;
       if (TaskExecutionCore(producer) != cores[i] ||
           TaskExecutionCore(consumer) != cores[j] ||
           !producer->WritesStorage(storage) ||

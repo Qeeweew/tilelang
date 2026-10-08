@@ -91,6 +91,14 @@ storage reuse therefore participate in RAW/WAR dependencies. The GEMM keeps
 its effective logical M/N/K. The late emitter consumes the same footprint
 helper; it does not infer a separate set of allowed reads.
 
+Dependency analysis retains each conflicting task pair's read/write modes and
+the region pairs that formed its RAW, WAR or WAW hazards. A pair may carry
+several hazards without adding duplicate scheduling edges or synchronization
+points. Reversing owner order reverses both endpoints and their access records.
+These regions remain conservative footprints, not exact coverage or completion
+proofs. SPR ordering records name the register and have no memory regions.
+The records belong to one analysis snapshot and are rebuilt after IR rewrites.
+
 After this normalization, native Cube instruction selection may replace
 2201 FP16/BF16 copies with Load3Dv2. A requires canonical L1 NZ and L0A ZA,
 full padded M and a compact aligned K interval. NN B requires canonical L1 NZ,

@@ -2684,8 +2684,8 @@ private:
         std::vector<DependencyTaskPair> first_to_second =
             std::move(dep.task_pairs);
         if (!lhs_first) {
-          for (auto &[producer, consumer] : first_to_second)
-            std::swap(producer, consumer);
+          for (auto &pair : first_to_second)
+            pair = pair.Reversed();
         }
         // A stage-s task executes logical iteration (physical_iteration - s).
         // Therefore two owners ordered in one physical iteration have logical
@@ -2693,8 +2693,8 @@ private:
         int forward_distance = first->GetStage() - second->GetStage();
         std::vector<DependencyTaskPair> second_to_first;
         second_to_first.reserve(first_to_second.size());
-        for (const auto &[producer, consumer] : first_to_second)
-          second_to_first.emplace_back(consumer, producer);
+        for (const auto &pair : first_to_second)
+          second_to_first.push_back(pair.Reversed());
         directed_deps.push_back({first, second, dep.storage,
                                  std::move(first_to_second), forward_distance,
                                  DependencyKind::kOwnerExclusion});
@@ -2787,7 +2787,9 @@ private:
                   domains_.DomainForStorage(counter_info->storage,
                                             counter_owner->loop));
       }
-      for (const auto &[producer, consumer] : dep.task_pairs) {
+      for (const auto &pair : dep.task_pairs) {
+        TaskNode *producer = pair.producer;
+        TaskNode *consumer = pair.consumer;
         if (IsClosedCByteConflict(dep, producer, consumer))
           continue;
         const L0OperandSlotMember *pool_member =

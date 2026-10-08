@@ -27,6 +27,7 @@
 #include <tvm/ffi/container/array.h>
 #include <tvm/ffi/optional.h>
 
+#include <cstdint>
 #include <map>
 #include <unordered_map>
 #include <utility>
@@ -41,7 +42,56 @@ namespace ascend {
 
 using namespace tirx;
 
-using DependencyTaskPair = std::pair<TaskNode *, TaskNode *>;
+enum class DependencyAccessMode { kRead, kWrite };
+
+// The logical may-regions used to form one conflict in shared analysis.
+// They may be conservative footprints or hulls. These are access provenance,
+// not exact accesses, must-access/coverage, or completion facts.
+struct DependencyMemoryAccess {
+  BufferRegion producer_region;
+  BufferRegion consumer_region;
+  DependencyAccessMode producer_mode;
+  DependencyAccessMode consumer_mode;
+};
+
+// One leaf endpoint pair, with every memory conflict that formed its grouped
+// dependency. Keep the endpoints and their roles together: a read-modify-write
+// pair can carry more than one hazard, without creating duplicate sync points.
+// A root SPR ordering has no memory accesses and names its actual register;
+// it must never masquerade as a versioned buffer hazard.
+struct DependencyTaskPair {
+  TaskNode *producer;
+  TaskNode *consumer;
+  std::vector<DependencyMemoryAccess> memory_accesses;
+  uint16_t special_register_mask{0};
+
+  bool MatchesEndpoints(const TaskNode *source,
+                        const TaskNode *destination) const {
+    return producer == source && consumer == destination;
+  }
+
+  bool HasMemoryHazard(DependencyAccessMode source_mode,
+                       DependencyAccessMode destination_mode,
+                       const Var &storage) const {
+    for (const auto &access : memory_accesses)
+      if (access.producer_mode == source_mode &&
+          access.consumer_mode == destination_mode &&
+          access.producer_region->buffer->data.same_as(storage) &&
+          access.consumer_region->buffer->data.same_as(storage))
+        return true;
+    return false;
+  }
+
+  DependencyTaskPair Reversed() const {
+    DependencyTaskPair result = *this;
+    std::swap(result.producer, result.consumer);
+    for (auto &access : result.memory_accesses) {
+      std::swap(access.producer_region, access.consumer_region);
+      std::swap(access.producer_mode, access.consumer_mode);
+    }
+    return result;
+  }
+};
 
 enum class DependencyKind {
   // A directed producer-to-consumer data dependency.
@@ -60,8 +110,10 @@ struct DepInfo {
   // dependency. Undefined for storage-free ordering (explicit conflicts or
   // invariant SPR state); those edges do not participate in buffer versioning.
   ffi::Optional<Var> storage;
-  // Conflicting access pairs. For kData these are directed producer→consumer
-  // pairs; for kOwnerExclusion they identify the two unordered owner sides.
+  // Conflicting leaf/access records. For kData these are directed
+  // producer→consumer pairs; for kOwnerExclusion they identify the two
+  // unordered owner sides. Reversing the owner order must reverse each entire
+  // record, including regions and access modes, not just its leaf pointers.
   std::vector<DependencyTaskPair> task_pairs;
   // Cross-iteration distance of this dependency:
   //   0   : same-iteration dependency.

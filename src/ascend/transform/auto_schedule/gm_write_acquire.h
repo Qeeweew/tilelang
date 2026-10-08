@@ -76,7 +76,10 @@ AnalyzeGmWriteAcquire(const std::vector<ValidatedOwnerTransfer> &results,
       dep.kind != DependencyKind::kData || dep.cross_storage_conflict ||
       !dep.storage || GetPtrStorageScope(*dep.storage) != "global" ||
       automatic.Find(*dep.storage) || dep.task_pairs.size() != 1 ||
-      dep.task_pairs[0] != DependencyTaskPair{reader, writer} ||
+      !dep.task_pairs[0].MatchesEndpoints(reader, writer) ||
+      !dep.task_pairs[0].HasMemoryHazard(DependencyAccessMode::kRead,
+                                         DependencyAccessMode::kWrite,
+                                         *dep.storage) ||
       !gm_read_release_detail::UnshiftedPath(reader, epoch) ||
       !gm_read_release_detail::UnshiftedPath(writer, epoch) ||
       reader->GetCoreMask() != kCoreVector ||
