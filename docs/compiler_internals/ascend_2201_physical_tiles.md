@@ -179,8 +179,24 @@ completion graph. M accumulation order, outer owner/epoch reuse, A/B readiness,
 GM publication, register state and other storage dependencies retain ordinary
 completion proofs.
 
-The stream has explicit ordinary event boundaries allocated by the existing
-flag allocator: M-to-S before selecting N direction, S-to-M before its first
+When every M/FIX task in the kernel belongs to a selected stream, N direction
+is invariant for the kernel. One root setter has unconditional M and FIX
+startup consumers, so even zero active streams consume its setup events.
+Each stream activation starts with a real PIPE_M barrier and retains ordinary
+M-to-FIX entry and full FIX-to-M retirement events. The barrier preserves
+whole-MAD retirement at owner/physical-C handoff: unit readiness and last-FIX
+retirement alone do not prove it. M entry follows the preceding M drain; FIX
+entry precedes its terminal notification. These two actual completion channels establish
+consume-before-reuse for both binary flags, using the ordinary reverse-
+completion analysis rather than a Scalar-blocking drain exception. Direction
+management no longer places later input loads after a per-owner Scalar wait;
+normal operand readiness and queue/resource backpressure still apply. A root
+M terminal site follows every active FIX-to-M drain and waits once on Scalar
+before restoring M direction. No unit seed or whole-completion edge is inferred
+from the unit controls themselves.
+
+Partial selection retains scoped ordinary event boundaries allocated by the
+existing flag allocator: M-to-S before selecting N direction, S-to-M before its first
 MAD, S-to-FIX before its first export, full FIX-to-M after its last export,
 and M-to-S before restoring M direction. The S-to-FIX gate carries the entry's
 real MAD completion to the next activation's FIX, preserving enclosing
@@ -202,8 +218,8 @@ and nonzero stages retain their original path.
 An enclosing guard may enable or disable the stream. A condition directly on
 the result loop is also supported when it depends only on immutable outer
 loop values or their pure scalar Bind snapshots. In that case one lexical
-activation scope contains the complete entry/setup/result/drain/restore/exit
-transaction, so an inactive epoch issues none of its boundary events. Mutable
+activation scope contains the complete ordinary boundary transaction, so an
+inactive epoch issues none of its owner boundary events. Mutable
 loads, opaque calls, result/K loop variables and attribute guards do not qualify
 for this normalization. It preserves the original result and storage clocks;
 an unrelated unsupported binary-event pattern still takes the original fallback
@@ -211,6 +227,9 @@ or diagnostic. Explicit direction or atomic-state control and opaque external
 calls also prevent automatic selection. These conservative
 boundaries do not require new user DSL and do not choose Python tiling policy
 or emulate 3510 RegBase/VF execution.
+An otherwise unmodeled registered opaque call prevents kernel-invariant
+direction, even when it has no modeled M/FIX effects; selected streams then
+retain their scoped direction boundaries.
 
 ## Supported boundary
 

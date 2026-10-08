@@ -17,7 +17,7 @@ from testing.ascend._ir import calls, copy, kernel, seq
 from testing.ascend.auto_schedule._scheduled_ir import unit
 from testing.ascend.auto_schedule.test_unit_flag_activation_guards import _replace_root
 from testing.ascend.auto_schedule.test_unit_flag_stream import (
-    _COPY, _DIRECTION, _GEMM, _SET, _WAIT, _fixture, _insert, _is_export,
+    _COPY, _DIRECTION, _GEMM, _SET, _WAIT, _check_direction_boundaries, _fixture, _insert, _is_export,
     _matching_completion, _name, _trace, _value,
 )
 
@@ -240,16 +240,7 @@ def test_boxed_pipeline_bound_retains_the_same_selected_stream():
 
 
 def _check_brackets(records, facts, activations):
-    for positions in activations.values():
-        directions = [(i, records[i][0].args[0].value) for i in positions if _name(records[i][0]) == _DIRECTION]
-        assert [name for _, name in directions] == ["n", "m"]
-        setup, restore = directions[0][0], directions[1][0]
-        mads = [i for i in positions if _name(records[i][0]) == _GEMM]
-        exports = [i for i in positions if _is_export(records[i][0], facts)]
-        for event, start, end in (("M_S", min(positions) - 1, setup), ("S_M", setup, min(mads)),
-                                  ("S_FIX", setup, min(exports)), ("FIX_M", max(exports), restore),
-                                  ("M_S", max(exports), restore), ("S_M", restore, max(positions) + 1)):
-            assert _matching_completion(records, event, start, end), (event, start, end)
+    _check_direction_boundaries(records, facts, activations)
     for event in ("MTE1_M", "M_MTE1"):
         assert any(_name(call) == _SET and call.args[0].value == event for call, _, _ in records), event
         assert any(_name(call) == _WAIT and call.args[0].value == event for call, _, _ in records), event
@@ -268,8 +259,8 @@ def test_guarded_scheduled_result_drains_before_restoring_direction():
     active = {epoch: [i for i, (_, env, _) in enumerate(records)
                       if facts["epoch"] in env and _value(facts["epoch"], env) == epoch]
               for epoch in range(4)}
-    directions = [(call, env) for call, env, _ in records if _name(call) == _DIRECTION]
-    assert {_value(facts["epoch"], env) for _, env in directions} == {1, 2}
+    assert {epoch for epoch, positions in active.items()
+            if any(_name(records[i][0]) == _GEMM for i in positions)} == {1, 2}
     _check_brackets(records, facts, {epoch: active[epoch] for epoch in (1, 2)})
 
 

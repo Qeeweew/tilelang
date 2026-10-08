@@ -348,7 +348,9 @@ enum class UnitFlagBoundaryRole {
   kFixSetup,
   kDrain,
   kRestore,
-  kExit
+  kExit,
+  kStreamEntry,
+  kStreamDrain
 };
 
 // A one-iteration child has no intra-child reuse. Its ready flag remains
@@ -3753,18 +3755,55 @@ inline Stmt MakeAscendPipeBarrier(const std::string &pipe) {
       Call(DataType::Handle(), ascend_pipe_barrier(), {StringImm(pipe)}));
 }
 
-// Bracket each selected result loop with a real direction-state transition
-// and a whole-FIX completion. Empty M tasks are insertion sites only: they do
-// not claim a C read/write or manufacture an allocation-lifetime proof.
+// A kernel may keep CTRL51 invariant only when every operation using M/FIX
+// belongs to a selected closed stream. Partial selection retains scoped
+// direction transitions; an unselected operation has no such state contract.
+bool HasClosedKernelUnitDirection(
+    const std::vector<std::shared_ptr<IRStructure>> &root,
+    const std::vector<UnitFlagStreamPlan> &plans, const Stmt &kernel_body) {
+  if (plans.empty())
+    return false;
+  // Reuse the existing native/pure-operation admission. An unmodeled opaque
+  // scalar call may change CTRL51 even though it uses neither M nor FIX.
+  // Explicit direction/atomic setters were rejected before stream selection.
+  bool known_state = true;
+  PostOrderVisit(kernel_body, [&](const ffi::ObjectRef &node) {
+    if (const auto *call = node.as<CallNode>())
+      known_state &= ascend::PreservesLoad3DConfig(call);
+  });
+  if (!known_state)
+    return false;
+  std::unordered_set<TaskNode *> mads, fixes;
+  for (const auto &plan : plans) {
+    mads.insert(plan.mads.begin(), plan.mads.end());
+    fixes.insert(plan.fix);
+  }
+  std::vector<TaskNode *> tasks;
+  CollectAllTaskNodes(root, tasks);
+  for (TaskNode *task : tasks) {
+    if ((task->UsesPipe(ResourcePipe::kCube) && !mads.count(task)) ||
+        (task->UsesPipe(ResourcePipe::kFixpipe) && !fixes.count(task)))
+      return false;
+  }
+  return true;
+}
+
+// Empty M tasks are insertion sites only: they do not claim a C access or
+// manufacture an allocation-lifetime proof. With invariant kernel direction,
+// each owner retains a real M->first FIX / last FIX->M completion handshake.
+// Its two ordinary channels prove their own consume-before-reuse relation;
+// they must not use the scoped drain's Scalar-blocking lifetime exception.
 void InsertUnitFlagBoundaries(std::vector<std::shared_ptr<IRStructure>> &nodes,
                               ControlNode *parent,
                               const std::vector<UnitFlagStreamPlan> &plans,
-                              std::vector<UnitFlagBoundary> *boundaries) {
+                              std::vector<UnitFlagBoundary> *boundaries,
+                              bool kernel_direction) {
   std::vector<std::shared_ptr<IRStructure>> result;
   for (const auto &node : nodes) {
     if (node->IsControl()) {
       auto *control = static_cast<ControlNode *>(node.get());
-      InsertUnitFlagBoundaries(control->children, control, plans, boundaries);
+      InsertUnitFlagBoundaries(control->children, control, plans, boundaries,
+                               kernel_direction);
     }
     auto plan = std::find_if(plans.begin(), plans.end(), [&](const auto &p) {
       return p.result_loop == node.get();
@@ -3834,13 +3873,36 @@ void InsertUnitFlagBoundaries(std::vector<std::shared_ptr<IRStructure>> &nodes,
       task->SetParent(scope);
       return task;
     };
-    auto entry = make_site(ResourcePipe::kCube, Evaluate(0));
+    // Unit readiness and even last-FIX retirement do not establish whole
+    // MAD retirement. Retain that obligation on M before another stream can
+    // reuse a physical C phase, without sending it back through Scalar.
+    Stmt entry_body = kernel_direction ? MakeAscendPipeBarrier("PIPE_M")
+                                       : Stmt(Evaluate(0));
+    auto entry = make_site(ResourcePipe::kCube, entry_body);
+    auto drain = make_site(ResourcePipe::kCube, Evaluate(0));
+    if (kernel_direction) {
+      boundaries->push_back({scope, entry.get(), entry.get(), node.get(),
+                             plan->fix, UnitFlagBoundaryRole::kStreamEntry});
+      boundaries->push_back({scope, node.get(), plan->fix, drain.get(),
+                             drain.get(), UnitFlagBoundaryRole::kStreamDrain});
+      if (activation) {
+        activation->children = {entry, node, drain};
+        for (size_t i = 0; i < activation->children.size(); ++i) {
+          activation->children[i]->SetIndex(i);
+          activation->children[i]->SetParent(activation.get());
+        }
+        activation->InitializeLoopBodyContext();
+        result.push_back(std::move(activation));
+      } else {
+        result.insert(result.end(), {entry, node, drain});
+      }
+      continue;
+    }
     auto setup =
         make_site(ResourcePipe::kScalar,
                   Evaluate(Call(DataType::Handle(), ascend_set_mmad_direction(),
                                 {StringImm("n")})));
     setup->AddSpecialWrite(SpecialRegister::kMmadDirection);
-    auto drain = make_site(ResourcePipe::kCube, Evaluate(0));
     auto restore =
         make_site(ResourcePipe::kScalar,
                   Evaluate(Call(DataType::Handle(), ascend_set_mmad_direction(),
@@ -3882,6 +3944,47 @@ void InsertUnitFlagBoundaries(std::vector<std::shared_ptr<IRStructure>> &nodes,
     result[i]->SetParent(parent);
   }
   nodes = std::move(result);
+}
+
+// Root consumers are unconditional: even an empty or entirely inactive first
+// stream consumes the setup flags. The terminal M site follows every active
+// owner's FIX->M drain, so restore is safe for zero as well as many owners.
+void InsertKernelUnitDirection(std::vector<std::shared_ptr<IRStructure>> &root,
+                               std::vector<UnitFlagBoundary> *boundaries) {
+  auto make_site = [](ResourcePipe pipe, const Stmt &body) {
+    auto task = MakeSyncTaskNode(body, kCoreCube, 0);
+    task->SetPipeMask(PipeMask(pipe));
+    return task;
+  };
+  auto setup =
+      make_site(ResourcePipe::kScalar,
+                Evaluate(Call(DataType::Handle(), ascend_set_mmad_direction(),
+                              {StringImm("n")})));
+  setup->AddSpecialWrite(SpecialRegister::kMmadDirection);
+  auto cube_start = make_site(ResourcePipe::kCube, Evaluate(0));
+  auto fix_start = make_site(ResourcePipe::kFixpipe, Evaluate(0));
+  fix_start->SetSpecialReadMask(
+      static_cast<uint16_t>(SpecialRegister::kMmadDirection));
+  auto terminal = make_site(ResourcePipe::kCube, Evaluate(0));
+  auto restore =
+      make_site(ResourcePipe::kScalar,
+                Evaluate(Call(DataType::Handle(), ascend_set_mmad_direction(),
+                              {StringImm("m")})));
+  restore->AddSpecialWrite(SpecialRegister::kMmadDirection);
+  // Scheduling preceded these sites. Retain both startup edges explicitly,
+  // rather than expecting its cached root conflicts to include new readers.
+  boundaries->push_back({nullptr, setup.get(), setup.get(), cube_start.get(),
+                         cube_start.get(), UnitFlagBoundaryRole::kSetup});
+  boundaries->push_back({nullptr, setup.get(), setup.get(), fix_start.get(),
+                         fix_start.get(), UnitFlagBoundaryRole::kFixSetup});
+  boundaries->push_back({nullptr, terminal.get(), terminal.get(), restore.get(),
+                         restore.get(), UnitFlagBoundaryRole::kRestore});
+  root.insert(root.begin(), {setup, cube_start, fix_start});
+  root.insert(root.end(), {terminal, restore});
+  for (size_t i = 0; i < root.size(); ++i) {
+    root[i]->SetIndex(i);
+    root[i]->SetParent(nullptr);
+  }
 }
 
 inline Stmt MakeAscendCrossCoreSetFlag(int mode_id, const std::string &pipe,
@@ -4343,8 +4446,13 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
         for (const auto &node : root)
           unit_fallback->tree.push_back(node->Clone());
       }
+      bool kernel_direction =
+          HasClosedKernelUnitDirection(root, unit_streams, kernel_body);
       ApplyUnitFlagStreams(unit_streams);
-      InsertUnitFlagBoundaries(root, nullptr, unit_streams, &unit_boundaries);
+      InsertUnitFlagBoundaries(root, nullptr, unit_streams, &unit_boundaries,
+                               kernel_direction);
+      if (kernel_direction)
+        InsertKernelUnitDirection(root, &unit_boundaries);
     }
   }
   // Keep this after the original unit-fallback snapshot. A recursive retry

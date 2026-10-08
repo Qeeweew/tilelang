@@ -22,6 +22,7 @@ from tvm import tirx
 
 from testing.ascend._ir import allocated_buffer, calls, copy, kernel, nodes, seq
 from testing.ascend.auto_schedule._scheduled_ir import unit
+from testing.ascend.auto_schedule.test_nested_local_protocols import _Command, _prove_completions
 from testing.ascend.auto_schedule.test_owner_result_completion import _name, _region, _trace, _value
 from testing.ascend.auto_schedule.test_sync_binary_flags import _prove_binary_protocol
 
@@ -420,23 +421,114 @@ def test_guarded_fixed_q_cache_shares_with_the_automatic_pv_ring():
     _assert_late_bases(artifact, cached_qk=True)
 
 
-def _matching_unit_boundary(records, event, start, end):
-    sent = [(index, _value(call.args[1], env)) for index, (call, env, _) in enumerate(records)
-            if start < index < end and _name(call) == "tl.ascend_set_flag" and call.args[0].value == event]
-    received = [(index, _value(call.args[1], env)) for index, (call, env, _) in enumerate(records)
-                if start < index < end and _name(call) == "tl.ascend_wait_flag" and call.args[0].value == event]
-    return any(notify < wait and flag == acquired for notify, flag in sent for wait, acquired in received)
+def _matching_unit_boundary(records, event, start, end, *, notify_before=None,
+                            root=False, prefix=()):
+    sent, received = defaultdict(list), defaultdict(list)
+    for index, (call, env, _) in enumerate(records):
+        name = _name(call)
+        if name in ("tl.ascend_set_flag", "tl.ascend_wait_flag") and call.args[0].value == event:
+            (sent if name == "tl.ascend_set_flag" else received)[_value(call.args[1], env)].append(index)
+    # Pair the actual finite generations, rather than finding any equal ID
+    # inside the interval and accidentally matching different notifications.
+    for flag, notifications in sent.items():
+        for notify, wait in zip(notifications, received[flag]):
+            if not (start < notify < wait < end) or (notify_before is not None and notify >= notify_before):
+                continue
+            endpoints = [tuple((var.name, value) for var, value, _ in records[index][2])
+                         for index in (notify, wait)]
+            if all(endpoint[:len(prefix)] == prefix and (not root or not endpoint)
+                   for endpoint in endpoints):
+                return True
+    return False
+
+
+def _unit_stream_activations(records, result_loops):
+    """Group actual work by the selected result loop's enclosing activation."""
+    activations, previous = {}, None
+    for index, (call, env, loops) in enumerate(records):
+        name = _name(call)
+        if name != _GEMM and not (name == _COPY and _region(call.args[0], env)[0].scope() == "shared.l0c"):
+            continue
+        selected = [depth for depth, (var, _, _) in enumerate(loops) if var.name in result_loops]
+        assert len(selected) == 1, "Each selected native operation belongs to one result loop"
+        depth = selected[0]
+        prefix = tuple((var.name, value) for var, value, _ in loops[:depth])
+        key = loops[depth][0].name, prefix
+        if key != previous:
+            assert key not in activations, "A closed result stream cannot interleave another stream"
+            activations[key] = {"prefix": prefix, "mads": [], "exports": []}
+            previous = key
+        activations[key]["mads" if name == _GEMM else "exports"].append((index, call, env, loops))
+    assert activations and all(item["mads"] and item["exports"] for item in activations.values())
+    return list(activations.values())
+
+
+def _assert_kernel_unit_boundaries(records, activations):
+    """Check real init, owner drains and restoration without a C unit edge."""
+    directions = [(index, call.args[0].value, loops) for index, (call, _, loops) in enumerate(records)
+                  if _name(call) == "tl.ascend_set_mmad_direction"]
+    assert [(direction, loops) for _, direction, loops in directions] == [("n", ()), ("m", ())]
+    setup, restore = directions[0][0], directions[1][0]
+    first_work = min(item["mads"][0][0] for item in activations)
+    last_work = max(index for item in activations for index, *_ in (*item["mads"], *item["exports"]))
+    assert setup < first_work <= last_work < restore
+    for event in ("S_M", "S_FIX"):
+        assert _matching_unit_boundary(records, event, setup, first_work, root=True), event
+    assert _matching_unit_boundary(records, "M_S", last_work, restore, root=True)
+
+    trace = []
+    for call, env, _ in records:
+        name = _name(call)
+        if name in ("tl.ascend_set_flag", "tl.ascend_wait_flag"):
+            event = call.args[0].value
+            source, destination = event.split("_")
+            flag = _value(call.args[1], env)
+            assert 0 <= flag < 8
+            setting = name == "tl.ascend_set_flag"
+            trace.append(_Command(source if setting else destination, "set" if setting else "wait", (event, flag)))
+        elif name == "tl.ascend_pipe_barrier":
+            trace.append(_Command(call.args[0].value.removeprefix("PIPE_"), "barrier"))
+        elif name == _GEMM:
+            trace.append(_Command("M", "mad"))
+        elif name in (_COPY, _LOAD3D):
+            source = _region(call.args[0], env)[0]
+            pipe = "FIX" if source.scope() == "shared.l0c" else "MTE2" if source.scope() == "global" else "MTE1"
+            trace.append(_Command(pipe, "copy"))
+        else:
+            assert name in ("tl.ascend_set_mmad_direction", "tl.ascend_set_fixpipe_config",
+                            "tl.ascend_set_cube_load_config", "tl.ascend_set_load3d_config"), name
+            trace.append(_Command("S", "scalar"))
+    require = _prove_completions(trace)
+    for number, item in enumerate(activations):
+        mads, exports, prefix = item["mads"], item["exports"], item["prefix"]
+        previous = activations[number - 1] if number else None
+        following = activations[number + 1] if number + 1 < len(activations) else None
+        start = previous["exports"][-1][0] if previous else setup
+        stop = following["mads"][0][0] if following else restore
+        assert _matching_unit_boundary(records, "M_FIX", start, exports[0][0],
+                                       notify_before=mads[0][0], prefix=prefix), prefix
+        assert _matching_unit_boundary(records, "FIX_M", exports[-1][0], stop, prefix=prefix), prefix
+        # The entry fence retires preceding M work before this owner's FIX;
+        # it does not turn the current native unit readiness into whole MAD.
+        if previous:
+            for old, *_ in previous["mads"]:
+                require(3 * old + 2, 3 * exports[0][0] + 1)
+        if following:
+            for old, *_ in exports:
+                require(3 * old + 2, 3 * following["mads"][0][0] + 1)
+        for index, *_ in (*mads, *exports):
+            require(3 * setup + 2, 3 * index + 1)
+            require(3 * index + 2, 3 * restore + 1)
 
 
 def _assert_joint_unit_streams(snapshots, pv_operand="ap"):
     synced = snapshots["tl.InsertSync"]
     directions = calls(synced, "tl.ascend_set_mmad_direction")
-    assert Counter(call.args[0].value for call in directions) == {"n": 2, "m": 2}, "Both native result streams must remain selected"
+    assert Counter(call.args[0].value for call in directions) == {"n": 1, "m": 1}, "Fully selected streams keep one kernel direction"
     shells = [loop for loop in nodes(synced, tirx.For) if loop.loop_var.name == "unit_activation"]
     assert shells and all(int(loop.extent) == 1 and calls(loop.body, _GEMM) for loop in shells)
 
     records = list(_trace(snapshots["tl.LowerScheduledTIR"], core=2, lane=0))
-    brackets, opened = [], None
     totals = {"tl.ascend_set_flag": Counter(), "tl.ascend_wait_flag": Counter()}
     for index, (call, env, loops) in enumerate(records):
         name = _name(call)
@@ -444,31 +536,20 @@ def _assert_joint_unit_streams(snapshots, pv_operand="ap"):
             event, flag = call.args[0].value, _value(call.args[1], env)
             assert 0 <= flag < 8
             totals[name][event, flag] += 1
-        if name == "tl.ascend_set_mmad_direction":
-            if call.args[0].value == "n":
-                assert opened is None
-                opened = index
-            else:
-                assert call.args[0].value == "m" and opened is not None
-                brackets.append((opened, index))
-                opened = None
         if name == _GEMM or (name == _COPY and _region(call.args[0], env)[0].scope() == "shared.l0c"):
             epochs = [value for var, value, _ in loops if var.name == "epoch"]
             assert len(epochs) == 1 and epochs[0] in (0, 1), "The inactive phase must issue no native result work"
-    assert opened is None and totals["tl.ascend_set_flag"] == totals["tl.ascend_wait_flag"]
+    assert totals["tl.ascend_set_flag"] == totals["tl.ascend_wait_flag"]
     # Operand completion retains ordinary finite flags. A native C unit check
     # is not inserted into a graph as whole-MAD or whole-FIX completion.
     for event in ("MTE1_M", "M_MTE1"):
         assert any(kind == event and count for (kind, _), count in totals["tl.ascend_set_flag"].items())
 
     seen = Counter()
-    for number, (setup, restore) in enumerate(brackets):
-        mads = [(index, call, env, loops) for index, (call, env, loops) in enumerate(records)
-                if setup < index < restore and _name(call) == _GEMM]
-        exports = [(index, call, env, loops) for index, (call, env, loops) in enumerate(records)
-                   if setup < index < restore and _name(call) == _COPY
-                   and _region(call.args[0], env)[0].scope() == "shared.l0c"]
-        assert mads and exports
+    activations = _unit_stream_activations(records, {"qk_n", "pv_owner"})
+    _assert_kernel_unit_boundaries(records, activations)
+    for item in activations:
+        mads, exports = item["mads"], item["exports"]
         phases = {_region(call.args[0], env)[0].name for _, call, env, _ in mads}
         assert len(phases) == 1
         (operand,) = phases
@@ -483,12 +564,6 @@ def _assert_joint_unit_streams(snapshots, pv_operand="ap"):
             assert len(mads) == 8 and len(exports) == 2
             assert controls == [2, 2, 2, 3] * 2 and clears == [1, 0, 0, 0] * 2
         assert all(_value(call.annotations["unit_flag_ctrl"], env) == 3 for _, call, env, _ in exports)
-        previous_restore = brackets[number - 1][1] if number else -1
-        next_setup = brackets[number + 1][0] if number + 1 < len(brackets) else len(records)
-        for event, start, end in (("M_S", previous_restore, setup), ("S_M", setup, mads[0][0]),
-                                  ("S_FIX", setup, exports[0][0]), ("FIX_M", exports[-1][0], restore),
-                                  ("M_S", exports[-1][0], restore), ("S_M", restore, next_setup)):
-            assert _matching_unit_boundary(records, event, start, end), (phase, event, start, end)
     assert seen == {"qk": 4, "pv": 2}
     assert any(_name(call) == _GEMM and any(var.name == "unit_activation" for var, _, _ in loops)
                for call, _, loops in records), "The one-trip activation shell must contain actual native work"

@@ -265,6 +265,50 @@ def _matching_completion(records, event, start, end):
     return any(sent == acquired and notify < wait for notify, sent in sets for wait, acquired in waits)
 
 
+def _check_direction_boundaries(records, facts, activations):
+    """Check the real C boundaries for invariant or mixed direction scope."""
+    directions = [(i, call.args[0].value, loops) for i, (call, _, loops) in enumerate(records)
+                  if _name(call) == _DIRECTION]
+    invariant = len(directions) == 2 and all(not loops for _, _, loops in directions)
+    if invariant:
+        assert [name for _, name, _ in directions] == ["n", "m"]
+        setup, restore = directions[0][0], directions[1][0]
+        mads = [i for i, (call, _, _) in enumerate(records) if _name(call) == _GEMM]
+        exports = [i for i, (call, _, _) in enumerate(records) if _is_export(call, facts)]
+        assert setup < min(mads) < max(exports) < restore
+        for event, start, end in (("S_M", setup, min(mads)), ("S_FIX", setup, min(exports)),
+                                  ("M_S", max(exports), restore)):
+            assert _matching_completion(records, event, start, end), (event, start, end)
+    for positions in activations.values():
+        mads = [i for i in positions if _name(records[i][0]) == _GEMM]
+        exports = [i for i in positions if _is_export(records[i][0], facts)]
+        assert mads and exports
+        if invariant:
+            # Entry carries preceding whole-M completion to the first FIX;
+            # the last whole-FIX completion gates the following M stream.
+            for event, start, end in (("M_FIX", min(positions) - 1, min(exports)),
+                                      ("FIX_M", max(exports), max(positions) + 1)):
+                assert _matching_completion(records, event, start, end), (event, start, end)
+            # Root SPR initialization can project an S_FIX acquire to this
+            # owner's first FIX. It is not a blocking owner Scalar gate.
+            assert not any(_name(records[i][0]) == _DIRECTION or
+                           (_name(records[i][0]) == _WAIT and
+                            records[i][0].args[0].value.split("_")[-1] == "S")
+                           for i in positions)
+        else:
+            local = [(i, records[i][0].args[0].value) for i in positions
+                     if _name(records[i][0]) == _DIRECTION]
+            assert [name for _, name in local] == ["n", "m"]
+            setup, restore = local[0][0], local[1][0]
+            assert setup < min(mads) < max(exports) < restore
+            for event, start, end in (("M_S", min(positions) - 1, setup),
+                                      ("S_M", setup, min(mads)), ("S_FIX", setup, min(exports)),
+                                      ("FIX_M", max(exports), restore), ("M_S", max(exports), restore),
+                                      ("S_M", restore, max(positions) + 1)):
+                assert _matching_completion(records, event, start, end), (event, start, end)
+    return invariant
+
+
 @pytest.mark.parametrize("native_k", [1, 3], ids=["single-MAD", "native-K-chain"])
 @pytest.mark.parametrize("whole_guard", [False, True], ids=["unconditional", "whole-stream-guard"])
 def test_full_result_stream_selects_units_and_drains_each_owner_epoch(native_k, whole_guard):
@@ -298,18 +342,7 @@ def test_full_result_stream_selects_units_and_drains_each_owner_epoch(native_k, 
         assert tuple(_value(extent, env) for extent in call.args[0].args[2:]) == (32, 32)
 
     assert len(activations) == 6
-    for positions in activations.values():
-        mads = [i for i in positions if _name(records[i][0]) == _GEMM]
-        exports = [i for i in positions if _is_export(records[i][0], facts)]
-        directions = [(i, records[i][0].args[0].value) for i in positions if _name(records[i][0]) == _DIRECTION]
-        assert [direction for _, direction in directions] == ["n", "m"]
-        first, last = directions[0][0], directions[-1][0]
-        assert first < min(mads) < max(exports) < last
-        assert _matching_completion(records, "FIX_M", max(exports), last), "Missing real full stream drain"
-        assert _matching_completion(records, "S_M", first, min(mads)), "Direction state needs ordinary completion"
-        assert _matching_completion(records, "S_FIX", first, min(exports)), "Entry must protect ancestor MAD/FIX completion"
-        assert _matching_completion(records, "M_S", max(exports), last), "Restore must follow the completed M drain"
-        assert _matching_completion(records, "S_M", last, max(positions) + 1), "Restored direction must complete before exit"
+    _check_direction_boundaries(records, facts, activations)
 
     # The same operations without the actual C layout are deliberately
     # ineligible. Compare issued C events rather than banning the first/last
@@ -373,17 +406,7 @@ def test_matching_zero_origin_full_m_subdomain_of_larger_c_selects_stream(native
             key = (_value(facts["epoch"], env), _value(facts["owner"], env))
             activations.setdefault(key, []).append(index)
     assert set(activations) == {(epoch, owner) for epoch in range(3) for owner in range(2)}
-    for positions in activations.values():
-        directions = [(i, records[i][0].args[0].value) for i in positions if _name(records[i][0]) == _DIRECTION]
-        assert [direction for _, direction in directions] == ["n", "m"]
-        setup, restore = directions[0][0], directions[1][0]
-        first_mad = min(i for i in positions if _name(records[i][0]) == _GEMM)
-        first_export = min(i for i in positions if _is_export(records[i][0], facts))
-        last_export = max(i for i in positions if _is_export(records[i][0], facts))
-        for event, start, end in (("M_S", min(positions) - 1, setup), ("S_M", setup, first_mad),
-                                  ("S_FIX", setup, first_export), ("FIX_M", last_export, restore),
-                                  ("M_S", last_export, restore), ("S_M", restore, max(positions) + 1)):
-            assert _matching_completion(records, event, start, end), (event, start, end)
+    _check_direction_boundaries(records, facts, activations)
     totals = [Counter((call.args[0].value, _value(call.args[1], env))
                       for call, env, _ in records if _name(call) == operation) for operation in (_SET, _WAIT)]
     assert totals[0] == totals[1]
@@ -400,29 +423,19 @@ def test_result_activation_guard_covers_complete_unit_bracket(native_k, activati
     selected = [(i, call, env) for i, (call, env, _) in enumerate(records)
                 if _name(call) == _GEMM or _is_export(call, facts) or _name(call) == _DIRECTION]
     assert selected
-    assert {_value(facts["epoch"], env) for _, _, env in selected} == {1, 2}
+    assert {_value(facts["epoch"], env) for _, call, env in selected
+            if _name(call) != _DIRECTION} == {1, 2}
     assert len([call for _, call, _ in selected if _name(call) == _GEMM]) == 8 * native_k
     assert len([call for _, call, _ in selected if _is_export(call, facts)]) == 8
-    for epoch in (1, 2):
-        positions = [i for i, _, env in selected if _value(facts["epoch"], env) == epoch]
-        directions = [(i, records[i][0].args[0].value) for i in positions
-                      if _name(records[i][0]) == _DIRECTION]
-        assert [value for _, value in directions] == ["n", "m"]
-        setup, restore = directions[0][0], directions[1][0]
-        first_mad = min(i for i in positions if _name(records[i][0]) == _GEMM)
-        first_fix = min(i for i in positions if _is_export(records[i][0], facts))
-        last_fix = max(i for i in positions if _is_export(records[i][0], facts))
-        whole = [i for i, (_, env, _) in enumerate(records)
-                 if facts["epoch"] in env and _value(facts["epoch"], env) == epoch]
-        for event, start, end in (("M_S", min(whole) - 1, setup),
-                                  ("S_M", setup, first_mad), ("S_FIX", setup, first_fix),
-                                  ("FIX_M", last_fix, restore), ("M_S", last_fix, restore),
-                                  ("S_M", restore, max(whole) + 1)):
-            assert _matching_completion(records, event, start, end), (event, epoch)
-    # Direction setters identify the transaction's lexical activation scope.
+    activations = {epoch: [i for i, (_, env, _) in enumerate(records)
+                           if facts["epoch"] in env and _value(facts["epoch"], env) == epoch]
+                   for epoch in (1, 2)}
+    _check_direction_boundaries(records, facts, activations)
+    # The C work and its entry/drain retain one lexical activation scope.
     # Ancestor-clock seed/forward/drain events still execute in inactive
     # epochs; those ordinary C/input/GM completion relations must survive.
-    shells = {loops[-1] for call, _, loops in records if _name(call) == _DIRECTION}
+    shells = {loop for call, _, loops in records if _name(call) == _GEMM
+              for loop in loops if loop.name == "unit_activation"}
     assert len(shells) == 1
     (shell,) = shells
     for call, env, loops in records:
@@ -470,16 +483,14 @@ def test_prepared_input_counters_preserve_their_real_clock_inside_selected_strea
     assert [env[_SCALAR_VALUES][facts["counter"].data] for _, env in mads] == list(range(72))
     assert len(exports) == 24 and all(_value(call.annotations["unit_flag_ctrl"], env) == 3 for call, env in exports)
     assert len(calls(after, _DIRECTION)) == 2
+    activations = {}
     for epoch in range(3):
         for owner in range(2):
             positions = [i for i, (_, env, _) in enumerate(records)
                          if facts["epoch"] in env and facts["owner"] in env
                          and _value(facts["epoch"], env) == epoch and _value(facts["owner"], env) == owner]
-            last_export = max(i for i in positions if _is_export(records[i][0], facts))
-            restore = next(i for i in positions if _name(records[i][0]) == _DIRECTION and records[i][0].args[0].value == "m")
-            assert _matching_completion(records, "FIX_M", last_export, restore)
-            assert _matching_completion(records, "M_S", last_export, restore)
-            assert _matching_completion(records, "S_M", restore, max(positions) + 1)
+            activations[epoch, owner] = positions
+    _check_direction_boundaries(records, facts, activations)
     totals = [Counter((call.args[0].value, _value(call.args[1], env))
                       for call, env, _ in records if _name(call) == operation) for operation in (_SET, _WAIT)]
     assert totals[0] == totals[1]
@@ -521,6 +532,11 @@ def test_exclusive_drain_budget_rolls_back_before_ordinary_capacity_diagnostic()
         setup = unit(tirx.Evaluate(tirx.Call("void", tvm.ir.Op.get(_CONFIG), [])), core=2)
         tasks = [setup, unit(copy(a_gm, a_l1), core=2), unit(copy(b_gm, b_l1), core=2),
                  unit(copy(a_l1, a), core=2), unit(copy(b_l1, b), core=2)]
+        # This valid root MAD is outside every result stream. Keep the mixed
+        # direction path under test: a fully selected kernel can instead use
+        # one invariant direction and ordinary reusable stream boundaries.
+        tasks.append(unit(tirx.Evaluate(T.gemm(a, b, c, transpose_B=True,
+                                               clear_accum=True)), core=2))
         for index in range(9):
             result = tirx.Var(f"result{index}", "int32")
             mad = unit(tirx.Evaluate(T.gemm(a, b, c, transpose_B=True, clear_accum=True)), core=2)
@@ -554,7 +570,7 @@ def test_exclusive_drain_budget_rolls_back_before_ordinary_capacity_diagnostic()
     assert not calls(after, "tl.ascend_get_buf")
     assert not calls(after, "tl.ascend_rls_buf")
     records = _trace(after)
-    assert sum(_name(call) == _GEMM for call, _, _ in records) == 36
+    assert sum(_name(call) == _GEMM for call, _, _ in records) == 37
     assert sum(_name(call) == _COPY and call.args[0].args[0].buffer.scope() == "shared.l0c"
                for call, _, _ in records) == 36
     totals = []

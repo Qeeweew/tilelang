@@ -21,7 +21,7 @@ from tvm import tirx
 from testing.ascend._ir import allocated_buffer, calls, copy, kernel, nodes, region as tile_region, seq
 from testing.ascend.auto_schedule._scheduled_ir import unit
 from testing.ascend.auto_schedule.test_l0ab_phase_reuse import (
-    _bytes, _lower, _matching_unit_boundary, _pairs, _root,
+    _assert_kernel_unit_boundaries, _bytes, _lower, _pairs, _root, _unit_stream_activations,
 )
 from testing.ascend.auto_schedule.test_nested_local_protocols import _Command, _prove_completions
 from testing.ascend.auto_schedule.test_owner_result_completion import _name, _region, _trace, _value
@@ -237,41 +237,20 @@ def _unit_completion(mod):
     trace, _ = _completion_commands(mod, unit_streams=True)
     _prove_completions(trace)
     records = list(_trace(mod, core=2, lane=0))
-    brackets, begin, flags = [], None, {"tl.ascend_set_flag": Counter(), "tl.ascend_wait_flag": Counter()}
-    for index, (call, env, _) in enumerate(records):
-        name = _name(call)
-        if name in flags:
-            flag = _value(call.args[1], env)
-            assert 0 <= flag < 8
-            flags[name][call.args[0].value, flag] += 1
-        if name == "tl.ascend_set_mmad_direction":
-            if call.args[0].value == "n":
-                assert begin is None
-                begin = index
-            else:
-                assert begin is not None
-                brackets.append((begin, index))
-                begin = None
-    assert begin is None and flags["tl.ascend_set_flag"] == flags["tl.ascend_wait_flag"]
+    activations = _unit_stream_activations(records, {"qk_n", "row_part"})
+    _assert_kernel_unit_boundaries(records, activations)
     seen = Counter()
-    for number, (begin, end) in enumerate(brackets):
-        mads = [(index, call, env) for index, (call, env, _) in enumerate(records) if begin < index < end and _name(call) == _GEMM]
-        fixes = [(index, call, env) for index, (call, env, _) in enumerate(records) if begin < index < end and _name(call) == _COPY
-                 and _region(call.args[0], env)[0].scope() == "shared.l0c"]
-        storages = {_region(call.args[2], env)[0].name for _, call, env in mads}
+    for item in activations:
+        mads, fixes = item["mads"], item["exports"]
+        storages = {_region(call.args[2], env)[0].name for _, call, env, _ in mads}
         assert len(storages) == 1
         (storage,) = storages
         seen[storage] += 1
         expected = [3] * 4 if storage == "cq" else [2, 2, 3] * 2
         assert len(fixes) == (4 if storage == "cq" else 2)
-        assert [_value(call.annotations["unit_flag_ctrl"], env) for _, call, env in mads] == expected
-        assert [_value(call.args[9], env) for _, call, env in mads] == ([1] * 4 if storage == "cq" else [1, 0, 0] * 2)
-        assert all(_value(call.annotations["unit_flag_ctrl"], env) == 3 for _, call, env in fixes)
-        previous = brackets[number - 1][1] if number else -1
-        following = brackets[number + 1][0] if number + 1 < len(brackets) else len(records)
-        for event, start, stop in (("M_S", previous, begin), ("S_M", begin, mads[0][0]), ("S_FIX", begin, fixes[0][0]),
-                                   ("FIX_M", fixes[-1][0], end), ("M_S", fixes[-1][0], end), ("S_M", end, following)):
-            assert _matching_unit_boundary(records, event, start, stop), (storage, event)
+        assert [_value(call.annotations["unit_flag_ctrl"], env) for _, call, env, _ in mads] == expected
+        assert [_value(call.args[9], env) for _, call, env, _ in mads] == ([1] * 4 if storage == "cq" else [1, 0, 0] * 2)
+        assert all(_value(call.annotations["unit_flag_ctrl"], env) == 3 for _, call, env, _ in fixes)
     assert seen == {"cq": 4, "cp": 4}
 
 
@@ -280,7 +259,7 @@ def test_independent_c_pitches_share_late_bytes_with_completed_phases(dtype, uni
     artifact, snapshots = _lower(_program(dtype, unit_streams))
     _assert_storage_contract(artifact, snapshots)
     if unit_streams:
-        assert Counter(call.args[0].value for call in calls(snapshots["tl.InsertSync"], "tl.ascend_set_mmad_direction")) == {"n": 2, "m": 2}
+        assert Counter(call.args[0].value for call in calls(snapshots["tl.InsertSync"], "tl.ascend_set_mmad_direction")) == {"n": 1, "m": 1}
         _unit_completion(snapshots["tl.LowerScheduledTIR"])
     else:
         _ordinary_completion(snapshots["tl.LowerScheduledTIR"])
@@ -521,9 +500,9 @@ def test_direct_full_clear_lifetimes_keep_native_units_and_both_retirement_ends(
     if not expected:
         return
 
-    assert Counter(call.args[0].value for call in calls(inserted, "tl.ascend_set_mmad_direction")) == {"n": 2, "m": 2}
+    assert Counter(call.args[0].value for call in calls(inserted, "tl.ascend_set_mmad_direction")) == {"n": 1, "m": 1}
     records = list(_trace(transform.LowerScheduledTIR()(inserted), core=2, lane=0))
-    trace, brackets, begin = [], [], None
+    trace = []
 
     def blocks(arg, env):
         buffer, origin, extent = _region(arg, env)
@@ -553,39 +532,24 @@ def test_direct_full_clear_lifetimes_keep_native_units_and_both_retirement_ends(
         else:
             assert name == "tl.ascend_set_mmad_direction", name
             trace.append(_Command("S", "scalar"))
-            if call.args[0].value == "n":
-                assert begin is None
-                begin = index
-            else:
-                assert begin is not None and call.args[0].value == "m"
-                brackets.append((begin, index))
-                begin = None
-    assert begin is None
     require = _prove_completions(trace)
+    activations = _unit_stream_activations(records, {"qk_result", "pv_result"})
+    _assert_kernel_unit_boundaries(records, activations)
     seen, previous_work, previous_storage = Counter(), [], None
-    for number, (setup, restore) in enumerate(brackets):
-        mads = [(index, call, env) for index, (call, env, _) in enumerate(records)
-                if setup < index < restore and _name(call) == _GEMM]
-        fixes = [(index, call, env) for index, (call, env, _) in enumerate(records)
-                 if setup < index < restore and _name(call) == _COPY and _region(call.args[0], env)[0].scope() == "shared.l0c"]
+    for item in activations:
+        mads, fixes = item["mads"], item["exports"]
         assert len(mads) == len(fixes) == 3
-        (storage,) = {_region(call.args[2], env)[0].name for _, call, env in mads}
+        (storage,) = {_region(call.args[2], env)[0].name for _, call, env, _ in mads}
         seen[storage] += 1
         assert all(_value(call.args[9], env) == 1 and _value(call.annotations["unit_flag_ctrl"], env) == 3
-                   for _, call, env in mads)
-        assert all(_value(call.annotations["unit_flag_ctrl"], env) == 3 for _, call, env in fixes)
-        previous = brackets[number - 1][1] if number else -1
-        following = brackets[number + 1][0] if number + 1 < len(brackets) else len(records)
-        for event, start, stop in (("M_S", previous, setup), ("S_M", setup, mads[0][0]),
-                                   ("S_FIX", setup, fixes[0][0]), ("FIX_M", fixes[-1][0], restore),
-                                   ("M_S", fixes[-1][0], restore), ("S_M", restore, following)):
-            assert _matching_unit_boundary(records, event, start, stop), (storage, event)
+                   for _, call, env, _ in mads)
+        assert all(_value(call.annotations["unit_flag_ctrl"], env) == 3 for _, call, env, _ in fixes)
         if previous_storage is not None and previous_storage != storage:
             # Alias handoff must retire both the old whole MADs and their
             # asynchronous FIX readers. No unit-internal C edge is assumed.
             for old in previous_work:
                 require(3 * old + 2, 3 * mads[0][0] + 1)
-        previous_work = [index for index, _, _ in (*mads, *fixes)]
+        previous_work = [index for index, *_ in (*mads, *fixes)]
         previous_storage = storage
     assert seen == {"cq": 4, "cp": 4}
 
