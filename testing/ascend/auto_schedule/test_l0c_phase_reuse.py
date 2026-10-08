@@ -253,7 +253,9 @@ def _unit_completion(mod):
     _prove_completions(trace)
     records = list(_trace(mod, core=2, lane=0))
     activations = _unit_stream_activations(records, {"qk_n", "row_part"})
-    _assert_kernel_unit_boundaries(records, activations)
+    # This exact full-allocation pair uses matching FIX completion for C
+    # bytes; the helper still checks every real FIX->next-MAD and root gate.
+    _assert_kernel_unit_boundaries(records, activations, c_byte_retirement=True)
     seen = Counter()
     for item in activations:
         mads, fixes = item["mads"], item["exports"]

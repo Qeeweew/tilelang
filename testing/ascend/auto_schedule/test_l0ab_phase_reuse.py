@@ -463,7 +463,7 @@ def _unit_stream_activations(records, result_loops):
     return list(activations.values())
 
 
-def _assert_kernel_unit_boundaries(records, activations):
+def _assert_kernel_unit_boundaries(records, activations, *, c_byte_retirement=False):
     """Check real init, owner drains and restoration without a C unit edge."""
     directions = [(index, call.args[0].value, loops) for index, (call, _, loops) in enumerate(records)
                   if _name(call) == "tl.ascend_set_mmad_direction"]
@@ -510,7 +510,7 @@ def _assert_kernel_unit_boundaries(records, activations):
         assert _matching_unit_boundary(records, "FIX_M", exports[-1][0], stop, prefix=prefix), prefix
         # The entry fence retires preceding M work before this owner's FIX;
         # it does not turn the current native unit readiness into whole MAD.
-        if previous:
+        if previous and not c_byte_retirement:
             for old, *_ in previous["mads"]:
                 require(3 * old + 2, 3 * exports[0][0] + 1)
         if following:

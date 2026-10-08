@@ -955,7 +955,8 @@ public:
       const std::vector<UnitFlagBoundary> *unit_boundaries = nullptr,
       const std::vector<L0OperandSlotPool> *operand_pools = nullptr,
       bool enable_gm_read_release = true,
-      bool enable_gm_write_acquire = true)
+      bool enable_gm_write_acquire = true,
+      bool closed_c_byte_retirement = false)
       : storage_groups_(std::move(storage_groups)),
         multi_buffer_plan_(multi_buffer_plan), domains_(domains),
         architecture_(architecture), manual_(std::move(manual)),
@@ -965,6 +966,7 @@ public:
         operand_pools_(operand_pools),
         enable_gm_read_release_(enable_gm_read_release),
         enable_gm_write_acquire_(enable_gm_write_acquire),
+        closed_c_byte_retirement_(closed_c_byte_retirement),
         site_registry_(domains),
         trace_c_lifetimes_(
             runtime::detail::VerboseLoggingEnabled(__FILE__, 1)) {
@@ -1353,16 +1355,77 @@ private:
     return endpoints;
   }
 
+  bool CWriterRetiredByFullExport(const Var &storage, TaskNode *mad,
+                                 TaskNode *fix,
+                                 ControlNode *result_scope) const final {
+    if (!closed_c_byte_retirement_ || !unit_streams_)
+      return false;
+    for (const auto &plan : *unit_streams_)
+      if (plan.c->data.same_as(storage) && plan.result_loop == result_scope &&
+          plan.mads.size() == 1 && plan.mads.front() == mad && plan.fix == fix)
+        return true;
+    return false;
+  }
+
+  bool IsClosedCByteConflict(const DepInfo &dep, TaskNode *producer,
+                            TaskNode *consumer) const {
+    if (!closed_c_byte_retirement_ || !unit_streams_ ||
+        dep.kind != DependencyKind::kData || !dep.cross_storage_conflict ||
+        dep.storage.has_value() || (dep.distance != 0 && dep.distance != -1))
+      return false;
+    const UnitFlagStreamPlan *old_result = nullptr, *new_result = nullptr;
+    for (const auto &plan : *unit_streams_) {
+      if (plan.mads.front() == producer || plan.fix == producer)
+        old_result = &plan;
+      if (plan.mads.front() == consumer || plan.fix == consumer)
+        new_result = &plan;
+    }
+    // The selected mandatory pair has a complete native C result per owner.
+    // Its matching full FIX consumes the old C bytes. Existing real owner
+    // drains/entries must prove FIX->next-MAD separation in the final alias
+    // analysis; otherwise the untouched UF+PIPE_M program is rebuilt. A wide
+    // phase event would reintroduce whole-MAD lifetime through flag reuse.
+    // Do not add that event or a synthetic completion edge. A/B obligations
+    // and the ordinary validation of all retained flags stay intact.
+    return old_result && new_result && old_result != new_result &&
+           !(producer == old_result->fix && consumer == new_result->fix);
+  }
+
   size_t PromoteLifetimeSite(const Var &storage, size_t site_id,
                              ControlNode *control) const final {
     ICHECK_LT(site_id, site_registry_.Size());
     int parent_domain_id =
         domains_.DomainForStorage(storage, control->GetParentControl());
-    size_t parent_site =
-        site_registry_.FindParentSiteInDomain(site_id, parent_domain_id);
+    if (closed_c_byte_retirement_ && unit_streams_ && unit_boundaries_ &&
+        !site_registry_.Sites()[site_id].at_beginning) {
+      for (const auto &plan : *unit_streams_) {
+        if (!plan.c->data.same_as(storage) || plan.result_loop != control ||
+            site_registry_.Sites()[site_id].path_end != plan.fix)
+          continue;
+        for (const auto &boundary : *unit_boundaries_) {
+          if (boundary.role != UnitFlagBoundaryRole::kStreamDrain ||
+              boundary.producer != plan.fix ||
+              boundary.scope != control->GetParentControl())
+            continue;
+          size_t fix_end =
+              site_registry_.FindParentSiteInDomain(site_id, parent_domain_id);
+          size_t drain_end = site_registry_.FindSiteId(SyncInsertionSiteKey{
+              boundary.consumer_node, boundary.consumer, false, kCoreCube,
+              parent_domain_id});
+          auto scope = scope_closures_.find(boundary.scope);
+          if (scope != scope_closures_.end() &&
+              MinCompletionDistance(scope->second, fix_end, drain_end) == 0) {
+            // Widen only these C bytes to their real FIX_M acquire witness.
+            // The empty M task ends after the emitted wait, not after whole
+            // MAD retirement. Its parent projection retains that real drain
+            // across guarded owners instead of inventing a FIX phase fence.
+            TraceLifetimeSite("promote-C-drain", storage, drain_end);
+            return drain_end;
+          }
+        }
+      }
+    }
     TraceLifetimeSite("promote-source", storage, site_id);
-    TraceLifetimeSite("promote-parent", storage, parent_site);
-    ICHECK_EQ(site_registry_.Sites()[parent_site].path_begin, control);
     if (!domains_.Domain(parent_domain_id).IsCounter()) {
       size_t lexical_site = site_registry_.FindParentSiteInDomain(
           site_id,
@@ -1374,9 +1437,17 @@ private:
         // Enclose the child in a wider real physical boundary. This does not
         // project its guarded closure: lifetime separation must be proved
         // again using the unconditional parent's own completion graph.
-        parent_site = lexical_site;
+        // A storage-free completion witness need not carry this storage's
+        // guarded domain. Select this conservative bound before requesting
+        // that narrower parent site.
+        TraceLifetimeSite("promote-selected", storage, lexical_site);
+        return lexical_site;
       }
     }
+    size_t parent_site =
+        site_registry_.FindParentSiteInDomain(site_id, parent_domain_id);
+    TraceLifetimeSite("promote-parent", storage, parent_site);
+    ICHECK_EQ(site_registry_.Sites()[parent_site].path_begin, control);
     TraceLifetimeSite("promote-selected", storage, parent_site);
     return parent_site;
   }
@@ -2194,6 +2265,8 @@ private:
                                             counter_owner->loop));
       }
       for (const auto &[producer, consumer] : dep.task_pairs) {
+        if (IsClosedCByteConflict(dep, producer, consumer))
+          continue;
         const L0OperandSlotMember *pool_member =
             PoolMemoryObligationMember(dep, producer, consumer, loop);
         // Every physical overwritten interval consumes its last reader's
@@ -3326,6 +3399,7 @@ private:
   std::vector<GmReadReleaseCut> gm_read_releases_;
   const bool enable_gm_write_acquire_;
   std::vector<GmWriteAcquireCut> gm_write_acquires_;
+  const bool closed_c_byte_retirement_;
   SyncSiteRegistry site_registry_;
   const bool trace_c_lifetimes_;
   mutable std::unordered_set<size_t> trace_c_sites_;
@@ -4122,6 +4196,72 @@ bool HasClosedKernelUnitDirection(
   return true;
 }
 
+// The installed dav-2201 inner-product Matmul reuses one canonical C bank
+// through matching complete unit results. Admit only the automatically
+// selected two-allocation phase pair here. The broader unit selector also
+// accepts column prefixes; those do not establish this C-byte contract.
+bool HasClosedCByteRetirement(const ScheduledTIRMetadata &metadata,
+                              const std::vector<UnitFlagStreamPlan> &plans) {
+  if (plans.size() != 2 || plans[0].c->data.same_as(plans[1].c->data))
+    return false;
+  auto selected = metadata.kernel_root->annotations.Get(kL0PhaseReusePairs);
+  if (!selected)
+    return false;
+  bool selected_pair = false;
+  for (const auto &pair : selected.value().cast<Array<Array<Var>>>()) {
+    if (pair.size() == 2)
+      selected_pair |=
+          (pair[0].same_as(plans[0].c->data) &&
+           pair[1].same_as(plans[1].c->data)) ||
+          (pair[1].same_as(plans[0].c->data) &&
+           pair[0].same_as(plans[1].c->data));
+  }
+  size_t allocations = 0;
+  for (const auto &buffer : metadata.kernel_root->alloc_buffers)
+    if (IsL0CBuffer(buffer)) {
+      ++allocations;
+      if (!buffer.same_as(plans[0].c) && !buffer.same_as(plans[1].c))
+        return false;
+    }
+  if (!selected_pair || allocations != 2)
+    return false;
+  auto full = [](const Buffer &buffer, const Array<Range> &region) {
+    if (!unit_flag_stream_detail::AdmissibleCDomain(buffer, region))
+      return false;
+    for (size_t axis = 0; axis < 2; ++axis)
+      if (!arith::Analyzer().CanProveEqual(region[axis]->extent,
+                                           buffer->shape[axis]))
+        return false;
+    return true;
+  };
+  for (const auto &plan : plans) {
+    auto version = metadata.buffer_versions.Get(plan.c->data);
+    // Phase-pair selection consumes an explicit fixed-one version entry.
+    // An absent entry therefore retains the same implicit single slot.
+    if (plan.mads.size() != 1 || (version && version.value() != 1) ||
+        metadata.manual_buffer_versions.count(plan.c->data) ||
+        metadata.buffer_version_modes.count(plan.c->data))
+      return false;
+    auto mad = unit_flag_stream_detail::Operation(plan.mads.front(), true);
+    auto fix = unit_flag_stream_detail::Operation(plan.fix, true);
+    if (!mad || !fix)
+      return false;
+    Gemm gemm((*mad)->args, (*mad)->annotations);
+    AscendCopy copy((*fix)->args, (*fix)->annotations);
+    if (!full(plan.c, gemm->cRegion_->region) ||
+        !full(plan.c, copy->src_range))
+      return false;
+    // CANN's native compute path adds PIPE_M for fewer than ten output
+    // fractals. Its ungated single-bank protocol is not the contract for
+    // those small results.
+    auto rows = unit_flag_stream_detail::Constant(plan.c->shape[0]);
+    auto columns = unit_flag_stream_detail::Constant(plan.c->shape[1]);
+    if (!rows || !columns || (*rows / 16) * (*columns / 16) < 10)
+      return false;
+  }
+  return true;
+}
+
 // Empty M tasks are insertion sites only: they do not claim a C access or
 // manufacture an allocation-lifetime proof. With invariant kernel direction,
 // each owner retains a real M->first FIX / last FIX->M completion handshake.
@@ -4131,13 +4271,14 @@ void InsertUnitFlagBoundaries(std::vector<std::shared_ptr<IRStructure>> &nodes,
                               ControlNode *parent,
                               const std::vector<UnitFlagStreamPlan> &plans,
                               std::vector<UnitFlagBoundary> *boundaries,
-                              bool kernel_direction) {
+                              bool kernel_direction,
+                              bool closed_c_byte_retirement) {
   std::vector<std::shared_ptr<IRStructure>> result;
   for (const auto &node : nodes) {
     if (node->IsControl()) {
       auto *control = static_cast<ControlNode *>(node.get());
       InsertUnitFlagBoundaries(control->children, control, plans, boundaries,
-                               kernel_direction);
+                               kernel_direction, closed_c_byte_retirement);
     }
     auto plan = std::find_if(plans.begin(), plans.end(), [&](const auto &p) {
       return p.result_loop == node.get();
@@ -4207,11 +4348,12 @@ void InsertUnitFlagBoundaries(std::vector<std::shared_ptr<IRStructure>> &nodes,
       task->SetParent(scope);
       return task;
     };
-    // Unit readiness and even last-FIX retirement do not establish whole
-    // MAD retirement. Retain that obligation on M before another stream can
-    // reuse a physical C phase, without sending it back through Scalar.
-    Stmt entry_body = kernel_direction ? MakeAscendPipeBarrier("PIPE_M")
-                                       : Stmt(Evaluate(0));
+    // Generic unit readiness does not establish whole-MAD retirement. Only
+    // the complete selected C-byte protocol may end that storage lifetime
+    // at matching FIX completion; A/B still use their whole-MAD slot credits.
+    Stmt entry_body = kernel_direction && !closed_c_byte_retirement
+                          ? MakeAscendPipeBarrier("PIPE_M")
+                          : Stmt(Evaluate(0));
     auto entry = make_site(ResourcePipe::kCube, entry_body);
     auto drain = make_site(ResourcePipe::kCube, Evaluate(0));
     if (kernel_direction) {
@@ -4809,7 +4951,8 @@ private:
 // ============================================================================
 SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
                         Target target, const std::vector<Var> &lane_variables,
-                        bool enable_unit_streams = true) {
+                        bool enable_unit_streams = true,
+                        bool enable_c_byte_retirement = true) {
   std::vector<std::shared_ptr<IRStructure>> &root = scheduled_tir.tree;
   const AscendTargetInfo &target_info = GetAscendTargetInfo(target);
   CrossCoreSyncContract cross_core_contract{
@@ -4823,6 +4966,7 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
   std::vector<UnitFlagStreamPlan> unit_streams;
   std::vector<UnitFlagBoundary> unit_boundaries;
   std::optional<ScheduledTIR> unit_fallback;
+  bool closed_c_byte_retirement = false;
   if (enable_unit_streams &&
       target_info.architecture == AscendArchitecture::kDav2201) {
     // An existing direction setter has an explicit state contract. Do not
@@ -4849,9 +4993,12 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
       }
       bool kernel_direction =
           HasClosedKernelUnitDirection(root, unit_streams, kernel_body);
+      closed_c_byte_retirement =
+          enable_c_byte_retirement && kernel_direction &&
+          HasClosedCByteRetirement(scheduled_tir.metadata, unit_streams);
       ApplyUnitFlagStreams(unit_streams);
       InsertUnitFlagBoundaries(root, nullptr, unit_streams, &unit_boundaries,
-                               kernel_direction);
+                               kernel_direction, closed_c_byte_retirement);
       if (kernel_direction)
         InsertKernelUnitDirection(root, &unit_boundaries);
     }
@@ -4913,8 +5060,14 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
         scheduled_tir.metadata.manual_buffer_versions,
         scheduled_tir.metadata.root_conflict_hints, groups, &owner_results,
         &owner_inputs, &unit_streams, &unit_boundaries, &operand_pools,
-        enable_gm_read_release, enable_gm_write_acquire);
+        enable_gm_read_release, enable_gm_write_acquire,
+        closed_c_byte_retirement);
     if (!analyzer->Analyze(root)) {
+      if (closed_c_byte_retirement) {
+        ICHECK(unit_fallback.has_value());
+        return InsertKernelSync(kernel_body, std::move(unit_fallback.value()),
+                                target, lane_variables, true, false);
+      }
       if (disable_gm_handoff()) {
         continue;
       }
@@ -4935,6 +5088,21 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
       ICHECK(!owner_results.empty());
       owner_results.clear();
       continue;
+    }
+    if (closed_c_byte_retirement) {
+      bool aliases_proven = true;
+      for (const auto &pair : scheduled_tir.metadata.kernel_root->annotations
+                                  .Get(kL0PhaseReusePairs)
+                                  .value()
+                                  .cast<Array<Array<Var>>>())
+        aliases_proven &=
+            HasBufferAlias(analyzer->BufferAliases(), pair[0], pair[1]) &&
+            HasBufferAlias(analyzer->BufferAliases(), pair[1], pair[0]);
+      if (!aliases_proven) {
+        ICHECK(unit_fallback.has_value());
+        return InsertKernelSync(kernel_body, std::move(unit_fallback.value()),
+                                target, lane_variables, true, false);
+      }
     }
     if (analyzer->HasPrivateGmHandoffs()) {
       // A private GM cut cannot replace whole-phase alias retirement.
@@ -5001,6 +5169,11 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
                                   !unit_streams.empty() || !operand_pools.empty(),
                               !unit_streams.empty() || !operand_pools.empty() ||
                                   analyzer->HasPrivateGmHandoffs())) {
+      if (closed_c_byte_retirement) {
+        ICHECK(unit_fallback.has_value());
+        return InsertKernelSync(kernel_body, std::move(unit_fallback.value()),
+                                target, lane_variables, true, false);
+      }
       if (disable_gm_handoff()) {
         continue;
       }

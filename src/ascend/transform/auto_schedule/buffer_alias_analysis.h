@@ -84,6 +84,15 @@ public:
                                               bool at_beginning) const {
     return false;
   }
+  // An exact closed native C-data protocol may retire this result's C bytes
+  // through its matching full export. This does not certify whole-MAD
+  // completion or change any completion-graph edge. Other contexts retain
+  // the producer's whole-command lifetime by default.
+  virtual bool CWriterRetiredByFullExport(const tirx::Var &storage,
+                                         TaskNode *mad, TaskNode *fix,
+                                         ControlNode *result_scope) const {
+    return false;
+  }
 };
 
 namespace buffer_alias_analysis_detail {
@@ -735,17 +744,21 @@ private:
     generation.begin_sites = MakeIterationEvents(
         context_->ResolveLifetimeEndpoints(info.storage, producer->task, true,
                                            result_scope));
-    generation.end_sites = MakeIterationEvents(
-        context_->ResolveLifetimeEndpoints(info.storage, producer->task, false,
-                                           result_scope));
+    if (!context_->CWriterRetiredByFullExport(
+            info.storage, producer->task, reader->task, result_scope)) {
+      generation.end_sites = MakeIterationEvents(
+          context_->ResolveLifetimeEndpoints(info.storage, producer->task,
+                                             false, result_scope));
+    }
     auto export_ends = MakeIterationEvents(context_->ResolveLifetimeEndpoints(
         info.storage, reader->task, false, result_scope));
     generation.end_sites.insert(generation.end_sites.end(), export_ends.begin(),
                                 export_ends.end());
     SortUnique(&generation.end_sites);
-    // These are actual whole-command endpoints, not unit-ready edges. Keeping
-    // both ends requires later reuse to retire MAD as well as asynchronous FIX.
-    // Existing promotion and happens-before queries still prove separation.
+    // Without the exact C-byte certificate, both whole-command ends remain
+    // necessary. The matching FIX whole END is always retained; neither path
+    // turns unit readiness into whole-MAD completion. Existing promotion and
+    // happens-before queries still prove separation of these C lifetimes.
     summary.generations.push_back(std::move(generation));
     if (trace)
       LOG(INFO) << "C-finite storage=" << info.storage << " scope="

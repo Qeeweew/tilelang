@@ -189,10 +189,10 @@ completion proofs.
 When every M/FIX task in the kernel belongs to a selected stream, N direction
 is invariant for the kernel. One root setter has unconditional M and FIX
 startup consumers, so even zero active streams consume its setup events.
-Each stream activation starts with a real PIPE_M barrier and retains ordinary
-M-to-FIX entry and full FIX-to-M retirement events. The barrier preserves
-whole-MAD retirement at owner/physical-C handoff: unit readiness and last-FIX
-retirement alone do not prove it. M entry follows the preceding M drain; FIX
+Each stream activation normally starts with a real PIPE_M barrier and retains
+ordinary M-to-FIX entry and full FIX-to-M retirement events. The barrier
+preserves generic whole-MAD retirement at owner/physical-C handoff: unit
+readiness and last-FIX retirement alone do not prove it. M entry follows the preceding M drain; FIX
 entry precedes its terminal notification. These two actual completion channels establish
 consume-before-reuse for both binary flags, using the ordinary reverse-
 completion analysis rather than a Scalar-blocking drain exception. Direction
@@ -201,6 +201,31 @@ normal operand readiness and queue/resource backpressure still apply. A root
 M terminal site follows every active FIX-to-M drain and waits once on Scalar
 before restoring M direction. No unit seed or whole-completion edge is inferred
 from the unit controls themselves.
+
+An automatically selected pair of complete canonical C allocations can use a
+narrower C-byte retirement contract from CANN's dav-2201 inner-product Matmul:
+the matching full unit FIX consumes that complete result, permitting the next
+closed result to reuse the bank. Both allocations must have one fixed slot,
+zero origin and at least ten output 16-by-16 fractals. Every M/FIX operation
+must belong to those two selected streams, with one static MAD task per
+result (possibly inside a finite K subtree). Column prefixes, a third C,
+other accesses and scoped direction changes retain the normal protocol.
+
+For this pair, the C lifetime ends at its full FIX completion, and C-only
+cross-storage conflicts no longer require the old MAD's whole-command end.
+When promoting a result lifetime, its full FIX end may widen to the actual
+empty M drain task after the ordinary FIX-to-M wait. The existing completion
+graph must prove that relation; the drain does not certify whole-MAD
+retirement. This preserves the real acquire witness across guarded owners.
+The original alias analysis must still prove full-FIX-to-next-MAD separation
+in both directions across owners and epochs before physical co-location.
+Only then may the owner entry omit PIPE_M. The real M-to-FIX/FIX-to-M gates,
+root direction protocol and A/B whole-MAD slot credits remain. This certificate
+adds no whole-MAD completion edge and makes no claim about global unit-state
+retirement or internal unit granularity. If lifetime, synchronization or
+flag-capacity proof fails, InsertSync rebuilds the original scheduled tree
+with unit selection and PIPE_M retained before considering ordinary unit-off
+fallback.
 
 Partial selection retains scoped ordinary event boundaries allocated by the
 existing flag allocator: M-to-S before selecting N direction, S-to-M before its first
