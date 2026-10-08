@@ -58,6 +58,7 @@
 
 #include "./auto_schedule/buffer_alias_analysis.h"
 #include "./auto_schedule/dependency_analysis.h"
+#include "./auto_schedule/gm_read_release.h"
 #include "./auto_schedule/kernel_rewriter.h"
 #include "./auto_schedule/l0ab_phase_reuse.h"
 #include "./auto_schedule/l0_operand_slot_pool.h"
@@ -290,6 +291,14 @@ struct SyncInsertionSite {
 
 using SyncInsertionSiteList = std::vector<SyncInsertionSite>;
 
+// This private certificate releases only the typed GM input. Its old wide
+// source END must never enter generic completion or flag-lifetime closure.
+struct GmReadReleaseCut {
+  GmReadReleasePlan plan;
+  SyncInsertionSite active;
+  SyncInsertionSite inactive;
+};
+
 // Inputs needed to look up a collected insertion site without reconstructing
 // it. Domain ids are pass-local and reconstructed from canonical guards.
 using SyncInsertionSiteKey =
@@ -377,6 +386,7 @@ struct SyncPoint {
   // Emitted by the selected physical pool, not this logical-storage ring.
   // Only an exact child-generation edge can enter the ordinary closure.
   bool operand_pool_release{false};
+  std::optional<size_t> gm_read_release;
 
   SyncPoint(DepEdge edge, DependencyKind dependency_kind, int num_versions,
             ControlNode *flag_loop)
@@ -929,7 +939,8 @@ public:
       const std::vector<OwnerResultPlan> *owner_inputs = nullptr,
       const std::vector<UnitFlagStreamPlan> *unit_streams = nullptr,
       const std::vector<UnitFlagBoundary> *unit_boundaries = nullptr,
-      const std::vector<L0OperandSlotPool> *operand_pools = nullptr)
+      const std::vector<L0OperandSlotPool> *operand_pools = nullptr,
+      bool enable_gm_read_release = true)
       : storage_groups_(std::move(storage_groups)),
         multi_buffer_plan_(multi_buffer_plan), domains_(domains),
         architecture_(architecture), manual_(std::move(manual)),
@@ -937,6 +948,7 @@ public:
         owner_results_(owner_results), owner_inputs_(owner_inputs),
         unit_streams_(unit_streams), unit_boundaries_(unit_boundaries),
         operand_pools_(operand_pools),
+        enable_gm_read_release_(enable_gm_read_release),
         site_registry_(domains),
         trace_c_lifetimes_(
             runtime::detail::VerboseLoggingEnabled(__FILE__, 1)) {
@@ -1037,6 +1049,10 @@ public:
   bool NeedsOperandPoolFallback() const {
     return operand_pool_fallback_required_;
   }
+  bool HasGmReadReleases() const { return !gm_read_releases_.empty(); }
+  const std::vector<GmReadReleaseCut> &GmReadReleases() const {
+    return gm_read_releases_;
+  }
 
   bool HasOwnerResultRelease(const OwnerResultPlan &plan) const {
     int domain = domains_.DomainForStorage(plan.storage, plan.epoch);
@@ -1054,6 +1070,16 @@ public:
   }
 
   bool HasOwnerInputRelease(const OwnerResultPlan &plan) const {
+    for (const SyncPoint &point : sync_points_) {
+      if (point.gm_read_release) {
+        const auto &cut = gm_read_releases_.at(*point.gm_read_release);
+        if (cut.plan.MatchesInput(plan) &&
+            cut.plan.MatchesProtocol(point.flag_loop, point.edge.distance,
+                                     point.num_versions,
+                                     point.counter_group_id))
+          return true;
+      }
+    }
     int domain = domains_.DomainForStorage(plan.storage, plan.epoch);
     size_t read_end = site_registry_.FindSiteId(
         SyncInsertionSiteKey{plan.consumer->GetChildOnPathFrom(plan.epoch),
@@ -1070,6 +1096,53 @@ public:
   }
 
 private:
+  bool GmReadReleaseNeedsFallback(bool valid) {
+    if (valid || !HasGmReadReleases())
+      return false;
+    // The private GM cut may remove an unrelated flag's old wide witness.
+    // Retry the same owner/unit/pool choices with ordinary GM release first.
+    owner_fallback_required_ = true;
+    return true;
+  }
+
+  void SelectGmReadRelease(SyncPoint *point, const DepInfo &dep,
+                          TaskNode *reader, TaskNode *writer,
+                          ControlNode *loop) {
+    if (!enable_gm_read_release_ || !owner_inputs_ ||
+        architecture_ != AscendArchitecture::kDav2201 || !loop ||
+        !site_registry_.IsCrossCore(*point))
+      return;
+    const SyncInsertionSite &src = site_registry_.Src(*point);
+    const SyncInsertionSite &dst = site_registry_.Dst(*point);
+    int lexical_domain = domains_.UnconditionalLexicalDomain(loop);
+    const EpochDomain &domain = domains_.Domain(lexical_domain);
+    if (domain.IsCounter() || domain.owner != loop ||
+        !is_one(domain.active_guard) ||
+        src.EpochDomainId() != lexical_domain ||
+        dst.EpochDomainId() != lexical_domain || !is_one(src.GetGuard()) ||
+        !is_one(dst.GetGuard()) || src.core != kCoreCube || src.pipe != "MTE2" ||
+        dst.core != kCoreVector || dst.pipe != "MTE3" ||
+        !loop->GetLoopBodyContext().CanProve(
+            point->flag_iteration == CalculateIterationCount(loop)))
+      return;
+    auto plan = AnalyzeGmReadRelease(*owner_inputs_, dep, reader, writer, loop,
+                                     manual_, multi_buffer_plan_);
+    if (!plan || !plan->MatchesProtocol(point->flag_loop, point->edge.distance,
+                                        point->num_versions,
+                                        point->counter_group_id))
+      return;
+    SyncInsertionSite active(plan->reader_boundary, reader, false, kCoreCube,
+                             domain, nullptr, true);
+    if (active.path_end != reader)
+      return;
+    active.guard = active.guard && plan->active;
+    SyncInsertionSite inactive = src;
+    inactive.guard = inactive.guard && plan->inactive;
+    point->gm_read_release = gm_read_releases_.size();
+    gm_read_releases_.push_back(
+        {std::move(*plan), std::move(active), std::move(inactive)});
+  }
+
   const L0OperandSlotMember *PoolMemoryObligationMember(
       const DepInfo &dep, TaskNode *source, TaskNode *destination,
       ControlNode *loop) const {
@@ -1442,7 +1515,7 @@ private:
     std::vector<std::vector<VisibleSyncPoint>> child_sync_points;
     for (IRStructure *node : nodes) {
       SyncAnalysisResult child_result = AnalyzeNode(node);
-      if (unit_fallback_required_)
+      if (owner_fallback_required_ || unit_fallback_required_)
         return result;
       AddPromotedChildClosure(result.closure, node, child_result.closure, loop);
       child_sync_points.push_back(std::move(child_result.visible_sync_points));
@@ -1469,6 +1542,8 @@ private:
     local_points.reserve(local_sync_points.size());
     for (SyncPoint &sync_point : local_sync_points) {
       size_t sync_point_id = AppendSyncPoint(std::move(sync_point));
+      if (sync_points_[sync_point_id].gm_read_release)
+        continue;
       local_points.push_back(
           {sync_point_id, {sync_points_[sync_point_id].edge}});
     }
@@ -2144,6 +2219,8 @@ private:
                                        flag_loop);
             }
             sync_points.back().operand_pool_release = pool_local_release;
+            SelectGmReadRelease(&sync_points.back(), dep, producer, consumer,
+                                loop);
           }
         }
       }
@@ -2341,8 +2418,10 @@ private:
   // persistent binary protocol. Prove the whole finite protocol, rather than
   // treating a child distance of one as one parent iteration by projection.
   bool CoversNestedLocalProtocol(const SyncPoint &wide,
-                                 const SyncPoint &narrow,
-                                 ControlNode *parent) const {
+                                const SyncPoint &narrow,
+                                ControlNode *parent) const {
+    if (wide.gm_read_release || narrow.gm_read_release)
+      return false;
     ControlNode *child = wide.flag_loop;
     auto persistent = [&](const SyncPoint &point) {
       return point.edge.strict && point.edge.distance == 1 &&
@@ -2506,6 +2585,8 @@ private:
 
   bool CoversLocalProtocol(const SyncPoint &wide, const SyncPoint &narrow,
                            ControlNode *loop) const {
+    if (wide.gm_read_release || narrow.gm_read_release)
+      return false;
     if (architecture_ != AscendArchitecture::kDav2201 || loop == nullptr ||
         wide.counter_group_id != 0 || narrow.counter_group_id != 0 ||
         wide.flag_loop != loop || narrow.flag_loop != loop ||
@@ -2585,6 +2666,12 @@ private:
     std::stable_sort(sync_points.begin(), sync_points.end());
     std::vector<SyncPoint> emit;
     for (SyncPoint &sync_point : sync_points) {
+      if (sync_point.gm_read_release) {
+        // Its physical set moves inside the phase. Retain the event, but
+        // never saturate the old phase-END edge or use it to remove a point.
+        emit.push_back(std::move(sync_point));
+        continue;
+      }
       if (sync_point.operand_pool_release) {
         // This exact same-generation relation is implemented by the physical
         // pool. It can close a retained load-ready flag's binary lifetime;
@@ -2724,6 +2811,8 @@ private:
   void OptimizeFlagVersions(std::vector<SyncPoint> &sync_points,
                             const DepClosure &closure, ControlNode *loop) {
     for (SyncPoint &sync_point : sync_points) {
+      if (sync_point.gm_read_release)
+        continue; // Preserve the original paired clock, seeds and drains.
       const SyncInsertionSite &src = site_registry_.Src(sync_point);
       const SyncInsertionSite &dst = site_registry_.Dst(sync_point);
       if (src.pipe == dst.pipe)
@@ -2822,9 +2911,13 @@ private:
         // contiguous active interval. Re-seeding an inner loop at each entry
         // is unsafe: a local drain only blocks its destination pipe, not the
         // next source seed.
-        ICHECK(is_innermost && sync_point.counter_group_id == 0 &&
-               loop != nullptr && loop->GetParentControl() == nullptr &&
-               !loop->HasConditions() && !loop->BodyHasLoopBreak())
+        bool shifted_scope =
+            is_innermost && sync_point.counter_group_id == 0 &&
+            loop != nullptr && loop->GetParentControl() == nullptr &&
+            !loop->HasConditions() && !loop->BodyHasLoopBreak();
+        if (GmReadReleaseNeedsFallback(shifted_scope))
+          return;
+        ICHECK(shifted_scope)
             << "dav-2201 local binary flag: shifted carried events require "
                "an unconditional outermost lexical loop"
             << binary_context();
@@ -2832,27 +2925,43 @@ private:
         PrimExpr step = for_node->step.has_value()
                             ? for_node->step.value()
                             : IntImm(for_node->extent.dtype(), 1);
-        ICHECK(loop->task->outer_ctx.CanProve(step > make_zero(step.dtype())))
+        bool positive_step =
+            loop->task->outer_ctx.CanProve(step > make_zero(step.dtype()));
+        if (GmReadReleaseNeedsFallback(positive_step))
+          return;
+        ICHECK(positive_step)
             << "dav-2201 local binary flag: loop step must be positive";
-        ICHECK(SideEffect(for_node->min) == CallEffectKind::kPure &&
-               SideEffect(for_node->extent) == CallEffectKind::kPure &&
-               SideEffect(step) == CallEffectKind::kPure)
+        bool immutable_bounds =
+            SideEffect(for_node->min) == CallEffectKind::kPure &&
+            SideEffect(for_node->extent) == CallEffectKind::kPure &&
+            SideEffect(step) == CallEffectKind::kPure;
+        if (GmReadReleaseNeedsFallback(immutable_bounds))
+          return;
+        ICHECK(immutable_bounds)
             << "dav-2201 local binary flag: loop bounds must be immutable";
         PrimExpr trip_count = max(ceildiv(for_node->extent, step),
                                   make_zero(for_node->extent.dtype()));
-        ICHECK(sync_point.flag_iteration.dtype().is_int() &&
-               trip_count.dtype().is_int())
+        bool signed_clock = sync_point.flag_iteration.dtype().is_int() &&
+                            trip_count.dtype().is_int();
+        if (GmReadReleaseNeedsFallback(signed_clock))
+          return;
+        ICHECK(signed_clock)
             << "dav-2201 local binary flag: shifted epoch clocks require "
                "signed integer iteration and trip-count types";
         PrimExpr lexical_ordinal =
             indexdiv(for_node->loop_var - for_node->min, step);
-        ICHECK(loop->GetLoopBodyContext().CanProve(sync_point.flag_iteration ==
-                                                   lexical_ordinal))
+        bool lexical_clock = loop->GetLoopBodyContext().CanProve(
+            sync_point.flag_iteration == lexical_ordinal);
+        if (GmReadReleaseNeedsFallback(lexical_clock))
+          return;
+        ICHECK(lexical_clock)
             << "dav-2201 local binary flag: shifted epoch clock must equal "
                "the root lexical iteration ordinal"
             << binary_context();
         std::optional<LocalBinaryEpochSpan> active_span =
             LocalBinaryActiveSpan(sync_point, loop, trip_count, step);
+        if (GmReadReleaseNeedsFallback(active_span.has_value()))
+          return;
         ICHECK(active_span.has_value())
             << "dav-2201 local binary flag: shifted carried events require "
                "one exact contiguous active-epoch interval with static cut "
@@ -2863,6 +2972,8 @@ private:
         if (reverse_completion == std::numeric_limits<int>::max()) {
           std::optional<int> finite_width =
               FiniteLocalBinaryWidth(loop, trip_count, distance);
+          if (GmReadReleaseNeedsFallback(finite_width.has_value()))
+            return;
           ICHECK(finite_width.has_value())
               << "dav-2201 local binary flag: no reverse completion path for "
               << src.pipe << "->" << dst.pipe
@@ -2870,6 +2981,10 @@ private:
                  "non-reusing event capacity";
           sync_point.num_versions = *finite_width;
         } else {
+          if (GmReadReleaseNeedsFallback(
+                  reverse_completion <=
+                  std::numeric_limits<int>::max() - distance))
+            return;
           ICHECK_LE(reverse_completion,
                     std::numeric_limits<int>::max() - distance);
           sync_point.num_versions = distance + reverse_completion;
@@ -2919,6 +3034,8 @@ private:
           // The owner clock does not advance within a descendant loop. Its
           // repeated uses of one ID need completion before the next child
           // iteration, irrespective of the owner's physical storage width.
+          if (GmReadReleaseNeedsFallback(min_distance <= 1))
+            return;
           ICHECK_LE(min_distance, 1)
               << "dav-2201 local binary flag: reverse completion is too loose "
                  "for a descendant loop sharing its owner's clock";
@@ -2970,6 +3087,8 @@ private:
                 bool allow_mixed_iter) const {
     const SyncPoint &lhs_sync = sync_points_[lhs.sync_point_id];
     const SyncPoint &rhs_sync = sync_points_[rhs.sync_point_id];
+    if (lhs_sync.gm_read_release || rhs_sync.gm_read_release)
+      return false;
     if (lhs_sync.unit_boundary == UnitFlagBoundaryRole::kDrain ||
         rhs_sync.unit_boundary == UnitFlagBoundaryRole::kDrain)
       return false;
@@ -3113,6 +3232,8 @@ private:
   const std::vector<UnitFlagStreamPlan> *unit_streams_;
   const std::vector<UnitFlagBoundary> *unit_boundaries_;
   const std::vector<L0OperandSlotPool> *operand_pools_;
+  const bool enable_gm_read_release_;
+  std::vector<GmReadReleaseCut> gm_read_releases_;
   SyncSiteRegistry site_registry_;
   const bool trace_c_lifetimes_;
   mutable std::unordered_set<size_t> trace_c_sites_;
@@ -4293,12 +4414,14 @@ public:
                    const std::vector<Var> &lane_variables,
                    const std::vector<OwnerCompletionEvent> &owner_events,
                    const std::vector<L0OperandSlotPool> &operand_pools,
-                   const std::vector<int> &operand_pool_bases)
+                   const std::vector<int> &operand_pool_bases,
+                   const std::vector<GmReadReleaseCut> &gm_read_releases)
       : site_registry_(site_registry), sync_points_(sync_points),
         allocations_(allocations), architecture_(architecture),
         cross_core_contract_(cross_core_contract),
         lane_variables_(lane_variables), owner_events_(owner_events),
-        operand_pools_(operand_pools), operand_pool_bases_(operand_pool_bases) {}
+        operand_pools_(operand_pools), operand_pool_bases_(operand_pool_bases),
+        gm_read_releases_(gm_read_releases) {}
 
   void Run(std::vector<std::shared_ptr<IRStructure>> &root) {
     InsertSyncPoints();
@@ -4382,6 +4505,33 @@ private:
       int base_id = allocation.base_id;
       PrimExpr event_id = MakeFlagEventId(sync_point.flag_iteration,
                                           sync_point.num_versions, base_id);
+
+      if (sync_point.gm_read_release) {
+        ICHECK(architecture_ == AscendArchitecture::kDav2201 &&
+               cross_core_contract_.collective &&
+               cross_core_contract_.num_aiv_subcores == 2 &&
+               site_registry_.IsCrossCore(sync_point));
+        ICHECK_EQ(allocation.sync_points.size(), 1u);
+        const auto &cut = gm_read_releases_.at(*sync_point.gm_read_release);
+        ICHECK(cut.plan.MatchesProtocol(
+            sync_point.flag_loop, sync_point.edge.distance,
+            sync_point.num_versions, sync_point.counter_group_id));
+        ValidateCollectiveSite(cut.active);
+        ValidateCollectiveSite(cut.inactive);
+        ValidateCollectiveSite(dst);
+        for (const SyncInsertionSite *site : {&cut.active, &cut.inactive}) {
+          InsertStatement(
+              site->path_end,
+              MakeAscendCrossCoreSetFlag(2, "PIPE_MTE2", event_id), false,
+              kCoreCube, site->GetGuard());
+        }
+        // Both AIVs retain the ordinary old-slot acquire and finite drains.
+        InsertStatement(
+            dst.path_end,
+            MakeAscendCrossCoreWaitFlag(2, "PIPE_MTE3", event_id), true,
+            kCoreVector, consumer_guard);
+        continue;
+      }
 
       if (site_registry_.IsCrossCore(sync_point)) {
         if (cross_core_contract_.collective) {
@@ -4541,6 +4691,7 @@ private:
   const std::vector<OwnerCompletionEvent> &owner_events_;
   const std::vector<L0OperandSlotPool> &operand_pools_;
   const std::vector<int> &operand_pool_bases_;
+  const std::vector<GmReadReleaseCut> &gm_read_releases_;
 };
 
 // ============================================================================
@@ -4630,14 +4781,20 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
   std::unique_ptr<SyncAnalyzer> analyzer;
   std::unique_ptr<FlagAllocator> flag_allocator;
   std::optional<std::vector<OwnerCompletionEvent>> owner_events;
+  bool enable_gm_read_release = true;
   for (;;) {
     flag_allocator.reset();
     analyzer = std::make_unique<SyncAnalyzer>(
         multi_buffer_plan, domains, target_info.architecture,
         scheduled_tir.metadata.manual_buffer_versions,
         scheduled_tir.metadata.root_conflict_hints, groups, &owner_results,
-        &owner_inputs, &unit_streams, &unit_boundaries, &operand_pools);
+        &owner_inputs, &unit_streams, &unit_boundaries, &operand_pools,
+        enable_gm_read_release);
     if (!analyzer->Analyze(root)) {
+      if (analyzer->HasGmReadReleases()) {
+        enable_gm_read_release = false;
+        continue;
+      }
       if (analyzer->NeedsOperandPoolFallback()) {
         ICHECK(!operand_pools.empty());
         operand_pools.clear();
@@ -4655,6 +4812,35 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
       ICHECK(!owner_results.empty());
       owner_results.clear();
       continue;
+    }
+    if (analyzer->HasGmReadReleases()) {
+      // Early P completion cannot replace whole-phase alias retirement.
+      // Retry before allocation/materialization if the removed wide edge
+      // was needed by a mandatory physical-storage proof.
+      bool aliases_proven = true;
+      if (auto selected = scheduled_tir.metadata.kernel_root->annotations.Get(
+              kL0PhaseReusePairs)) {
+        for (const Array<Var> &pair :
+             selected.value().cast<Array<Array<Var>>>()) {
+          ICHECK_EQ(pair.size(), 2u);
+          aliases_proven &=
+              HasBufferAlias(analyzer->BufferAliases(), pair[0], pair[1]) &&
+              HasBufferAlias(analyzer->BufferAliases(), pair[1], pair[0]);
+        }
+      }
+      bool releases_proven =
+          std::all_of(owner_results.begin(), owner_results.end(),
+                      [&](const OwnerResultPlan &plan) {
+                        return analyzer->HasOwnerResultRelease(plan);
+                      }) &&
+          std::all_of(owner_inputs.begin(), owner_inputs.end(),
+                      [&](const OwnerResultPlan &plan) {
+                        return analyzer->HasOwnerInputRelease(plan);
+                      });
+      if (!aliases_proven || !releases_proven) {
+        enable_gm_read_release = false;
+        continue;
+      }
     }
     if (!owner_inputs.empty() &&
         std::any_of(owner_results.begin(), owner_results.end(),
@@ -4690,7 +4876,12 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
         cross_core_contract, operand_pools);
     if (!flag_allocator->Plan(!owner_results.empty() || !owner_inputs.empty() ||
                                   !unit_streams.empty() || !operand_pools.empty(),
-                              !unit_streams.empty() || !operand_pools.empty())) {
+                              !unit_streams.empty() || !operand_pools.empty() ||
+                                  analyzer->HasGmReadReleases())) {
+      if (analyzer->HasGmReadReleases()) {
+        enable_gm_read_release = false;
+        continue;
+      }
       if (!operand_pools.empty()) {
         operand_pools.clear();
         continue;
@@ -4717,6 +4908,10 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
         cross_core_flag_reservation, domains);
     if (owner_events.has_value())
       break;
+    if (analyzer->HasGmReadReleases()) {
+      enable_gm_read_release = false;
+      continue;
+    }
     if (!owner_inputs.empty()) {
       owner_inputs.clear();
       continue;
@@ -4756,7 +4951,8 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
   SyncMaterializer(analyzer->SiteRegistry(), analyzer->SyncPoints(),
                    flag_allocator->Allocations(), target_info.architecture,
                    cross_core_contract, lane_variables, owner_events.value(),
-                   operand_pools, flag_allocator->OperandPoolBases())
+                   operand_pools, flag_allocator->OperandPoolBases(),
+                   analyzer->GmReadReleases())
       .Run(root);
   FlagInfoList flag_infos = flag_allocator->TakeFlagInfos();
 

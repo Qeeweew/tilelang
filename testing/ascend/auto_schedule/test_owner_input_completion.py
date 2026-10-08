@@ -231,16 +231,33 @@ def _completion_graph(mod):
     # Local binary flags and every active owner/slot counter need independent
     # consume-before-reuse. The ordinary paired release can additionally
     # publish a final counting notification in an inactive iteration, then
-    # drain it at the root. That is a narrowly bounded mode2 counter tail,
-    # rather than a binary reset or another data generation.
+    # drain it at the root. One initial empty epoch can likewise publish an
+    # ordinary release before the first seed has been consumed. These are
+    # narrowly bounded mode2 padding counts, not another data generation.
     owner_flags = _input_flags(mod)
+    first_epoch = min(node.epoch for node in trace if node.epoch is not None)
     last_epoch = max(node.epoch for node in trace if node.epoch is not None)
     memory_epochs = {node.epoch for node in trace if node.kind in ("copy", "read", "write")}
-    terminal_counters = set()
+    bounded_counters = set()
     for consumed, reset in reuse:
         if precedes(consumed, reset):
             continue
         old, new = trace[consumed], trace[reset]
+        if (old.kind == "cross-wait" and old.core == 1 and
+                new.kind == "cross-set" and new.core == 2 and
+                old.pipe == "MTE3" and new.pipe == "MTE2" and
+                old.flag == new.flag and new.flag[0] not in owner_flags and
+                old.epoch == new.epoch == first_epoch and
+                first_epoch not in memory_epochs and memory_epochs and
+                min(memory_epochs) == first_epoch + 1):
+            notifications, acquisitions = broadcasts[new.flag[0], old.lane]
+            assert reset == notifications[1] and consumed == acquisitions[0]
+            assert trace[notifications[0]].epoch is None, "Prefix must follow a root seed"
+            assert trace[acquisitions[-1]].epoch is None, "Prefix count must reach the root drain"
+            assert not any(node.kind == "cross-set" and node.flag[0] in owner_flags
+                           and node.epoch == first_epoch for node in trace)
+            bounded_counters.add((new.flag[0], old.lane))
+            continue
         assert (old.kind == "cross-wait" and old.core == 1 and
                 new.kind == "cross-set" and new.core == 2 and
                 old.flag == new.flag and new.flag[0] not in owner_flags and
@@ -252,7 +269,7 @@ def _completion_graph(mod):
         assert trace[acquisitions[-1]].epoch is None and precedes(reset, acquisitions[-1])
         assert not any(node.kind == "cross-set" and node.flag[0] in owner_flags
                        and node.epoch == last_epoch for node in trace)
-        terminal_counters.add((new.flag[0], old.lane))
+        bounded_counters.add((new.flag[0], old.lane))
     for counter, (notifications, acquisitions) in broadcasts.items():
         # All notifications of this fixture's recipient counter use one DMA
         # pipe. At its jth completion, at least every predecessor wait has
@@ -261,7 +278,7 @@ def _completion_graph(mod):
         assert len({trace[index].pipe for index in notifications}) == 1
         bound = max(ordinal + 1 - sum(precedes(acquire, notify) for acquire in acquisitions)
                     for ordinal, notify in enumerate(notifications))
-        assert bound <= (2 if counter in terminal_counters else 1), \
+        assert bound <= (2 if counter in bounded_counters else 1), \
             f"Unbounded ordinary counter accumulation: {counter}, outstanding={bound}"
         assert len(notifications) == len(acquisitions)
         assert all(precedes(notify, acquisitions[-1]) for notify in notifications)
