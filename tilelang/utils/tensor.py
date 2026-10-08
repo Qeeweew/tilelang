@@ -39,14 +39,15 @@ class TensorSupplyType(Enum):
     Auto = 7
 
 
-def get_tensor_supply(supply_type: TensorSupplyType = TensorSupplyType.Integer):
+def get_tensor_supply(supply_type: TensorSupplyType = TensorSupplyType.Integer, *, device=None):
+    """Create a supplier on an explicit device, or preserve the backend default."""
     from tilelang.engine.param import KernelParam
     from .device import get_current_device
 
     def get_tensor(param: KernelParam) -> torch.Tensor:
         # Convert tvm.DataType to torch.dtype for tensor creation
         dtype: torch.dtype = param.torch_dtype()
-        device = get_current_device()
+        tensor_device = get_current_device() if device is None else device
 
         if hasattr(param, "shape") and not param.shape:
             raise ValueError(
@@ -69,23 +70,23 @@ def get_tensor_supply(supply_type: TensorSupplyType = TensorSupplyType.Integer):
             is_float4 = param.is_float4()
             is_boolean = param.is_boolean()
             if is_unsigned:
-                return torch.randint(low=0, high=3, size=shape, device=device, dtype=dtype)
+                return torch.randint(low=0, high=3, size=shape, device=tensor_device, dtype=dtype)
             elif is_float8:
-                return torch.randint(low=-128, high=128, size=shape, device=device, dtype=torch.int8).to(dtype)
+                return torch.randint(low=-128, high=128, size=shape, device=tensor_device, dtype=torch.int8).to(dtype)
             elif is_float4:
-                return torch.randint(low=0, high=16, size=shape, device=device, dtype=dtype)
+                return torch.randint(low=0, high=16, size=shape, device=tensor_device, dtype=dtype)
             elif is_boolean:
-                return torch.randint(low=0, high=2, size=shape, device=device, dtype=dtype)
+                return torch.randint(low=0, high=2, size=shape, device=tensor_device, dtype=dtype)
             elif dtype in {torch.float16, torch.float32, torch.bfloat16}:
-                return torch.empty(*shape, device=device, dtype=dtype).uniform_(-1.0, 1.0)
+                return torch.empty(*shape, device=tensor_device, dtype=dtype).uniform_(-1.0, 1.0)
             else:
-                return torch.randint(low=-2, high=3, size=shape, device=device, dtype=dtype)
+                return torch.randint(low=-2, high=3, size=shape, device=tensor_device, dtype=dtype)
 
         if dtype == torch.int8 and supply_type in [
             TensorSupplyType.Uniform,
             TensorSupplyType.Normal,
         ]:
-            return torch.ones(*shape, device=device, dtype=dtype)
+            return torch.ones(*shape, device=tensor_device, dtype=dtype)
 
         if supply_type == TensorSupplyType.Integer:
             is_unsigned = param.is_unsigned()
@@ -93,25 +94,25 @@ def get_tensor_supply(supply_type: TensorSupplyType = TensorSupplyType.Integer):
             is_float4 = param.is_float4()
             is_boolean = param.is_boolean()
             if is_unsigned:
-                return torch.randint(low=0, high=3, size=shape, device=device, dtype=dtype)
+                return torch.randint(low=0, high=3, size=shape, device=tensor_device, dtype=dtype)
             elif is_float8:
-                return torch.randint(low=-128, high=128, size=shape, device=device, dtype=torch.int8).to(dtype)
+                return torch.randint(low=-128, high=128, size=shape, device=tensor_device, dtype=torch.int8).to(dtype)
             elif is_float4:
-                return torch.randint(low=0, high=16, size=shape, device=device, dtype=dtype)
+                return torch.randint(low=0, high=16, size=shape, device=tensor_device, dtype=dtype)
             elif is_boolean:
-                return torch.randint(low=0, high=2, size=shape, device=device, dtype=dtype)
+                return torch.randint(low=0, high=2, size=shape, device=tensor_device, dtype=dtype)
             else:
-                return torch.randint(low=-2, high=3, size=shape, device=device, dtype=dtype)
+                return torch.randint(low=-2, high=3, size=shape, device=tensor_device, dtype=dtype)
         elif supply_type == TensorSupplyType.Uniform:
-            return torch.empty(*shape, device=device, dtype=torch.float32).uniform_(-1.0, 1.0).to(dtype)
+            return torch.empty(*shape, device=tensor_device, dtype=torch.float32).uniform_(-1.0, 1.0).to(dtype)
         elif supply_type == TensorSupplyType.Normal:
-            return torch.empty(*shape, device=device, dtype=torch.float32).normal_(-1.0, 1.0).to(dtype)
+            return torch.empty(*shape, device=tensor_device, dtype=torch.float32).normal_(-1.0, 1.0).to(dtype)
         elif supply_type == TensorSupplyType.Randn:
-            return torch.randn(*shape, device=device).to(dtype)
+            return torch.randn(*shape, device=tensor_device).to(dtype)
         elif supply_type == TensorSupplyType.Zero:
-            return torch.zeros(*shape, device=device, dtype=dtype)
+            return torch.zeros(*shape, device=tensor_device, dtype=dtype)
         elif supply_type == TensorSupplyType.One:
-            return torch.ones(*shape, device=device, dtype=dtype)
+            return torch.ones(*shape, device=tensor_device, dtype=dtype)
         else:
             raise NotImplementedError(supply_type)
 

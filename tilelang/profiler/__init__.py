@@ -16,6 +16,17 @@ from tilelang.engine.param import KernelParam
 from tilelang.jit.adapter import BaseKernelAdapter
 from tilelang.profiler.bench import do_bench
 from tvm import tirx
+from tilelang.utils.device import device_synchronize
+
+
+def _synchronize_inputs(inputs, device=None):
+    """Wait for the devices actually used by a correctness comparison."""
+    if isinstance(device, int):
+        device = torch.device("cuda", device)
+    devices = {tensor.device for tensor in inputs if isinstance(tensor, torch.Tensor)} if device is None else {torch.device(device)}
+    for tensor_device in devices:
+        if tensor_device.type in ("cuda", "npu", "mps"):
+            device_synchronize(tensor_device)
 
 
 @dataclass
@@ -59,14 +70,15 @@ class Profiler:
         self.adapter = adapter
         return self
 
-    def _get_inputs(self, with_output=False, dynamic_symbolic_constraints: dict[str, int] | None = None):
+    def _get_inputs(self, with_output=False, dynamic_symbolic_constraints: dict[str, int] | None = None, *, device=None):
         ins = []
+        supply = self.supply if device is None else get_tensor_supply(self.supply_type, device=device)
         for i in range(len(self.params)):
             if with_output or i not in self.result_idx:
                 param = self.params[i]
                 if dynamic_symbolic_constraints:
                     param = self._substitute_dynamic_symbols(param, dynamic_symbolic_constraints)
-                ins.append(self.supply(param))
+                ins.append(supply(param))
         return ins
 
     def _substitute_dynamic_symbols(self, param: KernelParam, constraints: dict[str, int]) -> KernelParam:
@@ -108,6 +120,7 @@ class Profiler:
         atol: float = 1e-2,
         rtol: float = 1e-2,
         max_mismatched_ratio=0.01,
+        device: torch.device | None = None,
     ):
         """Validates kernel output against a reference implementation.
 
@@ -120,9 +133,9 @@ class Profiler:
         """
         ins = self._get_inputs() if input_tensors is None else input_tensors
         ref_outs = reference_program(*ins)
-        torch.cuda.synchronize()
+        _synchronize_inputs(ins, device)
         lib_outs = self.func(*ins)
-        torch.cuda.synchronize()
+        _synchronize_inputs(ins, device)
 
         if isinstance(lib_outs, torch.Tensor):
             lib_outs = [lib_outs]
@@ -166,6 +179,7 @@ class Profiler:
         reference_program: Callable,
         input_tensors: list[torch.Tensor] | None = None,
         manual_check_prog: Callable = None,
+        device: torch.device | None = None,
     ):
         """Validates kernel output against a reference implementation.
 
@@ -178,9 +192,9 @@ class Profiler:
         """
         ins = self._get_inputs() if input_tensors is None else input_tensors
         ref_outs = reference_program(*ins)
-        torch.cuda.synchronize()
+        _synchronize_inputs(ins, device)
         lib_outs = self.func(*ins)
-        torch.cuda.synchronize()
+        _synchronize_inputs(ins, device)
 
         if isinstance(lib_outs, torch.Tensor):
             lib_outs = [lib_outs]

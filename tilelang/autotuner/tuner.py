@@ -6,6 +6,7 @@ and performance optimization through configuration search.
 
 from __future__ import annotations
 from dataclasses import dataclass
+from contextlib import nullcontext
 
 import tilelang
 from tilelang import tvm as tvm
@@ -130,6 +131,32 @@ class AutoTuner:
         self.jit_compile = None
         self.jit_elaborate = None
 
+    def _target_kind(self) -> str:
+        target = self.compile_args.target
+        if isinstance(target, Target):
+            return target.kind.name
+        if isinstance(target, dict):
+            kind = target.get("kind")
+            if not isinstance(kind, str):
+                raise ValueError("Auto-tuning target configuration requires a string kind")
+            return kind
+        # Target strings may include options, e.g. "ascend -arch=dav-2201".
+        # Extract the declared kind without auto-detecting another backend.
+        fields = str(target).split(maxsplit=1)
+        if not fields:
+            raise ValueError("Auto-tuning target must not be empty")
+        return "ascend" if fields[0] in ("asc", "pto") else fields[0]
+
+    def _current_benchmark_device(self) -> torch.device:
+        """Use the target backend's current logical device, including in workers."""
+        if self._target_kind() == "ascend":
+            if not hasattr(torch, "npu") or not torch.npu.is_available():
+                raise RuntimeError("Ascend auto-tuning requires an available Torch NPU device")
+            return torch.device("npu", torch.npu.current_device())
+        if torch.cuda.is_available() and self._target_kind() == "cuda":
+            return torch.device("cuda", torch.cuda.current_device())
+        return torch.device("cpu")
+
     @classmethod
     def _get_cache_dir(cls) -> Path:
         from tilelang.cache.kernel_cache import KernelCache
@@ -222,7 +249,7 @@ class AutoTuner:
         skip_check: bool = False,
         manual_check_prog: Callable = None,
         cache_input_tensors: bool = False,
-        backend: Literal["event", "cupti", "cudagraph"] = "event",
+        backend: Literal["event", "cupti", "cudagraph", "wall"] = "event",
     ):
         """Set profiling arguments for the auto-tuner.
 
@@ -239,7 +266,8 @@ class AutoTuner:
             warmup: Number of warmup iterations.
             rep: Number of repetitions for timing.
             timeout: Maximum time per configuration.
-            backend: Profiler backend - "event", "cupti", or "cudagraph".
+            backend: Profiler backend - "event", "cupti", "cudagraph", or "wall".
+                Ascend supports "event" and "wall".
         Returns:
             AutoTuner: Self for method chaining.
         """
@@ -253,20 +281,13 @@ class AutoTuner:
             frozen_inputs = list(captured_inputs)
             cached_tensors_by_device = {}
 
-            def supply_prog(device, _frozen_inputs=frozen_inputs, _cached_tensors_by_device=cached_tensors_by_device):
-                if not isinstance(device, (int, str, torch.device)):
-                    device = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
-                if device not in _cached_tensors_by_device:
-                    if isinstance(device, torch.device):
-                        target_device = device
-                    elif isinstance(device, str):
-                        target_device = torch.device(device)
-                    else:
-                        target_device = torch.device(f"cuda:{device}") if torch.cuda.is_available() else torch.device("cpu")
-                    _cached_tensors_by_device[device] = [
+            def supply_prog(_params, _frozen_inputs=frozen_inputs, _cached_tensors_by_device=cached_tensors_by_device):
+                target_device = self._current_benchmark_device()
+                if target_device not in _cached_tensors_by_device:
+                    _cached_tensors_by_device[target_device] = [
                         tensor.to(device=target_device).clone() if isinstance(tensor, torch.Tensor) else tensor for tensor in _frozen_inputs
                     ]
-                return _cached_tensors_by_device[device]
+                return _cached_tensors_by_device[target_device]
 
         self.profile_args = ProfileArgs(
             supply_type=supply_type,
@@ -412,7 +433,7 @@ class AutoTuner:
         enable_grouped_compile: bool,
         group_compile_size: int,
     ) -> tuple[str, str, bool, str]:
-        target_kind = self.compile_args.target.kind.name if isinstance(self.compile_args.target, Target) else str(self.compile_args.target)
+        target_kind = self._target_kind()
         execution_backend = str(self.compile_args.execution_backend)
         grouped_compile_requested = enable_grouped_compile and group_compile_size > 1
         grouped_compile_active = grouped_compile_requested and target_kind == "cuda" and execution_backend == "tvm_ffi"
@@ -464,26 +485,23 @@ class AutoTuner:
         futures: list[concurrent.futures.Future] = []
         future_to_unit: dict[concurrent.futures.Future, list[UnitItem]] = {}
 
-        def cuda_device_wrapper(func: Callable[..., Any], device: int):
+        compile_device = self._current_benchmark_device()
+
+        def device_wrapper(func: Callable[..., Any]):
             def inner(**config_arg):
-                torch.cuda.set_device(device)
+                if compile_device.type == "cuda":
+                    torch.cuda.set_device(compile_device)
+                elif compile_device.type == "npu":
+                    torch.npu.set_device(compile_device)
                 return func(**config_arg)
 
             return inner
 
         def get_compile_func():
-            compile_impl = compile_func
-            if torch.cuda.is_available():
-                device = torch.cuda.current_device()
-                compile_impl = cuda_device_wrapper(compile_func, device)
-            return compile_impl
+            return device_wrapper(compile_func)
 
         def get_elaborate_func():
-            elaborate_impl = elaborate_func
-            if torch.cuda.is_available():
-                device = torch.cuda.current_device()
-                elaborate_impl = cuda_device_wrapper(elaborate_func, device)
-            return elaborate_impl
+            return device_wrapper(elaborate_func)
 
         def compile_unit(unit_items: list[UnitItem], per_config_pass_configs=None):
             if grouped_compile_active:
@@ -540,6 +558,7 @@ class AutoTuner:
         benchmark_target: Callable[..., tuple[float, float | None]],
         timeout: int,
         worker_state: _BenchmarkWorkerState,
+        stop_event: threading.Event | None = None,
     ) -> None:
         if target_kind == "cuda":
             try:
@@ -548,7 +567,17 @@ class AutoTuner:
                 logger.warning("Failed to bind benchmark worker to cuda:%s", worker_device)
                 logger.debug("Error: %s", traceback.format_exc())
 
-        benchmark_device = worker_device if torch.cuda.is_available() and target_kind == "cuda" else None
+        if target_kind == "ascend":
+            benchmark_device = torch.device("npu", worker_device)
+        elif target_kind == "cuda":
+            benchmark_device = torch.device("cuda", worker_device)
+        else:
+            benchmark_device = None
+
+        def report_failure(idx, config, jit_kernel, status, error_text):
+            if target_kind == "ascend" and stop_event is not None:
+                stop_event.set()
+            result_queue.put((idx, config, jit_kernel, None, None, status, error_text))
 
         def _call_benchmark_target(
             jit_kernel: tilelang.JITKernel,
@@ -563,14 +592,19 @@ class AutoTuner:
                     benchmark_device=benchmark_device,
                 )
 
-            if benchmark_device is None:
-                return invoke()
-            with torch.cuda.device(benchmark_device):
+            context = nullcontext()
+            if target_kind == "ascend":
+                context = torch.npu.device(benchmark_device)
+            elif target_kind == "cuda":
+                context = torch.cuda.device(benchmark_device)
+            with context:
                 return invoke()
 
         start_event.wait()
         queue_poll_timeout_s = 0.1
         while True:
+            if stop_event is not None and stop_event.is_set():
+                break
             try:
                 item = worker_queue.get(timeout=queue_poll_timeout_s)
             except queue.Empty:
@@ -603,23 +637,17 @@ class AutoTuner:
                     benchmark_call_thread.start()
                     benchmark_call_thread.join(timeout=timeout)
                     if benchmark_call_thread.is_alive():
-                        result_queue.put((idx, config, jit_kernel, None, None, "timeout", ""))
+                        report_failure(idx, config, jit_kernel, "timeout", "")
+                        if target_kind == "ascend":
+                            break
                         continue
 
                     try:
                         status, latency, worker_ref_latency, error_text = call_result_queue.get_nowait()
                     except queue.Empty:
-                        result_queue.put(
-                            (
-                                idx,
-                                config,
-                                jit_kernel,
-                                None,
-                                None,
-                                "error",
-                                "Benchmark call thread exited without returning a result.",
-                            )
-                        )
+                        report_failure(idx, config, jit_kernel, "error", "Benchmark call thread exited without returning a result.")
+                        if target_kind == "ascend":
+                            break
                         continue
 
                     if status == "ok":
@@ -628,14 +656,18 @@ class AutoTuner:
                         worker_state.ref_latency_cache = call_state.ref_latency_cache
                         result_queue.put((idx, config, jit_kernel, latency, worker_ref_latency, None, ""))
                     elif status == "timeout":
-                        result_queue.put((idx, config, jit_kernel, None, None, "timeout", ""))
+                        report_failure(idx, config, jit_kernel, "timeout", "")
                     else:
-                        result_queue.put((idx, config, jit_kernel, None, None, "error", error_text))
+                        report_failure(idx, config, jit_kernel, "error", error_text)
+                    if target_kind == "ascend" and status != "ok":
+                        break
                 else:
                     latency, worker_ref_latency = _call_benchmark_target(jit_kernel, worker_state)
                     result_queue.put((idx, config, jit_kernel, latency, worker_ref_latency, None, ""))
             except Exception:
-                result_queue.put((idx, config, jit_kernel, None, None, "error", traceback.format_exc()))
+                report_failure(idx, config, jit_kernel, "error", traceback.format_exc())
+                if target_kind == "ascend":
+                    break
 
     def _benchmark_target(
         self,
@@ -665,7 +697,7 @@ class AutoTuner:
                 if supply_prog is not None:
                     return supply_prog(profiler._get_params(with_output=with_output))
                 else:
-                    return profiler._get_inputs(with_output=with_output)
+                    return profiler._get_inputs(with_output=with_output, device=benchmark_device)
 
             return func
 
@@ -709,16 +741,20 @@ class AutoTuner:
 
         if (not skip_check) and (ref_prog is not None):
             if manual_check_prog is not None:
-                profiler.manual_assert_close(ref_prog, input_tensors=jit_input_tensors_cache, manual_check_prog=manual_check_prog)
+                profiler.manual_assert_close(
+                    ref_prog, input_tensors=jit_input_tensors_cache, manual_check_prog=manual_check_prog, device=benchmark_device
+                )
             else:
                 profiler.assert_allclose(
-                    ref_prog, input_tensors=jit_input_tensors_cache, rtol=rtol, atol=atol, max_mismatched_ratio=max_mismatched_ratio
+                    ref_prog, input_tensors=jit_input_tensors_cache, rtol=rtol, atol=atol,
+                    max_mismatched_ratio=max_mismatched_ratio, device=benchmark_device
                 )
         latency = profiler.do_bench(
             n_warmup=warmup,
             n_repeat=rep,
             input_tensors=jit_input_tensors_cache,
             backend=backend,
+            device=benchmark_device,
             early_stop_baseline=(
                 benchmark_state.shared_best_latency[0] * early_stop_factor if benchmark_state.shared_best_latency is not None else None
             ),
@@ -747,6 +783,18 @@ class AutoTuner:
         benchmark_devices: list[int] | None,
         target_kind: str,
     ) -> tuple[bool, list[int]]:
+        if target_kind == "ascend":
+            current_device = self._current_benchmark_device().index
+            requested_devices = list(dict.fromkeys(benchmark_devices or [current_device]))
+            if len(requested_devices) != 1:
+                raise ValueError("Ascend auto-tuning supports one explicitly selected logical NPU device per run")
+            device = requested_devices[0]
+            if not isinstance(device, int) or not 0 <= device < torch.npu.device_count():
+                raise ValueError(f"Invalid logical NPU benchmark device: {device}")
+            if benchmark_multi_gpu:
+                logger.warning("Ascend auto-tuning benchmarks configurations serially on npu:%s.", device)
+            return False, [device]
+
         current_device = torch.cuda.current_device() if torch.cuda.is_available() else 0
         single_device = [current_device]
 
@@ -828,7 +876,8 @@ class AutoTuner:
             use_pipeline: Whether to pipeline benchmarking with compilation.
             enable_grouped_compile: Whether to enable grouped compilation.
             group_compile_size: Number of configurations in one compile unit.
-            benchmark_devices: CUDA device ordinals used for benchmark workers when benchmark_multi_gpu=True.
+            benchmark_devices: CUDA ordinals for multi-GPU workers, or one logical NPU
+                ordinal for an Ascend run. Ascend defaults to the caller's current NPU.
             benchmark_multi_gpu: Whether to benchmark configurations across multiple CUDA GPUs.
             early_stop: Whether to skip full benchmark when estimate exceeds best * early_stop_factor.
             early_stop_factor: Multiplier for best latency to compute early stop threshold.
@@ -921,6 +970,8 @@ class AutoTuner:
             enable_grouped_compile=enable_grouped_compile,
             group_compile_size=group_compile_size,
         )
+        if target_kind == "ascend" and self.profile_args.backend not in ("event", "wall"):
+            raise ValueError("Ascend auto-tuning supports the event and wall profiler backends")
 
         benchmark_multi_gpu_active, benchmark_device_list = self._resolve_benchmark_devices(
             benchmark_multi_gpu=benchmark_multi_gpu,
@@ -996,6 +1047,7 @@ class AutoTuner:
         benchmark_task_queues = [queue.Queue() for _ in benchmark_worker_devices]
         benchmark_result_queue: queue.Queue = queue.Queue()
         benchmark_start_event = threading.Event()
+        benchmark_stop_event = threading.Event()
         benchmark_threads: list[threading.Thread] = []
         benchmark_expected_results = 0
         benchmark_processed_results = 0
@@ -1026,6 +1078,12 @@ class AutoTuner:
             idx, config, jit_kernel, latency, worker_ref_latency, status, error_text = result_item
             benchmark_processed_results += 1
             progress_bar.update(1)
+
+            if target_kind == "ascend" and status in ("timeout", "error"):
+                raise RuntimeError(
+                    f"Ascend auto-tuning stopped after benchmark {status} for config {self.configs[idx]}. "
+                    "No further NPU candidates will be launched.\n" + error_text
+                )
 
             if status == "timeout":
                 logger.warning(f"A timeout occurred while testing config {self.configs[idx]}, checkout autotuner.log for more details")
@@ -1070,6 +1128,7 @@ class AutoTuner:
                     benchmark_target,
                     timeout,
                     worker_state,
+                    benchmark_stop_event,
                 ),
                 daemon=True,
             )
@@ -1119,6 +1178,7 @@ class AutoTuner:
             progress_bar.total = max(progress_bar.n, benchmark_processed_results)
             progress_bar.refresh()
         finally:
+            benchmark_stop_event.set()
             benchmark_start_event.set()
             for worker_queue in benchmark_task_queues:
                 worker_queue.put(None)
