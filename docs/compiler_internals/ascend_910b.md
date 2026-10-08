@@ -43,9 +43,22 @@ output traversal in Python. Its default launches one logical block per output
 tile. Optional `num_cores` bounds the logical launch and distributes output
 tiles round robin through an ordinary serial loop with a per-core finite
 extent; it does not select a physical NPU. Both paths use the same automatic
-`T.Pipelined` K loop. `cache_a` remains private to each output tile and reloads
-for the next output. The compiler retains operand-slot completion and
+`T.Pipelined` K loop. `cache_a` keeps that output tile's full K in L1;
+alternatively, `a_cache_k` chooses a bounded A cache width that is a positive
+multiple of `tile_k`. Ordinary nested pipelines load A once per cache block
+and stream B panels, skipping absent final panels. Both caches remain private
+to each output tile and reload for the next output. Buffer versions and stages
+are selected by the compiler; expressing nested pipeline intent alone does
+not guarantee that a parent prefetch overlaps its child loop.
+The compiler retains operand-slot completion and
 last-MAD-to-FIX/FIX-to-next-clear completion when physical storage is reused.
+
+Before scheduling, a serial unit-step loop with extent one can be replaced by
+its body. Ordinary automatic pipeline intent alone does not prevent this:
+the annotation set must be exactly `tl.ascend_auto_pipeline=True` and a positive
+integer `num_stages`. Its minimum retains evaluate-on-entry semantics. Manual
+annotations, explicit stages, loop-control targets and annotated descendants
+keep their control boundary; larger loops are not expanded.
 
 L1 GEMM is expanded before layout inference into explicit L0 allocations,
 L1-to-L0 copies and ordinary L0 GEMM tasks. A bounded sub-K loop keeps IR size
@@ -419,6 +432,18 @@ independently validated feasible model is accepted. Unknown or unsat retains
 the selected feasible incumbent. Start normalization and emitted counts are recomputed from
 the selected plan. These are structural preferences in the existing cost
 model, not measured load latency or proof of a performance improvement.
+
+A static, unguarded 2201 AIC automatic child can expose its first-to-last
+issue interval per core/pipe and HBM resource to its parent. Each interval
+reserves internal gaps; the parent still emits the complete child as one
+source block. Forward, wrap and self conflicts follow that physical order.
+Completion latency and data dependencies remain unchanged, and the child's
+selected buffer versions remain charged to the parent's storage capacity.
+Scalar/device effects, guarded or dynamic children, manual scheduling and
+3510 retain the conservative envelope. The emitted plan is checked against
+the original hard constraints; an unverified fallback is rejected. These
+issue summaries permit parent prefetch decisions but do not establish
+runtime overlap or predict elapsed kernel time.
 
 Before the solver-based prefetch refinement, one bounded scan can try moving
 each qualifying producer to the stage immediately before its consumer while
