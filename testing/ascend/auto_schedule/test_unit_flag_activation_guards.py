@@ -103,7 +103,7 @@ def _shifted_diagnostic(error):
     assert "dav-2201 local binary flag:" in message
     reasons = (
         "shifted carried events require an unconditional outermost lexical loop",
-        "shifted carried events require one exact contiguous active-epoch interval with static cut points",
+        "shifted carried events require one exact contiguous active-epoch interval with loop-invariant cut points",
     )
     matched = [reason for reason in reasons if reason in message]
     assert len(matched) == 1, "Expected the existing ordinary shifted-clock diagnostic"

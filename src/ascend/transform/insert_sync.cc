@@ -1552,15 +1552,88 @@ private:
   LocalBinaryActiveSpan(const SyncPoint &sync_point, ControlNode *loop,
                         const PrimExpr &trip_count,
                         const PrimExpr &step) const {
+    const SyncInsertionSite &src = site_registry_.Src(sync_point);
+    const SyncInsertionSite &dst = site_registry_.Dst(sync_point);
+    // Expand only existing pure Bind definitions, never the endpoint's own
+    // assumed guard. In particular, a captured mutable read must not become
+    // a fresh, apparently immutable cut variable through Analyzer::Bind.
+    auto expand = [&](const SyncInsertionSite &site) {
+      const TaskNode *endpoint =
+          site.path_end->IsTask()
+              ? static_cast<const TaskNode *>(site.path_end)
+              : static_cast<const ControlNode *>(site.path_end)->task.get();
+      return owner_result_detail::Expand(
+          site_registry_.Domain(site).active_guard,
+          owner_result_detail::TaskBindings(endpoint));
+    };
+    PrimExpr source_guard = expand(src);
+    PrimExpr destination_guard = expand(dst);
+    if (!StableLocalBinaryBoundary(source_guard, loop, true) ||
+        !StableLocalBinaryBoundary(destination_guard, loop, true))
+      return std::nullopt;
     arith::Analyzer guard_analyzer;
     loop->GetLoopBodyContext().Populate(guard_analyzer);
-    PrimExpr source_guard = guard_analyzer.Simplify(
-        site_registry_.Domain(site_registry_.Src(sync_point)).active_guard);
-    PrimExpr destination_guard = guard_analyzer.Simplify(
-        site_registry_.Domain(site_registry_.Dst(sync_point)).active_guard);
+    source_guard = guard_analyzer.Simplify(source_guard);
+    destination_guard = guard_analyzer.Simplify(destination_guard);
     if (!guard_analyzer.CanProve(source_guard == destination_guard))
       return std::nullopt;
     return ContiguousLocalBinarySpan(source_guard, loop, trip_count, step);
+  }
+
+  bool StableLocalBinaryBoundary(const PrimExpr &expression,
+                                 const ControlNode *loop,
+                                 bool allow_epoch = false) const {
+    // Root fill/drain may use parameters and enclosing thread coordinates,
+    // but not values defined or changed inside the active loop. Follow outer
+    // Bind definitions only to validate their purity; this is not a second
+    // binding/rewriting mechanism.
+    std::unordered_set<const VarNode *> changing;
+    for (const Var &var : loop->GetWriteVars())
+      changing.insert(var.get());
+    std::function<void(const ControlNode *)> collect_loops =
+        [&](const ControlNode *control) {
+          changing.insert(control->control->loop_var.get());
+          for (const auto &child : control->children)
+            if (child->IsControl())
+              collect_loops(static_cast<const ControlNode *>(child.get()));
+        };
+    collect_loops(loop);
+    std::unordered_set<const VarNode *> checked, resolving;
+    std::function<bool(const PrimExpr &)> stable;
+    stable = [&](const PrimExpr &value) {
+      bool valid = true;
+      PostOrderVisit(value, [&](const ObjectRef &node) {
+        if (node.as<BufferLoadNode>() || node.as<ProducerLoadNode>() ||
+            node.as<CallNode>() || node.as<ReduceNode>())
+          valid = false;
+        const auto *var = node.as<VarNode>();
+        if (!var || !valid)
+          return;
+        if (allow_epoch && var == loop->control->loop_var.get())
+          return;
+        if (changing.count(var) || !var->dtype.is_scalar() ||
+            (!var->dtype.is_int() && !var->dtype.is_uint() &&
+             !var->dtype.is_bool())) {
+          valid = false;
+          return;
+        }
+        if (checked.count(var))
+          return;
+        if (!resolving.insert(var).second) {
+          valid = false;
+          return;
+        }
+        for (const Constr &constraint : loop->task->outer_ctx.constrs_)
+          if (constraint.kind == Constr::kBindValue &&
+              constraint.var.get() == var)
+            valid &= stable(constraint.value);
+        resolving.erase(var);
+        if (valid)
+          checked.insert(var);
+      });
+      return valid;
+    };
+    return stable(expression);
   }
 
   std::optional<LocalBinaryEpochSpan>
@@ -1574,34 +1647,124 @@ private:
       return LocalBinaryEpochSpan{zero, zero};
 
     // Accept one interval in the lexical coordinate, never a gapped active
-    // sequence. Static cut points keep root seed/drain expressions independent
-    // of condition snapshots or other values defined inside this loop.
+    // sequence. Stable outer cut points keep root seed/drain expressions
+    // independent of condition snapshots or values defined inside this loop.
     const ForNode *for_node = loop->control.get();
     Array<PrimExpr> bounds =
         arith::DetectClipBound(source_guard, {for_node->loop_var});
     if (bounds.size() != 2)
       return std::nullopt;
     for (const PrimExpr &bound : bounds) {
-      if (bound.defined() && !bound.as<IntImmNode>())
+      if (bound.defined() &&
+          (!bound.dtype().is_scalar() ||
+           (!bound.dtype().is_int() && !bound.dtype().is_uint()) ||
+           !StableLocalBinaryBoundary(bound, loop)))
         return std::nullopt;
     }
-    PrimExpr first = zero;
-    PrimExpr last = trip_count;
+    // Clip detection can introduce cut-1, and subtracting the loop origin
+    // before clamping can overflow a perfectly valid Int32 cut. Widen this
+    // generated arithmetic before evaluation, preserving explicit casts in
+    // the original expression. Do not reinterpret an already overflowing
+    // user expression as mathematical integer arithmetic.
+    arith::Analyzer boundary_analyzer;
+    loop->task->outer_ctx.Populate(boundary_analyzer);
+    arith::Analyzer input_analyzer;
+    loop->task->outer_ctx.Populate(input_analyzer);
+    input_analyzer.Bind(for_node->loop_var,
+                        Range::FromMinExtent(for_node->min, for_node->extent));
+    auto arithmetic = [](const ObjectRef &node) {
+      return node.as<AddNode>() || node.as<SubNode>() || node.as<MulNode>() ||
+             node.as<DivNode>() || node.as<FloorDivNode>() ||
+             node.as<ModNode>() || node.as<FloorModNode>();
+    };
+    bool representable = true;
+    PostOrderVisit(source_guard, [&](const ObjectRef &node) {
+      const auto *expr = node.as<PrimExprNode>();
+      if (!expr || !arithmetic(node) || !expr->dtype.is_scalar() ||
+          (!expr->dtype.is_int() && !expr->dtype.is_uint()))
+        return;
+      const int bits = expr->dtype.bits();
+      if (bits > 64 || (expr->dtype.is_uint() && bits == 64)) {
+        representable = false;
+        return;
+      }
+      auto bound = input_analyzer.const_int_bound(GetRef<PrimExpr>(expr));
+      const int64_t maximum = expr->dtype.is_int()
+                                  ? static_cast<int64_t>((uint64_t(1) <<
+                                                          (bits - 1)) - 1)
+                                  : static_cast<int64_t>((uint64_t(1) << bits) - 1);
+      const int64_t minimum = expr->dtype.is_int() ? -maximum - 1 : 0;
+      representable &= bound->min_value != arith::ConstIntBound::kNegInf &&
+                       bound->max_value != arith::ConstIntBound::kPosInf &&
+                       bound->min_value >= minimum &&
+                       bound->max_value <= maximum;
+    });
+    if (!representable)
+      return std::nullopt;
+    class WidenCutArithmetic : public ExprMutator {
+      PrimExpr VisitExpr_(const VarNode *op) final {
+        return Widen(GetRef<PrimExpr>(op));
+      }
+      PrimExpr VisitExpr_(const IntImmNode *op) final {
+        return Widen(GetRef<PrimExpr>(op));
+      }
+      PrimExpr VisitExpr_(const CastNode *op) final {
+        // A user's explicit narrowing cast still happens at its original
+        // width; only the surrounding generated boundary math is widened.
+        return Widen(GetRef<PrimExpr>(op));
+      }
+      static PrimExpr Widen(const PrimExpr &value) {
+        return value.dtype().is_bool() ? value : cast(DataType::Int(64), value);
+      }
+    } widen;
+    auto safe_wide = [&](const PrimExpr &expression) {
+      bool safe = true;
+      PostOrderVisit(expression, [&](const ObjectRef &node) {
+        if (!arithmetic(node))
+          return;
+        auto bound = boundary_analyzer.const_int_bound(Downcast<PrimExpr>(node));
+        safe &= bound->min_value != arith::ConstIntBound::kNegInf &&
+                bound->max_value != arith::ConstIntBound::kPosInf;
+      });
+      auto bound = boundary_analyzer.const_int_bound(expression);
+      return safe && bound->min_value != arith::ConstIntBound::kNegInf &&
+             bound->max_value != arith::ConstIntBound::kPosInf;
+    };
+    PrimExpr wide_zero = make_zero(DataType::Int(64));
+    PrimExpr wide_trip_count = cast(DataType::Int(64), trip_count);
+    PrimExpr wide_min = cast(DataType::Int(64), for_node->min);
+    PrimExpr wide_step = cast(DataType::Int(64), step);
+    PrimExpr first = wide_zero;
+    PrimExpr last = wide_trip_count;
     if (bounds[0].defined()) {
-      first =
-          max(zero, min(trip_count, ceildiv(bounds[0] - for_node->min, step)));
+      PrimExpr delta = boundary_analyzer.Simplify(widen(bounds[0]) - wide_min);
+      if (!safe_wide(delta))
+        return std::nullopt;
+      delta = max(wide_zero, delta);
+      // ceildiv uses a+b-1. Quotient plus remainder does not add the step
+      // to a possibly extreme cut-origin difference.
+      PrimExpr ordinal = boundary_analyzer.Simplify(
+          indexdiv(delta, wide_step) +
+          cast(DataType::Int(64), floormod(delta, wide_step) != wide_zero));
+      if (!safe_wide(ordinal))
+        return std::nullopt;
+      first = min(wide_trip_count, ordinal);
     }
     if (bounds[1].defined()) {
-      last = max(
-          zero, min(trip_count, indexdiv(bounds[1] - for_node->min, step) + 1));
+      PrimExpr delta = boundary_analyzer.Simplify(widen(bounds[1]) - wide_min);
+      if (!safe_wide(delta))
+        return std::nullopt;
+      PrimExpr ordinal = boundary_analyzer.Simplify(
+          indexdiv(delta, wide_step) + make_const(DataType::Int(64), 1));
+      if (!safe_wide(ordinal))
+        return std::nullopt;
+      last = max(wide_zero, min(wide_trip_count, ordinal));
     }
     // The span also controls kernel-root drain operations, including when
     // this loop never enters. Its expressions may use only outer facts;
     // the body's extent > 0 premise must not remove empty-span protection.
-    arith::Analyzer boundary_analyzer;
-    loop->task->outer_ctx.Populate(boundary_analyzer);
-    first = boundary_analyzer.Simplify(first);
-    last = boundary_analyzer.Simplify(last);
+    first = boundary_analyzer.Simplify(cast(trip_count.dtype(), first));
+    last = boundary_analyzer.Simplify(cast(trip_count.dtype(), last));
 
     // Check exact equivalence on actual loop iterations, including a nonzero
     // origin or positive step. Inferring a bound from a guard is not enough:
@@ -3239,8 +3402,8 @@ private:
           return;
         ICHECK(active_span.has_value())
             << "dav-2201 local binary flag: shifted carried events require "
-               "one exact contiguous active-epoch interval with static cut "
-               "points"
+               "one exact contiguous active-epoch interval with "
+               "loop-invariant cut points"
             << binary_context();
         sync_point.flag_iteration = lexical_ordinal - active_span->first;
         trip_count = active_span->trip_count;
@@ -3899,10 +4062,11 @@ public:
       LOG(WARNING) << "Ascend auto-schedule reached an intra-core flag-id "
                       "high-water mark of "
                    << total << " for " << domain << " after safe reuse, "
-                   << "exceeding the dav-3510 limit of " << kIntraCoreFlagLimit
-                   << "; the later RewriteFlagToBuf pass will compact sparse "
-                      "out-of-range ids or spill excess flag blocks to "
-                      "get_buf/rls_buf when capacity is exceeded.";
+                   << "exceeding the per-hard-event capacity of "
+                   << kIntraCoreFlagLimit
+                   << "; RewriteFlagToBuf will compact sparse IDs and check "
+                      "target-specific overflow support. This allocated "
+                      "high-water mark is not a minimum slot requirement.";
     }
 
     for (const FlagAllocation &allocation : allocations_) {

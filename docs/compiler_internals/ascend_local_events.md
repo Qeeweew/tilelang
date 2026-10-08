@@ -31,12 +31,22 @@ Cross-core counters have a different contract. Their collective participants,
 ID allocation and finite completion protocol are handled separately. This
 local event rule does not change dav-3510 synchronization.
 
-Each local hard-event namespace has eight IDs. The late flag normalization
+Each local hard-event namespace has eight IDs, independently for each physical
+core: for example, `V_S` and `S_V` each have eight, and the two AIVs execute
+their local event IDs in private banks. This is not a shared eight-ID budget
+for all pipe directions or both AIVs. The late flag normalization
 pass can compact sparse numbering into that namespace. CANN 9.1 exposes
 `asc_lock`/`asc_unlock` only for dav-3510; dav-2201 cannot spill excess local
 flags into that mutex pool. A 2201 layout requiring more than eight actual
 slots is diagnosed with its hard event and ID ranges before native code is
 emitted. Changing stage or buffer counts does not change this hardware limit.
+The diagnostic describes the current allocation, not a proven minimum.
+Compaction removes sparse numbering; sharing IDs between distinct channels
+requires a completion/lifetime proof in `InsertSync`, including seed and drain
+tokens. Summing separately allocated rings cannot prove they all overlap.
+For directions usable by both AIC and AIV, the current allocator conservatively
+reserves their whole-function union; it does not yet exploit the independent
+physical banks to reduce that reservation.
 
 ## A carried edge
 
@@ -75,7 +85,13 @@ Shifted carried local events use an unconditional outermost lexical loop with
 immutable bounds, a positive step, signed iteration/trip-count types, and no
 break. Their flag clock must equal the loop's lexical iteration ordinal.
 Source and destination must use the same active epoch sequence: either the
-whole loop or one exactly proven contiguous interval with static cut points.
+whole loop or one exactly proven contiguous interval with loop-invariant
+integer cut points. Cuts may use immutable outer parameters or thread
+coordinates, but cannot capture mutable reads or values changed in the loop.
+Generated cut arithmetic is widened to signed Int64 before subtracting the
+origin; ordinal ceiling uses quotient plus remainder. Its intermediate range
+must be representable before clamping and narrowing back to the event clock.
+Unknown or unsafe Int64 cut ranges are conservatively diagnosed.
 The proof expands established condition definitions and checks equivalence
 on actual loop iterations, including nonzero origins and positive steps.
 Periodic, gapped, or unknown active sequences are diagnosed.

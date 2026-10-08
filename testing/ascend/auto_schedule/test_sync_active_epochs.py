@@ -13,7 +13,7 @@ from tilelang import tvm
 from tilelang.ascend import transform
 from tvm import tirx
 
-from testing.ascend._ir import copy, kernel, seq
+from testing.ascend._ir import copy, kernel, seq, statements
 from testing.ascend.auto_schedule._scheduled_ir import unit
 from testing.ascend.auto_schedule.test_sync_binary_flags import (
     _completion_trace,
@@ -23,7 +23,8 @@ from testing.ascend.auto_schedule.test_sync_binary_flags import (
 
 
 def _active_dma_program(guard, *, minimum=0, extent=7, step=1, first=0,
-                        snapshot=False, gapped_phase=False):
+                        snapshot=False, gapped_phase=False, parameters=(),
+                        outer_bindings=(), extra_buffers=(), clock_dtype="int32"):
     # A symbolic extent is replayed only within the fixed backing capacity.
     capacity = minimum + (extent if isinstance(extent, int) else 7) + 1
     shape = (capacity, 2, 1, 64)
@@ -32,7 +33,7 @@ def _active_dma_program(guard, *, minimum=0, extent=7, step=1, first=0,
     storage = tirx.decl_buffer((1, 64), "float32", name="storage", scope="shared.dyn")
     seed = tirx.decl_buffer((1, 64), "float32", name="seed", scope="shared.dyn")
     output_cast = tirx.decl_buffer((1, 64), "float32", name="output_cast", scope="shared.dyn")
-    epoch, sub = tirx.Var("epoch", "int32"), tirx.Var("sub", "int32")
+    epoch, sub = tirx.Var("epoch", clock_dtype), tirx.Var("sub", "int32")
     active = guard(epoch)
     prefix = []
     if snapshot:
@@ -76,11 +77,14 @@ def _active_dma_program(guard, *, minimum=0, extent=7, step=1, first=0,
         load(state, odd), unit(update, guard=odd), unit(cast, guard=odd),
         store(output, odd, source=output_cast),
     ))
-    owner = tirx.For(epoch, minimum, extent, tirx.ForKind.SERIAL,
+    owner = tirx.For(epoch, tirx.const(minimum, clock_dtype),
+                     tirx.const(extent, clock_dtype) if isinstance(extent, int) else extent,
+                     tirx.ForKind.SERIAL,
                      seq(*prefix, unit(child, core=None, guard=active)),
-                     step=None if step == 1 else tirx.const(step, "int32"))
-    params = [state, output] + ([] if isinstance(extent, int) else [extent])
-    mod = kernel(unit(owner, core=None), buffers=[storage, seed, output_cast], params=params)
+                     step=None if step == 1 else tirx.const(step, clock_dtype))
+    params = [state, output] + ([] if isinstance(extent, int) else [extent]) + list(parameters)
+    mod = kernel(seq(*outer_bindings, unit(owner, core=None)),
+                 buffers=[storage, seed, output_cast, *extra_buffers], params=params)
     mod["main"] = mod["main"].with_attr(
         "target", tvm.target.Target({"kind": "ascend", "arch": "dav-2201"}))
     return mod
@@ -98,7 +102,7 @@ def _oracle_controls(mod):
 
     def collect(node):
         if isinstance(node, tirx.Bind):
-            assert node.var.dtype == "bool", "Only fixture predicate snapshots are inlined"
+            assert str(node.var.dtype).startswith(("bool", "int", "uint")), "Only scalar arithmetic fixture snapshots are inlined"
             impure = []
             tirx.stmt_functor.post_order_visit(
                 node.value, lambda value: impure.append(value)
@@ -222,6 +226,205 @@ def test_symbolic_extent_can_leave_the_contiguous_span_empty(trips):
     _prove_spill_reload_epochs(trace, range(1, trips))
 
 
+@pytest.mark.parametrize("kind", ["prefix", "suffix", "bounded"])
+def test_symbolic_outer_parameter_cuts_preserve_finite_dma_protocol(kind):
+    lower, upper = tirx.Var("lower", "int32"), tirx.Var("upper", "int32")
+    guard = {
+        "prefix": lambda epoch: epoch < upper,
+        "suffix": lambda epoch: epoch >= lower,
+        "bounded": lambda epoch: tirx.all(epoch >= lower, epoch < upper),
+    }[kind]
+    first = 0 if kind == "prefix" else tirx.max(0, tirx.min(lower, 7))
+    before = _active_dma_program(guard, first=first, snapshot=True, parameters=[lower, upper])
+    after = _oracle_controls(_lower_protocol(before))
+    # Independent concrete activation enumeration includes cuts outside the
+    # loop, reversed bounds, singleton, empty and wrapping ring lifetimes.
+    for left, right in [(-2, 4), (0, 0), (1, 5), (3, 4), (4, 2), (7, 8), (9, 12)]:
+        active = [epoch for epoch in range(7)
+                  if (kind == "prefix" or epoch >= left)
+                  and (kind == "suffix" or epoch < right)]
+        trace = _completion_trace(after, {lower: left, upper: right})
+        _prove_spill_reload_epochs(trace, active)
+
+
+def _checked_integer(expression, environment):
+    """Evaluate actual scalar IR, rejecting overflow at each native width.
+
+    Analyzer's mathematical constant folding alone cannot catch an Int32
+    cut-origin subtraction which wraps before a later clamp.
+    """
+    if isinstance(expression, tirx.IntImm):
+        result = int(expression)
+    elif isinstance(expression, tirx.Var):
+        result = environment[expression]
+    elif isinstance(expression, tirx.Cast):
+        result = _checked_integer(expression.value, environment)
+    elif isinstance(expression, tirx.Select):
+        arm = expression.true_value if _checked_integer(expression.condition, environment) else expression.false_value
+        result = _checked_integer(arm, environment)
+    elif isinstance(expression, tirx.Not):
+        result = not _checked_integer(expression.a, environment)
+    else:
+        left, right = (_checked_integer(value, environment) for value in (expression.a, expression.b))
+        operations = {
+            tirx.Add: lambda: left + right,
+            tirx.Sub: lambda: left - right,
+            tirx.Mul: lambda: left * right,
+            tirx.FloorDiv: lambda: left // right,
+            tirx.FloorMod: lambda: left % right,
+            tirx.Min: lambda: min(left, right),
+            tirx.Max: lambda: max(left, right),
+            tirx.EQ: lambda: left == right,
+            tirx.NE: lambda: left != right,
+            tirx.LT: lambda: left < right,
+            tirx.LE: lambda: left <= right,
+            tirx.GT: lambda: left > right,
+            tirx.GE: lambda: left >= right,
+            tirx.And: lambda: bool(left and right),
+            tirx.Or: lambda: bool(left or right),
+        }
+        result = operations[type(expression)]()
+    dtype = str(expression.dtype)
+    if dtype == "bool":
+        assert result in (0, 1)
+    else:
+        signed = dtype.startswith("int")
+        bits = int(dtype[3:] if signed else dtype[4:])
+        minimum = -(1 << (bits - 1)) if signed else 0
+        maximum = (1 << (bits - int(signed))) - 1
+        assert minimum <= result <= maximum, f"Native {dtype} arithmetic overflows: {expression} -> {result}"
+    return int(result)
+
+
+def _check_root_flag_arithmetic(mod, parameters):
+    checked = 0
+    for statement, parents in statements(mod):
+        if not isinstance(statement, tirx.Evaluate) or any(isinstance(parent, tirx.For) for parent in parents):
+            continue
+        call = statement.value
+        if not isinstance(call, tirx.Call) or not isinstance(call.op, tvm.ir.Op):
+            continue
+        if call.op.name in ("tl.ascend_set_flag", "tl.ascend_wait_flag"):
+            assert 0 <= _checked_integer(call.args[1], parameters) < 8
+            checked += 1
+    assert checked, "The regression must inspect actual kernel-root seed/drain IDs"
+
+
+@pytest.mark.parametrize("minimum,extent,step", [(0, 7, 1), (5, 7, 2)])
+@pytest.mark.parametrize("kind", ["prefix", "suffix", "bounded"])
+def test_symbolic_int32_extreme_cuts_do_not_overflow_root_seed_or_drain(kind, minimum, extent, step):
+    lower, upper = tirx.Var("lower", "int32"), tirx.Var("upper", "int32")
+    guard = {
+        "prefix": lambda epoch: epoch < upper,
+        "suffix": lambda epoch: epoch >= lower,
+        "bounded": lambda epoch: tirx.all(epoch >= lower, epoch < upper),
+    }[kind]
+    trips = (extent + step - 1) // step
+    # The fixture's data phase has its own safe, explicit 64-bit expression;
+    # the flag planner must independently normalize its guard's cut points.
+    first = 0 if kind == "prefix" else tirx.Cast("int32", tirx.max(
+        0, tirx.min(trips, (tirx.Cast("int64", lower) - minimum + step - 1) // step)))
+    before = _active_dma_program(
+        guard, minimum=minimum, extent=extent, step=step, first=first,
+        snapshot=True, parameters=[lower, upper])
+    after = _oracle_controls(_lower_protocol(before))
+    small, large = -(1 << 31), (1 << 31) - 1
+    for left, right in [(small, large), (small, small), (large, large),
+                        (large, small), (6, 10), (7, 8)]:
+        parameters = {lower: left, upper: right}
+        _check_root_flag_arithmetic(after, parameters)
+        active = [epoch for epoch in range(minimum, minimum + extent, step)
+                  if (kind == "prefix" or epoch >= left)
+                  and (kind == "suffix" or epoch < right)]
+        _prove_spill_reload_epochs(_completion_trace(after, parameters), active)
+
+
+def test_bounded_int64_cut_keeps_safe_extreme_int32_parameter_support():
+    lower = tirx.Var("lower", "int32")
+    first = tirx.Cast("int64", tirx.max(0, tirx.min(
+        4, (tirx.Cast("int64", lower) - 5 + 1) // 2)))
+    before = _active_dma_program(
+        lambda epoch: epoch >= tirx.Cast("int64", lower), minimum=5, extent=7,
+        step=2, first=first, snapshot=True, parameters=[lower], clock_dtype="int64")
+    after = _oracle_controls(_lower_protocol(before))
+    for cut in [-(1 << 31), (1 << 31) - 1, 6, 8]:
+        _check_root_flag_arithmetic(after, {lower: cut})
+        _prove_spill_reload_epochs(_completion_trace(after, {lower: cut}),
+                                  [epoch for epoch in range(5, 12, 2) if epoch >= cut])
+
+
+def test_unbounded_int64_cut_difference_is_conservatively_diagnosed():
+    lower = tirx.Var("lower", "int64")
+    before = transform.PrepareMultiBuffer()(_active_dma_program(
+        lambda epoch: epoch >= lower, minimum=5, extent=7, step=2,
+        snapshot=True, parameters=[lower], clock_dtype="int64"))
+    original = tvm.ir.save_json(before)
+    with pytest.raises(tvm.error.InternalError, match="one exact contiguous active-epoch interval with loop-invariant cut points"):
+        transform.InsertSync()(before)
+    assert tvm.ir.save_json(before) == original
+
+
+def test_symbolic_thread_cut_and_outer_pure_bind_keep_root_fill_drain_in_scope():
+    block = tirx.Var("block", "int32")
+    cut = tirx.Var("outer_cut", "int32")
+    # The cut differs by launched core, including a core with no active epoch.
+    # Neither the pure outer Bind nor the body predicate snapshot may leak
+    # into root fill/drain after its lexical scope ends.
+    before = _active_dma_program(
+        lambda epoch: epoch >= cut, first=tirx.min(cut, 7), snapshot=True,
+        outer_bindings=[unit(tirx.Bind(cut, (block % 5) * 2), core=3)],
+    )
+    lane = tirx.IterVar(tvm.ir.Range(0, 5), block, tirx.IterVar.ThreadIndex, "blockIdx.x")
+    before["main"] = before["main"].with_body(
+        tirx.AttrStmt(lane, "thread_extent", 5, before["main"].body))
+    lowered = _lower_protocol(before)
+    assert not tirx.analysis.undefined_vars(lowered["main"].body, lowered["main"].params)
+    after = _oracle_controls(lowered)
+    for core in range(5):
+        active = [epoch for epoch in range(7) if epoch >= core * 2]
+        _prove_spill_reload_epochs(_completion_trace(after, {block: core}), active)
+
+
+@pytest.mark.parametrize("captured", [False, True], ids=["direct-ub-cut", "outer-mutable-snapshot"])
+def test_mutable_symbolic_cut_is_rejected_without_weakening_flag_validation(captured):
+    control = tirx.decl_buffer((1,), "int32", name="mutable_cut", scope="shared.dyn")
+    cut = tirx.Var("captured_cut", "int32") if captured else control[0]
+    bindings = [unit(tirx.Bind(cut, control[0]), core=1)] if captured else []
+    before = transform.PrepareMultiBuffer()(_active_dma_program(
+        lambda epoch: epoch >= cut, snapshot=True, first=0,
+        outer_bindings=bindings, extra_buffers=[control],
+    ))
+    original = tvm.ir.save_json(before)
+    with pytest.raises(tvm.error.InternalError, match="one exact contiguous active-epoch interval with loop-invariant cut points"):
+        transform.InsertSync()(before)
+    assert tvm.ir.save_json(before) == original
+
+
+@pytest.mark.parametrize("symbolic", [False, True], ids=["float-literal", "float-parameter"])
+def test_float_cut_cannot_define_an_integer_flag_epoch_span(symbolic):
+    cut = tirx.Var("float_cut", "float32") if symbolic else tirx.FloatImm("float32", 2.5)
+    before = transform.PrepareMultiBuffer()(_active_dma_program(
+        lambda epoch: tirx.Cast("float32", epoch) >= cut,
+        snapshot=True, parameters=[cut] if symbolic else [],
+    ))
+    original = tvm.ir.save_json(before)
+    with pytest.raises(tvm.error.InternalError, match="one exact contiguous active-epoch interval with loop-invariant cut points"):
+        transform.InsertSync()(before)
+    assert tvm.ir.save_json(before) == original
+
+
+def test_symbolic_cut_does_not_hide_an_interior_active_epoch_hole():
+    cut = tirx.Var("cut", "int32")
+    before = transform.PrepareMultiBuffer()(_active_dma_program(
+        lambda epoch: tirx.all(epoch >= cut, epoch != cut + 2),
+        snapshot=True, gapped_phase=True, parameters=[cut],
+    ))
+    original = tvm.ir.save_json(before)
+    with pytest.raises(tvm.error.InternalError, match="one exact contiguous active-epoch interval with loop-invariant cut points"):
+        transform.InsertSync()(before)
+    assert tvm.ir.save_json(before) == original
+
+
 @pytest.mark.parametrize("guard", [
     pytest.param(lambda epoch: epoch % 2 == 0, id="parity"),
     pytest.param(lambda epoch: tirx.any(epoch < 2, epoch >= 4), id="disjoint-intervals"),
@@ -230,6 +433,6 @@ def test_symbolic_extent_can_leave_the_contiguous_span_empty(trips):
 def test_gapped_root_span_is_rejected_without_mutating_the_input(guard):
     before = transform.PrepareMultiBuffer()(_active_dma_program(guard, snapshot=True, gapped_phase=True))
     snapshot = tvm.ir.save_json(before)
-    with pytest.raises(tvm.error.InternalError, match="one exact contiguous active-epoch interval with static cut points"):
+    with pytest.raises(tvm.error.InternalError, match="one exact contiguous active-epoch interval with loop-invariant cut points"):
         transform.InsertSync()(before)
     assert tvm.ir.save_json(before) == snapshot
