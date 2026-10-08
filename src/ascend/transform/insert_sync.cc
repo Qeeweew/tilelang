@@ -292,7 +292,7 @@ struct SyncInsertionSite {
 
 using SyncInsertionSiteList = std::vector<SyncInsertionSite>;
 
-// This private certificate releases only the typed GM input. Its old wide
+// This private certificate releases only the typed GM storage. Its old wide
 // source END must never enter generic completion or flag-lifetime closure.
 struct GmReadReleaseCut {
   GmReadReleasePlan plan;
@@ -1079,6 +1079,14 @@ public:
 
   bool HasOwnerResultRelease(const OwnerResultPlan &plan) const {
     for (const SyncPoint &point : sync_points_) {
+      if (point.gm_read_release) {
+        const auto &cut = gm_read_releases_.at(*point.gm_read_release);
+        if (cut.plan.MatchesResult(plan) &&
+            cut.plan.MatchesProtocol(point.flag_loop, point.edge.distance,
+                                     point.num_versions,
+                                     point.counter_group_id))
+          return true;
+      }
       if (point.gm_write_acquire) {
         const auto &cut = gm_write_acquires_.at(*point.gm_write_acquire);
         if (cut.plan.MatchesResult(plan) &&
@@ -1141,7 +1149,7 @@ private:
   void SelectGmReadRelease(SyncPoint *point, const DepInfo &dep,
                           TaskNode *reader, TaskNode *writer,
                           ControlNode *loop) {
-    if (!enable_gm_read_release_ || !owner_inputs_ ||
+    if (!enable_gm_read_release_ || (!owner_inputs_ && !owner_results_) ||
         architecture_ != AscendArchitecture::kDav2201 || !loop ||
         !site_registry_.IsCrossCore(*point))
       return;
@@ -1153,18 +1161,27 @@ private:
         !is_one(domain.active_guard) ||
         src.EpochDomainId() != lexical_domain ||
         dst.EpochDomainId() != lexical_domain || !is_one(src.GetGuard()) ||
-        !is_one(dst.GetGuard()) || src.core != kCoreCube || src.pipe != "MTE2" ||
-        dst.core != kCoreVector || dst.pipe != "MTE3" ||
+        !is_one(dst.GetGuard()) ||
         !loop->GetLoopBodyContext().CanProve(
             point->flag_iteration == CalculateIterationCount(loop)))
       return;
-    auto plan = AnalyzeGmReadRelease(*owner_inputs_, dep, reader, writer, loop,
-                                     manual_, multi_buffer_plan_);
+    const bool input = src.core == kCoreCube && src.pipe == "MTE2" &&
+                       dst.core == kCoreVector && dst.pipe == "MTE3";
+    const bool result = src.core == kCoreVector && src.pipe == "MTE2" &&
+                        dst.core == kCoreCube && dst.pipe == "FIX";
+    if ((!input || !owner_inputs_) && (!result || !owner_results_))
+      return;
+    auto plan = input
+                    ? AnalyzeGmReadRelease(*owner_inputs_, dep, reader, writer,
+                                           loop, manual_, multi_buffer_plan_)
+                    : AnalyzeGmResultReadRelease(*owner_results_, dep, reader,
+                                                 writer, loop, manual_,
+                                                 multi_buffer_plan_);
     if (!plan || !plan->MatchesProtocol(point->flag_loop, point->edge.distance,
                                         point->num_versions,
                                         point->counter_group_id))
       return;
-    SyncInsertionSite active(plan->reader_boundary, reader, false, kCoreCube,
+    SyncInsertionSite active(plan->reader_boundary, reader, false, src.core,
                              domain, nullptr, true);
     if (active.path_end != reader)
       return;
@@ -4583,56 +4600,44 @@ private:
       PrimExpr event_id = MakeFlagEventId(sync_point.flag_iteration,
                                           sync_point.num_versions, base_id);
 
-      if (sync_point.gm_read_release) {
+      if (sync_point.IsPrivateGmHandoff()) {
         ICHECK(architecture_ == AscendArchitecture::kDav2201 &&
                cross_core_contract_.collective &&
                cross_core_contract_.num_aiv_subcores == 2 &&
                site_registry_.IsCrossCore(sync_point));
         ICHECK_EQ(allocation.sync_points.size(), 1u);
-        const auto &cut = gm_read_releases_.at(*sync_point.gm_read_release);
-        ICHECK(cut.plan.MatchesProtocol(
-            sync_point.flag_loop, sync_point.edge.distance,
-            sync_point.num_versions, sync_point.counter_group_id));
-        ValidateCollectiveSite(cut.active);
-        ValidateCollectiveSite(cut.inactive);
-        ValidateCollectiveSite(dst);
-        for (const SyncInsertionSite *site : {&cut.active, &cut.inactive}) {
-          InsertStatement(
-              site->path_end,
-              MakeAscendCrossCoreSetFlag(2, "PIPE_MTE2", event_id), false,
-              kCoreCube, site->GetGuard());
+        std::vector<const SyncInsertionSite *> releases{&src};
+        std::vector<const SyncInsertionSite *> acquisitions{&dst};
+        if (sync_point.gm_read_release) {
+          const auto &cut = gm_read_releases_.at(*sync_point.gm_read_release);
+          ICHECK(cut.plan.MatchesProtocol(
+              sync_point.flag_loop, sync_point.edge.distance,
+              sync_point.num_versions, sync_point.counter_group_id));
+          releases = {&cut.active, &cut.inactive};
         }
-        // Both AIVs retain the ordinary old-slot acquire and finite drains.
-        InsertStatement(
-            dst.path_end,
-            MakeAscendCrossCoreWaitFlag(2, "PIPE_MTE3", event_id), true,
-            kCoreVector, consumer_guard);
-        continue;
-      }
-
-      if (sync_point.gm_write_acquire) {
-        ICHECK(architecture_ == AscendArchitecture::kDav2201 &&
-               cross_core_contract_.collective &&
-               cross_core_contract_.num_aiv_subcores == 2 &&
-               site_registry_.IsCrossCore(sync_point));
-        ICHECK_EQ(allocation.sync_points.size(), 1u);
-        const auto &cut = gm_write_acquires_.at(*sync_point.gm_write_acquire);
-        ICHECK(cut.plan.MatchesProtocol(
-            sync_point.flag_loop, sync_point.edge.distance,
-            sync_point.num_versions, sync_point.counter_group_id));
-        ValidateCollectiveSite(src);
-        ValidateCollectiveSite(cut.active);
-        ValidateCollectiveSite(cut.inactive);
-        // Both physical AIVs still retire their reads at the original END.
-        InsertStatement(
-            src.path_end,
-            MakeAscendCrossCoreSetFlag(2, "PIPE_MTE2", event_id), false,
-            kCoreVector, producer_guard);
-        for (const SyncInsertionSite *site : {&cut.active, &cut.inactive}) {
+        if (sync_point.gm_write_acquire) {
+          const auto &cut = gm_write_acquires_.at(*sync_point.gm_write_acquire);
+          ICHECK(cut.plan.MatchesProtocol(
+              sync_point.flag_loop, sync_point.edge.distance,
+              sync_point.num_versions, sync_point.counter_group_id));
+          acquisitions = {&cut.active, &cut.inactive};
+        }
+        // Compose the two independent placement certificates on the same
+        // original permission. Both physical AIV contributions, direction,
+        // flag clock and finite seed/drain remain the ordinary protocol's.
+        for (const SyncInsertionSite *site : releases) {
+          ValidateCollectiveSite(*site);
           InsertStatement(
               site->path_end,
-              MakeAscendCrossCoreWaitFlag(2, "PIPE_FIX", event_id), true,
-              kCoreCube, site->GetGuard());
+              MakeAscendCrossCoreSetFlag(2, producer_pipe, event_id), false,
+              site->core, site->GetGuard());
+        }
+        for (const SyncInsertionSite *site : acquisitions) {
+          ValidateCollectiveSite(*site);
+          InsertStatement(
+              site->path_end,
+              MakeAscendCrossCoreWaitFlag(2, consumer_pipe, event_id), true,
+              site->core, site->GetGuard());
         }
         continue;
       }

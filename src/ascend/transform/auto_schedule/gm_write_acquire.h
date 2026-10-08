@@ -27,8 +27,9 @@ namespace tvm::tl::ascend {
 // The active wait precedes the first typed L0C->GM copy, across *both* owners
 // and every descendant slice. The inactive wait stays at the original wide
 // boundary. Together they consume one aggregate permission per original
-// lexical epoch; the release sites, clock, distance, seeds and drains remain
-// unchanged.
+// lexical epoch; the clock, distance, seeds and drains remain unchanged. This
+// certificate leaves source placement alone; an independent last-read release
+// certificate may compose with it on the same original permission.
 //
 // This does NOT establish completion before writer_boundary BEGIN: L1/L0
 // preparation and MADs may already have issued. The selected point must stay
@@ -70,8 +71,8 @@ struct GmWriteAcquirePlan {
 // site with active_tasks_only=true and participant_loop=nullptr; require
 // path_end==result.producer, then conjoin `active`. Keeping every crossed loop
 // in that traversal emits only at owner 0 / the first slice. Copy the original
-// BEGIN site and conjoin `inactive` for an empty epoch. The source END site
-// stays unchanged, and all C/SPR/unit completion obligations remain separate.
+// BEGIN site and conjoin `inactive` for an empty epoch. Source placement is
+// independent, and all C/SPR/unit completion obligations remain separate.
 inline std::optional<GmWriteAcquirePlan>
 AnalyzeGmWriteAcquire(const std::vector<OwnerResultPlan> &results,
                       const DepInfo &dep, TaskNode *reader, TaskNode *writer,

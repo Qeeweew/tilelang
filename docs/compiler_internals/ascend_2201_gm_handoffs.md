@@ -4,7 +4,7 @@
 
 For an established owner-result relation, InsertSync can delay the paired GM
 overwrite acquire from phase entry to the first typed L0C-to-GM FIX. The
-original two-AIV read-release stays at its existing source boundary. An active
+two-AIV read-release is selected independently as described below. An active
 epoch consumes the acquire only at owner zero's first slice; an inactive epoch
 consumes it at the original phase entry. This preserves the original lexical
 clock, reverse WAR distance, event width, seeds and drains, while allowing
@@ -23,6 +23,32 @@ It stays outside completion closure, parent projection, alias retirement and
 flag sharing. C, SPR, local binary lifetime and owner-ready checks remain
 independent. Analysis restores the original acquire before discarding another
 optional input release if any required proof or event allocation fails.
+
+## Output read release
+
+The same owner-result proof can move the paired result-slot release from the
+whole Vector phase END to its final typed GM-to-private-UB MTE2 copy. Later
+Vector math and output stores no longer delay permission to overwrite the old
+GM result. Each physical AIV contributes after its own final reader slice;
+the Cube acquire still requires both contributions. An inactive epoch retains
+one complementary notification at the original wide END on each AIV.
+
+This cut requires two manually declared GM slots, a distance-one owner result,
+its exact inverse WAR, and unshifted positive static serial paths. Canonical
+storage, private UB, complete coverage, aliases and activation are established
+by the current owner-result analysis. It preserves the original distance-one
+flag clock, root seed and terminal drain. It may compose with output write
+acquire on the same permission, or retain the ordinary destination acquire.
+
+Only the old result GM reads are certified complete. The early source does
+not certify Vector phase END, output update completion, UB retirement, local
+binary lifetime or any unrelated dependency. Both placement certificates stay
+outside generic closure, parent projection, alias proofs and flag sharing.
+Unsupported cases keep the wide release; a failed independent proof retries
+without optional cuts before materializing events. Finite regressions must
+check both AIVs, exact active/inactive contributions, all old read-to-new write
+paths, bounded counters and terminal drain, while showing unrelated Vector
+tail work is absent from the GM overwrite prerequisite.
 
 ## Input read release
 

@@ -29,30 +29,34 @@
 
 namespace tvm::tl::ascend {
 
-// A placement certificate for the existing paired GM-input WAR protocol.
-// The active notification follows the last typed GM->L1 copy, across *both*
-// owners and every descendant slice. The inactive notification stays at the
-// original wide boundary. They partition the original lexical epoch sequence;
-// its flag clock, distance, seeds, drains and two AIV recipients do not change.
+// A placement certificate for an existing paired GM WAR protocol. An input
+// release follows the last typed GM->L1 copy across both Cube owners; a result
+// release follows the last typed GM->UB copy on each AIV. The inactive
+// notification stays at the original wide boundary. They partition the
+// original lexical epoch sequence; its flag clock, distance, seeds, drains and
+// two AIV participants do not change.
 //
 // This is deliberately NOT a completion edge for reader_boundary END. In
-// particular, subsequent L1/L0 reads, MADs and FIXes need not have completed.
+// particular, subsequent L1/L0 reads, MADs, FIXes or Vector work need not have
+// completed.
 // A selected point must stay out of generic closure, projection, alias proofs
-// and flag sharing. Only this storage's exact WAR / owner-input release may
-// consume the certificate.
+// and flag sharing. Only this storage's exact WAR / corresponding owner
+// transfer release may consume the certificate.
 struct GmReadReleasePlan {
+  enum class Kind { kInput, kResult };
+
   OwnerResultPlan input;
   IRStructure *reader_boundary;
   PrimExpr active;
   PrimExpr inactive;
+  Kind kind{Kind::kInput};
 
   bool MatchesInput(const OwnerResultPlan &other) const {
-    return input.storage.same_as(other.storage) &&
-           input.producer == other.producer &&
-           input.consumer == other.consumer && input.epoch == other.epoch &&
-           input.owner == other.owner && input.sid.same_as(other.sid) &&
-           input.distance == other.distance &&
-           input.num_slots == other.num_slots;
+    return kind == Kind::kInput && MatchesTransfer(other);
+  }
+
+  bool MatchesResult(const OwnerResultPlan &other) const {
+    return kind == Kind::kResult && MatchesTransfer(other);
   }
 
   bool MatchesProtocol(ControlNode *flag_loop, int distance, int width,
@@ -60,6 +64,16 @@ struct GmReadReleasePlan {
     return flag_loop == input.epoch && counter_group == 0 &&
            distance == input.num_slots - input.distance && distance > 0 &&
            width == distance;
+  }
+
+private:
+  bool MatchesTransfer(const OwnerResultPlan &other) const {
+    return input.storage.same_as(other.storage) &&
+           input.producer == other.producer &&
+           input.consumer == other.consumer && input.epoch == other.epoch &&
+           input.owner == other.owner && input.sid.same_as(other.sid) &&
+           input.distance == other.distance &&
+           input.num_slots == other.num_slots;
   }
 };
 
@@ -155,6 +169,71 @@ AnalyzeGmReadRelease(const std::vector<OwnerResultPlan> &inputs,
     PrimExpr active =
         e >= make_const(e.dtype(), first) && e < make_const(e.dtype(), last);
     return GmReadReleasePlan{input, dep.prod_node, active, !active};
+  }
+  return std::nullopt;
+}
+
+// `results` must be the current AnalyzeOwnerResults result. The existing owner
+// proof supplies both AIVs' complete, SID-separated reads and the exact shifted
+// finite activation. This placement only shortens the GM storage's read
+// lifetime; it does not certify Vector phase END or any subsequent UB user.
+//
+// Caller checks are the same as above, except for the ordinary V/MTE2 -> C/FIX
+// direction. Build the active reader END site with kCoreVector,
+// active_tasks_only=true and participant_loop=nullptr; require
+// path_end==result.consumer, then conjoin `active`. Retaining all slice loops
+// makes each AIV notify only after its last GM read. The old wide END under
+// `inactive` preserves one contribution from each AIV in every empty epoch.
+// The destination can independently use a GmWriteAcquirePlan; neither cut may
+// contribute its old wide endpoint to generic completion closure.
+inline std::optional<GmReadReleasePlan> AnalyzeGmResultReadRelease(
+    const std::vector<OwnerResultPlan> &results, const DepInfo &dep,
+    TaskNode *reader, TaskNode *writer, ControlNode *epoch,
+    const BufferVersionMap &manual, const MultiBufferPlan &automatic) {
+  if (!epoch || epoch->GetStage() != 0 || epoch->ContainsLoopBreak() ||
+      dep.kind != DependencyKind::kData || dep.cross_storage_conflict ||
+      !dep.storage || GetPtrStorageScope(*dep.storage) != "global" ||
+      automatic.Find(*dep.storage) || dep.task_pairs.size() != 1 ||
+      dep.task_pairs[0] != DependencyTaskPair{reader, writer} ||
+      !gm_read_release_detail::UnshiftedPath(reader, epoch) ||
+      !gm_read_release_detail::UnshiftedPath(writer, epoch) ||
+      reader->GetCoreMask() != kCoreVector ||
+      !reader->UsesOnlyPipe(ResourcePipe::kMTE2) ||
+      writer->GetCoreMask() != kCoreCube ||
+      !writer->UsesOnlyPipe(ResourcePipe::kFixpipe) ||
+      dep.prod_node != reader->GetChildOnPathFrom(epoch) ||
+      dep.cons_node != writer->GetChildOnPathFrom(epoch))
+    return std::nullopt;
+
+  const For &loop = epoch->control;
+  auto low = owner_result_detail::Constant(loop->min);
+  auto count = owner_result_detail::Constant(loop->extent);
+  auto step = owner_result_detail::Constant(
+      loop->step.value_or(make_const(loop->loop_var.dtype(), 1)));
+  if (loop->kind != ForKind::kSerial || !low || !count || !step ||
+      *count <= 0 || *step != 1 ||
+      *low > std::numeric_limits<int64_t>::max() - *count)
+    return std::nullopt;
+
+  for (const OwnerResultPlan &result : results) {
+    if (!result.storage.same_as(*dep.storage) || result.epoch != epoch ||
+        result.consumer != reader || result.producer != writer ||
+        result.num_slots != 2 || result.distance != 1 ||
+        manual.Get(result.storage).value_or(0) != result.num_slots ||
+        dep.distance != result.num_slots - result.distance)
+      continue;
+    int64_t first, last;
+    if (!owner_result_detail::ExactInterval(result.consumer_activation,
+                                            loop->loop_var, *low, *low + *count,
+                                            &first, &last) ||
+        first >= last)
+      continue;
+    // Keep only the immutable lexical epoch expression at the wide site.
+    PrimExpr e = loop->loop_var;
+    PrimExpr active =
+        e >= make_const(e.dtype(), first) && e < make_const(e.dtype(), last);
+    return GmReadReleasePlan{result, dep.prod_node, active, !active,
+                             GmReadReleasePlan::Kind::kResult};
   }
   return std::nullopt;
 }
