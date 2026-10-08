@@ -1,6 +1,7 @@
 """CPU mathematical and frontend contracts for the ordinary dav-2201 FA."""
 
 import importlib.util
+import json
 from pathlib import Path
 import sys
 
@@ -124,12 +125,178 @@ def test_oracle_rejects_nonfinite_operands_and_score_overflow(example):
         example.attention_reference(q, k, v, dtype="bfloat16", block_kv=16)
 
 
-@pytest.mark.parametrize("changes,message", [({"query_heads": 3}, "divisible"), ({"head_dim": 17}, "multiple of 16"), ({"dtype": "float32"}, "float16 or bfloat16"), ({"query_len": 0}, "positive integers"), ({"causal": True, "query_start": 17}, "within the KV sequence"), ({"softmax_scale": float("inf")}, "finite")])
-def test_invalid_input_contract_is_rejected_before_frontend_construction(example, changes, message):
+@pytest.mark.parametrize("builder", ["flash_attention_fwd", "get_tuning_configs"])
+@pytest.mark.parametrize("changes,message", [({"query_heads": 3}, "divisible"), ({"head_dim": 17}, "multiple of 16"), ({"dtype": "float32"}, "float16 or bfloat16"), ({"query_len": 0}, "positive integers"), ({"causal": True, "query_start": 17}, "within the KV sequence"), ({"softmax_scale": float("inf")}, "finite"), ({"variant": "unknown"}, "variant")])
+def test_invalid_input_contract_is_rejected_before_frontend_construction(example, builder, changes, message):
     arguments = dict(batch=1, query_heads=4, kv_heads=2, query_len=17, kv_len=33, head_dim=16)
     arguments.update(changes)
     with pytest.raises(ValueError, match=message):
-        example.flash_attention_fwd(**arguments)
+        getattr(example, builder)(**arguments)
+
+
+@pytest.mark.parametrize("variant", ["generic", "pipeline"])
+@pytest.mark.parametrize("kv_len,width", [(35, 64), (64, 64), (65, 128), (128, 128), (129, 256), (256, 256), (257, 256), (1024, 256)])
+def test_default_frontend_kv_regions_and_trips_cover_the_sequence(example, variant, kv_len, width):
+    from tvm import tirx
+    from testing.ascend._ir import calls, nodes
+
+    program = example.flash_attention_fwd(1, 4, 2, 33, kv_len, 16, variant=variant)
+    (loop,) = [node for node in nodes(program, tirx.For) if node.kind == tirx.ForKind.SERIAL]
+    assert _constant(loop.extent, {}) == (kv_len + width - 1) // width
+    gemms = calls(program, "tl.tileop.gemm")
+    assert [tuple(map(int, call.args[5:8])) for call in gemms] == [(64, width, 16), (64, 16, width)]
+    for parameter in program.params[1:3]:
+        data = program.buffer_map[parameter].data
+        (load,) = [call for call in calls(program, "tl.tileop.ascend_copy")
+                   if call.args[0].args[0].buffer.data.same_as(data)]
+        assert int(load.args[0].args[4]) == width
+        assert tuple(map(int, load.args[1].args[0].buffer.shape)) == (width, 16)
+    assert bool(loop.annotations.get("tl.ascend_auto_pipeline", False)) == (variant == "pipeline")
+    if variant == "pipeline":
+        assert int(loop.annotations["num_stages"]) == 4
+
+
+@pytest.mark.parametrize("variant", ["generic", "pipeline"])
+@pytest.mark.parametrize("query_len,heads,head_dim,rows", [
+    (65, 4, 128, 64),
+    (65, 4, 144, 48),
+    (65, 4, 256, 32),
+    (33, 4, 512, 16),
+    (1, 130, 128, 64),
+    (1, 130, 256, 32),
+], ids=["prefill-d128", "prefill-aligned-nonpower", "prefill-d256",
+        "prefill-minimum", "packed-d128", "packed-d256"])
+def test_default_query_tiles_preserve_regions_and_launch_coverage(example, variant, query_len, heads, head_dim, rows):
+    from collections import Counter
+    from itertools import product
+    from tvm import tirx
+    from testing.ascend._ir import calls, nodes
+    from testing.ascend.auto_schedule.test_owner_result_completion import (
+        _PURE_DEFINITIONS, _SCALAR_VALUES, _region,
+    )
+
+    program = example.flash_attention_fwd(2, heads, 2, query_len, 1024, head_dim, variant=variant)
+    buffers = [program.buffer_map[parameter] for parameter in program.params]
+    launch, = [loop for loop in nodes(program, tirx.For)
+               if loop.thread_binding is not None and loop.thread_binding.thread_tag == "blockIdx.x"]
+    transfers = calls(program, "tl.tileop.ascend_copy")
+    q_load, = [call for call in transfers if call.args[0].args[0].buffer.data.same_as(buffers[0].data)]
+    export, = [call for call in transfers if call.args[1].args[0].buffer.data.same_as(buffers[3].data)]
+    assert tuple(map(int, q_load.args[1].args[0].buffer.shape)) == (rows, head_dim)
+    assert tuple(map(int, export.args[0].args[0].buffer.shape)) == (rows, head_dim)
+    assert [tuple(map(int, call.args[5:8])) for call in calls(program, "tl.tileop.gemm")] == [
+        (rows, 256, head_dim), (rows, head_dim, 256),
+    ]
+    definitions = {binding.var: binding.value for binding in nodes(program, tirx.Bind)}
+    packed = query_len == 1
+    groups = heads // 2
+    # Enumerate independent expected output ownership, including each tail.
+    expected = [(b, h, start, min(rows, (groups if packed else query_len) - start))
+                for b, h in product(range(2), range(2 if packed else heads))
+                for start in range(0, groups if packed else query_len, rows)]
+    assert int(launch.extent) == len(expected)
+    written = Counter()
+    for block, (batch, head, start, count) in enumerate(expected):
+        env = {_PURE_DEFINITIONS: definitions, _SCALAR_VALUES: {},
+               launch.loop_var: tirx.const(block, launch.loop_var.dtype)}
+        q_buffer, q_origin, q_shape = _region(q_load.args[0], env)
+        o_buffer, o_origin, o_shape = _region(export.args[1], env)
+        assert q_buffer.data.same_as(buffers[0].data) and o_buffer.data.same_as(buffers[3].data)
+        if packed:
+            assert q_origin == o_origin == (batch, head * groups + start, 0)
+            assert q_shape == o_shape == (1, count, head_dim)
+            written.update((batch, head * groups + row, 0) for row in range(start, start + count))
+        else:
+            assert q_origin == o_origin == (batch, head, start, 0)
+            assert q_shape == (1, 1, rows, head_dim)
+            assert o_shape == (1, 1, count, head_dim)
+            written.update((batch, head, row) for row in range(start, start + count))
+    assert written == Counter({position: 1 for position in product(range(2), range(heads), range(query_len))})
+
+
+@pytest.mark.parametrize("variant", ["generic", "pipeline"])
+@pytest.mark.parametrize("head_dim,rows", [(16, 32), (256, 64)])
+def test_explicit_tiling_dictionary_preserves_dataclass_frontend_and_overrides_defaults(example, variant, head_dim, rows):
+    from tilelang import tvm
+    from tvm import tirx
+    from testing.ascend._ir import calls, nodes
+
+    arguments = dict(batch=1, query_heads=4, kv_heads=2, query_len=33, kv_len=513, head_dim=head_dim, variant=variant)
+    explicit = dict(block_q=rows, block_kv=16, max_stages=2)
+    dictionary = example.flash_attention_fwd(**arguments, tiling=explicit)
+    dataclass = example.flash_attention_fwd(**arguments, tiling=example.FwdTiling(**explicit))
+    tvm.ir.assert_structural_equal(dictionary, dataclass)
+    assert [tuple(map(int, call.args[5:8])) for call in calls(dictionary, "tl.tileop.gemm")] == [(rows, 16, head_dim), (rows, head_dim, 16)]
+    (loop,) = [node for node in nodes(dictionary, tirx.For) if node.kind == tirx.ForKind.SERIAL]
+    assert _constant(loop.extent, {}) == 33
+    if variant == "pipeline":
+        assert int(loop.annotations["num_stages"]) == 2
+
+
+@pytest.mark.parametrize("tiling,message", [
+    ({"block_q": 64, "block_kv": 64, "max_stages": 4, "extra": 1}, "unknown fields"),
+    ({"block_q": 64, "block_kv": 64}, "missing fields"),
+    ({"block_q": 64, "block_kv": 64.0, "max_stages": 4}, "block_kv"),
+    ({"block_q": True, "block_kv": 64, "max_stages": 4}, "block_q"),
+    ({"block_q": 64, "block_kv": 64, "max_stages": True}, "max_stages"),
+    ({"block_q": 64, "block_kv": 64, "max_stages": 0}, "max_stages"),
+    ([], "FwdTiling or a dictionary"),
+])
+def test_tiling_dictionary_is_strict_before_frontend_construction(example, tiling, message):
+    with pytest.raises(ValueError, match=message):
+        example.flash_attention_fwd(1, 4, 2, 33, 513, 16, tiling=tiling)
+
+
+@pytest.mark.parametrize("variant", ["generic", "pipeline"])
+@pytest.mark.parametrize("query_len,kv_len,heads,kv_heads,head_dim,causal,start,rows,widths", [
+    (33, 35, 4, 2, 16, False, 0, 64, [64]),
+    (33, 65, 4, 2, 16, True, 32, 64, [64, 128]),
+    (65, 130, 4, 2, 16, False, 0, 64, [64, 128, 256]),
+    (1, 4096, 17, 1, 16, True, 4095, 32, [64, 128, 256]),
+    (65, 1024, 4, 2, 128, True, 0, 64, [64, 128, 256]),
+    (65, 1024, 4, 2, 256, True, 0, 32, [64, 128, 256]),
+    (1, 4096, 130, 2, 256, True, 4095, 32, [64, 128, 256]),
+])
+def test_tuning_configs_roundtrip_to_direct_factory_calls_with_complete_problem(
+        example, variant, query_len, kv_len, heads, kv_heads, head_dim, causal, start, rows, widths):
+    from tilelang import tvm
+    from tvm import tirx
+    from testing.ascend._ir import calls, nodes
+
+    problem = dict(batch=2, query_heads=heads, kv_heads=kv_heads, query_len=query_len,
+                   kv_len=kv_len, head_dim=head_dim, dtype="float16", variant=variant,
+                   causal=causal, query_start=start, softmax_scale=0.125)
+    configs = example.get_tuning_configs(**problem)
+    assert json.loads(json.dumps(configs, allow_nan=False)) == configs
+    assert len({json.dumps(config, sort_keys=True) for config in configs}) == len(configs)
+    assert [config["tiling"]["block_kv"] for config in configs] == widths
+    for config in configs:
+        assert {key: value for key, value in config.items() if key != "tiling"} == problem
+        assert config["tiling"] == dict(block_q=rows, block_kv=config["tiling"]["block_kv"], max_stages=4)
+        program = example.flash_attention_fwd(**config)
+        assert all(int(call.args[5]) == rows for call in calls(program, "tl.tileop.gemm"))
+        assert int(calls(program, "tl.tileop.gemm")[0].args[6]) == config["tiling"]["block_kv"]
+        (loop,) = [node for node in nodes(program, tirx.For) if node.kind == tirx.ForKind.SERIAL]
+        assert bool(loop.annotations.get("tl.ascend_auto_pipeline", False)) == (variant == "pipeline")
+    # The last candidate is the same complete algorithm expression as the
+    # default, including packed head ownership, tail bounds and typed math.
+    tvm.ir.assert_structural_equal(example.flash_attention_fwd(**problem), example.flash_attention_fwd(**configs[-1]))
+
+
+@pytest.mark.parametrize("dtype,tolerance", [("float16", 0.0015), ("bfloat16", 0.015)])
+@pytest.mark.parametrize("kv_len,width", [(65, 128), (130, 256), (513, 256)])
+@pytest.mark.parametrize("causal", [False, True])
+def test_default_oracle_uses_matching_block_rounding_and_tracks_attention_math(example, dtype, tolerance, kv_len, width, causal):
+    random = np.random.default_rng(941)
+    q = random.normal(0, 0.5, (2, 4, 5, 16)).astype(np.float32)
+    k = random.normal(0, 0.5, (2, 2, kv_len, 16)).astype(np.float32)
+    v = random.normal(0, 0.5, k.shape).astype(np.float32)
+    kwargs = dict(dtype=dtype, causal=causal, query_start=kv_len - 5, softmax_scale=0.25)
+    actual = example.attention_reference(q, k, v, **kwargs)
+    explicit = example.attention_reference(q, k, v, **kwargs, block_kv=width)
+    np.testing.assert_array_equal(actual, explicit)
+    expected = _full_attention(example, q, k, v, dtype=dtype, causal=causal, query_start=kv_len - 5, scale=0.25)
+    np.testing.assert_allclose(actual, expected, atol=tolerance, rtol=tolerance)
 
 
 @pytest.mark.parametrize("kv_len,causal", [(65, True), (64, False), (65, False), (64, True)])

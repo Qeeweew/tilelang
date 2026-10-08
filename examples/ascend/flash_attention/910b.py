@@ -17,6 +17,39 @@ class FwdTiling:
     max_stages: int = 4
 
 
+def _default_block_kv(kv_len):
+    # Cover short sequences without paying for a wider single KV tile. Long
+    # sequences amortize online-state updates and cross-core handoffs over 256
+    # keys. This is an algorithm starting point, not a resource/performance model.
+    return 64 if kv_len <= 64 else 128 if kv_len <= 128 else 256
+
+
+def _default_tiling(query_heads, kv_heads, query_len, kv_len, head_dim):
+    block_q = min(64, ((query_heads // kv_heads + 15) // 16) * 16) if query_len == 1 else 64
+    # Bound the logical FP32 output/state tile independently of the KV width.
+    # This targets 8192 elements, subject to the minimum 16-row Cube tile;
+    # compiler versions, scratch and physical resource legality remain separate.
+    block_q = min(block_q, max(16, (8192 // head_dim // 16) * 16))
+    return FwdTiling(block_q, _default_block_kv(kv_len), 4)
+
+
+def _as_tiling(tiling):
+    if tiling is None:
+        return FwdTiling()
+    if isinstance(tiling, FwdTiling):
+        return tiling
+    if isinstance(tiling, dict):
+        fields = {"block_q", "block_kv", "max_stages"}
+        unknown, missing = set(tiling) - fields, fields - set(tiling)
+        if unknown or missing:
+            raise ValueError(
+                "tiling requires exactly block_q, block_kv, max_stages; "
+                f"unknown fields={sorted(map(str, unknown))}, missing fields={sorted(missing)}"
+            )
+        return FwdTiling(**tiling)
+    raise ValueError("tiling must be a FwdTiling or a dictionary of its three integer fields")
+
+
 def _contract(batch, query_heads, kv_heads, query_len, kv_len, head_dim, dtype, causal, query_start, softmax_scale, tiling):
     dimensions = (batch, query_heads, kv_heads, query_len, kv_len, head_dim)
     if any(not isinstance(value, int) or isinstance(value, bool) or value <= 0 for value in dimensions):
@@ -40,6 +73,45 @@ def _contract(batch, query_heads, kv_heads, query_len, kv_len, head_dim, dtype, 
     return scale
 
 
+def get_tuning_configs(
+    batch,
+    query_heads,
+    kv_heads,
+    query_len,
+    kv_len,
+    head_dim,
+    *,
+    dtype="bfloat16",
+    variant="generic",
+    causal=False,
+    query_start=0,
+    softmax_scale=None,
+):
+    """Return complete JSON kwargs for existing AutoTuner.from_kernel.
+
+    Try at most the three KV widths 64/128/256, keeping the default query tile
+    and stage bound. Widths beyond the smallest one covering a short sequence
+    add padding without reducing its trip count and are omitted. Compilation
+    still decides physical resource legality; this is not a planner or a claim
+    that any candidate is optimal. Explicit FwdTiling configurations remain
+    available for other search spaces.
+    """
+    scale = _contract(batch, query_heads, kv_heads, query_len, kv_len, head_dim, dtype, causal, query_start, softmax_scale, FwdTiling())
+    if variant not in ("generic", "pipeline"):
+        raise ValueError("variant must be 'generic' or 'pipeline'")
+    default = _default_tiling(query_heads, kv_heads, query_len, kv_len, head_dim)
+    problem = dict(
+        batch=batch, query_heads=query_heads, kv_heads=kv_heads,
+        query_len=query_len, kv_len=kv_len, head_dim=head_dim,
+        dtype=dtype, variant=variant, causal=bool(causal), query_start=query_start,
+        softmax_scale=None if softmax_scale is None else scale,
+    )
+    return [
+        dict(problem, tiling=dict(block_q=default.block_q, block_kv=width, max_stages=default.max_stages))
+        for width in (64, 128, 256) if width <= default.block_kv
+    ]
+
+
 def flash_attention_fwd(
     batch,
     query_heads,
@@ -61,11 +133,16 @@ def flash_attention_fwd(
     is visible when its index <= query_start + query index. Accumulators and
     statistics are FP32; probabilities entering the second GEMM and output
     are rounded to dtype. Both variants retain the same typed math while
-    exposing different issue boundaries.
+    exposing different issue boundaries. With tiling=None, KV width is the
+    smallest of 64/128/256 covering Sk, or 256 for longer sequences. The query
+    tile targets 8192 output elements with a minimum of 16 aligned rows.
+    Explicit FwdTiling or a dictionary of all three fields overrides defaults.
     """
     default_tiling = tiling is None
-    tiling = tiling or FwdTiling()
+    tiling = _as_tiling(tiling)
     scale = _contract(batch, query_heads, kv_heads, query_len, kv_len, head_dim, dtype, causal, query_start, softmax_scale, tiling)
+    if default_tiling:
+        tiling = _default_tiling(query_heads, kv_heads, query_len, kv_len, head_dim)
     if variant not in ("generic", "pipeline"):
         raise ValueError("variant must be 'generic' or 'pipeline'")
 
@@ -75,7 +152,7 @@ def flash_attention_fwd(
     packed_decode = query_len == 1
     # With one query position, adjacent GQA heads are contiguous rows in
     # BNSD storage. One head tile shares its K/V scan and useful Cube rows.
-    block_q = min(64, ((groups + 15) // 16) * 16) if packed_decode and default_tiling else tiling.block_q
+    block_q = tiling.block_q
     block_kv, max_stages = tiling.block_kv, tiling.max_stages
     logical_rows = groups if packed_decode else query_len
     q_tiles = (logical_rows + block_q - 1) // block_q
@@ -239,12 +316,13 @@ def _round_dtype(values, dtype):
     return rounded.view(np.float32)
 
 
-def attention_reference(q, k, v, *, dtype="bfloat16", block_kv=64, causal=False, query_start=0, softmax_scale=None):
+def attention_reference(q, k, v, *, dtype="bfloat16", block_kv=None, causal=False, query_start=0, softmax_scale=None):
     """CPU oracle for the shared FP32/rounded-block-probability contract.
 
     This models numerical operations, rather than instruction accuracy or
     device execution. Inputs and final output are rounded to dtype. Choosing
     another block_kv changes the probability-rounding points of the algorithm.
+    None uses the same sequence-width default as flash_attention_fwd.
     Operand-rounded inputs and FP32 scores must be finite. Masked scores and
     the initial running maximum still use their defined negative infinities.
     """
@@ -257,6 +335,8 @@ def attention_reference(q, k, v, *, dtype="bfloat16", block_kv=64, causal=False,
     if k.shape[0] != batch or k.shape[3] != head_dim:
         raise ValueError("Q/K/V batch and head_dim must agree")
     kv_heads, kv_len = k.shape[1:3]
+    if block_kv is None:
+        block_kv = _default_block_kv(kv_len)
     scale = _contract(batch, query_heads, kv_heads, query_len, kv_len, head_dim, dtype, causal, query_start, softmax_scale, FwdTiling(block_kv=block_kv))
     with np.errstate(over="ignore", invalid="ignore"):
         q, k, v = (_round_dtype(value, dtype) for value in (q, k, v))

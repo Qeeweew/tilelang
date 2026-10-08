@@ -306,7 +306,7 @@ def test_native_decode_regions_and_empty_aiv_collective_fill_drain(example, vari
     )
 
     if case == "default-four":
-        batch, kv_heads, groups, kv_len, dim, width, trips = 1, 1, 4, 4096, 64, 64, 64
+        batch, kv_heads, groups, kv_len, dim, width, trips = 1, 1, 4, 4096, 64, 256, 16
         program = example.flash_attention_fwd(batch, groups, kv_heads, 1, kv_len, dim,
                                              variant=variant)
     elif case == "causal-head-tail":
