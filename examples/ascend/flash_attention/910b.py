@@ -50,6 +50,11 @@ def _as_tiling(tiling):
     raise ValueError("tiling must be a FwdTiling or a dictionary of its three integer fields")
 
 
+def _check_query_grouping(value):
+    if not isinstance(value, int) or isinstance(value, bool) or value not in (1, 2):
+        raise ValueError("query_grouping must be the integer 1 or 2")
+
+
 def _contract(batch, query_heads, kv_heads, query_len, kv_len, head_dim, dtype, causal, query_start, softmax_scale, tiling):
     dimensions = (batch, query_heads, kv_heads, query_len, kv_len, head_dim)
     if any(not isinstance(value, int) or isinstance(value, bool) or value <= 0 for value in dimensions):
@@ -86,6 +91,7 @@ def get_tuning_configs(
     causal=False,
     query_start=0,
     softmax_scale=None,
+    query_groupings=(1,),
 ):
     """Return complete JSON kwargs for existing AutoTuner.from_kernel.
 
@@ -94,11 +100,18 @@ def get_tuning_configs(
     add padding without reducing its trip count and are omitted. Compilation
     still decides physical resource legality; this is not a planner or a claim
     that any candidate is optimal. Explicit FwdTiling configurations remain
-    available for other search spaces.
+    available for other search spaces. query_groupings is a nonempty tuple or
+    list of unique integers from (1, 2); the default searches only grouping 1.
     """
     scale = _contract(batch, query_heads, kv_heads, query_len, kv_len, head_dim, dtype, causal, query_start, softmax_scale, FwdTiling())
     if variant not in ("generic", "pipeline"):
         raise ValueError("variant must be 'generic' or 'pipeline'")
+    if not isinstance(query_groupings, (tuple, list)) or not query_groupings:
+        raise ValueError("query_groupings must be a nonempty tuple or list of unique 1/2 values")
+    for grouping in query_groupings:
+        _check_query_grouping(grouping)
+    if len(set(query_groupings)) != len(query_groupings):
+        raise ValueError("query_groupings must contain unique values")
     default = _default_tiling(query_heads, kv_heads, query_len, kv_len, head_dim)
     problem = dict(
         batch=batch, query_heads=query_heads, kv_heads=kv_heads,
@@ -107,7 +120,8 @@ def get_tuning_configs(
         softmax_scale=None if softmax_scale is None else scale,
     )
     return [
-        dict(problem, tiling=dict(block_q=default.block_q, block_kv=width, max_stages=default.max_stages))
+        dict(problem, query_grouping=grouping, tiling=dict(block_q=default.block_q, block_kv=width, max_stages=default.max_stages))
+        for grouping in query_groupings
         for width in (64, 128, 256) if width <= default.block_kv
     ]
 
@@ -126,6 +140,7 @@ def flash_attention_fwd(
     query_start=0,
     softmax_scale=None,
     tiling=None,
+    query_grouping=1,
 ):
     """Build Q[B,Hq,Sq,D], K/V[B,Hkv,Sk,D] -> O[B,Hq,Sq,D].
 
@@ -137,6 +152,9 @@ def flash_attention_fwd(
     smallest of 64/128/256 covering Sk, or 256 for longer sequences. The query
     tile targets 8192 output elements with a minimum of 16 aligned rows.
     Explicit FwdTiling or a dictionary of all three fields overrides defaults.
+    query_grouping=2 lets two adjacent query tiles in one head/KV-head group
+    share each L1 K/V import. Each query retains its own UB component and
+    online state; resource feasibility remains a compiler contract.
     """
     default_tiling = tiling is None
     tiling = _as_tiling(tiling)
@@ -145,6 +163,7 @@ def flash_attention_fwd(
         tiling = _default_tiling(query_heads, kv_heads, query_len, kv_len, head_dim)
     if variant not in ("generic", "pipeline"):
         raise ValueError("variant must be 'generic' or 'pipeline'")
+    _check_query_grouping(query_grouping)
 
     from tilelang.ascend import language as T
 
@@ -155,15 +174,12 @@ def flash_attention_fwd(
     block_q = tiling.block_q
     block_kv, max_stages = tiling.block_kv, tiling.max_stages
     logical_rows = groups if packed_decode else query_len
-    q_tiles = (logical_rows + block_q - 1) // block_q
+    group_rows = block_q * query_grouping
+    q_tiles = (logical_rows + group_rows - 1) // group_rows
     kv_tiles = (kv_len + block_kv - 1) // block_kv
 
     @T.macro
-    def kv_step(kv_tile, batch_id, query_head, kv_head, query_base, qrows, Q, K, V, q_l1, k_l1, v_l1, p_l1, score_acc, pv_acc, score_input, scores, p, pv, output, maximum, next_maximum, denominator, row_sum, alpha):
-        key_base = kv_tile * block_kv
-        first_query = T.int64(query_start) if packed_decode else T.int64(query_start) + T.cast(query_base, "int64")
-        T.copy(K[batch_id, kv_head, key_base : key_base + block_kv, :], k_l1)
-        T.copy(V[batch_id, kv_head, key_base : key_base + block_kv, :], v_l1)
+    def query_step(key_base, first_query, qrows, q_l1, k_l1, v_l1, p_l1, score_acc, pv_acc, score_input, scores, p, pv, output, maximum, next_maximum, denominator, row_sum, alpha):
         T.gemm(q_l1, k_l1, score_acc, transpose_B=True, clear_accum=True)
         # The logical producer retains its complete allocation. Its actual
         # read region supplies the one valid row domain to the GM bridge and
@@ -226,6 +242,30 @@ def flash_attention_fwd(
             for i, j in T.Parallel(block_q, head_dim):
                 output[i, j] = output[i, j] + pv[i, j]
 
+    @T.macro
+    def kv_step(kv_tile, batch_id, kv_head, query_base, qrows, active_kv_tiles, K, V, q_l1, k_l1, v_l1, p_l1, score_acc, pv_acc, score_input, scores, p, pv, output, maximum, next_maximum, denominator, row_sum, alpha):
+        key_base = kv_tile * block_kv
+        first_query = T.int64(query_start) if packed_decode else T.int64(query_start) + T.cast(query_base, "int64")
+        # One input epoch serves all present query readers in this group.
+        T.copy(K[batch_id, kv_head, key_base : key_base + block_kv, :], k_l1)
+        T.copy(V[batch_id, kv_head, key_base : key_base + block_kv, :], v_l1)
+        if query_grouping == 2 and causal and not packed_decode:
+            # The second query may visit more causal KV tiles. Do not append
+            # completely invisible steps to the first query's recurrence.
+            if kv_tile < active_kv_tiles:
+                query_step(key_base, first_query, qrows, q_l1, k_l1, v_l1, p_l1, score_acc, pv_acc, score_input, scores, p, pv, output, maximum, next_maximum, denominator, row_sum, alpha)
+        else:
+            query_step(key_base, first_query, qrows, q_l1, k_l1, v_l1, p_l1, score_acc, pv_acc, score_input, scores, p, pv, output, maximum, next_maximum, denominator, row_sum, alpha)
+
+    @T.macro
+    def finish_query(batch_id, query_head, query_base, qrows, O_target, output, output_cast, denominator):
+        for i, j in T.Parallel(block_q, head_dim):
+            output_cast[i, j] = T.cast(output[i, j] / denominator[i], dtype)
+        if packed_decode:
+            T.copy(output_cast[0:qrows, :], O_target[batch_id, query_head + query_base : query_head + query_base + qrows, :])
+        else:
+            T.copy(output_cast[0:qrows, :], O_target[batch_id, query_head, query_base : query_base + qrows, :])
+
     @T.prim_func
     def main(
         Q: T.Tensor((batch, query_heads, query_len, head_dim), dtype),
@@ -242,7 +282,7 @@ def flash_attention_fwd(
                 batch_id = core // (query_heads * q_tiles)
                 query_head = core // q_tiles % query_heads
                 kv_head = query_head // groups
-            query_base = core % q_tiles * block_q
+            query_base = core % q_tiles * group_rows
             qrows = T.min(block_q, logical_rows - query_base)
             if causal:
                 # Exclusive largest visible key across this group's valid
@@ -254,6 +294,17 @@ def flash_attention_fwd(
                 active_kv_tiles = T.min(T.int64(kv_tiles), visible_end // kv_width + T.cast(visible_end % kv_width != 0, "int64"))
             else:
                 active_kv_tiles = kv_tiles
+
+            if query_grouping == 2:
+                query_base_second = query_base + block_q
+                qrows_second = T.min(block_q, T.max(0, logical_rows - query_base_second))
+                if causal and not packed_decode:
+                    # The last existing query has the longest visible prefix.
+                    # This stays within the actual sequence on an odd pair.
+                    group_visible_end = T.int64(query_start) + T.cast(query_base, "int64") + T.cast(T.min(group_rows, logical_rows - query_base), "int64")
+                    group_kv_tiles = T.min(T.int64(kv_tiles), group_visible_end // kv_width + T.cast(group_visible_end % kv_width != 0, "int64"))
+                else:
+                    group_kv_tiles = active_kv_tiles
 
             # Q is reused across KV iterations. Tile shape and this cache
             # policy are algorithm choices expressed here in Python.
@@ -275,6 +326,23 @@ def flash_attention_fwd(
             row_sum = T.alloc_shared((block_q,), "float32")
             alpha = T.alloc_shared((block_q,), "float32")
 
+            if query_grouping == 2:
+                # Distinct leading-row components preserve different tail
+                # domains. Any physical reuse requires compiler completion
+                # proof; a query axis is not an AIV owner axis.
+                q_l1_second = T.alloc_l1((block_q, head_dim), dtype)
+                score_input_second = T.alloc_shared((block_q, block_kv), "float32")
+                scores_second = T.alloc_shared((block_q, block_kv), "float32")
+                p_second = T.alloc_shared((block_q, block_kv), dtype)
+                pv_second = T.alloc_shared((block_q, head_dim), "float32")
+                output_second = T.alloc_shared((block_q, head_dim), "float32")
+                output_cast_second = T.alloc_shared((block_q, head_dim), dtype)
+                maximum_second = T.alloc_shared((block_q,), "float32")
+                next_maximum_second = T.alloc_shared((block_q,), "float32")
+                denominator_second = T.alloc_shared((block_q,), "float32")
+                row_sum_second = T.alloc_shared((block_q,), "float32")
+                alpha_second = T.alloc_shared((block_q,), "float32")
+
             if packed_decode:
                 # These views share the original parameter data; callers keep
                 # their BNSD tensors. Initialize unused physical Cube rows.
@@ -287,19 +355,39 @@ def flash_attention_fwd(
             T.fill(output, 0)
             T.fill(denominator, 0)
             T.fill(maximum, -T.infinity("float32"))
+            if query_grouping == 2:
+                if qrows_second > 0:
+                    if packed_decode:
+                        T.fill(q_l1_second, 0)
+                        T.copy(Q_heads[batch_id, query_head + query_base_second : query_head + query_base_second + qrows_second, :], q_l1_second[0:qrows_second, :])
+                    else:
+                        T.copy(Q[batch_id, query_head, query_base_second : query_base_second + block_q, :], q_l1_second)
+                    T.fill(output_second, 0)
+                    T.fill(denominator_second, 0)
+                    T.fill(maximum_second, -T.infinity("float32"))
             if variant == "generic":
-                for kv_tile in T.serial(active_kv_tiles):
-                    kv_step(kv_tile, batch_id, query_head, kv_head, query_base, qrows, Q, K, V, q_l1, k_l1, v_l1, p_l1, score_acc, pv_acc, score_input, scores, p, pv, output, maximum, next_maximum, denominator, row_sum, alpha)
+                for kv_tile in T.serial(group_kv_tiles if query_grouping == 2 else active_kv_tiles):
+                    kv_step(kv_tile, batch_id, kv_head, query_base, qrows, active_kv_tiles, K, V, q_l1, k_l1, v_l1, p_l1, score_acc, pv_acc, score_input, scores, p, pv, output, maximum, next_maximum, denominator, row_sum, alpha)
+                    if query_grouping == 2:
+                        if qrows_second > 0:
+                            query_step(kv_tile * block_kv, T.int64(query_start) if packed_decode else T.int64(query_start) + T.cast(query_base_second, "int64"), qrows_second, q_l1_second, k_l1, v_l1, p_l1, score_acc, pv_acc, score_input_second, scores_second, p_second, pv_second, output_second, maximum_second, next_maximum_second, denominator_second, row_sum_second, alpha_second)
             else:
-                for kv_tile in T.Pipelined(active_kv_tiles, max_stages=max_stages):
-                    kv_step(kv_tile, batch_id, query_head, kv_head, query_base, qrows, Q, K, V, q_l1, k_l1, v_l1, p_l1, score_acc, pv_acc, score_input, scores, p, pv, output, maximum, next_maximum, denominator, row_sum, alpha)
+                for kv_tile in T.Pipelined(group_kv_tiles if query_grouping == 2 else active_kv_tiles, max_stages=max_stages):
+                    kv_step(kv_tile, batch_id, kv_head, query_base, qrows, active_kv_tiles, K, V, q_l1, k_l1, v_l1, p_l1, score_acc, pv_acc, score_input, scores, p, pv, output, maximum, next_maximum, denominator, row_sum, alpha)
+                    if query_grouping == 2:
+                        if qrows_second > 0:
+                            query_step(kv_tile * block_kv, T.int64(query_start) if packed_decode else T.int64(query_start) + T.cast(query_base_second, "int64"), qrows_second, q_l1_second, k_l1, v_l1, p_l1, score_acc, pv_acc, score_input_second, scores_second, p_second, pv_second, output_second, maximum_second, next_maximum_second, denominator_second, row_sum_second, alpha_second)
 
-            for i, j in T.Parallel(block_q, head_dim):
-                output_cast[i, j] = T.cast(output[i, j] / denominator[i], dtype)
             if packed_decode:
-                T.copy(output_cast[0:qrows, :], O_heads[batch_id, query_head + query_base : query_head + query_base + qrows, :])
+                finish_query(batch_id, query_head, query_base, qrows, O_heads, output, output_cast, denominator)
             else:
-                T.copy(output_cast[0:qrows, :], O[batch_id, query_head, query_base : query_base + qrows, :])
+                finish_query(batch_id, query_head, query_base, qrows, O, output, output_cast, denominator)
+            if query_grouping == 2:
+                if qrows_second > 0:
+                    if packed_decode:
+                        finish_query(batch_id, query_head, query_base_second, qrows_second, O_heads, output_second, output_cast_second, denominator_second)
+                    else:
+                        finish_query(batch_id, query_head, query_base_second, qrows_second, O, output_second, output_cast_second, denominator_second)
 
     return main
 

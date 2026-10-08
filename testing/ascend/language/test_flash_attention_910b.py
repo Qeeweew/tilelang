@@ -271,7 +271,7 @@ def test_tuning_configs_roundtrip_to_direct_factory_calls_with_complete_problem(
     assert len({json.dumps(config, sort_keys=True) for config in configs}) == len(configs)
     assert [config["tiling"]["block_kv"] for config in configs] == widths
     for config in configs:
-        assert {key: value for key, value in config.items() if key != "tiling"} == problem
+        assert {key: value for key, value in config.items() if key != "tiling"} == dict(problem, query_grouping=1)
         assert config["tiling"] == dict(block_q=rows, block_kv=config["tiling"]["block_kv"], max_stages=4)
         program = example.flash_attention_fwd(**config)
         assert all(int(call.args[5]) == rows for call in calls(program, "tl.tileop.gemm"))
@@ -281,6 +281,185 @@ def test_tuning_configs_roundtrip_to_direct_factory_calls_with_complete_problem(
     # The last candidate is the same complete algorithm expression as the
     # default, including packed head ownership, tail bounds and typed math.
     tvm.ir.assert_structural_equal(example.flash_attention_fwd(**problem), example.flash_attention_fwd(**configs[-1]))
+
+
+@pytest.mark.parametrize("grouping", [0, 3, -1, True, 1.0, "2", None])
+def test_query_grouping_rejects_noninteger_or_unsupported_values(example, grouping):
+    with pytest.raises(ValueError, match="query_grouping must be the integer 1 or 2"):
+        example.flash_attention_fwd(1, 4, 2, 33, 65, 16, query_grouping=grouping)
+
+
+@pytest.mark.parametrize("groupings", [(), [], [1, 1], [1, True], [0], [3], [1.0], "12", None])
+def test_query_grouping_search_is_explicit_and_strict(example, groupings):
+    with pytest.raises(ValueError, match="query_group"):
+        example.get_tuning_configs(1, 4, 2, 33, 65, 16, query_groupings=groupings)
+
+
+@pytest.mark.parametrize("variant", ["generic", "pipeline"])
+@pytest.mark.parametrize("query_len,heads,kv_heads", [(65, 4, 2), (1, 130, 2)])
+def test_grouped_tuning_configs_are_complete_direct_json_factory_calls(example, variant, query_len, heads, kv_heads):
+    from testing.ascend._ir import calls
+
+    problem = dict(batch=2, query_heads=heads, kv_heads=kv_heads,
+                   query_len=query_len, kv_len=130, head_dim=16, dtype="float16",
+                   variant=variant, causal=True, query_start=130 - query_len,
+                   softmax_scale=0.125)
+    defaults = example.get_tuning_configs(**problem)
+    assert len(defaults) == 3 and {config["query_grouping"] for config in defaults} == {1}
+    configs = example.get_tuning_configs(**problem, query_groupings=[1, 2])
+    assert json.loads(json.dumps(configs, allow_nan=False)) == configs
+    assert configs[:3] == defaults
+    assert [(config["query_grouping"], config["tiling"]["block_kv"]) for config in configs] == [
+        (grouping, width) for grouping in (1, 2) for width in (64, 128, 256)
+    ]
+    for config in configs:
+        assert {key: value for key, value in config.items()
+                if key not in ("tiling", "query_grouping")} == problem
+        program = example.flash_attention_fwd(**config)
+        assert len(calls(program, "tl.tileop.gemm")) == 2 * config["query_grouping"]
+
+
+def _grouped_frontend(example, *, query_len=33, kv_len=65, heads=4, kv_heads=2,
+                      variant="generic", causal=False, query_start=0, dtype="float16"):
+    """Actual frontend operations, with no reconstruction of factory indices."""
+    from tvm import tirx
+    from testing.ascend._ir import calls, nodes, statements
+
+    program = example.flash_attention_fwd(
+        2, heads, kv_heads, query_len, kv_len, 16, dtype=dtype,
+        variant=variant, causal=causal, query_start=query_start,
+        tiling=example.FwdTiling(16, 16, 3), query_grouping=2,
+    )
+    buffers = [program.buffer_map[param] for param in program.params]
+    launch, = [loop for loop in nodes(program, tirx.For)
+               if loop.thread_binding is not None and loop.thread_binding.thread_tag == "blockIdx.x"]
+    kv_loop, = [loop for loop in nodes(program, tirx.For) if loop.kind == tirx.ForKind.SERIAL]
+    transfers = calls(program, "tl.tileop.ascend_copy")
+    q_loads = [call for call in transfers if call.args[0].args[0].buffer.data.same_as(buffers[0].data)]
+    exports = [call for call in transfers if call.args[1].args[0].buffer.data.same_as(buffers[3].data)]
+    kv_loads = [next(call for call in transfers if call.args[0].args[0].buffer.data.same_as(buffer.data))
+                for buffer in buffers[1:3]]
+    gemms = calls(program, "tl.tileop.gemm")
+    definitions = {binding.var: binding.value for binding in nodes(program, tirx.Bind)}
+    evaluated = [(stmt.value, parents) for stmt, parents in statements(program) if isinstance(stmt, tirx.Evaluate)]
+
+    def enabled(call, env):
+        from testing.ascend.auto_schedule.test_owner_result_completion import _value
+        parents = next(parents for value, parents in evaluated if value.same_as(call))
+        # These copies/GEMMs occur only in then branches of the two query
+        # admission guards; vector scale/mask branches are below the GEMMs.
+        guards = [parent.condition for parent in parents if isinstance(parent, tirx.IfThenElse)]
+        return all(_value(condition, env) for condition in guards)
+
+    return program, buffers, launch, kv_loop, q_loads, exports, kv_loads, gemms, definitions, enabled
+
+
+@pytest.mark.parametrize("variant", ["generic", "pipeline"])
+@pytest.mark.parametrize("query_len,causal,start", [
+    (16, False, 0), (32, False, 0), (33, False, 0),
+    (33, True, 0), (33, True, 32),
+], ids=["absent-second", "complete-pair", "odd-tail", "causal-prefix", "causal-offset"])
+def test_grouped_frontend_shares_only_kv_and_preserves_exact_query_admission(example, variant, query_len, causal, start):
+    from collections import Counter
+    from itertools import product
+    from tvm import tirx
+    from testing.ascend._ir import calls
+    from testing.ascend.auto_schedule.test_owner_result_completion import _PURE_DEFINITIONS, _SCALAR_VALUES, _region, _value
+
+    program, buffers, launch, loop, q_loads, exports, kv_loads, gemms, definitions, enabled = _grouped_frontend(
+        example, query_len=query_len, variant=variant, causal=causal, query_start=start,
+    )
+    # If no block can have a second query, the frontend may prove the guard
+    # false and remove its complete body. A runtime odd tail retains that
+    # guarded body, whose zero-row regions are checked below.
+    slots = 1 if query_len <= 16 else 2
+    assert len(q_loads) == len(exports) == slots and len(kv_loads) == 2
+    assert len(gemms) == 2 * slots
+    assert [tuple(map(int, call.args[5:8])) for call in gemms] == [(16, 16, 16)] * (2 * slots)
+    for parameter in buffers[1:3]:
+        assert sum(call.args[0].args[0].buffer.data.same_as(parameter.data)
+                   for call in calls(program, "tl.tileop.ascend_copy")) == 1
+    # Q and every query's row state remain separate leading-row components.
+    if slots == 2:
+        for first, second in ((q_loads[0].args[1], q_loads[1].args[1]),
+                              (exports[0].args[0], exports[1].args[0])):
+            assert not first.args[0].buffer.data.same_as(second.args[0].buffer.data)
+            assert tuple(map(int, first.args[0].buffer.shape)) == tuple(map(int, second.args[0].buffer.shape)) == (16, 16)
+        assert gemms[0].args[1].args[0].buffer.data.same_as(gemms[2].args[1].args[0].buffer.data)
+        for index in (0, 1, 2):
+            assert gemms[1].args[index].args[0].buffer.data.same_as(gemms[3].args[index].args[0].buffer.data)
+        assert gemms[0].args[2].args[0].buffer.data.same_as(gemms[2].args[2].args[0].buffer.data)
+    assert bool(loop.annotations.get("tl.ascend_auto_pipeline", False)) == (variant == "pipeline")
+
+    blocks = [(b, head, start_row) for b, head in product(range(2), range(4))
+              for start_row in range(0, query_len, 32)]
+    assert int(launch.extent) == len(blocks)
+    written = Counter()
+    for block, (batch, head, group_start) in enumerate(blocks):
+        env = {_PURE_DEFINITIONS: definitions, _SCALAR_VALUES: {},
+               launch.loop_var: tirx.const(block, launch.loop_var.dtype)}
+        query_steps = []
+        for owner, (load, export) in enumerate(zip(q_loads, exports)):
+            base = group_start + owner * 16
+            count = min(16, max(0, query_len - base))
+            assert enabled(load, env) == enabled(export, env) == (count > 0)
+            _, _, physical_source_shape = _region(export.args[0], env)
+            assert physical_source_shape == (count, 16), "An absent second query must retain a zero, not negative, region"
+            query_steps.append(((start + base + count + 15) // 16 if causal else 5) if count else 0)
+            if not count:
+                continue
+            _, q_origin, q_shape = _region(load.args[0], env)
+            _, o_origin, o_shape = _region(export.args[1], env)
+            assert q_origin == o_origin == (batch, head, base, 0)
+            assert q_shape == (1, 1, 16, 16) and o_shape == (1, 1, count, 16)
+            written.update((batch, head, row) for row in range(base, base + count))
+        trips = _value(loop.extent, env)
+        assert trips == max(query_steps)
+        observed_steps = [0] * slots
+        for kv in range(trips):
+            step_env = {**env, loop.loop_var: tirx.const(kv, loop.loop_var.dtype)}
+            for load in kv_loads:
+                assert enabled(load, step_env)
+                _, origin, shape = _region(load.args[0], step_env)
+                assert origin == (batch, head // 2, kv * 16, 0) and shape == (1, 1, 16, 16)
+            for owner in range(slots):
+                assert enabled(gemms[owner * 2], step_env) == enabled(gemms[owner * 2 + 1], step_env) == (kv < query_steps[owner])
+                observed_steps[owner] += enabled(gemms[owner * 2], step_env)
+        assert observed_steps == query_steps
+    assert written == Counter({position: 1 for position in product(range(2), range(4), range(query_len))})
+
+
+@pytest.mark.parametrize("dtype,tolerance", [("float16", 0.0015), ("bfloat16", 0.015)])
+@pytest.mark.parametrize("variant", ["generic", "pipeline"])
+@pytest.mark.parametrize("causal,start", [(False, 0), (True, 0), (True, 32)])
+def test_grouped_frontend_regions_reconstruct_same_typed_attention(example, dtype, tolerance, variant, causal, start):
+    from tvm import tirx
+    from testing.ascend.auto_schedule.test_owner_result_completion import _PURE_DEFINITIONS, _SCALAR_VALUES, _region
+
+    _, _, launch, _, _, exports, _, _, definitions, enabled = _grouped_frontend(
+        example, dtype=dtype, variant=variant, causal=causal, query_start=start,
+    )
+    random = np.random.default_rng(836)
+    q = random.normal(0, 0.5, (2, 4, 33, 16)).astype(np.float32)
+    k = random.normal(0, 0.5, (2, 2, 65, 16)).astype(np.float32)
+    v = random.normal(0, 0.5, k.shape).astype(np.float32)
+    options = dict(dtype=dtype, block_kv=16, causal=causal, softmax_scale=0.25)
+    expected = example.attention_reference(q, k, v, query_start=start, **options)
+    actual = np.full_like(expected, np.nan)
+    for block in range(int(launch.extent)):
+        env = {_PURE_DEFINITIONS: definitions, _SCALAR_VALUES: {},
+               launch.loop_var: tirx.const(block, launch.loop_var.dtype)}
+        for export in exports:
+            if not enabled(export, env):
+                continue
+            _, (b, h, first, _), (_, _, count, _) = _region(export.args[1], env)
+            actual[b:b + 1, h:h + 1, first:first + count] = example.attention_reference(
+                q[b:b + 1, h:h + 1, first:first + count],
+                k[b:b + 1, h // 2:h // 2 + 1], v[b:b + 1, h // 2:h // 2 + 1],
+                query_start=start + first, **options,
+            )
+    assert np.isfinite(actual).all()
+    np.testing.assert_allclose(actual, expected, atol=tolerance, rtol=tolerance)
 
 
 @pytest.mark.parametrize("dtype,tolerance", [("float16", 0.0015), ("bfloat16", 0.015)])

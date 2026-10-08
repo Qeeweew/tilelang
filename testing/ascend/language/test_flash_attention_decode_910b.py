@@ -1,10 +1,10 @@
 """Decode head packing preserves BNSD storage and ordinary attention math.
 
-These are frontend region and CPU mathematical checks. Native mixed-core
-completion, CANN compilation and device accuracy remain separate gates.
+These cover frontend regions, CPU math and finite native completion. CANN
+compilation and device accuracy remain separate gates.
 """
 
-from collections import Counter
+from collections import Counter, defaultdict, deque
 from itertools import product
 
 import numpy as np
@@ -16,7 +16,7 @@ from testing.ascend._ir import calls, nodes, statements
 from testing.ascend.auto_schedule.test_owner_result_completion import (
     _PURE_DEFINITIONS, _SCALAR_VALUES, _region, _value,
 )
-from testing.ascend.language.test_flash_attention_910b import example
+from testing.ascend.language.test_flash_attention_910b import example, _grouped_frontend
 
 
 def _frontend(example, *, batch=2, kv_heads=2, groups=17, block_q=16,
@@ -230,6 +230,99 @@ def test_decode_causal_oracle_has_no_head_dependent_visibility(example, dtype):
     np.testing.assert_array_equal(actual, expected)
 
 
+@pytest.mark.parametrize("variant", ["generic", "pipeline"])
+@pytest.mark.parametrize("groups", [1, 4, 17, 32, 33])
+def test_grouped_decode_has_exact_head_ownership_and_one_kv_import_per_epoch(example, variant, groups):
+    program, buffers, launch, loop, q_loads, exports, kv_loads, gemms, definitions, enabled = _grouped_frontend(
+        example, query_len=1, heads=2 * groups, variant=variant,
+        causal=True, query_start=17,
+    )
+    assert [tuple(map(int, buffer.shape)) for buffer in buffers] == [
+        (2, 2 * groups, 1, 16), (2, 2, 65, 16),
+        (2, 2, 65, 16), (2, 2 * groups, 1, 16),
+    ]
+    # An everywhere-absent second query is folded out of the frontend. A
+    # runtime-absent final query keeps its guarded nodes and zero regions.
+    query_components = min(2, (groups + 15) // 16)
+    assert len(q_loads) == len(exports) == query_components
+    assert len(gemms) == 2 * query_components
+    blocks = [(b, kv_head, first) for b, kv_head in product(range(2), range(2))
+              for first in range(0, groups, 32)]
+    assert int(launch.extent) == len(blocks)
+    written = Counter()
+    for block, (b, kv_head, first) in enumerate(blocks):
+        env = _env(definitions, launch, block)
+        assert _value(loop.extent, env) == 2
+        for owner, (q_load, export) in enumerate(zip(q_loads, exports)):
+            offset = first + owner * 16
+            count = min(16, max(0, groups - offset))
+            assert enabled(q_load, env) == enabled(export, env) == (count > 0)
+            _, _, exported_shape = _region(export.args[0], env)
+            assert exported_shape == (count, 16)
+            if not count:
+                continue
+            _, q_origin, q_shape = _region(q_load.args[0], env)
+            _, o_origin, o_shape = _region(export.args[1], env)
+            assert q_origin == o_origin == (b, kv_head * groups + offset, 0)
+            assert q_shape == o_shape == (1, count, 16)
+            assert q_origin[1] + count <= (kv_head + 1) * groups
+            written.update((b, head) for head in range(o_origin[1], o_origin[1] + count))
+        for kv in range(2):
+            step_env = _env(definitions, launch, block, loop, kv)
+            for load in kv_loads:
+                assert enabled(load, step_env)
+                _, origin, shape = _region(load.args[0], step_env)
+                assert origin == (b, kv_head, kv * 16, 0) and shape == (1, 1, 16, 16)
+            for owner in range(query_components):
+                assert enabled(gemms[owner * 2], step_env) == (first + owner * 16 < groups)
+    assert written == Counter({head: 1 for head in product(range(2), range(2 * groups))})
+    # Both packed query components use the same causal position. Query-head
+    # offsets may select Q/O rows, but must never enter the key predicate.
+    masked = [(store, selection) for store in nodes(program, tirx.BufferStore)
+              for selection in nodes(store.value, tirx.Call)
+              if isinstance(selection.op, tvm.ir.Op) and selection.op.name == "tirx.if_then_else"]
+    assert len(masked) == query_components
+    for store, selection in masked:
+        parents = next(parents for stmt, parents in statements(program) if stmt.same_as(store))
+        row, column = [parent for parent in parents if isinstance(parent, tirx.For)][-2:]
+        for block, kv, i, j in product(range(int(launch.extent)), range(2), range(16), range(16)):
+            env = _env(definitions, launch, block, loop, kv)
+            env.update({row.loop_var: tirx.const(i, row.loop_var.dtype),
+                        column.loop_var: tirx.const(j, column.loop_var.dtype)})
+            assert _predicate_value(selection.args[0], env) == (kv * 16 + j <= 17)
+
+
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+@pytest.mark.parametrize("variant", ["generic", "pipeline"])
+def test_grouped_decode_ir_scatter_preserves_original_bnsd_math(example, dtype, variant):
+    _, _, launch, _, _, exports, _, _, definitions, enabled = _grouped_frontend(
+        example, query_len=1, heads=66, variant=variant, dtype=dtype,
+        causal=True, query_start=17,
+    )
+    q = np.zeros((2, 66, 1, 16), dtype=np.float32)
+    k = np.zeros((2, 2, 65, 16), dtype=np.float32)
+    v = np.empty_like(k)
+    for batch, head in product(range(2), range(2)):
+        v[batch, head] = (100 * batch + 10 * head + np.arange(65, dtype=np.float32))[:, None]
+    options = dict(dtype=dtype, block_kv=16, causal=True, query_start=17)
+    expected = example.attention_reference(q, k, v, **options)
+    actual = np.full((2, 66, 16), np.nan, dtype=np.float32)
+    for block in range(int(launch.extent)):
+        env = _env(definitions, launch, block)
+        for export in exports:
+            if not enabled(export, env):
+                continue
+            _, (b, first, _), (_, count, _) = _region(export.args[1], env)
+            kv_head = first // 33
+            packed = example.attention_reference(
+                q[b:b + 1, first:first + count], k[b:b + 1, kv_head:kv_head + 1],
+                v[b:b + 1, kv_head:kv_head + 1], **options,
+            )
+            actual[b, first:first + count] = packed[0, :, 0]
+    assert np.isfinite(actual).all()
+    np.testing.assert_array_equal(actual[:, :, None], expected)
+
+
 def test_short_prefill_keeps_query_rows_and_the_existing_default_tile(example):
     program = example.flash_attention_fwd(1, 4, 1, 2, 35, 16)
     q = program.buffer_map[program.params[0]]
@@ -263,7 +356,7 @@ def _native_decode_lower(program):
     return artifact.kernel_source, snapshots
 
 
-def _decode_completion_controls(mod, *, core, block):
+def _decode_completion_controls(mod, *, core, block, native_hb=False):
     """Project finite copies/collectives, preserving their actual controls.
 
     The existing trace interprets integer control and explicit counter state.
@@ -289,8 +382,8 @@ def _decode_completion_controls(mod, *, core, block):
             return tirx.Evaluate(0)
         if isinstance(node, tirx.Evaluate):
             call = node.value
-            if not isinstance(call, tirx.Call) or not isinstance(call.op, tvm.ir.Op) or call.op.name not in (
-                    _COPY, _CROSS_SET, _CROSS_WAIT):
+            if not isinstance(call, tirx.Call) or not isinstance(call.op, tvm.ir.Op) or (
+                    not native_hb and call.op.name not in (_COPY, _CROSS_SET, _CROSS_WAIT)):
                 return tirx.Evaluate(0)
 
     func = mod["main"]
@@ -298,22 +391,279 @@ def _decode_completion_controls(mod, *, core, block):
     return tvm.IRModule({"main": func.with_body(body)})
 
 
+def _grouped_native_completion_commands(mod, block):
+    """Retain real commands; track only native L1/L0 storage effects.
+
+    Vector arithmetic is not numerically interpreted. Its real commands,
+    local fences and mode-2 handoffs remain in the completion graph, because
+    a C retirement path can run through Score -> AIV -> P -> PV.
+    """
+    from testing.ascend.auto_schedule.test_nested_local_protocols import _Command
+    from testing.ascend.auto_schedule.test_owner_result_completion import (
+        _COPY, _CROSS_SET, _CROSS_WAIT, _name, _trace,
+    )
+
+    def cells(argument, env):
+        buffer, origin, shape = _region(argument, env)
+        if not buffer.scope().startswith(("shared.l1", "shared.l0a", "shared.l0b", "shared.l0c")):
+            return ()
+        # Exact logical elements preserve partial FIX rows and L1 padding;
+        # rounding a one-row tail to a full fractal would invent overlaps.
+        assert all(extent >= 0 for extent in shape) and np.prod(shape) <= 4096
+        return tuple((buffer.data, *indices) for indices in product(
+            *(range(start, start + extent) for start, extent in zip(origin, shape))))
+
+    result = []
+    for core, lane in ((2, 0), (1, 0), (1, 1)):
+        projected = _decode_completion_controls(mod, core=core, block=block, native_hb=True)
+        for call, env, _ in _trace(projected, core=core, lane=lane):
+            name = _name(call)
+            flag, reads, writes = None, (), ()
+            if name in ("tl.ascend_set_flag", "tl.ascend_wait_flag"):
+                source, destination = call.args[0].value.split("_")
+                kind = "set" if name == "tl.ascend_set_flag" else "wait"
+                pipe = source if kind == "set" else destination
+                flag = (call.args[0].value, _value(call.args[1], env))
+                assert 0 <= flag[1] < 8
+            elif name in (_CROSS_SET, _CROSS_WAIT):
+                assert _value(call.args[0], env) == 2, "This grouped 2201 fixture uses collective mode 2"
+                kind = "cross_set" if name == _CROSS_SET else "cross_wait"
+                # A2 wait_flag_dev ignores the nominal pipe argument and
+                # blocks subsequent dispatch on this core/lane, not work
+                # which has already been issued to other queues.
+                pipe = call.args[1].value.removeprefix("PIPE_") if kind == "cross_set" else "S"
+                flag = (2, _value(call.args[2], env))
+            elif name == "tl.ascend_pipe_barrier":
+                pipe, kind = call.args[0].value.removeprefix("PIPE_"), "barrier"
+            elif name in (_COPY, "tl.tileop.ascend_cube_load3d"):
+                source, _, _ = _region(call.args[0], env)
+                destination, _, _ = _region(call.args[1], env)
+                pipe = ("MTE2" if source.scope() == "global" else
+                        "MTE1" if destination.scope().startswith(("shared.l0a", "shared.l0b")) else
+                        "FIX" if source.scope().startswith("shared.l0c") else "MTE3")
+                kind, reads, writes = "copy", cells(call.args[0], env), cells(call.args[1], env)
+            elif name == "tl.tileop.fill":
+                buffer, _, _ = _region(call.args[0], env)
+                pipe, kind, writes = ("MTE2" if buffer.scope().startswith("shared.l1") else "V"), "fill", cells(call.args[0], env)
+            elif name == "tl.tileop.gemm":
+                assert core == 2
+                unit = call.annotations.get("unit_flag_ctrl")
+                assert unit is None or _value(unit, env) == 0, "Unit readiness is not whole-MAD retirement"
+                pipe, kind = "M", "mad"
+                reads = (*cells(call.args[0], env), *cells(call.args[1], env))
+                if not _value(call.args[9], env):
+                    reads += cells(call.args[2], env)
+                writes = cells(call.args[2], env)
+            elif name.startswith("tl.ascend_membase."):
+                assert core == 1
+                pipe, kind = "V", "vector"
+            else:
+                assert name in ("tl.ascend_set_load3d_config", "tl.ascend_set_fixpipe_config",
+                                "tl.ascend_set_mmad_direction"), name
+                pipe, kind = "S", "scalar"
+            result.append(((core, lane), _Command(pipe, kind, flag, reads, writes)))
+    return result
+
+
+def _prove_grouped_native_completions(commands):
+    """Finite issue/start/done graph using the existing native oracle rules.
+
+    Each track dispatches independently. Only S/M have implicit completion
+    order; Vector, DMA and FIX need actual source fences/destination gates.
+    Mode 2 pairs one Cube publication with each AIV, and both AIV releases
+    with one Cube acquire. Matching counts add no extra completion edges.
+    This finite fixture also proves consume-before-next-notify; that is a
+    sufficient bound, not a general requirement of mode-2 counting events.
+    """
+    parents, pending, gates, issue_tail, implicit_tail = {}, defaultdict(set), {}, {}, {}
+    local_sets, local_waits, cross_sets, cross_waits = (defaultdict(list) for _ in range(4))
+    pipes = ("S", "M", "FIX", "MTE1", "MTE2", "MTE3", "V")
+    for index, (track, command) in enumerate(commands):
+        issue, start, done = 3 * index, 3 * index + 1, 3 * index + 2
+        parents[issue] = {issue_tail[track]} if track in issue_tail else set()
+        parents[start], parents[done] = {issue}, {start}
+        for pipe in pipes if command.pipe == "ALL" else (command.pipe,):
+            key = track, pipe
+            if key in gates:
+                parents[start].add(gates[key])
+            if pipe in ("S", "M") and key in implicit_tail:
+                parents[start].add(implicit_tail[key])
+            if command.kind in ("set", "cross_set", "barrier"):
+                parents[done].update(pending[key])
+                pending[key].clear()
+            pending[key].add(done)
+            if command.kind in ("wait", "barrier"):
+                gates[key] = done
+            if pipe in ("S", "M"):
+                implicit_tail[key] = done
+        # Destination-S local waits and A2 cross-core waits stop later
+        # dispatch. An ordinary asynchronous acquire does not do so.
+        issue_tail[track] = done if command.kind == "cross_wait" or (
+            command.kind == "wait" and command.pipe == "S") else issue
+        if command.kind in ("set", "wait"):
+            (local_sets if command.kind == "set" else local_waits)[track, command.flag].append(done)
+        if command.kind in ("cross_set", "cross_wait"):
+            (cross_sets if command.kind == "cross_set" else cross_waits)[track, command.flag].append(done)
+
+    reuse = []
+    assert local_sets.keys() == local_waits.keys()
+    for key, notifications in local_sets.items():
+        acquisitions = local_waits[key]
+        assert len(notifications) == len(acquisitions), (key, "Unbalanced local binary event")
+        for notify, acquire in zip(notifications, acquisitions):
+            parents[acquire].add(notify)
+        reuse.extend(zip(acquisitions, notifications[1:]))
+    flags = {flag for _, flag in cross_sets.keys() | cross_waits.keys()}
+    for flag in flags:
+        cube_sets, cube_waits = cross_sets[(2, 0), flag], cross_waits[(2, 0), flag]
+        for lane in (0, 1):
+            vector_sets, vector_waits = cross_sets[(1, lane), flag], cross_waits[(1, lane), flag]
+            assert len(cube_sets) == len(vector_waits) and len(vector_sets) == len(cube_waits)
+            for notify, acquire in (*zip(cube_sets, vector_waits), *zip(vector_sets, cube_waits)):
+                parents[acquire].add(notify)
+            reuse.extend(zip(vector_waits, cube_sets[1:]))
+            reuse.extend(zip(cube_waits, vector_sets[1:]))
+
+    children, remaining = defaultdict(list), {node: len(incoming) for node, incoming in parents.items()}
+    for node, incoming in parents.items():
+        for predecessor in incoming:
+            children[predecessor].append(node)
+    ready, rank = deque(node for node, degree in remaining.items() if not degree), {}
+    while ready:
+        node = ready.popleft()
+        rank[node] = len(rank)
+        for child in children[node]:
+            remaining[child] -= 1
+            if not remaining[child]:
+                ready.append(child)
+    assert len(rank) == len(parents), "Grouped native completion graph deadlocks"
+    proven = set()
+
+    def require(before, after, *, obligation="data"):
+        if (before, after) in proven:
+            return
+        frontier, seen = [after], set()
+        while frontier:
+            node = frontier.pop()
+            if node == before:
+                proven.add((before, after))
+                return
+            if node not in seen and rank[node] > rank[before]:
+                seen.add(node)
+                frontier.extend(parents[node])
+        source_track, source = commands[before // 3]
+        destination_track, destination = commands[after // 3]
+        raise AssertionError(
+            f"Missing grouped {obligation} completion path "
+            f"{before // 3}:{source_track}:{source.kind}/{source.pipe} -> "
+            f"{after // 3}:{destination_track}:{destination.kind}/{destination.pipe}")
+
+    writers, readers, hazards = {}, defaultdict(set), Counter()
+    for index, (track, command) in enumerate(commands):
+        for cell in command.reads:
+            if cell in writers:
+                require(3 * writers[cell] + 2, 3 * index + 1)
+            readers[cell].add(index)
+        for cell in command.writes:
+            if cell in writers:
+                require(3 * writers[cell] + 2, 3 * index + 1)
+            for reader in readers[cell]:
+                if reader != index:
+                    require(3 * reader + 2, 3 * index + 1)
+                    hazards[commands[reader][1].pipe, command.pipe, cell[0]] += 1
+            writers[cell] = index
+            readers[cell].clear()
+    for consumed, reset in reuse:
+        require(consumed, reset, obligation="event reuse")
+    return hazards
+
+
 @pytest.mark.parametrize("variant", ["generic", "pipeline"])
-@pytest.mark.parametrize("case", ["default-four", "causal-head-tail", "causal-one-key-prefix"])
+def test_grouped_decode_native_shared_storage_completion(example, variant):
+    """Real grouped FA, including slot wrap, empty AIV and absent q1.
+
+    Five causal KV epochs exceed the three-stage bound. Block 0 has both
+    queries; block 1 has one row in q0 (AIV1 empty) and an absent q1. The
+    graph covers actual L1/L0 regions and explicit completion, not UB math,
+    final arena aliasing or numerical accuracy.
+    """
+    from testing.ascend.auto_schedule.test_owner_result_completion import _COPY
+
+    program = example.flash_attention_fwd(
+        1, 33, 1, 1, 130, 16, dtype="float16", variant=variant,
+        causal=True, query_start=65, tiling=example.FwdTiling(16, 16, 3),
+        query_grouping=2,
+    )
+    _, snapshots = _native_decode_lower(program)
+    lowered = snapshots["tl.LowerScheduledTIR"]
+    func = lowered["main"]
+    q, k, v, _ = [func.buffer_map[param] for param in func.params]
+    imports = [call for call in calls(lowered, _COPY)
+               if call.args[0].args[0].buffer.scope() == "global"
+               and call.args[1].args[0].buffer.scope().startswith("shared.l1")]
+    kv_storage = {
+        next(call.args[1].args[0].buffer.data for call in imports
+             if call.args[0].args[0].buffer.data.same_as(source.data))
+        for source in (k, v)
+    }
+    p_storage = {call.args[1].args[0].buffer.data for call in imports
+                 if not any(call.args[0].args[0].buffer.data.same_as(source.data)
+                            for source in (q, k, v))}
+    assert len(kv_storage) == 2 and len(p_storage) == 1
+    c_storage = {call.args[2].args[0].buffer.data for call in calls(lowered, "tl.tileop.gemm")}
+    assert len(c_storage) == 2
+    actual_commands = []
+    for block, active_queries in ((0, 2), (1, 1)):
+        commands = _grouped_native_completion_commands(lowered, block)
+        hazards = _prove_grouped_native_completions(commands)
+        for storage in kv_storage | p_storage:
+            assert hazards["MTE1", "MTE2", storage] > 0, "Must exercise real shared-L1 reuse"
+            assert sum(command.pipe == "MTE1" and any(cell[0].same_as(storage) for cell in command.reads)
+                       for _, command in commands) == 5 * active_queries
+        for storage in c_storage:
+            assert hazards["FIX", "M", storage] > 0, "Must retire FIX before reusing shared L0C"
+        assert sum(command.kind == "mad" for _, command in commands) == 10 * active_queries
+        actual_commands.append(commands)
+
+    # Retain every event/token and every data operation, but publish one
+    # Score result before its FIX is issued. Matching mode-2 counts still
+    # hold; the real cross-track C-retirement path must now fail.
+    commands = actual_commands[0]
+    notify, = [index for index, (track, command) in enumerate(commands)
+               if track == (2, 0) and command.kind == "cross_set" and command.pipe == "FIX"][:1]
+    fix = max(index for index in range(notify)
+              if commands[index][0] == (2, 0) and commands[index][1].kind == "copy"
+              and commands[index][1].pipe == "FIX")
+    premature = commands[:fix] + [commands[notify]] + commands[fix:notify] + commands[notify + 1:]
+    def tokens(trace):
+        return Counter((track, command.kind, command.flag) for track, command in trace
+                       if command.kind in ("set", "wait", "cross_set", "cross_wait"))
+
+    assert tokens(premature) == tokens(commands)
+    with pytest.raises(AssertionError, match="Missing grouped data completion path .*copy/FIX -> .*mad/M"):
+        _prove_grouped_native_completions(premature)
+
+
+@pytest.mark.parametrize("variant", ["generic", "pipeline"])
+@pytest.mark.parametrize("case", ["default-four", "causal-head-tail", "causal-one-key-prefix",
+                                  "grouped-causal-head-tail", "grouped-absent-second"])
 def test_native_decode_regions_and_empty_aiv_collective_fill_drain(example, variant, case):
     from testing.ascend.auto_schedule.test_owner_result_completion import (
         _COPY, _CROSS_SET, _CROSS_WAIT, _name, _trace,
     )
 
+    query_grouping = 2 if case.startswith("grouped-") else 1
     if case == "default-four":
         batch, kv_heads, groups, kv_len, dim, width, trips = 1, 1, 4, 4096, 64, 256, 16
         program = example.flash_attention_fwd(batch, groups, kv_heads, 1, kv_len, dim,
                                              variant=variant)
-    elif case == "causal-head-tail":
-        batch, kv_heads, groups, kv_len, dim, width, trips = 2, 2, 17, 35, 16, 16, 2
+    elif case in ("causal-head-tail", "grouped-causal-head-tail", "grouped-absent-second"):
+        groups = 33 if case == "grouped-absent-second" else 17
+        batch, kv_heads, kv_len, dim, width, trips = 2, 2, 35, 16, 16, 2
         program = example.flash_attention_fwd(
             batch, kv_heads * groups, kv_heads, 1, kv_len, dim, dtype="float16",
             variant=variant, causal=True, query_start=17, tiling=example.FwdTiling(16, 16, 3),
+            query_grouping=query_grouping,
         )
     else:
         batch, kv_heads, groups, kv_len, dim, width, trips = 2, 2, 17, 130, 64, 64, 2
@@ -329,19 +679,27 @@ def test_native_decode_regions_and_empty_aiv_collective_fill_drain(example, vari
                if stmt.attr_key == "thread_extent" and isinstance(stmt.node, tirx.IterVar)}
     definitions = {binding.var: binding.value for binding in nodes(partition, tirx.Bind)}
     copies = calls(partition, _COPY)
-    q_load, = [call for call in copies if call.args[0].args[0].buffer.data.same_as(q.data)]
-    export, = [call for call in copies if call.args[1].args[0].buffer.data.same_as(output.data)]
+    q_loads = [call for call in copies if call.args[0].args[0].buffer.data.same_as(q.data)]
+    exports = [call for call in copies if call.args[1].args[0].buffer.data.same_as(output.data)]
     fixes = [call for call in copies if call.args[0].args[0].buffer.scope() == "shared.l0c"
              and call.args[1].args[0].buffer.scope() == "global"]
-    p_spill, = [call for call in copies if call.args[0].args[0].buffer.scope() == "shared.dyn"
+    p_spills = [call for call in copies if call.args[0].args[0].buffer.scope() == "shared.dyn"
                 and call.args[1].args[0].buffer.scope() == "global"
                 and not call.args[1].args[0].buffer.data.same_as(output.data)]
-    assert len(fixes) == 2
-    workspaces = [call.args[1].args[0].buffer.data for call in (*fixes, p_spill)]
+    assert len(q_loads) == len(exports) == len(p_spills) == query_grouping
+    assert len(fixes) == 2 * query_grouping
+    query_workspaces = [
+        [call.args[1].args[0].buffer.data
+         for call in (fixes[2 * index], fixes[2 * index + 1], p_spills[index])]
+        for index in range(query_grouping)
+    ]
+    # Reusing L0C and L1 P must not merge the separate valid-row components or
+    # their GM publications. Every logical handoff retains its own workspace.
+    assert len({data for workspace in query_workspaces for data in workspace}) == 3 * query_grouping
     gemms = calls(partition, "tl.tileop.gemm")
-    assert len(gemms) == 2 and all(int(call.args[5]) == 16 for call in gemms)
+    assert len(gemms) == 2 * query_grouping and all(int(call.args[5]) == 16 for call in gemms)
     native_mads = calls(snapshots["tl.AscendLowerTileOp"], "tl.ascend_mad")
-    assert len(native_mads) == 2 and all(int(call.args[3]) == 16 for call in native_mads)
+    assert len(native_mads) == 2 * query_grouping and all(int(call.args[3]) == 16 for call in native_mads)
     # Keep generated-code assertions at the native API boundary, not offsets,
     # flag numbers, task order or a complete golden source.
     for api in ("asc_mmad(", "asc_copy_l0c2gm(", "asc_copy_gm2ub_align(",
@@ -350,55 +708,103 @@ def test_native_decode_regions_and_empty_aiv_collective_fill_drain(example, vari
     assert calls(snapshots["tl.InsertSync"], _CROSS_SET)
     assert calls(snapshots["tl.InsertSync"], _CROSS_WAIT)
 
-    covered, nonempty_lanes = Counter(), set()
-    expected = [(b, h, start, min(16, groups - start))
+    covered, nonempty_lanes, absent_queries, empty_owners = Counter(), set(), set(), set()
+    expected = [(b, h, start)
                 for b, h in product(range(batch), range(kv_heads))
-                for start in range(0, groups, 16)]
-    for block, (b, kv_head, head_offset, count) in enumerate(expected):
-        head_start = kv_head * groups + head_offset
+                for start in range(0, groups, 16 * query_grouping)]
+    for block, (b, kv_head, head_offset) in enumerate(expected):
         base = {_PURE_DEFINITIONS: definitions, _SCALAR_VALUES: {},
                 threads["blockIdx.x"]: tirx.const(block, threads["blockIdx.x"].dtype)}
-        q_view, q_origin, q_shape = _region(q_load.args[0], base)
-        assert q_view.data.same_as(q.data) and q_origin == (b, head_start, 0)
-        assert q_shape == (1, count, dim)
-        for fix in fixes:
-            _, src_origin, src_shape = _region(fix.args[0], base)
-            _, dst_origin, dst_shape = _region(fix.args[1], base)
-            assert src_origin[-2:] == dst_origin[-2:] == (0, 0)
-            assert src_shape[-2:] == dst_shape[-2:] == (count, width if fix.same_as(fixes[0]) else dim)
-
+        query_counts = [min(16, max(0, groups - head_offset - index * 16))
+                        for index in range(query_grouping)]
         traces = {}
         for core, lane in ((2, 0), (1, 0), (1, 1)):
             projected = _decode_completion_controls(snapshots["tl.LowerScheduledTIR"], core=core, block=block)
             traces[core, lane] = list(_trace(projected, core=core, lane=lane))
+        # Simplify may use the presence guard to replace an active second
+        # query's Q/FIX extent by 16. Outside that guard its raw expression
+        # need not evaluate to zero. Trace the real controls first, then check
+        # regions only for operations that actually execute in this block.
+        cube_q_loads, cube_fixes = Counter(), Counter()
+        for call, actual, _ in traces[2, 0]:
+            if _name(call) != _COPY:
+                continue
+            src, src_origin, src_shape = _region(call.args[0], actual)
+            dst, dst_origin, dst_shape = _region(call.args[1], actual)
+            if src.data.same_as(q.data):
+                index, = [index for index, q_load in enumerate(q_loads)
+                          if dst.data.same_as(q_load.args[1].args[0].buffer.data)]
+                count = query_counts[index]
+                assert count > 0, "An absent query must execute no Q import"
+                head_start = kv_head * groups + head_offset + index * 16
+                assert src_origin == (b, head_start, 0) and src_shape == (1, count, dim)
+                cube_q_loads[index] += 1
+            for index, workspace in enumerate(query_workspaces):
+                for handoff, columns in enumerate((width, dim)):
+                    if dst.data.same_as(workspace[handoff]):
+                        count = query_counts[index]
+                        assert count > 0, "An absent query must execute no Cube publication"
+                        assert src.scope() == "shared.l0c"
+                        assert src_origin[-2:] == dst_origin[-2:] == (0, 0)
+                        assert src_shape[-2:] == dst_shape[-2:] == (count, columns)
+                        cube_fixes[index, handoff] += 1
+        for index, count in enumerate(query_counts):
+            assert cube_q_loads[index] == int(count > 0)
+            for handoff in (0, 1):
+                assert cube_fixes[index, handoff] == (trips if count else 0)
+            if not count:
+                absent_queries.add(index)
         transfers = Counter()
         for lane in (0, 1):
             env = {**base, threads["cthread"]: tirx.const(lane, threads["cthread"].dtype)}
-            view, origin, shape = _region(export.args[1], env)
-            assert view.data.same_as(output.data) and tuple(map(int, view.shape)) == (batch, kv_heads * groups, dim)
-            assert shape[0] == 1 and shape[2] == dim and 0 <= shape[1] <= 8
-            assert origin[0] == b and origin[2] == 0
-            assert head_start <= origin[1] <= head_start + count
-            assert origin[1] + shape[1] <= head_start + count
-            for head in range(origin[1], origin[1] + shape[1]):
-                covered[b, head] += 1
-            if shape[1]:
-                nonempty_lanes.add(lane)
+            owner_shapes = []
+            for index, (export, count) in enumerate(zip(exports, query_counts)):
+                if not count:
+                    # No region is evaluated under a false presence guard.
+                    # Actual no-copy/no-export behavior is checked below.
+                    owner_shapes.append(None)
+                    continue
+                head_start = kv_head * groups + head_offset + index * 16
+                view, origin, shape = _region(export.args[1], env)
+                owner_shapes.append(shape)
+                assert view.data.same_as(output.data) and tuple(map(int, view.shape)) == (batch, kv_heads * groups, dim)
+                assert shape[0] == 1 and shape[2] == dim and 0 <= shape[1] <= 8
+                assert origin[0] == b and origin[2] == 0
+                assert head_start <= origin[1] <= head_start + count
+                assert origin[1] + shape[1] <= head_start + count
+                if shape[1]:
+                    nonempty_lanes.add(lane)
+                elif count:
+                    empty_owners.add((index, lane))
+            exported = Counter()
             for call, actual, _ in traces[1, lane]:
                 if _name(call) != _COPY:
                     continue
                 src, _, src_shape = _region(call.args[0], actual)
                 dst, _, dst_shape = _region(call.args[1], actual)
-                for index, data in enumerate(workspaces):
-                    if src.data.same_as(data) or dst.data.same_as(data):
-                        assert np.prod(src_shape) == np.prod(dst_shape)
-                        transfers[index, lane] += int(np.prod(src_shape))
+                for index, workspace in enumerate(query_workspaces):
+                    for handoff, data in enumerate(workspace):
+                        if src.data.same_as(data) or dst.data.same_as(data):
+                            assert query_counts[index] > 0, "An absent query must execute no AIV handoff copy"
+                            assert np.prod(src_shape) == np.prod(dst_shape)
+                            if not owner_shapes[index][1]:
+                                assert np.prod(src_shape) == 0, "An empty AIV must transfer no handoff payload"
+                            transfers[index, handoff, lane] += int(np.prod(src_shape))
                 if dst.data.same_as(output.data):
-                    assert tuple(dst_shape) == tuple(shape)
-                if not shape[1] and (src.scope() == "global" or dst.scope() == "global"):
+                    index, = [index for index, export in enumerate(exports)
+                              if src.data.same_as(export.args[0].args[0].buffer.data)]
+                    assert query_counts[index] > 0, "An absent query must execute no output export"
+                    assert tuple(dst_shape) == tuple(owner_shapes[index])
+                    _, origin, _ = _region(call.args[1], actual)
+                    covered.update((origin[0], head) for head in range(origin[1], origin[1] + dst_shape[1]))
+                    exported[index] += 1
+                if not any(shape is not None and shape[1] for shape in owner_shapes) and (src.scope() == "global" or dst.scope() == "global"):
                     assert np.prod(src_shape) == np.prod(dst_shape) == 0
-            for index, columns in enumerate((width, dim, width)):
-                assert transfers[index, lane] == shape[1] * columns * trips
+            for index, shape in enumerate(owner_shapes):
+                for handoff, columns in enumerate((width, dim, width)):
+                    expected_elements = shape[1] * columns * trips if shape is not None else 0
+                    assert transfers[index, handoff, lane] == expected_elements
+                assert exported[index] == int(query_counts[index] > 0), "Absent queries must execute no export"
 
         def events(core, lane, operation):
             return Counter((_value(call.args[0], actual), _value(call.args[2], actual))
@@ -412,8 +818,12 @@ def test_native_decode_regions_and_empty_aiv_collective_fill_drain(example, vari
         for lane in (0, 1):
             assert events(1, lane, _CROSS_WAIT) == cube_sets
             assert events(1, lane, _CROSS_SET) == cube_waits
-        if variant == "pipeline":
-            assert any(_name(call) == _CROSS_WAIT and not loops
-                       for call, _, loops in traces[2, 0]), "Carried result slots need a final drain"
+        # The finite counters above include seeds and drains on every lane.
+        # Automatic T.Pipelined may select a same-epoch schedule without a
+        # carried result slot; correctness does not require a root-level wait.
     assert covered == Counter({head: 1 for head in product(range(batch), range(kv_heads * groups))})
     assert nonempty_lanes == ({0} if case == "default-four" else {0, 1})
+    if case == "grouped-causal-head-tail":
+        assert (1, 1) in empty_owners, "The present second query must exercise its empty AIV"
+    if case == "grouped-absent-second":
+        assert absent_queries == {1} and (0, 1) in empty_owners

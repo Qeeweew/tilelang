@@ -31,6 +31,14 @@ Cross-core counters have a different contract. Their collective participants,
 ID allocation and finite completion protocol are handled separately. This
 local event rule does not change dav-3510 synchronization.
 
+On dav-2201, a block/cross-core wait stops subsequent instruction dispatch
+on every pipeline of the waiting core; already issued work can continue.
+CANN 9.1's `asc_sync_block_wait(pipe, id)` expands to `wait_flag_dev(id)`
+and ignores `pipe`. An early result import can therefore prevent independent
+Vector work from being issued, even when the source names `PIPE_MTE2`.
+This differs from dav-3510's pipe-specific wait and from local hard-event
+waits, which gate their destination pipeline.
+
 Each local hard-event namespace has eight IDs, independently for each physical
 core: for example, `V_S` and `S_V` each have eight, and the two AIVs execute
 their local event IDs in private banks. This is not a shared eight-ID budget
