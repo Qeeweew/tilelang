@@ -104,6 +104,16 @@ def _assert_storage_contract(artifact, snapshots):
 
     a, b = [allocated_buffer(scheduled, name) for name in ("gemm_l0a_0", "gemm_l0b_0")]
     assert tuple(map(int, a.shape)) == (64, 256) and tuple(map(int, b.shape)) == (256, 64)
+    # QK/PV require different A configurations, while the independent PV B
+    # bank remains eligible. Bank fallback must preserve both ordinary A loads.
+    (load3d,) = calls(scheduled, _LOAD3D)
+    assert load3d.args[0].args[0].buffer.name == "v_l1"
+    assert load3d.args[1].args[0].buffer.same_as(b)
+    (config,) = calls(scheduled, "tl.ascend_set_load3d_config")
+    assert tuple(map(int, config.args)) == (1, 768)
+    assert {call.args[1].args[0].buffer.data for call in calls(scheduled, _COPY)
+            if call.args[1].args[0].buffer.scope() == "shared.l0a"} == {
+                allocated_buffer(scheduled, "aq").data, a.data}
     assert all(int(versions[buffer.data]) == 2 for buffer in (a, b))
     assert all(tuple(map(int, allocated_buffer(physical, buffer.name).shape)) == (2, *map(int, buffer.shape))
                for buffer in (a, b))
@@ -192,7 +202,8 @@ def _completion_commands(mod, unit_streams=False):
             else:
                 trace.append(_Command(pipe, "copy", reads=blocks(call.args[0], env), writes=blocks(call.args[1], env)))
         else:
-            assert name in ("tl.ascend_set_mmad_direction", "tl.ascend_set_fixpipe_config", "tl.ascend_set_cube_load_config"), name
+            assert name in ("tl.ascend_set_mmad_direction", "tl.ascend_set_fixpipe_config",
+                            "tl.ascend_set_cube_load_config", "tl.ascend_set_load3d_config"), name
             trace.append(_Command("S", "scalar"))
     assert exports == Counter({("Score", e, owner, 0, n * 256): 1 for e in range(2) for owner in range(2) for n in range(4)} | {
         ("Result", e, owner, row * 64, 0): 1 for e in range(2) for owner in range(2) for row in range(2)})

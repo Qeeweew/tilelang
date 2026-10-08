@@ -616,6 +616,50 @@ def test_a_and_b_configure_independent_fmatrix_widths():
     _equal(config.args, [128, 1024])
 
 
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+def test_conflicting_a_bank_keeps_invariant_b_native_regions(dtype):
+    roots = [mod["main"].body.block for mod in
+             (_fixture(dtype, m=32), _fixture(dtype, m=64), _b_fixture(dtype))]
+    combined = kernel(seq(*(root.body for root in roots)),
+                      buffers=[buffer for root in roots for buffer in root.alloc_buffers],
+                      annotations={"layout_map": {buffer: layout for root in roots
+                                                 for buffer, layout in root.annotations["layout_map"].items()}})
+    selected = _select(combined)
+    (native,) = calls(selected, NATIVE)
+    (config,) = calls(selected, CFG)
+    _equal(config.args, [1, 1024])
+    tvm.ir.assert_structural_equal(native.args[:2], calls(roots[2], "tl.tileop.ascend_copy")[0].args)
+    _equal(native.args[2:], [1024, 64])
+    fallback = calls(selected, "tl.tileop.ascend_copy")
+    assert len(fallback) == 2
+    for actual, root in zip(fallback, roots[:2]):
+        tvm.ir.assert_structural_equal(actual, calls(root, "tl.tileop.ascend_copy")[0])
+    assert not calls(seq(*list(selected["main"].body.block.body.seq)[1:]), CFG)
+    tvm.ir.assert_structural_equal(transform.AscendSelectCubeLoads()(selected), selected)
+
+
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+def test_conflicting_b_bank_keeps_invariant_a_native_regions(dtype):
+    roots = [mod["main"].body.block for mod in
+             (_fixture(dtype, m=128), _b_fixture(dtype, cache_k=512), _b_fixture(dtype, cache_k=1024))]
+    combined = kernel(seq(*(root.body for root in roots)),
+                      buffers=[buffer for root in roots for buffer in root.alloc_buffers],
+                      annotations={"layout_map": {buffer: layout for root in roots
+                                                 for buffer, layout in root.annotations["layout_map"].items()}})
+    selected = _select(combined)
+    (native,) = calls(selected, NATIVE)
+    (config,) = calls(selected, CFG)
+    _equal(config.args, [128, 1])
+    tvm.ir.assert_structural_equal(native.args[:2], calls(roots[0], "tl.tileop.ascend_copy")[0].args)
+    _equal(native.args[2:], [128, 256])
+    fallback = calls(selected, "tl.tileop.ascend_copy")
+    assert len(fallback) == 2
+    for actual, root in zip(fallback, roots[1:]):
+        tvm.ir.assert_structural_equal(actual, calls(root, "tl.tileop.ascend_copy")[0])
+    assert not calls(seq(*list(selected["main"].body.block.body.seq)[1:]), CFG)
+    tvm.ir.assert_structural_equal(transform.AscendSelectCubeLoads()(selected), selected)
+
+
 @pytest.mark.parametrize("activation", ["periodic", "late", "runtime"])
 def test_conditional_native_readers_acquire_root_state_once_before_all_controls(activation):
     original = _state_fixture(nested=False, consumers=2)

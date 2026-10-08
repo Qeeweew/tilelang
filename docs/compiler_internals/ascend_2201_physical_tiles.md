@@ -105,9 +105,11 @@ different from the old 2D transpose bit. Partial M for A, partial N for B,
 unproved bounds, unsupported layouts and annotated copies keep their existing
 copy path. These recipes are specific to 2201.
 
-FMATRIX_A and FMATRIX_B have independent invariant widths. A kernel with
-inconsistent widths for either register keeps its ordinary loads. One root
-AIC scalar task sets both registers and the shared repeat, padding and size
+FMATRIX_A and FMATRIX_B have independent invariant widths. Selection requires
+width consensus separately for each bank. A conflicting bank keeps its exact
+ordinary copies while a compatible bank can still use native loads; if neither
+bank qualifies, the original kernel is retained. One root AIC scalar task sets
+both registers and the shared repeat, padding and size
 state. `InsertSync` acquires that initialization once through a real root
 S-to-MTE1 event, before every data control. Later descriptors inherit readiness
 through MTE1 issue order even when earlier readers are skipped or their loops

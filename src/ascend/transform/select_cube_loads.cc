@@ -9,6 +9,9 @@
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/tirx/transform.h>
 
+#include <unordered_map>
+#include <vector>
+
 #include "arith/ir_mutator_with_analyzer.h"
 #include "ascend/layout/ascend_layouts.h"
 #include "ascend/op/builtin.h"
@@ -51,14 +54,42 @@ public:
     if (existing_state || unknown_state)
       return root;
     SBlock rewritten = Downcast<SBlock>(operator()(root));
-    if (different_configurations_ ||
-        (!fmatrix_a_width_.defined() && !fmatrix_b_width_.defined()))
+    const bool select_a =
+        fmatrix_a_width_.defined() && !different_a_configurations_;
+    const bool select_b =
+        fmatrix_b_width_.defined() && !different_b_configurations_;
+    if (!select_a && !select_b)
       return root;
+    // FMATRIX_A and FMATRIX_B are independent banks. Keep every conflicting
+    // bank on its original copy path without discarding the other bank's
+    // invariant configuration. Geometry and effects were proved only once.
+    std::unordered_map<const CallNode *, Stmt> fallbacks;
+    for (const SelectedLoad &load : selected_loads_)
+      if (!(load.is_l0a ? select_a : select_b))
+        fallbacks.emplace(load.selected.get(), load.original);
+    if (!fallbacks.empty()) {
+      class RestoreCopies : public StmtExprMutator {
+      public:
+        explicit RestoreCopies(
+            const std::unordered_map<const CallNode *, Stmt> &fallbacks)
+            : fallbacks_(fallbacks) {}
+
+      private:
+        Stmt VisitStmt_(const EvaluateNode *op) final {
+          auto it = fallbacks_.find(op->value.as<CallNode>());
+          if (it != fallbacks_.end())
+            return it->second;
+          return StmtExprMutator::VisitStmt_(op);
+        }
+        const std::unordered_map<const CallNode *, Stmt> &fallbacks_;
+      };
+      rewritten = Downcast<SBlock>(RestoreCopies(fallbacks)(rewritten));
+    }
     ascend::TaskMetadata ownership;
     ownership.core_mask = kCoreCube;
     Stmt setup = Evaluate(Call(DataType::Void(), ascend_set_load3d_config(),
-                               {fmatrix_a_width_.value_or(Integer(1)),
-                                fmatrix_b_width_.value_or(Integer(1))}));
+                               {select_a ? fmatrix_a_width_.value() : Integer(1),
+                                select_b ? fmatrix_b_width_.value() : Integer(1)}));
     setup = AttrStmt(ascend::MergeTaskMetadata(ownership, Integer(0)),
                      attr::kAscendTask, Integer(1), setup);
     rewritten.CopyOnWrite()->body = SeqStmt({setup, rewritten->body});
@@ -199,24 +230,33 @@ private:
     if (!configured_width.as<IntImmNode>())
       return Parent::VisitStmt_(op);
     auto &side_width = is_l0a ? fmatrix_a_width_ : fmatrix_b_width_;
+    auto &side_conflict =
+        is_l0a ? different_a_configurations_ : different_b_configurations_;
     if (side_width.defined() && !Equal(side_width.value(), configured_width))
-      different_configurations_ = true;
+      side_conflict = true;
     side_width = configured_width;
 
     Array<Range> reads = copy->src_range, writes = copy->dst_range;
     // Consume the shared NormalizeCubeCopyFootprints contract verbatim.
     // Selection never invents or enlarges a hardware read/write region.
-    return Evaluate(Call(DataType::Void(), AscendCubeLoad3D::Get(),
-                         {Region(copy->src, reads, kAccessRead),
-                          Region(copy->dst, writes, kAccessWrite),
-                          physical_rows, physical_cols},
-                         call->annotations),
-                    op->span);
+    Call selected(DataType::Void(), AscendCubeLoad3D::Get(),
+                  {Region(copy->src, reads, kAccessRead),
+                   Region(copy->dst, writes, kAccessWrite), physical_rows,
+                   physical_cols},
+                  call->annotations);
+    selected_loads_.push_back({selected, GetRef<Stmt>(op), is_l0a});
+    return Evaluate(selected, op->span);
   }
 
+  struct SelectedLoad {
+    Call selected;
+    Stmt original;
+    bool is_l0a;
+  };
   LayoutMap layouts_;
   Optional<PrimExpr> fmatrix_a_width_, fmatrix_b_width_;
-  bool different_configurations_{false};
+  std::vector<SelectedLoad> selected_loads_;
+  bool different_a_configurations_{false}, different_b_configurations_{false};
   int atomic_depth_{0};
 };
 } // namespace

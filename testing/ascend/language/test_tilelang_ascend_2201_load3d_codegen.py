@@ -35,15 +35,25 @@ def test_native_full_m_subk_codegen_fully_defines_shared_configuration(dtype, m)
     assert "(__ca__ half*)" in args[0] and "(__cbuf__ half*)" in args[1], source
     assert args[2:] == ["128", "128", "128", "0", "1", "1", "1", "1", "1", "1", "0", "0", "0", "0", "256"], source
     assert "uint64_t(128) | (uint64_t(1) << 16)" in source, source
+    assert "load3d_fmatrix_b = { .config = uint64_t(1) | (uint64_t(1) << 16) }" in source, source
     assert ".config = uint64_t(1) << 16" in source, source
-    ordered = ["asc_set_l13d_fmatrix(",
+    ordered = ["asc_set_l13d_fmatrix(", "asc_set_l13d_fmatrix_b(",
                "asc_set_l13d_rpt(", "asc_set_l13d_padding(uint64_t(0))",
                "asc_set_l13d_size(uint64_t(0))",
                "asc_sync_notify(PIPE_S, PIPE_MTE1,",
                "asc_sync_wait(PIPE_S, PIPE_MTE1,", "asc_copy_l12l0a("]
     positions = [source.index(item) for item in ordered]
     assert positions == sorted(positions), source
-    assert "asc_set_l13d_fmatrix_b(" not in source, source
+    # Both banks and the shared SPRs have one root setup. The unused B bank
+    # receives width1; this does not promote its transposed 2D operand load.
+    for setter in ordered[:5]:
+        assert source.count(setter) == 1, source
+    offset = 0
+    while (offset := source.find("for (", offset)) >= 0:
+        body, offset = _braced_body(source, offset)
+        assert all(setter not in body for setter in ordered[:5]), source
+    b_args = _call_arguments(source, "asc_copy_l12l0b")
+    assert len(b_args) == 6 and b_args[2:] == ["16", "16", "1", "0"], source
     # BF16 uses an exact storage reinterpretation, not a numerical conversion.
     assert "vconv_bf162f32" not in source and "vconv_f322bf16" not in source, source
 
