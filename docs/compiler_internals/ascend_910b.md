@@ -385,6 +385,12 @@ native completion costs or require instructions to finish within the period.
 exhaustion is a bounded search policy, not a proof that the smaller II is
 infeasible. Such a result is reported as a selected feasible II with unproven
 minimality. Manual search exhaustion has a separate diagnostic.
+If automatic free search finds no feasible model, a source-oriented DAG can
+provide one single-stage candidate. It sets physical minimum ring widths and
+checks every original hard assertion without model completion, including both
+resource arcs and carried buffer dependencies. This witness does not constrain
+free search, replace an existing SAT result, or prove minimum II. Manual
+schedules do not use it.
 
 Ordinary automatic 2201 loops with offsets also consider prefetch at the
 already selected II, before fixing stages or recalculating versions.
