@@ -17,10 +17,10 @@
  *      expressions that access buffers into preceding Bind statements. This
  *      preserves their evaluate-on-entry semantics and gives dependency and
  *      lifetime analysis an ordinary Task endpoint for each access.
- *   4. singleton-inline: an ordinary, unannotated serial loop of extent one
- *      and unit step becomes its body with the induction variable replaced
- *      by its entry-time minimum. Explicit scheduling and loop-control
- *      boundaries retain their loops.
+ *   4. singleton-inline: an ordinary serial loop of extent one and unit step
+ *      becomes its body with the induction variable replaced by its entry-time
+ *      minimum. The automatic pipeline's two intent annotations can also be
+ *      removed; explicit scheduling and loop-control boundaries retain loops.
  */
 
 #include <tvm/ffi/reflection/registry.h>
@@ -47,6 +47,20 @@ using namespace ascend;
 using namespace ffi;
 
 namespace {
+
+bool HasOnlyAutomaticPipelineIntent(const ForNode *loop) {
+  if (loop->annotations.size() != 2)
+    return false;
+  auto intent = loop->annotations.Get("tl.ascend_auto_pipeline");
+  auto bound = loop->annotations.Get("num_stages");
+  if (!intent.has_value() || !bound.has_value())
+    return false;
+  auto enabled = intent.value().as<bool>();
+  auto stages = bound.value().try_cast<Integer>();
+  return enabled.has_value() && enabled.value() &&
+         !bound.value().as<bool>().has_value() && stages.has_value() &&
+         !stages.value()->dtype.is_bool() && stages.value()->value > 0;
+}
 
 // Removing a loop must not change the target of a break/continue, the loop
 // whose child list owns an explicit Stage, or an annotated scheduling domain.
@@ -244,7 +258,8 @@ private:
     Stmt body = VisitStmt(op->body);
 
     const bool inline_singleton =
-        op->kind == ForKind::kSerial && op->annotations.empty() &&
+        op->kind == ForKind::kSerial &&
+        (op->annotations.empty() || HasOnlyAutomaticPipelineIntent(op)) &&
         !op->thread_binding.defined() && is_one(extent) &&
         (!step.defined() || is_one(step.value())) &&
         SideEffect(min) <= CallEffectKind::kReadState &&
