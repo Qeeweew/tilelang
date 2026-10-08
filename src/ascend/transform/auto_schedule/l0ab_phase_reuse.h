@@ -86,8 +86,7 @@ inline std::string StorageScope(const Var &storage) {
   if (!scope.empty())
     return scope;
   scope = GetPtrStorageScope(storage);
-  return scope == "shared.l0c" || scope == "shared.l0c.dyn" ? "shared.l0c"
-                                                          : "";
+  return scope == "shared.l0c" || scope == "shared.l0c.dyn" ? "shared.l0c" : "";
 }
 
 inline bool StageZero(const IRStructure *node) {
@@ -174,7 +173,9 @@ inline bool PositiveStaticLoop(const ControlNode *control) {
 
 // This boundary itself must not pipeline the two phases into each other.
 // Automatic pipelines wholly inside a phase keep their normal stages/clocks.
-inline bool ClosedEpoch(const ControlNode *epoch, bool prepared = false) {
+inline bool ClosedEpoch(
+    const ControlNode *epoch, bool prepared = false,
+    const std::function<bool(const ControlNode *)> &independent_counters = {}) {
   if (epoch->GetParentControl() || epoch->HasGuards() || !StageZero(epoch) ||
       !PositiveStaticLoop(epoch))
     return false;
@@ -187,6 +188,12 @@ inline bool ClosedEpoch(const ControlNode *epoch, bool prepared = false) {
     // clocks from MultiBufferPlan; early admission never enables this option.
     if (prepared &&
         (key == "conflict_hint" || key == "tl.storage_epoch_guard_map"))
+      continue;
+    // Only a resource-specific late audit may separate an unrelated prepared
+    // counter from this phase clock. Early admission and unknown metadata keep
+    // the original closed-epoch restriction.
+    if (prepared && key == kMultiBufferCounterMap && independent_counters &&
+        independent_counters(epoch))
       continue;
     if (key == "num_stages" && Constant(value.cast<PrimExpr>()) == 1)
       continue;
@@ -452,13 +459,16 @@ CollectControls(const std::vector<std::shared_ptr<IRStructure>> &nodes,
 
 // Locate the existing lexical phase without changing any of its activation
 // predicates. Completion and final address reuse remain downstream proofs.
-inline bool LocateClosedPhase(TaskNode *task, ControlNode **epoch,
-                              IRStructure **phase, bool prepared = false) {
+inline bool LocateClosedPhase(
+    TaskNode *task, ControlNode **epoch, IRStructure **phase,
+    bool prepared = false,
+    const std::function<bool(const ControlNode *)> &independent_counters = {}) {
   ControlNode *outer = ParentControl(task);
   if (!outer)
     return false;
   outer = outer->GetOutermostControl();
-  if (!ClosedEpoch(outer, prepared) || (*epoch && *epoch != outer))
+  if (!ClosedEpoch(outer, prepared, independent_counters) ||
+      (*epoch && *epoch != outer))
     return false;
   IRStructure *child = task->GetChildOnPathFrom(outer);
   if (!child->IsControl() || !StageZero(child) || (*phase && *phase != child))

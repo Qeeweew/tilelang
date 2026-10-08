@@ -214,9 +214,52 @@ inline std::optional<L0OperandSlotMember> RejectMember(const Buffer &buffer,
   return std::nullopt;
 }
 
+// Removing an AIV singleton can move its prepared UB counter owner to the
+// common epoch. That annotation does not change an AIC operand clock. Accept
+// only allocated, plan-backed UB entries used exclusively by the AIV; never
+// ignore an L0 entry or a counter shared with another storage class.
+inline bool IndependentEpochCounters(const ScheduledTIR &scheduled,
+                                     const MultiBufferPlan &plan,
+                                     const ControlNode *epoch,
+                                     const std::vector<TaskNode *> &tasks) {
+  auto counters = epoch->control->annotations.Get(kMultiBufferCounterMap);
+  if (!counters)
+    return false;
+  auto allocated_ub = [&](const Var &storage) {
+    for (const Buffer &buffer : scheduled.metadata.kernel_root->alloc_buffers)
+      if (buffer->data.same_as(storage)) {
+        std::string scope = GetPtrStorageScope(storage);
+        return scope == "shared" || scope == "shared.dyn";
+      }
+    return false;
+  };
+  for (const auto &[storage, counter] :
+       counters.value().cast<MultiBufferCounterMap>()) {
+    const MultiBufferInfo *info = plan.Find(storage);
+    if (!allocated_ub(storage) || !info || !info->UsesCounter() ||
+        !info->counter.same_as(counter) || info->owners.size() != 1 ||
+        info->owners.front().loop != epoch)
+      return false;
+    for (const MultiBufferInfo &other : plan.Infos())
+      if (other.UsesCounter() && other.counter->data.same_as(counter->data) &&
+          !allocated_ub(other.storage))
+        return false;
+    for (TaskNode *task : tasks) {
+      bool touches = Touches(task->stmt, storage) ||
+                     Touches(task->stmt, counter->data) ||
+                     task->GuardsTouchStorage(storage) ||
+                     task->GuardsTouchStorage(counter->data);
+      if (touches && task->GetCoreMask() != kCoreVector)
+        return false;
+    }
+  }
+  return true;
+}
+
 inline std::optional<L0OperandSlotMember>
 Member(const ScheduledTIR &scheduled, const MultiBufferPlan &plan,
-       const Buffer &buffer, const LayoutMap &layouts, int64_t capacity) {
+       const Buffer &buffer, const LayoutMap &layouts, int64_t capacity,
+       const std::function<bool(const ControlNode *)> &independent_counters) {
   if (!CanonicalAllocation(buffer, layouts, capacity))
     return RejectMember(buffer, "canonical allocation");
   if (auto physical =
@@ -288,8 +331,10 @@ Member(const ScheduledTIR &scheduled, const MultiBufferPlan &plan,
       return RejectMember(buffer, "fixed endpoint stage");
     result.slot = Integer(0);
   }
-  if (!LocateClosedPhase(result.writer, &result.epoch, &result.phase, true) ||
-      !LocateClosedPhase(result.reader, &result.epoch, &result.phase, true) ||
+  if (!LocateClosedPhase(result.writer, &result.epoch, &result.phase, true,
+                         independent_counters) ||
+      !LocateClosedPhase(result.reader, &result.epoch, &result.phase, true,
+                         independent_counters) ||
       !SelectedPhaseConflicts(scheduled, result.epoch))
     return RejectMember(buffer, "closed prepared phase");
   std::function<bool(IRStructure *)> controls = [&](IRStructure *node) {
@@ -329,6 +374,15 @@ AnalyzeL0OperandSlotPools(const ScheduledTIR &scheduled,
       !raw_layouts || scheduled.metadata.has_buffer_aliases)
     return pools;
   LayoutMap layouts = raw_layouts.value().cast<LayoutMap>();
+  std::vector<TaskNode *> tasks;
+  CollectAllTaskNodes(scheduled.tree, tasks);
+  std::unordered_map<const ControlNode *, bool> counter_audits;
+  auto independent_counters = [&](const ControlNode *epoch) {
+    auto [it, inserted] = counter_audits.emplace(epoch, false);
+    if (inserted)
+      it->second = IndependentEpochCounters(scheduled, versions, epoch, tasks);
+    return it->second;
+  };
   for (const Array<Var> &pair : pairs.value().cast<Array<Array<Var>>>()) {
     if (pair.size() != 2 || Scope(pair[0]).empty() ||
         Scope(pair[0]) != Scope(pair[1]))
@@ -357,8 +411,6 @@ AnalyzeL0OperandSlotPools(const ScheduledTIR &scheduled,
       continue;
     KernelAudit audit(
         {{buffers[0]->data, buffers[0]}, {buffers[1]->data, buffers[1]}});
-    std::vector<TaskNode *> tasks;
-    CollectAllTaskNodes(scheduled.tree, tasks);
     for (TaskNode *task : tasks) {
       auto operation = Operation(task);
       // Unit-stream selection inserted a real whole-M entry barrier before
@@ -374,8 +426,10 @@ AnalyzeL0OperandSlotPools(const ScheduledTIR &scheduled,
       continue;
     int64_t capacity =
         Scope(pair[0]) == "shared.l0a" ? target.l0a_bytes : target.l0b_bytes;
-    auto a = Member(scheduled, versions, buffers[0], layouts, capacity);
-    auto b = Member(scheduled, versions, buffers[1], layouts, capacity);
+    auto a = Member(scheduled, versions, buffers[0], layouts, capacity,
+                    independent_counters);
+    auto b = Member(scheduled, versions, buffers[1], layouts, capacity,
+                    independent_counters);
     if (!a || !b || a->epoch != b->epoch || a->phase == b->phase)
       continue;
     auto bytes = [](const Buffer &buffer) {
