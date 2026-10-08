@@ -17,6 +17,7 @@
 #include <tvm/tirx/stmt_functor.h>
 #include <tvm/tirx/transform.h>
 
+#include <iterator>
 #include <limits>
 #include <unordered_map>
 #include <unordered_set>
@@ -110,6 +111,280 @@ TVM_REGISTER_OP("tl.ascend_membase.copy_bits")
 
 namespace {
 
+// Storage liveness for destructive expression destinations. This is
+// deliberately before vector lowering: a native instruction may overwrite one
+// of its inputs only when no later statement can observe the old value. Full
+// tile copies and fills are strong definitions; a scalar/partial store is not.
+// Loop backedges and both control-flow arms participate, so lexical last use
+// alone is never a certificate for an accumulator inside a recurring pipeline
+// epoch.
+class VectorExpressionLastUse {
+public:
+  using StorageSet = std::unordered_set<const VarNode *>;
+
+  void Analyze(const Stmt &body) {
+    PostOrderVisit(body, [&](const ObjectRef &node) {
+      if (const auto *block = node.as<SBlockNode>())
+        for (const Buffer &buffer : block->alloc_buffers)
+          if (IsSharedBuffer(buffer)) {
+            local_.insert(buffer->data.get());
+            local_buffers_.emplace(buffer->data.get(), buffer);
+          }
+    });
+    PostOrderVisit(body, [&](const ObjectRef &node) {
+      Optional<Buffer> view;
+      if (const auto *load = node.as<BufferLoadNode>())
+        view = load->buffer;
+      if (const auto *store = node.as<BufferStoreNode>())
+        view = store->buffer;
+      if (view.has_value()) {
+        auto owner = local_buffers_.find(view.value()->data.get());
+        if (owner != local_buffers_.end() &&
+            !owner->second.same_as(view.value()))
+          aliased_definitions_.insert(owner->first);
+      }
+    });
+    EscapeCollector escapes(&local_, &escaped_);
+    escapes(body);
+    Analyze(body, {}, true);
+  }
+
+  const StorageSet &DeadInputs(const BufferStoreNode *store) const {
+    auto found = dead_inputs_.find(store);
+    return found == dead_inputs_.end() ? empty_ : found->second;
+  }
+
+private:
+  class EscapeCollector : public StmtExprVisitor {
+  public:
+    EscapeCollector(const StorageSet *local, StorageSet *escaped)
+        : local_(local), escaped_(escaped) {}
+
+  private:
+    void MarkPointerStorages(const PrimExpr &expr) {
+      PostOrderVisit(expr, [&](const ObjectRef &node) {
+        if (const auto *load = node.as<BufferLoadNode>();
+            load && local_->count(load->buffer->data.get()))
+          escaped_->insert(load->buffer->data.get());
+      });
+    }
+
+    void VisitExpr_(const VarNode *op) final {
+      if (local_->count(op))
+        escaped_->insert(op);
+    }
+
+    void VisitExpr_(const CallNode *op) final {
+      // Compiler-owned regions/copies do not retain pointers. Unknown handle
+      // consumers may do so even if there is no later syntactic buffer read.
+      bool known = op->op.same_as(tl::access_ptr()) ||
+                   op->op.same_as(tl::region()) || IsAscendCopyCall(op) ||
+                   op->op.same_as(Fill::Get());
+      if (!known) {
+        for (const PrimExpr &arg : op->args) {
+          if (arg.dtype().is_handle() || op->dtype.is_handle())
+            MarkPointerStorages(arg);
+        }
+      }
+      StmtExprVisitor::VisitExpr_(op);
+    }
+
+    void VisitStmt_(const BindNode *op) final {
+      if (op->value.dtype().is_handle())
+        MarkPointerStorages(op->value);
+      StmtExprVisitor::VisitStmt_(op);
+    }
+
+    void VisitStmt_(const BufferStoreNode *op) final {
+      if (op->value.dtype().is_handle())
+        MarkPointerStorages(op->value);
+      StmtExprVisitor::VisitStmt_(op);
+    }
+
+    void VisitStmt_(const SBlockNode *op) final {
+      // Match-buffer aliases have a different data Var. This narrow analysis
+      // must not infer that the source allocation is dead from that identity.
+      for (const MatchBufferRegion &match : op->match_buffers)
+        if (local_->count(match->source->buffer->data.get()))
+          escaped_->insert(match->source->buffer->data.get());
+      StmtExprVisitor::VisitStmt_(op);
+    }
+
+    const StorageSet *local_;
+    StorageSet *escaped_;
+  };
+
+  static void AddReads(const ObjectRef &node, StorageSet *live) {
+    PostOrderVisit(node, [&](const ObjectRef &child) {
+      if (const auto *load = child.as<BufferLoadNode>())
+        live->insert(load->buffer->data.get());
+      if (const auto *var = child.as<VarNode>())
+        live->insert(var);
+    });
+  }
+
+  static void Union(const StorageSet &other, StorageSet *live) {
+    live->insert(other.begin(), other.end());
+  }
+
+  bool FullDefinition(const Buffer &buffer, const Array<Range> &region) {
+    auto allocation = local_buffers_.find(buffer->data.get());
+    // A full write of a smaller same-data view does not define all values of
+    // the allocation. Only the actual local allocation is a strong kill.
+    if (allocation == local_buffers_.end() ||
+        aliased_definitions_.count(buffer->data.get()) ||
+        !allocation->second.same_as(buffer))
+      return false;
+    if (region.size() != buffer->shape.size())
+      return false;
+    for (size_t i = 0; i < region.size(); ++i)
+      if (!analyzer_.CanProveEqual(region[i]->min, 0) ||
+          !analyzer_.CanProveEqual(region[i]->extent, buffer->shape[i]))
+        return false;
+    return true;
+  }
+
+  StorageSet AnalyzeLoop(const Stmt &body, const StorageSet &after,
+                         bool record) {
+    StorageSet live = after;
+    while (true) {
+      StorageSet next = Analyze(body, live, false);
+      Union(after, &next); // The loop may have zero iterations.
+      if (next == live)
+        break;
+      live = std::move(next);
+    }
+    if (record)
+      Analyze(body, live, true);
+    return live;
+  }
+
+  StorageSet Analyze(const Stmt &stmt, StorageSet live, bool record) {
+    if (const auto *seq = stmt.as<SeqStmtNode>()) {
+      for (size_t i = seq->seq.size(); i-- > 0;)
+        live = Analyze(seq->seq[i], std::move(live), record);
+      return live;
+    }
+    if (const auto *realize = stmt.as<SBlockRealizeNode>()) {
+      StorageSet skipped = live;
+      live = Analyze(realize->block, std::move(live), record);
+      if (!is_one(realize->predicate))
+        Union(skipped, &live);
+      AddReads(realize->predicate, &live);
+      for (const PrimExpr &value : realize->iter_values)
+        AddReads(value, &live);
+      return live;
+    }
+    if (const auto *block = stmt.as<SBlockNode>()) {
+      live = Analyze(block->body, std::move(live), record);
+      // Reduction init can be conditional on reduction iterators. It is not
+      // an unconditional definition at every block realization.
+      if (block->init.has_value())
+        AddReads(block->init.value(), &live);
+      return live;
+    }
+    if (const auto *loop = stmt.as<ForNode>()) {
+      // Parallel lanes become one dense native region. The lowerer separately
+      // checks that this region has no repeated/broadcast source coordinates.
+      if (loop->step.has_value())
+        AddReads(loop->step.value(), &live);
+      if (loop->kind == ForKind::kParallel || is_one(loop->extent)) {
+        live = Analyze(loop->body, std::move(live), record);
+      } else {
+        AddReads(loop->min, &live);
+        AddReads(loop->extent, &live);
+        live = AnalyzeLoop(loop->body, live, record);
+      }
+      AddReads(loop->min, &live);
+      AddReads(loop->extent, &live);
+      return live;
+    }
+    if (const auto *loop = stmt.as<WhileNode>()) {
+      AddReads(loop->condition, &live);
+      return AnalyzeLoop(loop->body, live, record);
+    }
+    if (const auto *branch = stmt.as<IfThenElseNode>()) {
+      StorageSet otherwise =
+          branch->else_case.has_value()
+              ? Analyze(branch->else_case.value(), live, record)
+              : live;
+      live = Analyze(branch->then_case, std::move(live), record);
+      Union(otherwise, &live);
+      AddReads(branch->condition, &live);
+      return live;
+    }
+    if (const auto *attr = stmt.as<AttrStmtNode>()) {
+      live = Analyze(attr->body, std::move(live), record);
+      AddReads(attr->value, &live);
+      return live;
+    }
+    if (const auto *store = stmt.as<BufferStoreNode>()) {
+      if (record) {
+        StorageSet reads;
+        AddReads(store->value, &reads);
+        StorageSet dead;
+        for (const VarNode *data : reads)
+          if (local_.count(data) && !escaped_.count(data) && !live.count(data))
+            dead.insert(data);
+        auto [found, inserted] = dead_inputs_.emplace(store, dead);
+        if (!inserted)
+          for (auto it = found->second.begin(); it != found->second.end();)
+            it = dead.count(*it) ? std::next(it) : found->second.erase(it);
+      }
+      AddReads(store->value, &live);
+      for (const PrimExpr &index : store->indices)
+        AddReads(index, &live);
+      if (store->predicate.has_value())
+        AddReads(store->predicate.value(), &live);
+      return live;
+    }
+    if (const auto *evaluate = stmt.as<EvaluateNode>()) {
+      const auto *call = evaluate->value.as<CallNode>();
+      if (IsAscendCopyCall(call)) {
+        Copy copy(call->args, call->annotations);
+        if (FullDefinition(copy->dst, copy->dst_range))
+          live.erase(copy->dst->data.get());
+        live.insert(copy->src->data.get());
+        for (const Range &range : copy->src_range) {
+          AddReads(range->min, &live);
+          AddReads(range->extent, &live);
+        }
+        for (const Range &range : copy->dst_range) {
+          AddReads(range->min, &live);
+          AddReads(range->extent, &live);
+        }
+        for (const auto &[key, value] : call->annotations)
+          if (value.as<PrimExprNode>())
+            AddReads(value, &live);
+        return live;
+      }
+      if (call && call->op.same_as(Fill::Get())) {
+        Fill fill(call->args, call->annotations);
+        if (FullDefinition(fill->dst, fill->region))
+          live.erase(fill->dst->data.get());
+        AddReads(fill->value, &live);
+        for (const Range &range : fill->region) {
+          AddReads(range->min, &live);
+          AddReads(range->extent, &live);
+        }
+        for (const auto &[key, value] : call->annotations)
+          if (value.as<PrimExprNode>())
+            AddReads(value, &live);
+        return live;
+      }
+    }
+    // Binds, unknown operators and unsupported control forms cannot establish
+    // a strong definition. Reading their entire subtree is conservative.
+    AddReads(stmt, &live);
+    return live;
+  }
+
+  arith::Analyzer analyzer_;
+  StorageSet local_, escaped_, aliased_definitions_, empty_;
+  std::unordered_map<const VarNode *, Buffer> local_buffers_;
+  std::unordered_map<const BufferStoreNode *, StorageSet> dead_inputs_;
+};
+
 class VectorTileLowerer : public StmtExprMutator {
 public:
   static PrimFunc Rewrite(PrimFunc func) {
@@ -121,6 +396,7 @@ public:
       return func;
 
     VectorTileLowerer lowerer;
+    lowerer.last_use_.Analyze(func->body);
     PrimFuncNode *writer = func.CopyOnWrite();
     writer->body = lowerer.VisitStmt(func->body);
     ICHECK(lowerer.scratch_.empty())
@@ -613,6 +889,7 @@ private:
     PrimExpr saved_min = batch_row_min_;
     Optional<Var> saved_column_var = batch_column_var_;
     PrimExpr saved_column_min = batch_column_min_;
+    bool saved_dense_reuse = dense_reuse_region_;
     auto restore = [&]() {
       base_map_ = saved_base;
       linear_index_ = saved_linear;
@@ -624,6 +901,7 @@ private:
       batch_column_min_ = saved_column_min;
       batch_row_var_ = saved_var;
       batch_row_min_ = saved_min;
+      dense_reuse_region_ = saved_dense_reuse;
     };
     base_map_.clear();
     base_map_.Set(op->loop_var, op->min);
@@ -716,6 +994,7 @@ private:
       CheckBuffer(load->buffer);
       CheckInBounds(load);
     }
+    dense_reuse_region_ = true;
     Stmt result = LowerBody(body);
     restore();
     return result;
@@ -972,6 +1251,51 @@ private:
     return {dst, PrimExpr()};
   }
 
+  Optional<BufferLoad> DestructiveCastSource(const CastNode *cast) {
+    // Reuse only an FP32 arithmetic intermediate immediately consumed by a
+    // narrowing cast. Conversion retains its distinct typed destination and
+    // rounding point. A declared arithmetic destination (for example a DMA
+    // input followed by a separate work tile) is never replaced here.
+    if (!dense_reuse_region_ || !expression_reuse_allowed_ ||
+        cast->value.dtype() != DataType::Float(32) ||
+        (cast->dtype != DataType::Float(16) && !cast->dtype.is_bfloat16()))
+      return std::nullopt;
+    PrimExpr lhs, rhs;
+    if (const auto *op = cast->value.as<AddNode>()) {
+      lhs = op->a;
+      rhs = op->b;
+    } else if (const auto *op = cast->value.as<SubNode>()) {
+      lhs = op->a;
+      rhs = op->b;
+    } else if (const auto *op = cast->value.as<MulNode>()) {
+      lhs = op->a;
+      rhs = op->b;
+    } else if (const auto *op = cast->value.as<DivNode>()) {
+      lhs = op->a;
+      rhs = op->b;
+    } else {
+      return std::nullopt;
+    }
+    for (const PrimExpr &operand : {lhs, rhs}) {
+      const auto *load = operand.as<BufferLoadNode>();
+      if (!load || load->buffer->dtype != DataType::Float(32))
+        continue;
+      const VarNode *data = load->buffer->data.get();
+      // A second occurrence can require the old value in a sibling expression,
+      // even when the buffer is dead after the enclosing assignment.
+      if (!dead_inputs_.count(data) || expression_reads_[data] != 1)
+        continue;
+      BufferLoad region = GetRef<BufferLoad>(load);
+      if (!DenseOrScalar(region, false))
+        continue;
+      // Use the exact same BufferLoad, owner and version coordinates, layout
+      // and physical start. Emit checks the native same-dtype exact-overlap
+      // contract against every other operand, including row broadcasts.
+      return Base(region);
+    }
+    return std::nullopt;
+  }
+
   class VectorComputationDetector : public ExprVisitor {
   public:
     bool found{false};
@@ -1067,8 +1391,8 @@ private:
     Require(!output.has_value() || output.value()->buffer->dtype == dtype,
             "expression dtype must match its output buffer");
     if (const auto *op = expr.as<CastNode>()) {
-      Value result =
-          Convert(LowerExpr(op->value), dtype, output, CastRounding(op));
+      Value result = Convert(LowerExpr(op->value, DestructiveCastSource(op)),
+                             dtype, output, CastRounding(op));
       values_.emplace(expr, result);
       return result;
     }
@@ -1229,6 +1553,25 @@ private:
     emitted_.clear();
     values_.clear();
     row_blocks_.clear();
+    dead_inputs_ = last_use_.DeadInputs(store);
+    expression_reads_.clear();
+    ReadStorageCollector reads;
+    reads(store->value);
+    for (const PrimExpr &index : store->indices)
+      reads(index);
+    if (store->predicate.has_value())
+      reads(store->predicate.value());
+    for (const VarNode *data : reads.data)
+      ++expression_reads_[data];
+    expression_reuse_allowed_ =
+        !store->predicate.has_value() || is_one(store->predicate.value());
+    PostOrderVisit(store->value, [&](const ObjectRef &node) {
+      if (node.as<SelectNode>())
+        expression_reuse_allowed_ = false;
+      if (const auto *call = node.as<CallNode>();
+          call && call->op.same_as(Op::Get("tirx.if_then_else")))
+        expression_reuse_allowed_ = false;
+    });
     BufferLoad dst = Base(BufferLoad(store->buffer, store->indices));
     CheckAligned(dst);
     Value result = LowerExpr(store->value, dst);
@@ -1404,7 +1747,13 @@ private:
             "the innermost Parallel axis must be contiguous in both logical "
             "and physical UB layout; strided/gather accesses are unsupported");
     active_count_ = analyzer_.Simplify(active_count_);
+    bool saved_dense_reuse = dense_reuse_region_;
+    // When outer Parallel axes need serial traversal, a source may broadcast
+    // across those axes. Do not overwrite it without a cross-row last-use
+    // proof; the coalesced route above already establishes a dense rectangle.
+    dense_reuse_region_ = first == 0;
     Stmt result = LowerBody(body);
+    dense_reuse_region_ = saved_dense_reuse;
     for (size_t i = first; i-- > 0;) {
       // One native instruction processes a contiguous row/tile. Outer row
       // traversal remains a control loop, never a scalar element-wise fallback.
@@ -1488,6 +1837,11 @@ private:
   }
 
   arith::Analyzer analyzer_;
+  VectorExpressionLastUse last_use_;
+  VectorExpressionLastUse::StorageSet dead_inputs_;
+  std::unordered_map<const VarNode *, size_t> expression_reads_;
+  bool dense_reuse_region_{false};
+  bool expression_reuse_allowed_{false};
   LayoutMap layouts_;
   bool mixed_cube_{false};
   bool row_partitioned_{false};
