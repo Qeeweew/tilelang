@@ -104,16 +104,20 @@ def _assert_storage_contract(artifact, snapshots):
 
     a, b = [allocated_buffer(scheduled, name) for name in ("gemm_l0a_0", "gemm_l0b_0")]
     assert tuple(map(int, a.shape)) == (64, 256) and tuple(map(int, b.shape)) == (256, 64)
-    # QK/PV require different A configurations, while the independent PV B
-    # bank remains eligible. Bank fallback must preserve both ordinary A loads.
-    (load3d,) = calls(scheduled, _LOAD3D)
-    assert load3d.args[0].args[0].buffer.name == "v_l1"
-    assert load3d.args[1].args[0].buffer.same_as(b)
+    # The repeated PV A64 group saves more descriptors than QK A128.
+    # Keep QK's original copy and select both independent PV banks.
+    loads = {call.args[0].args[0].buffer.name: call
+             for call in calls(scheduled, _LOAD3D)}
+    assert set(loads) == {"p_l1", "v_l1"}
+    assert loads["p_l1"].args[1].args[0].buffer.same_as(a)
+    assert loads["v_l1"].args[1].args[0].buffer.same_as(b)
+    assert tuple(map(int, loads["p_l1"].args[2:])) == (64, 256)
+    assert tuple(map(int, loads["v_l1"].args[2:])) == (768, 64)
     (config,) = calls(scheduled, "tl.ascend_set_load3d_config")
-    assert tuple(map(int, config.args)) == (1, 768)
+    assert tuple(map(int, config.args)) == (64, 768)
     assert {call.args[1].args[0].buffer.data for call in calls(scheduled, _COPY)
             if call.args[1].args[0].buffer.scope() == "shared.l0a"} == {
-                allocated_buffer(scheduled, "aq").data, a.data}
+                allocated_buffer(scheduled, "aq").data}
     assert all(int(versions[buffer.data]) == 2 for buffer in (a, b))
     assert all(tuple(map(int, allocated_buffer(physical, buffer.name).shape)) == (2, *map(int, buffer.shape))
                for buffer in (a, b))
