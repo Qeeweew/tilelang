@@ -15,7 +15,7 @@ from tilelang.layout import make_ascend_l0c_layout
 from testing.ascend._ir import calls, nodes, region, seq
 from testing.ascend.auto_schedule._scheduled_ir import unit
 from testing.ascend.auto_schedule.test_nested_local_protocols import _Command, _prove_completions
-from testing.ascend.auto_schedule.test_owner_result_completion import _name, _trace, _value
+from testing.ascend.auto_schedule.test_owner_result_completion import _name, _region, _trace, _value
 from testing.ascend.auto_schedule.test_parent_versioned_operand_war import (
     _blocks, _check_physical_lifetime, _fixture, _lower,
 )
@@ -120,6 +120,115 @@ def test_canonical_counter_is_a_supported_cycle_without_an_owner_guard(stage):
                 assert counts[epoch, owner, row, "set"] == 3
                 assert counts[epoch, owner, row, "wait"] == 3
     assert _root_credits(physical) == {"tl.ascend_set_flag": 2, "tl.ascend_wait_flag": 2}
+
+
+def _common_stage_cycle(versions, *, fault=None):
+    before, facts = _counter_fixture("b", 3, kind="counter", versions=versions, runtime_epochs=True)
+    loops = {loop.loop_var.name: loop.loop_var for loop in nodes(before, tirx.For)}
+    k, epoch = loops["chunk"], loops["epoch"]
+    activation = tirx.all(k % 2 == 0, epoch % 2 == 0)
+
+    def post(node):
+        if not isinstance(node, tirx.For) or node.loop_var.name != "chunk":
+            return None
+        body = []
+        # A real stage-zero sibling makes stage1 a fill/drain translation,
+        # rather than allowing an all-equal-stage loop to normalize to zero.
+        body.append(unit(tirx.Evaluate(0), core=2))
+        for statement in node.body.seq:
+            assert isinstance(statement, tirx.AttrStmt) and statement.attr_key == "tl.schedule_unit"
+            task = statement.body
+            assert isinstance(task, tirx.AttrStmt) and task.attr_key == "tl.ascend_task"
+            tick = bool(nodes(task, tirx.BufferStore))
+            loads = [call for call in calls(task, "tl.tileop.ascend_copy")
+                     if call.args[1].args[0].buffer.scope() == "shared.l0b"]
+            mad = bool(calls(task, "tl.tileop.gemm"))
+            export = any(call.args[0].args[0].buffer.scope() == "shared.l0c"
+                         for call in calls(task, "tl.tileop.ascend_copy"))
+            stage = 0 if fault == "writer-stage" and loads else (
+                2 if fault == "reader-stage" and (mad or export) else (
+                    0 if fault == "tick-stage" and tick else 1))
+            guard = tirx.all(activation, k == 0) if (
+                fault == "writer-guard" and loads or fault == "tick-guard" and tick) else activation
+            if tick:
+                # Match PrepareMultiBuffer: its activation is inside the
+                # atomic Scalar task, not in TaskNode's outer guard list.
+                task = tirx.AttrStmt(task.node, task.attr_key, task.value,
+                                    tirx.IfThenElse(guard, task.body, None))
+            else:
+                task = tirx.IfThenElse(guard, task, None)
+            body.append(tirx.AttrStmt({"stage": stage}, "tl.schedule_unit", 1, task))
+        annotations = dict(node.annotations)
+        annotations["tl.storage_epoch_guard_map"] = {facts["operands"]["b"].data: activation}
+        return tirx.For(node.loop_var, node.min, node.extent, node.kind, seq(*body),
+                        thread_binding=node.thread_binding, annotations=annotations, step=node.step)
+
+    return _rewrite(before, post), {**facts, "read_stage": 1}
+
+
+def _check_common_stage_payload(physical, facts, epochs):
+    # Replay actual physical addresses and the prepared counter, including a
+    # whole empty epoch and holes within each owner. Common source order is
+    # never introduced as an inter-pipe completion edge.
+    _prove_completions([command for command, _ in _physical_commands(physical)])
+    payload, fills, reads, exports = {}, {}, Counter(), Counter()
+    for call, env, loops in _trace(physical, core=2, lane=0):
+        name = _name(call)
+        coordinates = {var.name: value for var, value, _ in loops}
+        if name in ("tl.tileop.ascend_copy", "tl.tileop.ascend_cube_load3d"):
+            source, _, _ = _region(call.args[0], env)
+            destination, origin, _ = _region(call.args[1], env)
+            source_blocks, destination_blocks = _blocks(call.args[0], env), _blocks(call.args[1], env)
+            if source.scope() == "global":
+                for block in source_blocks:
+                    payload.setdefault(block, (source.name, *block[1:]))
+            elif destination.data.same_as(facts["operands"]["b"].data):
+                logical = tuple(coordinates[key] for key in ("epoch", "owner", "row_part")) + (
+                    coordinates["chunk"] - 1,)
+                assert logical not in fills
+                fills[logical] = origin[0] if facts["versions"] > 1 else 0
+            elif source.scope() == "shared.l0c":
+                logical = tuple(origin[:4])
+                for block in source_blocks:
+                    assert payload[block] == ("result", *logical, *block[-2:])
+                exports[logical] += 1
+            for read, write in zip(source_blocks, destination_blocks, strict=True):
+                assert read in payload
+                payload[write] = payload[read]
+        elif name == "tl.tileop.gemm":
+            logical = tuple(coordinates[key] for key in ("epoch", "owner", "row_part")) + (
+                coordinates["chunk"] - 1,)
+            assert _value(call.args[9], env)
+            for side, argument in zip(("a", "b"), call.args[:2], strict=True):
+                for block in _blocks(argument, env):
+                    expected = (("InputB", *logical, *block[-2:]) if side == "b" else
+                                ("FixedA", *block[-2:]))
+                    assert payload[block] == expected
+            for block in _blocks(call.args[2], env):
+                payload[block] = ("result", *logical, *block[-2:])
+            reads[logical] += 1
+    expected = [(e, owner, row, k) for e in range(epochs) if e % 2 == 0
+                for owner in range(2) for row in range(3) for k in (0, 2)]
+    assert reads == exports == Counter(expected)
+    assert set(fills) == set(expected)
+    assert [fills[key] for key in expected] == [index % facts["versions"] for index in range(len(expected))]
+
+
+@pytest.mark.parametrize("versions", [1, 2], ids=["single-slot", "two-slots"])
+@pytest.mark.parametrize("epochs", [0, 1, 3], ids=["empty-root", "single-root", "empty-middle-epoch"])
+def test_common_stage_and_gapped_activation_keep_the_actual_counter_cycle(versions, epochs):
+    before, facts = _common_stage_cycle(versions)
+    physical = _bind_epochs(_lower(before), facts, epochs)
+    _check_common_stage_payload(physical, facts, epochs)
+    assert _root_credits(physical) == {"tl.ascend_set_flag": versions, "tl.ascend_wait_flag": versions}
+
+
+@pytest.mark.parametrize("fault", ["writer-stage", "reader-stage", "tick-stage", "writer-guard", "tick-guard"])
+def test_independent_counter_stage_or_activation_keeps_the_l0_diagnostic(fault):
+    before, _ = _common_stage_cycle(1, fault=fault)
+    with pytest.raises(tvm.error.InternalError,
+                       match=_DIAGNOSTIC + r".*pipe=(?:MTE1->M|M->MTE1),"):
+        _lower(before)
 
 
 def _counter_and_owner(mod):

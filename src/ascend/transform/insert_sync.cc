@@ -2211,15 +2211,65 @@ private:
   // A counter is a kernel-wide ordinal of actual complete owner
   // activations. Unlike a lexical radix, skipping the whole owner does not
   // advance it. Reconstructed metadata alone does not prove this property.
+  bool CounterOperandGuardsEquivalent(const PrimExpr &lhs, const PrimExpr &rhs,
+                                      const TaskNode *task,
+                                      ControlNode *owner) const {
+    const auto bindings = owner_result_detail::TaskBindings(task);
+    PrimExpr left = owner_result_detail::Expand(lhs, bindings);
+    PrimExpr right = owner_result_detail::Expand(rhs, bindings);
+    // Do not import either endpoint's assumed If predicate. Unexpanded
+    // mutable snapshots and owner-local definitions are not pure epochs.
+    return StableLocalBinaryBoundary(left, owner, true) &&
+           StableLocalBinaryBoundary(right, owner, true) &&
+           GuardsEquivalent(left, right, owner->GetLoopBodyContext());
+  }
+
+  bool HasCounterOperandActivation(const TaskNode *task, ControlNode *owner,
+                                   const PrimExpr &activation) const {
+    for (const auto &guard : task->GetGuards())
+      if (!guard->IsCondition())
+        return false;
+    return CounterOperandGuardsEquivalent(task->GetConditionGuard(), activation,
+                                          task, owner);
+  }
+
+  bool HasCounterOperandAdvance(const TaskNode *task, ControlNode *owner,
+                                const MultiBufferInfo &info) const {
+    for (const auto &guard : task->GetGuards())
+      if (!guard->IsCondition())
+        return false;
+    Stmt body = task->stmt;
+    while (const auto *wrapper = body.as<AttrStmtNode>()) {
+      if (wrapper->attr_key != attr::kAscendTask)
+        return false;
+      body = wrapper->body;
+    }
+    PrimExpr activation = task->GetConditionGuard();
+    // Prepare may put the tick's If inside its atomic Scalar task. Match
+    // exactly one common activation, never discard an independent condition.
+    if (const auto *conditional = body.as<IfThenElseNode>()) {
+      if (conditional->else_case.defined())
+        return false;
+      activation = activation && conditional->condition;
+      body = conditional->then_case;
+    }
+    return CounterOperandGuardsEquivalent(
+               activation, info.owners.front().active_guard, task, owner) &&
+           IsCanonicalCounterAdvanceBody(body, info.counter);
+  }
+
   bool ClosedOperandCounter(const MultiBufferInfo &info, ControlNode *owner,
                             TaskNode *reader) const {
+    const PrimExpr &activation = info.owners.front().active_guard;
+    int stage = reader->GetStage();
     for (const MultiBufferInfo &other : multi_buffer_plan_.Infos()) {
       if (!other.UsesCounter() ||
           !other.counter->data.same_as(info.counter->data))
         continue;
       if (!other.counter.same_as(info.counter) || other.owners.size() != 1 ||
           other.owners.front().loop != owner ||
-          !is_one(other.owners.front().active_guard))
+          !CounterOperandGuardsEquivalent(other.owners.front().active_guard,
+                                          activation, reader, owner))
         return false;
     }
     int initializers = 0, advances = 0;
@@ -2243,14 +2293,14 @@ private:
       auto *task = static_cast<TaskNode *>(node);
       if (!touches(task->stmt))
         return;
-      if (task->HasGuards() || task->IsPerCoreTask() || task->GetStage() != 0 ||
-          task->GetCoreMask() != kCoreCube ||
+      if (task->IsPerCoreTask() || task->GetCoreMask() != kCoreCube ||
           !task->UsesOnlyPipe(ResourcePipe::kScalar)) {
         valid = false;
         return;
       }
       if (task->GetParent() == owner && task->GetIndex() > reader->GetIndex() &&
-          IsCanonicalCounterAdvance(task, info.counter)) {
+          task->GetStage() == stage &&
+          HasCounterOperandAdvance(task, owner, info)) {
         ++advances;
         return;
       }
@@ -2261,7 +2311,7 @@ private:
         body = wrapper->body;
       }
       const auto *store = body.as<BufferStoreNode>();
-      if (!task->GetParent() &&
+      if (!task->GetParent() && task->GetStage() == 0 && !task->HasGuards() &&
           task->GetIndex() < owner->GetOutermostControl()->GetIndex() &&
           store && store->buffer.same_as(info.counter) &&
           store->indices.size() == 1 && is_zero(store->indices[0]) &&
@@ -2287,8 +2337,7 @@ private:
     if (architecture_ != AscendArchitecture::kDav2201 || !parent ||
         dep.kind != DependencyKind::kData || dep.distance != -1 ||
         dep.cross_storage_conflict || !info.UsesCounter() ||
-        info.num_versions <= 1 || info.owners.size() != 1 ||
-        !is_one(info.owners.front().active_guard))
+        info.num_versions < 1 || info.owners.size() != 1)
       return false;
     ControlNode *owner = info.owners.front().loop;
     if (owner == parent || !owner->IsWithin(parent) ||
@@ -2306,7 +2355,7 @@ private:
       bool reads = child->ReadsStorage(info.storage);
       if (!writes && !reads)
         continue;
-      if (!child->IsTask() || child->GetStage() != 0 || child->HasGuards() ||
+      if (!child->IsTask() || child->GetStage() < 0 ||
           static_cast<TaskNode *>(child.get())->IsPerCoreTask() ||
           static_cast<TaskNode *>(child.get())->GetCoreMask() != kCoreCube ||
           (writes && (writer || reads)) || (reads && reader))
@@ -2317,6 +2366,11 @@ private:
         reader = static_cast<TaskNode *>(child.get());
     }
     if (!writer || !reader || writer->GetIndex() >= reader->GetIndex() ||
+        writer->GetStage() != reader->GetStage() ||
+        !HasCounterOperandActivation(writer, owner,
+                                     info.owners.front().active_guard) ||
+        !HasCounterOperandActivation(reader, owner,
+                                     info.owners.front().active_guard) ||
         !writer->UsesOnlyPipe(ResourcePipe::kMTE1) ||
         !reader->UsesOnlyPipe(ResourcePipe::kCube) ||
         !((producer == writer && consumer == reader) ||
@@ -2330,7 +2384,8 @@ private:
         HasUnitFlagCtrl(reader->stmt))
       return false;
     Gemm mad((*operation)->args, (*operation)->annotations);
-    if (mad->mbar_.defined() || mad->wgWait_ || mad->isWgmma_ || mad->isTcgen05_)
+    if (mad->mbar_.defined() || mad->wgWait_ || mad->isWgmma_ ||
+        mad->isTcgen05_)
       return false;
     auto closure = scope_closures_.find(owner);
     if (closure == scope_closures_.end())
@@ -2352,15 +2407,27 @@ private:
           !ffi::StructuralEqual()(point.flag_iteration, clock) ||
           src.EpochDomainId() != dst.EpochDomainId() || !domain.IsCounter() ||
           domain.owner != owner || !domain.counter.same_as(info.counter) ||
-          !is_one(domain.active_guard) || src.core != kCoreCube ||
-          dst.core != kCoreCube || src.path_begin != src.path_end ||
-          dst.path_begin != dst.path_end || !src.path_end->IsTask() ||
-          !dst.path_end->IsTask() ||
+          src.core != kCoreCube || dst.core != kCoreCube ||
+          src.path_begin != src.path_end || dst.path_begin != dst.path_end ||
+          !src.path_end->IsTask() || !dst.path_end->IsTask() ||
           static_cast<TaskNode *>(src.path_end)->IsPerCoreTask() ||
           static_cast<TaskNode *>(dst.path_end)->IsPerCoreTask() ||
           src.path_end->GetParent() != owner ||
-          dst.path_end->GetParent() != owner || !is_one(src.GetGuard()) ||
-          !is_one(dst.GetGuard()))
+          dst.path_end->GetParent() != owner)
+        continue;
+      // All actual ring endpoints, including merged adjacent operand loads,
+      // must share the same stage and activation as writer/MAD/tick. This is
+      // one counter epoch translated together, not independent leaf guards.
+      auto same_activation = [&](const SyncInsertionSite &site) {
+        const auto *task = static_cast<const TaskNode *>(site.path_end);
+        return task->GetStage() == reader->GetStage() &&
+               HasCounterOperandActivation(task, owner,
+                                           info.owners.front().active_guard) &&
+               CounterOperandGuardsEquivalent(
+                   site_registry_.Domain(site).active_guard && site.GetGuard(),
+                   info.owners.front().active_guard, task, owner);
+      };
+      if (!same_activation(src) || !same_activation(dst))
         continue;
       ready |= point.edge.distance == 0 && src.pipe == "MTE1" &&
                dst.pipe == "M" && dst.path_end == reader;
@@ -3277,9 +3344,7 @@ private:
     sync_points = std::move(emit);
   }
 
-  bool IsCanonicalCounterAdvance(const TaskNode *task,
-                                 const Buffer &counter) const {
-    Stmt body = task->stmt;
+  bool IsCanonicalCounterAdvanceBody(Stmt body, const Buffer &counter) const {
     while (const auto *wrapper = body.as<AttrStmtNode>()) {
       if (wrapper->attr_key != attr::kAscendTask)
         return false;
@@ -3295,6 +3360,11 @@ private:
     return load && load->buffer.same_as(counter) && load->indices.size() == 1 &&
            is_zero(load->indices[0]) && !load->predicate.has_value() &&
            is_one(add->b);
+  }
+
+  bool IsCanonicalCounterAdvance(const TaskNode *task,
+                                 const Buffer &counter) const {
+    return IsCanonicalCounterAdvanceBody(task->stmt, counter);
   }
 
   void CompleteCounterBinaryPoints(std::vector<SyncPoint> &sync_points,
