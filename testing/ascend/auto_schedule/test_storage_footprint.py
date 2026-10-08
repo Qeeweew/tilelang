@@ -1,9 +1,12 @@
 """Scheduling, version origins and allocation share physical storage facts."""
 
+from unittest.mock import patch
+
 import pytest
 import tilelang
 from tilelang import tvm
 from tilelang.ascend import transform
+from tilelang.ascend.transform import z3_scheduler
 from tilelang.layout import Layout
 from tvm import tirx
 
@@ -101,6 +104,159 @@ def test_dynamic_storage_is_diagnosed_instead_of_charged_zero():
     ub = tirx.decl_buffer((n,), "float32", name="dynamic_ub", scope="shared.dyn")
     with pytest.raises(tvm.error.InternalError, match="requires a static physical storage footprint for dynamic_ub"):
         transform.AutoSchedule()(_scheduled_ub(ub))
+
+
+def _ub_storage(name, size, scope="shared.dyn"):
+    return tirx.decl_buffer((size // 4,), "float32", name=name, scope=scope)
+
+
+def _ub_owner(storage, name, out, *, child=None):
+    epoch = tirx.Var(name, "int32")
+    tasks = [
+        unit(tirx.BufferStore(storage, tirx.const(1, "float32"), [0]), stage=-1, cost=(1, 1)),
+        unit(tirx.BufferStore(out, storage[0], [0]), stage=-1, cost=(1, 1)),
+    ]
+    if child is not None:
+        tasks.append(child)
+    return unit(tirx.For(
+        epoch, 0, 3, tirx.ForKind.SERIAL, seq(*tasks),
+        annotations={"multi_buffer_eligible": [storage.data],
+                     "tl.ascend_auto_pipeline": True, "num_stages": 3},
+    ), core=None, stage=-1)
+
+
+def _ub_module(body, storages, out, *, annotations=None, arch="dav-2201"):
+    module = kernel(body, buffers=storages, params=[out], annotations=annotations)
+    module["main"] = module["main"].with_attr("target", tvm.target.Target({"kind": "ascend", "arch": arch}))
+    return module
+
+
+def _capture_ub_budget(module, *, first_versions=None):
+    """Observe the real FFI contract, with a deterministic legal serial witness.
+
+    Unit costs isolate byte accounting from latency estimates. Choosing two
+    versions for the first owner is legal even though this serial witness only
+    needs one, and exposes the physical ring shared by subsequent owners.
+    """
+    queries = []
+
+    def schedule(*args, **kwargs):
+        sizes = list(map(int, args[8]))
+        minimum = list(map(int, kwargs["buffer_min_versions"]))
+        counts = list(minimum)
+        if not queries and first_versions is not None:
+            assert len(counts) == 1
+            counts[0] = first_versions
+        groups = [list(map(int, group)) for group in args[9]]
+        assert all(sum(sizes[index] * counts[index] for index in group[1:]) <= group[0]
+                   for group in groups)
+        queries.append(dict(sizes=sizes, minimum=minimum, groups=groups, selected=counts))
+        starts, end = [], 0
+        for latency, ii in zip(map(int, args[1]), map(int, args[2])):
+            starts.append(end)
+            end += max(latency, ii, 1)
+        return starts, counts, max(end, 1)
+
+    with patch.object(z3_scheduler, "z3_schedule_loop_python", side_effect=schedule):
+        after = transform.AutoSchedule()(module)
+    return after, queries
+
+
+def _ub_variable_capacity(query):
+    # These fixtures have exactly one variable buffer, always in the UB group.
+    group, = [group for group in query["groups"] if len(group) > 1]
+    assert query["sizes"] and group[1:] == list(range(len(query["sizes"])))
+    return group[0]
+
+
+@pytest.mark.parametrize("scope", ["shared", "shared.dyn"])
+def test_root_only_epilogue_is_reserved_before_choosing_a_ub_ring(scope):
+    ring = _ub_storage("ring", 64 * 1024, scope)
+    epilogue = _ub_storage("epilogue", 96 * 1024, scope)
+    out = tirx.decl_buffer((1,), "float32", name="out")
+    finish = unit(tirx.BufferStore(epilogue, out[0], [0]), stage=-1, cost=(1, 1))
+    _, queries = _capture_ub_budget(_ub_module(
+        seq(_ub_owner(ring, "epoch", out), finish), [ring, epilogue], out))
+    assert len(queries) == 1 and queries[0]["sizes"] == [64 * 1024]
+    # Two ring slots fit if only this loop is budgeted; the actual epilogue
+    # allocation leaves room for just one. Its tiny write is not its footprint.
+    assert _ub_variable_capacity(queries[0]) == 96 * 1024
+    assert queries[0]["selected"] == [1]
+
+
+def test_root_only_ub_reservation_keeps_layout_padding_and_alignment():
+    ring = _ub_storage("ring", 64 * 1024)
+    epilogue = _ub_storage("epilogue", 68)
+    out = tirx.decl_buffer((1,), "float32", name="out")
+    module = _ub_module(_ub_owner(ring, "epoch", out), [ring, epilogue], out,
+                        annotations={"layout_map": {epilogue: Layout((17,), lambda i: i * 2)}})
+    _, queries = _capture_ub_budget(module)
+    assert _ub_variable_capacity(queries[0]) == 192 * 1024 - 160
+
+
+@pytest.mark.parametrize("accessed", [False, True])
+def test_manual_ub_physical_ring_is_reserved_exactly_once(accessed):
+    ring = _ub_storage("ring", 64 * 1024)
+    manual = tirx.decl_buffer((2, 6144), "float32", name="manual", scope="shared.dyn")
+    out = tirx.decl_buffer((1,), "float32", name="out")
+    touch = unit(tirx.BufferStore(manual, tirx.const(2, "float32"), [0, 0]), stage=-1, cost=(1, 1)) if accessed else None
+    module = _ub_module(_ub_owner(ring, "epoch", out, child=touch), [ring, manual], out,
+                        annotations={"tl.manual_multi_buffer": {manual.data: 2}})
+    _, queries = _capture_ub_budget(module)
+    assert queries[0]["sizes"] == [64 * 1024]
+    assert _ub_variable_capacity(queries[0]) == 144 * 1024
+
+
+def test_previously_selected_ub_width_is_a_lower_bound_and_foreign_reservation():
+    ring = _ub_storage("ring", 32 * 1024)
+    other = _ub_storage("other", 96 * 1024)
+    out = tirx.decl_buffer((1,), "float32", name="out")
+    module = _ub_module(seq(_ub_owner(ring, "first", out), _ub_owner(ring, "second", out),
+                            _ub_owner(other, "other_epoch", out)), [ring, other], out)
+    after, queries = _capture_ub_budget(module, first_versions=2)
+    assert [query["minimum"] for query in queries] == [[1], [2], [1]]
+    assert [_ub_variable_capacity(query) for query in queries] == [96 * 1024, 96 * 1024, 128 * 1024]
+    assert int(after["main"].body.block.annotations["tl.buffer_versions_map"][ring.data]) == 2
+
+
+def test_parent_ub_budget_counts_the_selected_child_ring_without_double_charging():
+    parent = _ub_storage("parent", 32 * 1024)
+    child = _ub_storage("child", 32 * 1024)
+    epilogue = _ub_storage("epilogue", 16 * 1024)
+    out = tirx.decl_buffer((1,), "float32", name="out")
+    body = _ub_owner(parent, "parent_epoch", out, child=_ub_owner(child, "child_epoch", out))
+    _, queries = _capture_ub_budget(_ub_module(body, [parent, child, epilogue], out), first_versions=2)
+    assert [query["sizes"] for query in queries] == [[32 * 1024], [32 * 1024]]
+    assert [_ub_variable_capacity(query) for query in queries] == [144 * 1024, 112 * 1024]
+
+
+def test_future_fixed_ub_owner_reserves_its_requested_physical_width():
+    current = _ub_storage("current", 64 * 1024)
+    future = _ub_storage("future", 32 * 1024)
+    out = tirx.decl_buffer((1,), "float32", name="out")
+    module = _ub_module(seq(_ub_owner(current, "first", out), _ub_owner(future, "future_epoch", out)),
+                        [current, future], out, annotations={"tl.buffer_versions_map": {future.data: 2}})
+    after, queries = _capture_ub_budget(module)
+    assert _ub_variable_capacity(queries[0]) == 128 * 1024
+    assert int(after["main"].body.block.annotations["tl.buffer_versions_map"][future.data]) == 2
+
+
+def test_root_only_ub_storage_cannot_be_spent_on_the_loop_minimum():
+    ring = _ub_storage("ring", 128 * 1024)
+    epilogue = _ub_storage("epilogue", 80 * 1024)
+    out = tirx.decl_buffer((1,), "float32", name="out")
+    module = _ub_module(_ub_owner(ring, "epoch", out), [ring, epilogue], out)
+    with patch.object(z3_scheduler, "z3_schedule_loop_python", side_effect=AssertionError("capacity must fail before solve")):
+        with pytest.raises(tvm.error.InternalError, match="insufficient for minimum buffer usage"):
+            transform.AutoSchedule()(module)
+
+
+def test_3510_keeps_its_existing_loop_local_ub_budget():
+    ring = _ub_storage("ring", 64 * 1024)
+    epilogue = _ub_storage("epilogue", 96 * 1024)
+    out = tirx.decl_buffer((1,), "float32", name="out")
+    _, queries = _capture_ub_budget(_ub_module(_ub_owner(ring, "epoch", out), [ring, epilogue], out, arch="dav-3510"))
+    assert _ub_variable_capacity(queries[0]) == 248 * 1024
 
 
 @pytest.mark.parametrize("dtype, pitch, bytes_per_element", [("float16", 32, 2), ("float32", 24, 4)])

@@ -22,6 +22,7 @@
  * \brief Merge Ascend on-chip allocations from a buffer-alias contract.
  */
 
+#include "ascend/target_utils.h"
 #include "buffer_alias.h"
 #include "merge_ub_common.h"
 
@@ -405,12 +406,55 @@ private:
   bool found_contract_{false};
 };
 
+void CheckOnChipCapacity(const PrimExpr &size, const std::string &scope,
+                         const AscendTargetInfo *target_info) {
+  // Targetless IR fixtures can still exercise the packer. Production lowering
+  // binds the target before this final physical storage boundary.
+  if (!target_info)
+    return;
+  int64_t capacity = scope.empty()           ? target_info->ub_bytes
+                     : scope == "shared.l1"  ? target_info->l1_bytes
+                     : scope == "shared.l0a" ? target_info->l0a_bytes
+                     : scope == "shared.l0b" ? target_info->l0b_bytes
+                     : scope == "shared.l0c" ? target_info->l0c_bytes
+                                             : 0;
+  ICHECK_GT(capacity, 0) << "Unknown Ascend physical storage bank " << scope;
+  arith::Analyzer analyzer;
+  PrimExpr bytes = analyzer.Simplify(size);
+  const auto *constant = bytes.as<IntImmNode>();
+  const std::string bank = scope.empty() ? "UB (per AIV)" : scope;
+  ICHECK(constant) << "Ascend final allocation requires a static physical "
+                      "storage footprint for "
+                   << bank << " on " << target_info->arch << ", got " << bytes;
+  ICHECK_GE(constant->value, 0);
+  ICHECK_LE(constant->value, capacity)
+      << "Ascend final allocation for " << bank << " on " << target_info->arch
+      << " requires " << constant->value << " bytes, exceeding capacity "
+      << capacity << " bytes";
+}
+
 Stmt MergeUBAllocations(Stmt stmt, int align_bytes, bool verbose,
-                        bool disable_reuse) {
+                        bool disable_reuse,
+                        const AscendTargetInfo *target_info) {
   BufferAliasContractExtractor extractor;
   stmt = extractor.Extract(stmt);
-  if (!extractor.FoundContract())
+  auto validate = [target_info](const PrimExpr &bytes,
+                                const std::string &scope) {
+    CheckOnChipCapacity(bytes, scope, target_info);
+  };
+  if (!extractor.FoundContract()) {
+    // Without a completion-proved alias contract, allocations remain disjoint.
+    // Validate their physical total even though this pass leaves them intact.
+    AllocateCollector collector;
+    collector(stmt);
+    if (!collector.dyn_shmem_allocs.empty())
+      validate(BuildSequentialPlan(collector.dyn_shmem_allocs, align_bytes)
+                   .total_size,
+               "");
+    for (const auto &[scope, allocations] : collector.ascend_scope_allocs)
+      validate(BuildSequentialPlan(allocations, align_bytes).total_size, scope);
     return stmt;
+  }
   BufferAliasMap aliases = extractor.Aliases();
   ValidateBufferAliasMap(aliases);
 
@@ -422,7 +466,7 @@ Stmt MergeUBAllocations(Stmt stmt, int align_bytes, bool verbose,
                                 aliases);
   };
   return merge_ub::MergeAllocations(std::move(stmt), align_bytes, verbose,
-                                    disable_reuse, planner);
+                                    disable_reuse, planner, validate);
 }
 
 } // namespace
@@ -438,9 +482,13 @@ Pass MergeUBAllocations(int align_bytes = 16, bool disable_reuse = false) {
         context
             ->GetConfig<Bool>(kDebugMergeSharedMemoryAllocations, Bool(false))
             .value();
+    Target target = func->GetAttr<Target>(tvm::attr::kTarget)
+                        .value_or(Target::Current(true));
+    const AscendTargetInfo *target_info =
+        TargetIsAscend(target) ? &GetAscendTargetInfo(target) : nullptr;
     PrimFuncNode *writer = func.CopyOnWrite();
     writer->body = tl::MergeUBAllocations(std::move(writer->body), align_bytes,
-                                          verbose, disable_reuse);
+                                          verbose, disable_reuse, target_info);
     return func;
   };
   return CreatePrimFuncPass(pass_func, 0, "tl.MergeUBAllocations", {});

@@ -72,7 +72,8 @@ inline bool IsScopeMemory(tirx::Var buffer_var,
                           const std::string &target_scope) {
   if (!buffer_var->type_annotation.as<PointerTypeNode>())
     return false;
-  return GetPtrStorageScope(std::move(buffer_var)) == target_scope;
+  const std::string scope = GetPtrStorageScope(std::move(buffer_var));
+  return scope == target_scope || scope == target_scope + ".dyn";
 }
 
 using ascend::AlignPrimExpr;
@@ -92,7 +93,7 @@ public:
       std::string scope = GetPtrStorageScope(op->buffer->data);
       for (const std::string &candidate :
            {"shared.l0a", "shared.l0b", "shared.l0c", "shared.l1"}) {
-        if (scope != candidate)
+        if (scope != candidate && scope != candidate + ".dyn")
           continue;
         const tirx::VarNode *key = op->buffer->data.get();
         if (ascend_scope_allocs[candidate].emplace(key, op).second)
@@ -126,7 +127,7 @@ inline MemoryPlan BuildSequentialPlan(const AllocationMap &allocations,
               return lhs->name_hint < rhs->name_hint;
             });
 
-  DataType offset_dtype = DataType::Int(32);
+  DataType offset_dtype = DataType::Int(64);
   PrimExpr cursor = tirx::make_const(offset_dtype, 0);
   PrimExpr total_size = tirx::make_const(offset_dtype, 0);
   for (const tirx::VarNode *var : sorted_vars) {
@@ -145,10 +146,10 @@ inline MemoryPlan BuildSequentialPlan(const AllocationMap &allocations,
 class SharedMemoryRewriter : public tirx::StmtExprMutator {
 public:
   SharedMemoryRewriter(const AllocationMap &allocations, bool verbose = false,
-                       int align_bytes = 0, const std::string &merged_name = "",
+                       const std::string &merged_name = "",
                        const std::string &merged_scope = "",
                        const std::string &target_scope = "")
-      : allocations_(allocations), verbose_(verbose), align_bytes_(align_bytes),
+      : allocations_(allocations), verbose_(verbose),
         target_scope_(target_scope) {
     if (!merged_name.empty() && !merged_scope.empty()) {
       merged_buf_var_ = tirx::Var(
@@ -159,16 +160,6 @@ public:
   void SetPlan(MemoryPlan plan) {
     buffer_byte_offsets_ = std::move(plan.byte_offsets);
     merged_alloc_size_ = std::move(plan.total_size);
-  }
-
-  void PlanNoReuse() {
-    SetPlan(BuildSequentialPlan(allocations_, align_bytes_));
-    if (!verbose_)
-      return;
-    LOG(DEBUG) << "No-Reuse Memory Allocation Plan for Ascend UB:";
-    LOG(DEBUG) << "  Total Merged Size: " << merged_alloc_size_ << " bytes";
-    for (const auto &[var, offset] : buffer_byte_offsets_)
-      LOG(DEBUG) << "    Buffer " << var->name_hint << " offset=" << offset;
   }
 
 private:
@@ -333,7 +324,6 @@ private:
 
   AllocationMap allocations_;
   bool verbose_{false};
-  int align_bytes_{16};
   tirx::Var merged_buf_var_{
       "buf_dyn_shmem", PointerType(PrimType(DataType::UInt(8)), "shared.dyn")};
   std::string target_scope_;
@@ -345,27 +335,31 @@ private:
   bool allocated_{false};
 };
 
-template <typename Planner>
+template <typename Planner, typename Validator>
 tirx::Stmt MergeAllocations(tirx::Stmt stmt, int align_bytes, bool verbose,
-                            bool disable_reuse, const Planner &planner) {
+                            bool disable_reuse, const Planner &planner,
+                            const Validator &validate) {
   AllocateCollector collector;
   collector(stmt);
   auto run = [&](SharedMemoryRewriter &rewriter,
                  const AllocationMap &allocations,
                  const AllocationOrder &allocation_order,
                  const std::string &target_scope) {
-    if (disable_reuse) {
-      rewriter.PlanNoReuse();
-    } else {
-      rewriter.SetPlan(planner(stmt, allocations, allocation_order,
-                               target_scope, align_bytes, verbose));
-    }
+    MemoryPlan plan = disable_reuse
+                          ? BuildSequentialPlan(allocations, align_bytes)
+                          : planner(stmt, allocations, allocation_order,
+                                    target_scope, align_bytes, verbose);
+    validate(plan.total_size, target_scope);
+    // Even a single allocation must satisfy the physical bank capacity, but
+    // does not need an address rewrite.
+    if (allocations.size() == 1)
+      return;
+    rewriter.SetPlan(std::move(plan));
     stmt = rewriter(std::move(stmt));
   };
 
-  if (collector.dyn_shmem_allocs.size() > 1) {
-    SharedMemoryRewriter rewriter(collector.dyn_shmem_allocs, verbose,
-                                  align_bytes);
+  if (!collector.dyn_shmem_allocs.empty()) {
+    SharedMemoryRewriter rewriter(collector.dyn_shmem_allocs, verbose);
     run(rewriter, collector.dyn_shmem_allocs, collector.dyn_shmem_order, "");
   }
 
@@ -376,16 +370,14 @@ tirx::Stmt MergeAllocations(tirx::Stmt stmt, int align_bytes, bool verbose,
   std::sort(scopes.begin(), scopes.end());
   for (const std::string &scope : scopes) {
     const AllocationMap &allocations = collector.ascend_scope_allocs.at(scope);
-    if (allocations.size() <= 1)
-      continue;
     auto order = collector.ascend_scope_order.find(scope);
     const AllocationOrder empty_order;
     const AllocationOrder &allocation_order =
         order == collector.ascend_scope_order.end() ? empty_order
                                                     : order->second;
     std::string suffix = scope.substr(7);
-    SharedMemoryRewriter rewriter(allocations, verbose, align_bytes,
-                                  "buf_dyn_" + suffix, scope + ".dyn", scope);
+    SharedMemoryRewriter rewriter(allocations, verbose, "buf_dyn_" + suffix,
+                                  scope + ".dyn", scope);
     run(rewriter, allocations, allocation_order, scope);
   }
   return stmt;

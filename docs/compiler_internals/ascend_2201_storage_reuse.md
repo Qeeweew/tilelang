@@ -1,4 +1,4 @@
-# 2201 accumulator storage admission
+# 2201 on-chip storage admission
 
 AutoSchedule may repair L0C memory pressure by placing separate logical
 accumulators in one physical allocation. This is a storage choice made before
@@ -52,3 +52,19 @@ indices, extents and call annotations remain ordinary expressions and are
 checked for those unsupported uses, including an opaque use in the same task
 as a precise typed operand. Scheduler read-vars includes typed storage
 identities and therefore cannot serve as a scalar-escape test.
+
+The 2201 UB budget covers the complete kernel allocation owners, including
+scratch, normalization and output casts used only after a pipelined loop.
+Each owner's aligned physical slot size is charged once, using the selected
+ring width or a fixed future owner's requested width. Manual allocation shapes
+already contain their physical version axis. Independently scheduled owners
+must retain an existing storage ring width as a lower bound. This reservation
+is conservative; it does not infer new UB alias relationships.
+
+After version materialization and flattening, `MergeUBAllocations` checks the
+actual aligned allocation plan against the target's separate UB, L1, L0A,
+L0B and L0C capacities. UB is private to each AIV. Plain and `.dyn` scopes for
+the same bank consume one capacity. The check also applies to single buffers,
+disabled reuse and allocations without an alias contract; unknown physical
+sizes are diagnosed. A scheduler budget override cannot authorize hardware
+over-allocation. Successful AscendC compilation is not a capacity check.

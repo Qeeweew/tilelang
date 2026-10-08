@@ -60,8 +60,8 @@
 #include "./auto_schedule/kernel_rewriter.h"
 #include "./auto_schedule/l0ab_phase_reuse.h"
 #include "./auto_schedule/l0c_storage_reuse.h"
-#include "./auto_schedule/multi_buffer.h"
 #include "./auto_schedule/manual_schedule_completion.h"
+#include "./auto_schedule/multi_buffer.h"
 #include "./auto_schedule/optimization_diagnostic.h"
 #include "./auto_schedule/scheduled_tir.h"
 #include "./auto_schedule/task_analysis.h"
@@ -184,6 +184,10 @@ public:
   // every reader before the other phase may overwrite the same address.
   void SetReserveL0Storage(bool value) { reserve_l0_storage_ = value; }
 
+  // UB has one physical arena per AIV, including buffers used only outside
+  // the current loop. A loop-local version choice cannot spend their bytes.
+  void SetReserveUBStorage(bool value) { reserve_ub_storage_ = value; }
+
   void SetL0PhaseReuse(std::vector<L0PhaseReusePair> pairs) {
     l0_phase_reuse_ = std::move(pairs);
   }
@@ -256,9 +260,9 @@ private:
     if (existing != selected_buffer_versions_.end()) {
       // Disjoint owners are scheduled independently but share one physical
       // storage ring, so keep enough versions for every owner. Automatic
-      // dav-2201 L0 queries reserve other root allocations and carry this
+      // dav-2201 UB/L0 queries reserve other root allocations and carry this
       // existing count as a hard lower bound before selecting again. Selected
-      // phase contracts also require this reservation in manual ancestors.
+      // L0 phase contracts also require this reservation in manual ancestors.
       num_versions = std::max((*existing).second, num_versions);
     }
     for (const Var &member : storage_groups_.Members(storage))
@@ -268,6 +272,7 @@ private:
   bool prefer_handoff_issue_{false};
   bool prefer_prefetch_issue_{false};
   bool reserve_l0_storage_{false};
+  bool reserve_ub_storage_{false};
   std::vector<L0PhaseReusePair> l0_phase_reuse_;
   L0StorageGroups storage_groups_;
   ffi::Map<Var, PrimExpr> storage_slot_bytes_;
@@ -1051,6 +1056,12 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
           << "Explicit Ascend source issue order is not legal: "
              "source-order-memory-capacity for fixed storage";
       group_capacities[group] -= static_cast<int64_t>(bytes);
+    } else if (reserve_ub_storage_ && group_scopes[group] == "shared") {
+      __int128 remaining =
+          __int128(group_capacities[group]) - __int128(slot_bytes) * versions;
+      ICHECK(remaining >= std::numeric_limits<int64_t>::min())
+          << "Ascend UB reservation exceeds int64 byte representation";
+      group_capacities[group] = static_cast<int64_t>(remaining);
     } else {
       group_capacities[group] -= slot_bytes * versions;
     }
@@ -1063,6 +1074,10 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
   // their existing per-query resource policy.
   const bool reserve_l0 =
       reserve_l0_storage_ && (!manual_schedule || !l0_phase_reuse_.empty());
+  auto is_ub_storage = [](const Var &storage) {
+    const std::string scope = GetPtrStorageScope(storage);
+    return scope == "shared" || scope == "shared.dyn";
+  };
   auto l0_scope = [](const Var &storage) -> std::string {
     const std::string scope = GetPtrStorageScope(storage);
     if (scope == "shared.l0a" || scope == "shared.l0a.dyn")
@@ -1149,26 +1164,33 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
     }
     int group_id = scope_to_group[scope];
     bool root_l0 = reserve_l0 && !l0_scope(storage).empty();
+    bool root_ub = reserve_ub_storage_ && is_ub_storage(storage);
     if (root_l0 && manual_buffer_versions_.count(storage))
       continue;
+    if (root_ub && manual_buffer_versions_.count(storage)) {
+      // Its allocation already includes the physical version axis.
+      consume_fixed_capacity(group_id, get_buffer_size(buffer), 1);
+      continue;
+    }
     if (!ctrl->IsMultiBufferEligible(storage)) {
       // These buffers cannot be multi-buffered, and cannot share memory with
       // other buffers either, so we directly reduce the capacity of the
       // memory group by their size
       if (!root_l0) {
-        int versions = preserve_issue_order ? reserved_versions(storage) : 1;
+        int versions =
+            preserve_issue_order || root_ub ? reserved_versions(storage) : 1;
         consume_fixed_capacity(group_id, get_buffer_size(buffer), versions);
       }
     } else {
       auto override_it = buffer_version_overrides_.find(storage);
       if (override_it != buffer_version_overrides_.end()) {
         int override_val = (*override_it).second;
-        if (root_l0 && preserve_issue_order)
+        if ((root_l0 || root_ub) && preserve_issue_order)
           ICHECK_GE(override_val, reserved_versions(storage))
               << "Explicit Ascend source issue order has a fixed version count "
                  "smaller than an already selected shared ring for storage "
               << storage->name_hint;
-        if (root_l0)
+        if (root_l0 || root_ub)
           override_val = std::max(override_val, reserved_versions(storage));
         annotated_storage_versions[storage] = override_val;
         if (!root_l0)
@@ -1184,6 +1206,34 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
   }
 
   std::vector<int64_t> storage_min_versions(storage_sizes.size(), 1);
+  if (reserve_ub_storage_) {
+    // Every root UB allocation occupies this AIV's arena, including epilogue
+    // casts, normalization results and scratch absent from ctrl's accesses.
+    // Accessed fixed storage was charged above; variable storage remains in
+    // its memory group, with any previously selected physical ring as a lower
+    // bound. Reserve only the remaining allocation owners here, once each.
+    for (const auto &[storage, _] : storage_slot_bytes_) {
+      if (!is_ub_storage(storage))
+        continue;
+      int versions = reserved_versions(storage);
+      ICHECK_GT(versions, 0);
+      auto variable = storage_version_id.find(storage);
+      if (variable != storage_version_id.end()) {
+        storage_min_versions[variable->second] = versions;
+        continue;
+      }
+      if (seen_storages.count(storage))
+        continue;
+      int64_t bytes = get_storage_size(storage);
+      int64_t &remaining = group_capacities[scope_to_group.at("shared")];
+      ICHECK_LE(bytes, remaining / versions)
+          << "Z3 loop scheduling failed: scope \"shared\" capacity "
+          << remaining << " is insufficient for reserved root storage "
+          << storage->name_hint << " (" << bytes << " bytes, " << versions
+          << " physical versions)";
+      remaining -= bytes * versions;
+    }
+  }
   if (reserve_l0) {
     std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> phase_storages;
     auto reserved_bytes = [&](const Var &storage) {
@@ -1908,7 +1958,7 @@ static void ScheduleSingleKernel(const Stmt &kernel_body, Target target,
     for (const L0PhaseReusePair &pair : phase_reuse)
       pairs.push_back({pair.first, pair.second});
     metadata.kernel_root.CopyOnWrite()->annotations.Set(kL0PhaseReusePairs,
-                                                       std::move(pairs));
+                                                        std::move(pairs));
   }
   unit_builder.SetL0PhaseReuse(std::move(phase_reuse));
   unit_builder.SetPreferHandoffIssue(target_info.architecture ==
@@ -1916,6 +1966,8 @@ static void ScheduleSingleKernel(const Stmt &kernel_body, Target target,
   unit_builder.SetPreferPrefetchIssue(target_info.architecture ==
                                       AscendArchitecture::kDav2201);
   unit_builder.SetReserveL0Storage(target_info.architecture ==
+                                   AscendArchitecture::kDav2201);
+  unit_builder.SetReserveUBStorage(target_info.architecture ==
                                    AscendArchitecture::kDav2201);
   int64_t shared_mem_limit = GetSharedMemoryLimit(kernel_body, target_info);
   unit_builder.SetMemoryLimit("shared", shared_mem_limit);
@@ -1968,8 +2020,8 @@ tvm::transform::Pass AutoSchedule() {
             // A capacity repair changes physical storage identity. Decode the
             // changed shell once so every task/owner/dependency consumes those
             // facts, rather than retaining a parallel alias side table.
-            scheduled_tir = DecodeScheduledTIR(
-                root, context.outer_ctx, MakeAutoScheduleExtraInfo);
+            scheduled_tir = DecodeScheduledTIR(root, context.outer_ctx,
+                                               MakeAutoScheduleExtraInfo);
           }
           BufferVersionMap buffer_version_overrides =
               scheduled_tir.metadata.buffer_versions;
