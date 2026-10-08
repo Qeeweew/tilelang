@@ -112,13 +112,20 @@ def test_proved_strided_destination_layout_falls_back():
     assert nodes(after, tirx.For)
 
 
-def test_dynamic_rows_including_zero_keep_serial_row_issue_semantics():
+def test_bounded_dynamic_rows_use_one_guarded_exact_native_batch():
     row_extent = tirx.Var("dynamic_rows", "int32")
     before, _, _ = _program(rows=5, row_extent=row_extent)
     after = _lower(before)
-    assert [int(call.args[-1]) for call in _reduce_calls(after)] == [64]
-    loops = nodes(after, tirx.For)
-    assert len(loops) == 2 and any(loop.extent.same_as(row_extent) for loop in loops)
+    (call,) = _reduce_calls(after)
+    analyzer = tvm.arith.Analyzer()
+    assert analyzer.can_prove_equal(call.args[0].args[1], row_extent)
+    assert analyzer.can_prove_equal(call.args[1].args[1], row_extent * 64)
+    assert analyzer.can_prove_equal(call.args[-1], tirx.Cast("uint32", row_extent * 64))
+    (loop,) = nodes(after, tirx.For)
+    assert loop.loop_var.same_as(row_extent)
+    (guard,) = nodes(after, tirx.IfThenElse)
+    assert analyzer.can_prove_equal(guard.condition, row_extent > 0)
+    assert not nodes(after, tirx.Bind) and not nodes(after, tirx.BufferStore)
 
 
 def test_static_empty_rows_do_not_create_a_batched_zero_count_instruction():

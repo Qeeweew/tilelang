@@ -1161,8 +1161,8 @@ private:
     active_count_ = analyzer_.Simplify(
         max(make_zero(saved_count.dtype()),
             min(make_const(saved_count.dtype(), vl), saved_count - offset)));
-    // Reuse the normal overlap/effect emitter, then retain one compact Serial
-    // VL loop. No elementwise scalar loop or compile-time unroll is introduced.
+    // Reuse the normal overlap/effect emitter. Multiple VLs retain one compact
+    // Serial loop, so code size does not grow with the vector extent.
     size_t before = emitted_.size();
     Emit("select_bits", {Ptr(ChunkBase(dst, offset), kAccessWrite),
                          Ptr(ChunkBase(a.tile.value(), offset), kAccessRead),
@@ -1171,8 +1171,17 @@ private:
     chunk_body.push_back(emitted_.back());
     emitted_.resize(before);
     active_count_ = saved_count;
-    emitted_.push_back(For(chunk, Integer(0), make_const(chunk.dtype(), chunks),
-                           ForKind::kSerial, MakeSeq(chunk_body)));
+    if (chunks == 1) {
+      // A single VL has no independent reuse epoch. Keep the scalar mask
+      // writes and vector read in their actual enclosing owner, whose reverse
+      // completion protects reuse across rows and outer loop iterations.
+      emitted_.push_back(
+          Substitute(MakeSeq(chunk_body), {{chunk, make_zero(chunk.dtype())}}));
+    } else {
+      emitted_.push_back(For(chunk, Integer(0),
+                             make_const(chunk.dtype(), chunks),
+                             ForKind::kSerial, MakeSeq(chunk_body)));
+    }
     return {dst, PrimExpr()};
   }
 

@@ -135,10 +135,13 @@ private:
     }
   }
 
-  PrimExpr Ptr(const BufferLoad &base, int64_t extent, int mask) {
+  PrimExpr Ptr(const BufferLoad &base, PrimExpr extent, int mask) {
     return Call(DataType::Handle(), tl::access_ptr(),
-                {base, make_const(DataType::Int(32), extent),
-                 make_const(DataType::Int(32), mask)});
+                {base, extent, make_const(DataType::Int(32), mask)});
+  }
+
+  PrimExpr Ptr(const BufferLoad &base, int64_t extent, int mask) {
+    return Ptr(base, make_const(DataType::Int(32), extent), mask);
   }
 
   BufferLoad NewScratch(int64_t elements, DataType dtype) {
@@ -196,11 +199,12 @@ private:
         !op->src->axis_separators.empty() || !op->dst->axis_separators.empty())
       return std::nullopt;
     PrimExpr row_extent = analyzer_.Simplify(op->srcRegion_->region[0]->extent);
-    const auto *row_count = row_extent.as<IntImmNode>();
+    arith::ConstIntBound row_bound = analyzer_.const_int_bound(row_extent);
     // Counter mode ignores the uint8 repeat field; the native count is
-    // uint32. Retain the tighter existing int32 pointer-metadata contract.
-    if (!row_count || row_count->value <= 0 ||
-        row_count->value > std::numeric_limits<int32_t>::max() / vl)
+    // uint32. Retain the tighter existing int32 pointer-metadata contract,
+    // including when an established row domain is only partially active.
+    if (row_bound->min_value < 0 || row_bound->max_value <= 0 ||
+        row_bound->max_value > std::numeric_limits<int32_t>::max() / vl)
       return std::nullopt;
 
     auto src_ranges = op->srcRegion_->region;
@@ -239,17 +243,28 @@ private:
                                  Integer(0)))
       return std::nullopt;
 
-    const int64_t count = row_count->value * vl;
+    PrimExpr count =
+        analyzer_.Simplify(row_extent * make_const(row_extent.dtype(), vl));
     const Op &intrinsic = Op::Get(
         op->type->IsSum() ? "tl.ascend_membase.repeat_reduce_sum"
                           : "tl.ascend_membase.repeat_reduce_max_only_value");
     // Each 256B input repeat is one complete logical row. ONLY_VALUE dst
     // stride=1 is in elements; the conservative C API alignment applies only
     // to this call's base, not each internal result. No row scalar readback.
-    return Evaluate(Call(DataType::Void(), intrinsic,
-                         {Ptr(dst_base, row_count->value, kAccessWrite),
-                          Ptr(src_base, count, kAccessRead),
-                          make_const(DataType::UInt(32), count)}));
+    Stmt native = Evaluate(Call(DataType::Void(), intrinsic,
+                                {Ptr(dst_base, row_extent, kAccessWrite),
+                                 Ptr(src_base, count, kAccessRead),
+                                 cast(DataType::UInt(32), count)}));
+    if (row_bound->min_value == 0) {
+      Require(task_depth_ == 0,
+              "a possibly empty batched reduction needs guarded completion; "
+              "use T.Stage rather than an opaque T.Task/PerCoreTask wrapper");
+      // Empty private AIV partitions read and write no rows. Keep the native
+      // count strictly positive without padding an inactive row or adding S
+      // readback. The enclosing schedule consumes this exact guarded V task.
+      native = IfThenElse(row_extent > make_zero(row_extent.dtype()), native);
+    }
+    return native;
   }
 
   Optional<Stmt> TryMultiVLNativeRows(const ReduceOp &reduce,
@@ -831,8 +846,8 @@ private:
       if (auto value = op->annotations.Get(kBufferVersionsMap)) {
         for (const auto &[storage, versions] :
              value.value().cast<BufferVersionMap>()) {
-          if (versions > 1 && ascend::AscendScopeAlignBytes(
-                                  GetPtrStorageScope(storage)) == 32)
+          if (versions > 1 &&
+              ascend::AscendScopeAlignBytes(GetPtrStorageScope(storage)) == 32)
             ub_owner_bytes_ = std::nullopt;
         }
       }
