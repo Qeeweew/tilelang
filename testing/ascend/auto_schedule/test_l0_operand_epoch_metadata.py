@@ -140,18 +140,21 @@ def test_aiv_owner_counter_metadata_preserves_aic_physical_completions():
     assert _aic_events(baseline["tl.LowerScheduledTIR"]) == _aic_events(direct["tl.LowerScheduledTIR"])
 
 
-def _insert_modified(prepared, key):
+def _insert_modified(prepared, key=None, *, unknown_annotation=False):
     """An unverified outer annotation must retain ordinary completion flags."""
     owner = _epoch(prepared)
     counters = dict(owner.annotations[_COUNTERS])
     counter = next(iter(counters.values()))
-    counters[key] = counter
+    if key is not None:
+        counters[key] = counter
 
     def mutate(node):
         if isinstance(node, tirx.For) and node.same_as(owner):
+            annotations = {**dict(node.annotations), _COUNTERS: counters}
+            if unknown_annotation:
+                annotations["unverified_resource_epoch"] = 1
             return tirx.For(node.loop_var, node.min, node.extent, node.kind, node.body,
-                            annotations={**dict(node.annotations), _COUNTERS: counters},
-                            step=node.step)
+                            annotations=annotations, step=node.step)
 
     function = prepared["main"]
     body = tirx.stmt_functor.ir_transform(function.body, None, mutate)
@@ -162,13 +165,15 @@ def _insert_modified(prepared, key):
         return transform.LowerScheduledTIR()(materialized)
 
 
-@pytest.mark.parametrize("metadata_key", ["unallocated", "l0-bank"])
+@pytest.mark.parametrize("metadata_key", ["unallocated", "l0-bank", "unknown-annotation"])
 def test_unverified_or_relevant_epoch_metadata_keeps_ordinary_operand_handoff(metadata_key):
     _, snapshots = _lower(_program(active=1))
     prepared = snapshots["tl.PrepareMultiBuffer"]
     key = (tirx.decl_buffer((1,), "float32", name="unallocated", scope="shared.dyn").data
-           if metadata_key == "unallocated" else allocated_buffer(prepared, "bq").data)
-    after = _insert_modified(prepared, key)
+           if metadata_key == "unallocated" else
+           allocated_buffer(prepared, "bq").data if metadata_key == "l0-bank" else None)
+    after = _insert_modified(prepared, key,
+                             unknown_annotation=metadata_key == "unknown-annotation")
     _check_physical_completions(_cube_only(after), 1)
     original_ids = {item[2] for item in _aic_events(snapshots["tl.LowerScheduledTIR"])
                     if item[1] == "M_MTE1"}

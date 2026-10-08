@@ -21,6 +21,7 @@
 
 #include "./l0ab_phase_reuse.h"
 #include "./multi_buffer.h"
+#include "./optimization_diagnostic.h"
 
 namespace tvm::tl::ascend {
 
@@ -48,18 +49,7 @@ struct L0OperandSlotPool {
 namespace l0_operand_slot_detail {
 using namespace l0ab_phase_reuse_detail;
 
-inline bool Touches(const ObjectRef &value, const Var &storage) {
-  bool found = false;
-  PostOrderVisit(value, [&](const ObjectRef &node) {
-    if (const auto *load = node.as<BufferLoadNode>())
-      found |= load->buffer->data.same_as(storage);
-    if (const auto *store = node.as<BufferStoreNode>())
-      found |= store->buffer->data.same_as(storage);
-    if (const auto *var = node.as<VarNode>())
-      found |= var == storage.get();
-  });
-  return found;
-}
+using resource_epoch_detail::Touches;
 
 inline bool PureTypedArguments(const Call &call, const Buffer &buffer) {
   for (const PrimExpr &argument : call->args) {
@@ -125,16 +115,14 @@ inline bool IsFullEndpoint(TaskNode *task, const Buffer &buffer, bool write) {
 }
 
 inline bool ClosedCounter(const std::vector<std::shared_ptr<IRStructure>> &root,
-                          const MultiBufferPlan &plan,
+                          const ResourceEpochAnalysis &resource_epochs,
                           const MultiBufferInfo &info,
                           const L0OperandSlotMember &member) {
   if (info.owners.size() != 1 || member.writer->GetStage() != 0 ||
       member.reader->GetStage() != 0)
     return false;
-  for (const auto &other : plan.Infos())
-    if (!other.storage.same_as(info.storage) &&
-        other.counter_group_id == info.counter_group_id)
-      return false;
+  if (!resource_epochs.HasExclusiveCounter(info))
+    return false;
   int init = 0, commit = 0;
   bool valid = true;
   std::function<void(IRStructure *)> visit = [&](IRStructure *node) {
@@ -214,58 +202,21 @@ inline std::optional<L0OperandSlotMember> RejectMember(const Buffer &buffer,
   return std::nullopt;
 }
 
-// Removing an AIV singleton can move its prepared UB counter owner to the
-// common epoch. That annotation does not change an AIC operand clock. Accept
-// only allocated, plan-backed UB entries used exclusively by the AIV; never
-// ignore an L0 entry or a counter shared with another storage class.
-inline bool IndependentEpochCounters(const ScheduledTIR &scheduled,
-                                     const MultiBufferPlan &plan,
-                                     const ControlNode *epoch,
-                                     const std::vector<TaskNode *> &tasks) {
-  auto counters = epoch->control->annotations.Get(kMultiBufferCounterMap);
-  if (!counters)
-    return false;
-  auto allocated_ub = [&](const Var &storage) {
-    for (const Buffer &buffer : scheduled.metadata.kernel_root->alloc_buffers)
-      if (buffer->data.same_as(storage)) {
-        std::string scope = GetPtrStorageScope(storage);
-        return scope == "shared" || scope == "shared.dyn";
-      }
-    return false;
-  };
-  for (const auto &[storage, counter] :
-       counters.value().cast<MultiBufferCounterMap>()) {
-    const MultiBufferInfo *info = plan.Find(storage);
-    if (!allocated_ub(storage) || !info || !info->UsesCounter() ||
-        !info->counter.same_as(counter) || info->owners.size() != 1 ||
-        info->owners.front().loop != epoch)
-      return false;
-    for (const MultiBufferInfo &other : plan.Infos())
-      if (other.UsesCounter() && other.counter->data.same_as(counter->data) &&
-          !allocated_ub(other.storage))
-        return false;
-    for (TaskNode *task : tasks) {
-      bool touches = Touches(task->stmt, storage) ||
-                     Touches(task->stmt, counter->data) ||
-                     task->GuardsTouchStorage(storage) ||
-                     task->GuardsTouchStorage(counter->data);
-      if (touches && task->GetCoreMask() != kCoreVector)
-        return false;
-    }
-  }
-  return true;
-}
-
 inline std::optional<L0OperandSlotMember>
 Member(const ScheduledTIR &scheduled, const MultiBufferPlan &plan,
        const Buffer &buffer, const LayoutMap &layouts, int64_t capacity,
-       const std::function<bool(const ControlNode *)> &independent_counters) {
+       const ResourceEpochAnalysis &resource_epochs,
+       ResourceEpochDecision *epoch_decision, const char **rejection_reason) {
+  auto reject = [&](const char *reason) {
+    *rejection_reason = reason;
+    return RejectMember(buffer, reason);
+  };
   if (!CanonicalAllocation(buffer, layouts, capacity))
-    return RejectMember(buffer, "canonical allocation");
+    return reject("canonical-allocation");
   if (auto physical =
           scheduled.metadata.manual_buffer_versions.Get(buffer->data))
     if (physical.value() != 1)
-      return RejectMember(buffer, "manual physical versions");
+      return reject("manual-physical-versions");
   L0OperandSlotMember result;
   result.buffer = buffer;
   std::vector<TaskNode *> tasks;
@@ -278,39 +229,39 @@ Member(const ScheduledTIR &scheduled, const MultiBufferPlan &plan,
       writes |= access->buffer->data.same_as(buffer->data);
     if (!reads && !writes) {
       if (Touches(task->stmt, buffer->data))
-        return RejectMember(buffer, "unmodeled operand access");
+        return reject("unmodeled-operand-access");
       continue;
     }
     if (reads == writes || !IsFullEndpoint(task, buffer, writes))
-      return RejectMember(buffer, "typed full endpoint");
+      return reject("typed-full-endpoint");
     TaskNode *&endpoint = writes ? result.writer : result.reader;
     if (endpoint)
-      return RejectMember(buffer, "nonunique endpoint");
+      return reject("nonunique-endpoint");
     endpoint = task;
   }
   if (!result.writer || !result.reader)
-    return RejectMember(buffer, "missing endpoint");
+    return reject("missing-endpoint");
   result.generation = ParentControl(result.writer);
   if (!result.generation || !PositiveStaticLoop(result.generation) ||
       !result.reader->IsWithin(result.generation))
-    return RejectMember(buffer, "finite generation");
+    return reject("finite-generation");
   IRStructure *read_child =
       result.reader->GetChildOnPathFrom(result.generation);
   if (result.writer->GetStage() > read_child->GetStage() ||
       (result.writer->GetStage() == read_child->GetStage() &&
        result.writer->GetIndex() >= read_child->GetIndex()))
-    return RejectMember(buffer, "logical endpoint order");
+    return reject("logical-endpoint-order");
   // All intervening controls are finite. An activation may skip an entire
   // generation, never its writer or one of its readers independently.
   for (IRStructure *node : result.reader->PathFrom(result.generation)) {
     if (node == result.generation || node == result.reader)
       continue;
     if (!node->IsControl())
-      return RejectMember(buffer, "reader path");
+      return reject("reader-path");
     auto *control = static_cast<ControlNode *>(node);
     if (!PositiveStaticLoop(control) || control->HasGuards() ||
         !StageZero(control))
-      return RejectMember(buffer, "finite reader path");
+      return reject("finite-reader-path");
     result.last_reader = result.last_reader && (control->control->loop_var ==
                                                 control->control->extent - 1);
   }
@@ -321,22 +272,22 @@ Member(const ScheduledTIR &scheduled, const MultiBufferPlan &plan,
         info.owners.size() != 1 ||
         info.owners.front().loop != result.generation ||
         result.reader->GetParent() != result.generation)
-      return RejectMember(buffer, "prepared version ownership");
+      return reject("prepared-version-ownership");
     if (info.UsesCounter() &&
-        !ClosedCounter(scheduled.tree, plan, info, result))
-      return RejectMember(buffer, "closed counter");
+        !ClosedCounter(scheduled.tree, resource_epochs, info, result))
+      return reject("closed-counter");
     result.slot = MultiBufferVersionIndex(info);
   } else {
     if (result.writer->GetStage() != 0 || result.reader->GetStage() != 0)
-      return RejectMember(buffer, "fixed endpoint stage");
+      return reject("fixed-endpoint-stage");
     result.slot = Integer(0);
   }
   if (!LocateClosedPhase(result.writer, &result.epoch, &result.phase, true,
-                         independent_counters) ||
+                         &resource_epochs, {buffer->data}, epoch_decision) ||
       !LocateClosedPhase(result.reader, &result.epoch, &result.phase, true,
-                         independent_counters) ||
+                         &resource_epochs, {buffer->data}, epoch_decision) ||
       !SelectedPhaseConflicts(scheduled, result.epoch))
-    return RejectMember(buffer, "closed prepared phase");
+    return reject("closed-prepared-phase");
   std::function<bool(IRStructure *)> controls = [&](IRStructure *node) {
     if (node->GuardsTouchStorage(buffer->data))
       return false;
@@ -355,7 +306,7 @@ Member(const ScheduledTIR &scheduled, const MultiBufferPlan &plan,
   };
   for (const auto &node : scheduled.tree)
     if (!controls(node.get()))
-      return RejectMember(buffer, "storage-dependent control");
+      return reject("storage-dependent-control");
   return result;
 }
 } // namespace l0_operand_slot_detail
@@ -363,7 +314,8 @@ Member(const ScheduledTIR &scheduled, const MultiBufferPlan &plan,
 inline std::vector<L0OperandSlotPool>
 AnalyzeL0OperandSlotPools(const ScheduledTIR &scheduled,
                           const MultiBufferPlan &versions,
-                          const AscendTargetInfo &target) {
+                          const AscendTargetInfo &target,
+                          OptimizationDiagnostics *diagnostics = nullptr) {
   using namespace l0_operand_slot_detail;
   std::vector<L0OperandSlotPool> pools;
   auto pairs =
@@ -376,17 +328,27 @@ AnalyzeL0OperandSlotPools(const ScheduledTIR &scheduled,
   LayoutMap layouts = raw_layouts.value().cast<LayoutMap>();
   std::vector<TaskNode *> tasks;
   CollectAllTaskNodes(scheduled.tree, tasks);
-  std::unordered_map<const ControlNode *, bool> counter_audits;
-  auto independent_counters = [&](const ControlNode *epoch) {
-    auto [it, inserted] = counter_audits.emplace(epoch, false);
-    if (inserted)
-      it->second = IndependentEpochCounters(scheduled, versions, epoch, tasks);
-    return it->second;
-  };
+  ResourceEpochAnalysis resource_epochs(scheduled, &versions);
   for (const Array<Var> &pair : pairs.value().cast<Array<Array<Var>>>()) {
+    auto record = [&](OptimizationStatus status, const char *reason,
+                      const ControlNode *epoch = nullptr,
+                      const Var &cause = Var()) {
+      if (!diagnostics)
+        return;
+      std::vector<Var> resources(pair.begin(), pair.end());
+      if (cause.defined() && std::none_of(resources.begin(), resources.end(),
+                                          [&](const Var &storage) {
+                                            return storage.same_as(cause);
+                                          }))
+        resources.push_back(cause);
+      diagnostics->Record("l0-operand-slot-pool", status, reason,
+                          std::move(resources), epoch);
+    };
     if (pair.size() != 2 || Scope(pair[0]).empty() ||
-        Scope(pair[0]) != Scope(pair[1]))
+        Scope(pair[0]) != Scope(pair[1])) {
+      record(OptimizationStatus::kRejected, "incompatible-storage-pair");
       continue;
+    }
     Buffer buffers[2];
     int allocations = 0;
     for (const Buffer &buffer : scheduled.metadata.kernel_root->alloc_buffers) {
@@ -396,8 +358,10 @@ AnalyzeL0OperandSlotPools(const ScheduledTIR &scheduled,
         if (buffer->data.same_as(pair[i]))
           buffers[i] = buffer;
     }
-    if (allocations != 2 || !buffers[0].defined() || !buffers[1].defined())
+    if (allocations != 2 || !buffers[0].defined() || !buffers[1].defined()) {
+      record(OptimizationStatus::kRejected, "noncanonical-root-allocations");
       continue;
+    }
     bool nested_allocation = false;
     PostOrderVisit(scheduled.metadata.kernel_root, [&](const ObjectRef &node) {
       if (const auto *allocation = node.as<AllocBufferNode>())
@@ -407,8 +371,10 @@ AnalyzeL0OperandSlotPools(const ScheduledTIR &scheduled,
           for (const Buffer &allocation : block->alloc_buffers)
             nested_allocation |= Scope(allocation->data) == Scope(pair[0]);
     });
-    if (nested_allocation)
+    if (nested_allocation) {
+      record(OptimizationStatus::kRejected, "nested-storage-allocation");
       continue;
+    }
     KernelAudit audit(
         {{buffers[0]->data, buffers[0]}, {buffers[1]->data, buffers[1]}});
     for (TaskNode *task : tasks) {
@@ -422,16 +388,33 @@ AnalyzeL0OperandSlotPools(const ScheduledTIR &scheduled,
         continue;
       audit(task->stmt);
     }
-    if (audit.unsafe_metadata || !audit.invalid.empty())
+    if (audit.unsafe_metadata || !audit.invalid.empty()) {
+      record(OptimizationStatus::kRejected, "unmodeled-storage-effects");
       continue;
+    }
     int64_t capacity =
         Scope(pair[0]) == "shared.l0a" ? target.l0a_bytes : target.l0b_bytes;
-    auto a = Member(scheduled, versions, buffers[0], layouts, capacity,
-                    independent_counters);
-    auto b = Member(scheduled, versions, buffers[1], layouts, capacity,
-                    independent_counters);
-    if (!a || !b || a->epoch != b->epoch || a->phase == b->phase)
+    ResourceEpochDecision epoch_decisions[2];
+    const char *member_rejections[2] = {nullptr, nullptr};
+    auto a =
+        Member(scheduled, versions, buffers[0], layouts, capacity,
+               resource_epochs, &epoch_decisions[0], &member_rejections[0]);
+    auto b =
+        Member(scheduled, versions, buffers[1], layouts, capacity,
+               resource_epochs, &epoch_decisions[1], &member_rejections[1]);
+    if (!a || !b) {
+      size_t rejected = a ? 1 : 0;
+      const auto &decision = epoch_decisions[rejected];
+      const char *reason = decision.Accepted()
+                               ? member_rejections[rejected]
+                               : ResourceEpochReason(decision.reason);
+      record(OptimizationStatus::kRejected, reason, nullptr, decision.storage);
       continue;
+    }
+    if (a->epoch != b->epoch || a->phase == b->phase) {
+      record(OptimizationStatus::kRejected, "different-or-shared-phase");
+      continue;
+    }
     auto bytes = [](const Buffer &buffer) {
       return *Constant(buffer->shape[0]) * *Constant(buffer->shape[1]) * 2;
     };
@@ -441,13 +424,19 @@ AnalyzeL0OperandSlotPools(const ScheduledTIR &scheduled,
     // With equal pitches every version is one identical byte interval. A
     // fixed smaller tile may occupy a prefix of slot zero, never another slot.
     if ((av > 1 && bv > 1 && ab != bb) || (av > 1 && bb > ab) ||
-        (bv > 1 && ab > bb))
+        (bv > 1 && ab > bb)) {
+      record(OptimizationStatus::kRejected, "incompatible-version-pitches",
+             a->epoch);
       continue;
+    }
     int slots = std::max(av, bv);
     int64_t pitch = std::max(ab, bb);
-    if (pitch * slots > capacity)
+    if (pitch * slots > capacity) {
+      record(OptimizationStatus::kRejected, "storage-capacity", a->epoch);
       continue;
+    }
     pools.push_back({*a, *b, slots, pitch});
+    record(OptimizationStatus::kSelected, "physical-slot-candidate", a->epoch);
   }
   return pools;
 }

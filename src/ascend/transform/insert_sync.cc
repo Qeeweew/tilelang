@@ -5025,7 +5025,14 @@ private:
 SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
                         Target target, const std::vector<Var> &lane_variables,
                         bool enable_unit_streams = true,
-                        bool enable_c_byte_retirement = true) {
+                        bool enable_c_byte_retirement = true,
+                        OptimizationDiagnostics *diagnostics = nullptr) {
+  OptimizationDiagnostics local_diagnostics;
+  if (!diagnostics)
+    diagnostics = &local_diagnostics;
+  auto retry = [&](const char *feature, const char *reason) {
+    diagnostics->Record(feature, OptimizationStatus::kRetry, reason);
+  };
   std::vector<std::shared_ptr<IRStructure>> &root = scheduled_tir.tree;
   const AscendTargetInfo &target_info = GetAscendTargetInfo(target);
   CrossCoreSyncContract cross_core_contract{
@@ -5059,6 +5066,8 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
                                  scheduled_tir.metadata.buffer_versions,
                                  scheduled_tir.metadata.manual_buffer_versions);
       if (!unit_streams.empty()) {
+        diagnostics->Record("unit-flag-stream", OptimizationStatus::kSelected,
+                            "native-stream-candidates");
         unit_fallback.emplace();
         unit_fallback->metadata = scheduled_tir.metadata;
         for (const auto &node : root)
@@ -5074,6 +5083,9 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
                                kernel_direction, closed_c_byte_retirement);
       if (kernel_direction)
         InsertKernelUnitDirection(root, &unit_boundaries);
+    } else {
+      diagnostics->Record("unit-flag-stream", OptimizationStatus::kRejected,
+                          "explicit-native-state-or-extern");
     }
   }
   // Keep this after the original unit-fallback snapshot. A recursive retry
@@ -5081,8 +5093,8 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
   // reuse this tree without inserting another initialization consumer.
   if (target_info.architecture == AscendArchitecture::kDav2201)
     InsertRootLoad3DInitMarker(root, kernel_body);
-  std::vector<L0OperandSlotPool> operand_pools =
-      AnalyzeL0OperandSlotPools(scheduled_tir, multi_buffer_plan, target_info);
+  std::vector<L0OperandSlotPool> operand_pools = AnalyzeL0OperandSlotPools(
+      scheduled_tir, multi_buffer_plan, target_info, diagnostics);
   if (runtime::detail::VerboseLoggingEnabled(__FILE__, 1))
     for (const auto &pool : operand_pools)
       LOG(INFO) << "L0 operand slot pool " << pool.first.buffer->data << " / "
@@ -5113,14 +5125,16 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
   std::optional<std::vector<OwnerCompletionEvent>> owner_events;
   bool enable_gm_read_release = true;
   bool enable_gm_write_acquire = true;
-  auto disable_gm_handoff = [&]() {
+  auto disable_gm_handoff = [&](const char *reason) {
     // Restore the delayed acquire before discarding an independent early
     // input release. Each retry rebuilds the complete original proof graph.
     if (analyzer->HasGmWriteAcquires()) {
+      retry("gm-write-acquire", reason);
       enable_gm_write_acquire = false;
       return true;
     }
     if (analyzer->HasGmReadReleases()) {
+      retry("gm-read-release", reason);
       enable_gm_read_release = false;
       return true;
     }
@@ -5137,28 +5151,35 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
         closed_c_byte_retirement);
     if (!analyzer->Analyze(root)) {
       if (closed_c_byte_retirement) {
+        retry("c-byte-retirement", "completion-proof");
         ICHECK(unit_fallback.has_value());
         return InsertKernelSync(kernel_body, std::move(unit_fallback.value()),
-                                target, lane_variables, true, false);
+                                target, lane_variables, true, false,
+                                diagnostics);
       }
-      if (disable_gm_handoff()) {
+      if (disable_gm_handoff("completion-proof")) {
         continue;
       }
       if (analyzer->NeedsOperandPoolFallback()) {
+        retry("l0-operand-slot-pool", "completion-proof");
         ICHECK(!operand_pools.empty());
         operand_pools.clear();
         continue;
       }
       if (!owner_inputs.empty()) {
+        retry("owner-input", "completion-proof");
         owner_inputs.clear();
         continue;
       }
       if (analyzer->NeedsUnitFallback()) {
+        retry("unit-flag-stream", "completion-proof");
         ICHECK(unit_fallback.has_value());
         return InsertKernelSync(kernel_body, std::move(unit_fallback.value()),
-                                target, lane_variables, false);
+                                target, lane_variables, false, true,
+                                diagnostics);
       }
       ICHECK(!owner_results.empty());
+      retry("owner-result", "completion-proof");
       owner_results.clear();
       continue;
     }
@@ -5172,9 +5193,11 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
             HasBufferAlias(analyzer->BufferAliases(), pair[0], pair[1]) &&
             HasBufferAlias(analyzer->BufferAliases(), pair[1], pair[0]);
       if (!aliases_proven) {
+        retry("c-byte-retirement", "mandatory-storage-alias");
         ICHECK(unit_fallback.has_value());
         return InsertKernelSync(kernel_body, std::move(unit_fallback.value()),
-                                target, lane_variables, true, false);
+                                target, lane_variables, true, false,
+                                diagnostics);
       }
     }
     if (analyzer->HasPrivateGmHandoffs()) {
@@ -5202,7 +5225,8 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
                         return analyzer->HasOwnerInputRelease(plan);
                       });
       if (!aliases_proven || !releases_proven) {
-        ICHECK(disable_gm_handoff());
+        ICHECK(disable_gm_handoff(!aliases_proven ? "mandatory-storage-alias"
+                                                  : "owner-release-proof"));
         continue;
       }
     }
@@ -5213,6 +5237,7 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
                     })) {
       // A new optional input cut must not discard an already admissible
       // result protocol by removing one of its ordinary release witnesses.
+      retry("owner-input", "preserve-owner-result-release");
       owner_inputs.clear();
       continue;
     }
@@ -5223,8 +5248,10 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
                          return !analyzer->HasOwnerResultRelease(plan);
                        }),
         owner_results.end());
-    if (owner_results.size() != candidate_count)
+    if (owner_results.size() != candidate_count) {
+      retry("owner-result", "missing-release-witness");
       continue;
+    }
     candidate_count = owner_inputs.size();
     owner_inputs.erase(std::remove_if(owner_inputs.begin(), owner_inputs.end(),
                                       [&](const OwnerResultPlan &plan) {
@@ -5232,33 +5259,41 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
                                             plan);
                                       }),
                        owner_inputs.end());
-    if (owner_inputs.size() != candidate_count)
+    if (owner_inputs.size() != candidate_count) {
+      retry("owner-input", "missing-release-witness");
       continue;
+    }
     flag_allocator = std::make_unique<FlagAllocator>(
         analyzer->SiteRegistry(), analyzer->SyncPoints(),
         analyzer->ReusablePairs(), cross_core_flag_reservation,
         cross_core_contract, operand_pools);
     if (!flag_allocator->Plan(!owner_results.empty() || !owner_inputs.empty() ||
-                                  !unit_streams.empty() || !operand_pools.empty(),
+                                  !unit_streams.empty() ||
+                                  !operand_pools.empty(),
                               !unit_streams.empty() || !operand_pools.empty() ||
                                   analyzer->HasPrivateGmHandoffs())) {
       if (closed_c_byte_retirement) {
+        retry("c-byte-retirement", "flag-capacity");
         ICHECK(unit_fallback.has_value());
         return InsertKernelSync(kernel_body, std::move(unit_fallback.value()),
-                                target, lane_variables, true, false);
+                                target, lane_variables, true, false,
+                                diagnostics);
       }
-      if (disable_gm_handoff()) {
+      if (disable_gm_handoff("flag-capacity")) {
         continue;
       }
       if (!operand_pools.empty()) {
+        retry("l0-operand-slot-pool", "flag-capacity");
         operand_pools.clear();
         continue;
       }
       if (!owner_inputs.empty()) {
+        retry("owner-input", "flag-capacity");
         owner_inputs.clear();
         continue;
       }
       if (!owner_results.empty()) {
+        retry("owner-result", "flag-capacity");
         owner_results.clear();
         continue;
       }
@@ -5266,9 +5301,10 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
       // must not force a previously legal 2201 kernel past its eight local
       // IDs: this target cannot spill hard events to the 3510 mutex API.
       ICHECK(unit_fallback.has_value());
+      retry("unit-flag-stream", "flag-capacity");
       LOG(WARNING) << "Unit stream fallback due to flag allocation capacity";
       return InsertKernelSync(kernel_body, std::move(unit_fallback.value()),
-                              target, lane_variables, false);
+                              target, lane_variables, false, true, diagnostics);
     }
     owner_events = AllocateOwnerCompletionEvents(
         owner_results, owner_inputs, analyzer->SiteRegistry(),
@@ -5276,16 +5312,18 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
         cross_core_flag_reservation, domains);
     if (owner_events.has_value())
       break;
-    if (disable_gm_handoff()) {
+    if (disable_gm_handoff("owner-event-capacity")) {
       continue;
     }
     if (!owner_inputs.empty()) {
+      retry("owner-input", "owner-event-capacity");
       owner_inputs.clear();
       continue;
     }
     // Owner specialization is optional. A kernel requiring the remaining
     // result IDs keeps the normal collective implementation instead.
     ICHECK(!owner_results.empty());
+    retry("owner-result", "owner-event-capacity");
     owner_results.clear();
   }
   if (auto selected = scheduled_tir.metadata.kernel_root->annotations.Get(
@@ -5300,8 +5338,8 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
         for (const auto &plan : unit_streams)
           loops << " " << plan.result_loop->control->loop_var->name_hint;
         LOG(WARNING) << "L0 phase alias proof failed with "
-                     << unit_streams.size() << " active unit streams:"
-                     << loops.str();
+                     << unit_streams.size()
+                     << " active unit streams:" << loops.str();
       }
       ICHECK(proven)
           << "Selected L0 phase reuse lacks a completion-proven physical "
@@ -5312,6 +5350,22 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
     scheduled_tir.metadata.kernel_root.CopyOnWrite()->annotations.erase(
         kL0PhaseReusePairs);
   }
+  for (const auto &pool : operand_pools)
+    diagnostics->Record("l0-operand-slot-pool", OptimizationStatus::kAccepted,
+                        "completion-and-capacity-proven",
+                        {pool.first.buffer->data, pool.second.buffer->data},
+                        pool.first.epoch);
+  auto accepted = [&](const char *feature, bool selected) {
+    if (selected)
+      diagnostics->Record(feature, OptimizationStatus::kAccepted,
+                          "completion-and-capacity-proven");
+  };
+  accepted("unit-flag-stream", !unit_streams.empty());
+  accepted("c-byte-retirement", closed_c_byte_retirement);
+  accepted("owner-input", !owner_inputs.empty());
+  accepted("owner-result", !owner_results.empty());
+  accepted("gm-read-release", analyzer->HasGmReadReleases());
+  accepted("gm-write-acquire", analyzer->HasGmWriteAcquires());
   scheduled_tir.metadata.root_conflict_hints = {};
   scheduled_tir.metadata.buffer_aliases = analyzer->BufferAliases();
   scheduled_tir.metadata.has_buffer_aliases = true;

@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "./dependency_analysis.h"
+#include "./resource_epoch.h"
 #include "./scheduled_tir.h"
 #include "ascend/layout/ascend_layouts.h"
 #include "ascend/op/builtin.h"
@@ -65,12 +66,9 @@ template <typename T>
 using StorageMap =
     std::unordered_map<Var, T, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>;
 
-inline std::optional<int64_t> Constant(const PrimExpr &expr) {
-  PrimExpr value = arith::Analyzer().Simplify(expr);
-  if (const auto *integer = value.as<IntImmNode>())
-    return integer->value;
-  return std::nullopt;
-}
+using resource_epoch_detail::Constant;
+using resource_epoch_detail::PositiveStaticLoop;
+using resource_epoch_detail::StageZero;
 
 inline std::string Scope(const Var &storage) {
   std::string scope = GetPtrStorageScope(storage);
@@ -87,10 +85,6 @@ inline std::string StorageScope(const Var &storage) {
     return scope;
   scope = GetPtrStorageScope(storage);
   return scope == "shared.l0c" || scope == "shared.l0c.dyn" ? "shared.l0c" : "";
-}
-
-inline bool StageZero(const IRStructure *node) {
-  return node->GetStage() == kUnscheduledStage || node->GetStage() == 0;
 }
 
 inline ControlNode *ParentControl(IRStructure *node) {
@@ -158,49 +152,6 @@ inline bool StableGuards(const IRStructure *node, const TaskNode *context) {
     expression(static_cast<const ConditionGuard *>(guard.get())->condition);
     if (!expression.valid)
       return false;
-  }
-  return true;
-}
-
-inline bool PositiveStaticLoop(const ControlNode *control) {
-  const For &loop = control->control;
-  auto extent = Constant(loop->extent);
-  return loop->kind == ForKind::kSerial && Constant(loop->min) == 0 && extent &&
-         *extent > 0 &&
-         (!loop->step.has_value() || Constant(loop->step.value()) == 1) &&
-         !control->BodyHasLoopBreak();
-}
-
-// This boundary itself must not pipeline the two phases into each other.
-// Automatic pipelines wholly inside a phase keep their normal stages/clocks.
-inline bool ClosedEpoch(
-    const ControlNode *epoch, bool prepared = false,
-    const std::function<bool(const ControlNode *)> &independent_counters = {}) {
-  if (epoch->GetParentControl() || epoch->HasGuards() || !StageZero(epoch) ||
-      !PositiveStaticLoop(epoch))
-    return false;
-  for (const auto &[key, value] : epoch->control->annotations) {
-    if (key == kMultiBufferEligible)
-      continue;
-    // Late slot selection rechecks the same finite lexical control after
-    // scheduling/preparation. These facts do not change its execution. The
-    // caller separately validates generated phase conflicts and reads actual
-    // clocks from MultiBufferPlan; early admission never enables this option.
-    if (prepared &&
-        (key == "conflict_hint" || key == "tl.storage_epoch_guard_map"))
-      continue;
-    // Only a resource-specific late audit may separate an unrelated prepared
-    // counter from this phase clock. Early admission and unknown metadata keep
-    // the original closed-epoch restriction.
-    if (prepared && key == kMultiBufferCounterMap && independent_counters &&
-        independent_counters(epoch))
-      continue;
-    if (key == "num_stages" && Constant(value.cast<PrimExpr>()) == 1)
-      continue;
-    if ((key == "enable_offset" || key == "tl.ascend_auto_pipeline") &&
-        !value.cast<bool>())
-      continue;
-    return false;
   }
   return true;
 }
@@ -459,16 +410,24 @@ CollectControls(const std::vector<std::shared_ptr<IRStructure>> &nodes,
 
 // Locate the existing lexical phase without changing any of its activation
 // predicates. Completion and final address reuse remain downstream proofs.
-inline bool LocateClosedPhase(
-    TaskNode *task, ControlNode **epoch, IRStructure **phase,
-    bool prepared = false,
-    const std::function<bool(const ControlNode *)> &independent_counters = {}) {
+inline bool
+LocateClosedPhase(TaskNode *task, ControlNode **epoch, IRStructure **phase,
+                  bool prepared = false,
+                  const ResourceEpochAnalysis *resource_epochs = nullptr,
+                  const std::vector<Var> &resources = {},
+                  ResourceEpochDecision *decision = nullptr) {
   ControlNode *outer = ParentControl(task);
   if (!outer)
     return false;
   outer = outer->GetOutermostControl();
-  if (!ClosedEpoch(outer, prepared, independent_counters) ||
-      (*epoch && *epoch != outer))
+  ResourceEpochAnalysis lexical_epochs;
+  const ResourceEpochAnalysis &facts =
+      resource_epochs ? *resource_epochs : lexical_epochs;
+  ResourceEpochDecision epoch_decision =
+      facts.Inspect(outer, resources, prepared);
+  if (decision)
+    *decision = epoch_decision;
+  if (!epoch_decision.Accepted() || (*epoch && *epoch != outer))
     return false;
   IRStructure *child = task->GetChildOnPathFrom(outer);
   if (!child->IsControl() || !StageZero(child) || (*phase && *phase != child))
@@ -496,6 +455,7 @@ AnalyzeL0ABPhaseReuse(const ScheduledTIR &scheduled,
                       const AscendTargetInfo &target) {
   using namespace l0ab_phase_reuse_detail;
   std::vector<L0PhaseReusePair> plans;
+  ResourceEpochAnalysis resource_epochs(scheduled);
   const auto &metadata = scheduled.metadata;
   if (target.architecture != AscendArchitecture::kDav2201 ||
       metadata.has_buffer_aliases || !metadata.root_conflict_hints.empty() ||
@@ -570,7 +530,8 @@ AnalyzeL0ABPhaseReuse(const ScheduledTIR &scheduled,
           valid = false;
           break;
         }
-        valid &= LocateClosedPhase(task, &epoch, &phases[index]);
+        valid &= LocateClosedPhase(task, &epoch, &phases[index], false,
+                                   &resource_epochs, {a->data, b->data});
       }
       valid &= has_read && has_write;
     }
