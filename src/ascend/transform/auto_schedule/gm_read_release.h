@@ -43,37 +43,21 @@ namespace tvm::tl::ascend {
 // and flag sharing. Only this storage's exact WAR / corresponding owner
 // transfer release may consume the certificate.
 struct GmReadReleasePlan {
-  enum class Kind { kInput, kResult };
-
-  OwnerResultPlan input;
+  ValidatedOwnerTransfer transfer;
   IRStructure *reader_boundary;
   PrimExpr active;
   PrimExpr inactive;
-  Kind kind{Kind::kInput};
-
-  bool MatchesInput(const OwnerResultPlan &other) const {
-    return kind == Kind::kInput && MatchesTransfer(other);
+  bool MatchesInput(const ValidatedOwnerTransfer &other) const {
+    return transfer.IsInput() && transfer.MatchesTransfer(other);
   }
 
-  bool MatchesResult(const OwnerResultPlan &other) const {
-    return kind == Kind::kResult && MatchesTransfer(other);
+  bool MatchesResult(const ValidatedOwnerTransfer &other) const {
+    return transfer.IsResult() && transfer.MatchesTransfer(other);
   }
 
   bool MatchesProtocol(ControlNode *flag_loop, int distance, int width,
                        size_t counter_group) const {
-    return flag_loop == input.epoch && counter_group == 0 &&
-           distance == input.num_slots - input.distance && distance > 0 &&
-           width == distance;
-  }
-
-private:
-  bool MatchesTransfer(const OwnerResultPlan &other) const {
-    return input.storage.same_as(other.storage) &&
-           input.producer == other.producer &&
-           input.consumer == other.consumer && input.epoch == other.epoch &&
-           input.owner == other.owner && input.sid.same_as(other.sid) &&
-           input.distance == other.distance &&
-           input.num_slots == other.num_slots;
+    return transfer.MatchesPairedWar(flag_loop, distance, width, counter_group);
   }
 };
 
@@ -82,7 +66,7 @@ namespace gm_read_release_detail {
 // The cut crosses only unshifted, positive immutable serial loops. Bounds
 // are simplified without a loop-entered or phase-active constraint: empty,
 // mutable, guarded-by-a-descendant and scheduled-offset cases keep the old
-// collective protocol. OwnerResultPlan already proves exact region coverage,
+// collective protocol. ValidatedOwnerTransfer proves exact region coverage,
 // immutable activation, storage identity and exclusion of other GM accesses.
 inline bool UnshiftedPath(TaskNode *task, ControlNode *epoch) {
   if (!task || !epoch || !task->IsWithin(epoch))
@@ -116,12 +100,12 @@ inline bool UnshiftedPath(TaskNode *task, ControlNode *epoch) {
 // endpoints in the same unconditional lexical domain with guard=true, and an
 // ordinary C/MTE2 -> V/MTE3 point matching MatchesProtocol. Construct the
 // active END site with active_tasks_only=true and participant_loop=nullptr;
-// require path_end==input.consumer, then conjoin `active`. Keeping the owner
+// require path_end==transfer.consumer, then conjoin `active`. Keeping the owner
 // loop in that traversal is essential: it emits once after owner 1, not once
 // per owner. Copy the original END site and conjoin `inactive` for the empty
 // epoch contribution. The destination BEGIN site remains untouched.
 inline std::optional<GmReadReleasePlan>
-AnalyzeGmReadRelease(const std::vector<OwnerResultPlan> &inputs,
+AnalyzeGmReadRelease(const std::vector<ValidatedOwnerTransfer> &inputs,
                      const DepInfo &dep, TaskNode *reader, TaskNode *writer,
                      ControlNode *epoch, const BufferVersionMap &manual,
                      const MultiBufferPlan &automatic) {
@@ -140,35 +124,19 @@ AnalyzeGmReadRelease(const std::vector<OwnerResultPlan> &inputs,
       dep.cons_node != writer->GetChildOnPathFrom(epoch))
     return std::nullopt;
 
-  const For &loop = epoch->control;
-  auto low = owner_result_detail::Constant(loop->min);
-  auto count = owner_result_detail::Constant(loop->extent);
-  auto step = owner_result_detail::Constant(
-      loop->step.value_or(make_const(loop->loop_var.dtype(), 1)));
-  if (loop->kind != ForKind::kSerial || !low || !count || !step ||
-      *count <= 0 || *step != 1 ||
-      *low > std::numeric_limits<int64_t>::max() - *count)
-    return std::nullopt;
-
-  for (const OwnerResultPlan &input : inputs) {
-    if (!input.storage.same_as(*dep.storage) || input.epoch != epoch ||
-        input.consumer != reader || input.producer != writer ||
-        input.num_slots != 2 || input.distance != 0 ||
-        manual.Get(input.storage).value_or(0) != input.num_slots ||
-        dep.distance != input.num_slots)
+  for (const ValidatedOwnerTransfer &transfer : inputs) {
+    if (!transfer.IsInput() || !transfer.storage.same_as(*dep.storage) ||
+        transfer.epoch != epoch || transfer.consumer != reader ||
+        transfer.producer != writer || transfer.num_slots != 2 ||
+        transfer.distance != 0 ||
+        manual.Get(transfer.storage).value_or(0) != transfer.num_slots ||
+        dep.distance != transfer.num_slots)
       continue;
-    int64_t first, last;
-    if (!owner_result_detail::ExactInterval(input.consumer_activation,
-                                            loop->loop_var, *low, *low + *count,
-                                            &first, &last) ||
-        first >= last)
+    auto active =
+        transfer.ActiveEpochs(ValidatedOwnerTransfer::Endpoint::kConsumer);
+    if (!active)
       continue;
-    // Only the outer epoch variable escapes the guarded phase. Local Bind
-    // names from a task's activation must not be referenced at the wide END.
-    PrimExpr e = loop->loop_var;
-    PrimExpr active =
-        e >= make_const(e.dtype(), first) && e < make_const(e.dtype(), last);
-    return GmReadReleasePlan{input, dep.prod_node, active, !active};
+    return GmReadReleasePlan{transfer, dep.prod_node, *active, !*active};
   }
   return std::nullopt;
 }
@@ -181,13 +149,13 @@ AnalyzeGmReadRelease(const std::vector<OwnerResultPlan> &inputs,
 // Caller checks are the same as above, except for the ordinary V/MTE2 -> C/FIX
 // direction. Build the active reader END site with kCoreVector,
 // active_tasks_only=true and participant_loop=nullptr; require
-// path_end==result.consumer, then conjoin `active`. Retaining all slice loops
+// path_end==transfer.consumer, then conjoin `active`. Retaining all slice loops
 // makes each AIV notify only after its last GM read. The old wide END under
 // `inactive` preserves one contribution from each AIV in every empty epoch.
 // The destination can independently use a GmWriteAcquirePlan; neither cut may
 // contribute its old wide endpoint to generic completion closure.
 inline std::optional<GmReadReleasePlan> AnalyzeGmResultReadRelease(
-    const std::vector<OwnerResultPlan> &results, const DepInfo &dep,
+    const std::vector<ValidatedOwnerTransfer> &results, const DepInfo &dep,
     TaskNode *reader, TaskNode *writer, ControlNode *epoch,
     const BufferVersionMap &manual, const MultiBufferPlan &automatic) {
   if (!epoch || epoch->GetStage() != 0 || epoch->ContainsLoopBreak() ||
@@ -205,35 +173,19 @@ inline std::optional<GmReadReleasePlan> AnalyzeGmResultReadRelease(
       dep.cons_node != writer->GetChildOnPathFrom(epoch))
     return std::nullopt;
 
-  const For &loop = epoch->control;
-  auto low = owner_result_detail::Constant(loop->min);
-  auto count = owner_result_detail::Constant(loop->extent);
-  auto step = owner_result_detail::Constant(
-      loop->step.value_or(make_const(loop->loop_var.dtype(), 1)));
-  if (loop->kind != ForKind::kSerial || !low || !count || !step ||
-      *count <= 0 || *step != 1 ||
-      *low > std::numeric_limits<int64_t>::max() - *count)
-    return std::nullopt;
-
-  for (const OwnerResultPlan &result : results) {
-    if (!result.storage.same_as(*dep.storage) || result.epoch != epoch ||
-        result.consumer != reader || result.producer != writer ||
-        result.num_slots != 2 || result.distance != 1 ||
-        manual.Get(result.storage).value_or(0) != result.num_slots ||
-        dep.distance != result.num_slots - result.distance)
+  for (const ValidatedOwnerTransfer &transfer : results) {
+    if (!transfer.IsResult() || !transfer.storage.same_as(*dep.storage) ||
+        transfer.epoch != epoch || transfer.consumer != reader ||
+        transfer.producer != writer || transfer.num_slots != 2 ||
+        transfer.distance != 1 ||
+        manual.Get(transfer.storage).value_or(0) != transfer.num_slots ||
+        dep.distance != transfer.num_slots - transfer.distance)
       continue;
-    int64_t first, last;
-    if (!owner_result_detail::ExactInterval(result.consumer_activation,
-                                            loop->loop_var, *low, *low + *count,
-                                            &first, &last) ||
-        first >= last)
+    auto active =
+        transfer.ActiveEpochs(ValidatedOwnerTransfer::Endpoint::kConsumer);
+    if (!active)
       continue;
-    // Keep only the immutable lexical epoch expression at the wide site.
-    PrimExpr e = loop->loop_var;
-    PrimExpr active =
-        e >= make_const(e.dtype(), first) && e < make_const(e.dtype(), last);
-    return GmReadReleasePlan{result, dep.prod_node, active, !active,
-                             GmReadReleasePlan::Kind::kResult};
+    return GmReadReleasePlan{transfer, dep.prod_node, *active, !*active};
   }
   return std::nullopt;
 }

@@ -36,25 +36,18 @@ namespace tvm::tl::ascend {
 // out of generic closure, projection, alias proofs and flag sharing. Only this
 // storage's exact WAR / owner-result release may consume the certificate.
 struct GmWriteAcquirePlan {
-  OwnerResultPlan result;
+  ValidatedOwnerTransfer transfer;
   IRStructure *writer_boundary;
   PrimExpr active;
   PrimExpr inactive;
 
-  bool MatchesResult(const OwnerResultPlan &other) const {
-    return result.storage.same_as(other.storage) &&
-           result.producer == other.producer &&
-           result.consumer == other.consumer && result.epoch == other.epoch &&
-           result.owner == other.owner && result.sid.same_as(other.sid) &&
-           result.distance == other.distance &&
-           result.num_slots == other.num_slots;
+  bool MatchesResult(const ValidatedOwnerTransfer &other) const {
+    return transfer.IsResult() && transfer.MatchesTransfer(other);
   }
 
   bool MatchesProtocol(ControlNode *flag_loop, int distance, int width,
                        size_t counter_group) const {
-    return flag_loop == result.epoch && counter_group == 0 &&
-           distance == result.num_slots - result.distance && distance > 0 &&
-           width == distance;
+    return transfer.MatchesPairedWar(flag_loop, distance, width, counter_group);
   }
 };
 
@@ -69,12 +62,13 @@ struct GmWriteAcquirePlan {
 // in the same unconditional lexical domain with guard=true, and an ordinary
 // V/MTE2 -> C/FIX point matching MatchesProtocol. Construct the active BEGIN
 // site with active_tasks_only=true and participant_loop=nullptr; require
-// path_end==result.producer, then conjoin `active`. Keeping every crossed loop
-// in that traversal emits only at owner 0 / the first slice. Copy the original
-// BEGIN site and conjoin `inactive` for an empty epoch. Source placement is
-// independent, and all C/SPR/unit completion obligations remain separate.
+// path_end==transfer.producer, then conjoin `active`. Keeping every crossed
+// loop in that traversal emits only at owner 0 / the first slice. Copy the
+// original BEGIN site and conjoin `inactive` for an empty epoch. Source
+// placement is independent, and all C/SPR/unit completion obligations remain
+// separate.
 inline std::optional<GmWriteAcquirePlan>
-AnalyzeGmWriteAcquire(const std::vector<OwnerResultPlan> &results,
+AnalyzeGmWriteAcquire(const std::vector<ValidatedOwnerTransfer> &results,
                       const DepInfo &dep, TaskNode *reader, TaskNode *writer,
                       ControlNode *epoch, const BufferVersionMap &manual,
                       const MultiBufferPlan &automatic) {
@@ -93,36 +87,19 @@ AnalyzeGmWriteAcquire(const std::vector<OwnerResultPlan> &results,
       dep.cons_node != writer->GetChildOnPathFrom(epoch))
     return std::nullopt;
 
-  const For &loop = epoch->control;
-  auto low = owner_result_detail::Constant(loop->min);
-  auto count = owner_result_detail::Constant(loop->extent);
-  auto step = owner_result_detail::Constant(
-      loop->step.value_or(make_const(loop->loop_var.dtype(), 1)));
-  if (loop->kind != ForKind::kSerial || !low || !count || !step ||
-      *count <= 0 || *step != 1 ||
-      *low > std::numeric_limits<int64_t>::max() - *count)
-    return std::nullopt;
-
-  for (const OwnerResultPlan &result : results) {
-    if (!result.storage.same_as(*dep.storage) || result.epoch != epoch ||
-        result.consumer != reader || result.producer != writer ||
-        result.num_slots != 2 || result.distance < 0 ||
-        result.distance >= result.num_slots ||
-        manual.Get(result.storage).value_or(0) != result.num_slots ||
-        dep.distance != result.num_slots - result.distance)
+  for (const ValidatedOwnerTransfer &transfer : results) {
+    if (!transfer.IsResult() || !transfer.storage.same_as(*dep.storage) ||
+        transfer.epoch != epoch || transfer.consumer != reader ||
+        transfer.producer != writer || transfer.num_slots != 2 ||
+        transfer.distance < 0 || transfer.distance >= transfer.num_slots ||
+        manual.Get(transfer.storage).value_or(0) != transfer.num_slots ||
+        dep.distance != transfer.num_slots - transfer.distance)
       continue;
-    int64_t first, last;
-    if (!owner_result_detail::ExactInterval(result.producer_activation,
-                                            loop->loop_var, *low, *low + *count,
-                                            &first, &last) ||
-        first >= last)
+    auto active =
+        transfer.ActiveEpochs(ValidatedOwnerTransfer::Endpoint::kProducer);
+    if (!active)
       continue;
-    // Only the outer epoch variable escapes the guarded phase. Rebuild the
-    // interval instead of leaking local Bind names to the inactive wide site.
-    PrimExpr e = loop->loop_var;
-    PrimExpr active =
-        e >= make_const(e.dtype(), first) && e < make_const(e.dtype(), last);
-    return GmWriteAcquirePlan{result, dep.cons_node, active, !active};
+    return GmWriteAcquirePlan{transfer, dep.cons_node, *active, !*active};
   }
   return std::nullopt;
 }

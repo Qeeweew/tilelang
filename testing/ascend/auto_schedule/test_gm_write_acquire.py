@@ -27,21 +27,31 @@ _COPY = "tl.tileop.ascend_copy"
 
 
 def _program(*, epochs=3, first=0, distance=1, private=True, alias=False,
-             complete=True, mismatched_activation=False):
+             complete=True, mismatched_activation=False, feedback=False):
     result = tirx.decl_buffer((1, 2, 2, 32, 32), "float32", name="Result")
     read_result = (tirx.decl_buffer(result.shape, result.dtype,
                                    name="ResultAlias", data=result.data)
                    if alias else result)
     source = tirx.decl_buffer((epochs, 32, 32), "float16", name="Prepare")
-    output = tirx.decl_buffer((epochs, 2, 32, 32), "float32", name="Output")
+    output = tirx.decl_buffer((epochs + 2 if feedback else epochs, 2, 32, 32),
+                              "float32", name="Output")
     c = tirx.decl_buffer((16, 32), "float32", name="accum", scope="shared.l0c")
     l1 = tirx.decl_buffer((32, 32), "float16", name="prepare_l1", scope="shared.l1")
+    feedback_l1 = (tirx.decl_buffer((2, 32, 32), "float32", name="feedback_l1",
+                                    scope="shared.l1") if feedback else None)
     value = tirx.decl_buffer((16, 32), "float32", name="value", scope="shared.dyn")
     e, phase, owner, part, sub, sid = [tirx.Var(name, "int32") for name in
                                      ("epoch", "cube_phase", "owner", "part", "sub", "sid")]
     active = tirx.And(first <= e, e < first + epochs)
     prepare = unit(copy(source, l1, src_indices=[e - first, 0, 0],
                         src_shape=[1, 32, 32]), core=2)
+    preparation = [prepare]
+    if feedback:
+        # The first two tiles are external inputs. Thereafter this reads both
+        # AIVs' unrelated Output exports from the preceding epoch, before FIX.
+        preparation.append(unit(copy(output, feedback_l1,
+                                     src_indices=[e - first, 0, 0, 0],
+                                     src_shape=[1, 2, 32, 32]), core=2))
     publish = unit(copy(c, result,
                         dst_indices=[0, owner, e % 2, part * 16, 0],
                         dst_shape=[1, 1, 1, 16, 32]), core=2)
@@ -51,12 +61,13 @@ def _program(*, epochs=3, first=0, distance=1, private=True, alias=False,
     # The one-trip phase is nonempty. Its old BEGIN precedes the preparation,
     # whereas the selected first actual GM write is owner0/part0 below it.
     producer = unit(tirx.For(phase, 0, 1, tirx.ForKind.SERIAL,
-                             seq(prepare, owners)), core=None, guard=active)
+                             seq(*preparation, owners)), core=None, guard=active)
     read = unit(copy(read_result, value,
                      src_indices=[0, sid, (e - distance) % 2, sub * 16, 0],
                      src_shape=[1, 1, 1, 16, 32]), core=1)
     export = unit(copy(value, output,
-                       dst_indices=[e - first - distance, sid, sub * 16, 0],
+                       dst_indices=[e - first + 1 if feedback else e - first - distance,
+                                    sid, sub * 16, 0],
                        dst_shape=[1, 1, 16, 32]), core=1)
     consumer_end = first + distance + epochs - int(mismatched_activation)
     consumer = unit(tirx.For(sub, 0, 2, tirx.ForKind.SERIAL, seq(read, export)),
@@ -66,7 +77,8 @@ def _program(*, epochs=3, first=0, distance=1, private=True, alias=False,
     annotations = {"vector_count": 2, "tl.manual_multi_buffer": {result.data: 2}}
     if private:
         annotations["tl.ascend_aiv_private_validated"] = [value.data]
-    mod = kernel(body, buffers=[c, l1, value], params=[source, result, output],
+    mod = kernel(body, buffers=[c, l1, value] + ([feedback_l1] if feedback else []),
+                 params=[source, result, output],
                  annotations=annotations)
     thread = tirx.IterVar(tvm.ir.Range(0, 2), sid, tirx.IterVar.ThreadIndex, "cthread")
     function = mod["main"].with_body(tirx.AttrStmt(
@@ -153,6 +165,9 @@ def _completion_graph(mod, *, first):
                     if source.name == "Prepare":
                         assert core == 2
                         kind = "prepare"
+                    elif source.name == "Output":
+                        assert core == 2 and source_shape == (1, 2, 32, 32)
+                        kind, region = "feedback-read", source_min
                     else:
                         assert source.name == "Result" and core == 1
                         assert source_shape == (1, 1, 1, 16, 32)
@@ -162,6 +177,7 @@ def _completion_graph(mod, *, first):
                     assert source.scope() == "shared.dyn" and core == 1
                     assert destination.name == "Output"
                     pipe = "MTE3"
+                    region = destination_min
                 trace.append(_Event(core, lane, pipe, kind, epoch, region=region))
             else:
                 pytest.fail(f"Unexpected GM-write-acquire instruction: {name}")
@@ -186,7 +202,7 @@ def _completion_graph(mod, *, first):
             (sets if node.kind == "cross-set" else waits)[
                 ("cross", node.core, node.lane, *node.flag)].append(index)
 
-    strict_reuse, collective = [], []
+    strict_reuse, collective, broadcasts = [], [], []
     for key in sets.keys() | waits.keys():
         if key[0] != "local":
             continue
@@ -200,18 +216,29 @@ def _completion_graph(mod, *, first):
         vector_sets = [sets["cross", 1, lane, flag] for lane in range(2)]
         vector_waits = [waits["cross", 1, lane, flag] for lane in range(2)]
         if cube_sets:
-            assert flag in owner_flags and not cube_waits
-            # Owner readiness consumes exactly the owning AIV's counter.
-            # The unused recipient is not modeled as a FIFO or a completion
-            # edge. This finite fixture sends at most three copies per ID.
-            assert sum(map(len, vector_waits)) == len(cube_sets) <= 3
-            assert sum(bool(acquires) for acquires in vector_waits) == 1
-            for acquires in vector_waits:
-                if acquires:
+            if flag in owner_flags:
+                assert not cube_waits
+                # Owner readiness consumes exactly the owning AIV's counter.
+                # The unused recipient is not a completion edge. This finite
+                # fixture sends at most three copies per ID.
+                assert sum(map(len, vector_waits)) == len(cube_sets) <= 3
+                assert sum(bool(acquires) for acquires in vector_waits) == 1
+                for acquires in vector_waits:
+                    if not acquires:
+                        continue
                     assert len(acquires) == len(cube_sets)
                     for notify, acquire in zip(cube_sets, acquires):
                         successors[notify].add(acquire)
                     strict_reuse.extend(zip(acquires, cube_sets[1:]))
+            else:
+                # Ordinary paired publication reaches both independent AIV
+                # recipient counters. The same numeric ID can also name the
+                # opposite direction's distinct Cube recipient counter.
+                for lane, acquires in enumerate(vector_waits):
+                    assert len(acquires) == len(cube_sets)
+                    for notify, acquire in zip(cube_sets, acquires):
+                        successors[notify].add(acquire)
+                    broadcasts.append((flag, lane, cube_sets, acquires))
         else:
             assert not any(vector_waits)
         if cube_waits:
@@ -254,6 +281,12 @@ def _completion_graph(mod, *, first):
 
     assert all(precedes(acquire, notify) for acquire, notify in strict_reuse), \
         "Local/owner data flags require independent consume-before-reuse"
+    for flag, lane, notifications, acquisitions in broadcasts:
+        assert len({trace[index].pipe for index in notifications}) == 1
+        bound = max(ordinal + 1 - sum(precedes(acquire, notify) for acquire in acquisitions)
+                    for ordinal, notify in enumerate(notifications))
+        assert bound < 16, (flag, lane, bound)
+        assert all(precedes(notify, acquisitions[-1]) for notify in notifications)
     assert collective
     body_epochs = sorted({node.epoch for node in trace if node.epoch is not None})
     writer_epochs = sorted({node.epoch for node in trace if node.kind == "write"})
@@ -270,10 +303,16 @@ def _completion_graph(mod, *, first):
         # CANN mode2 counters are four-bit; no binary assumption is imposed
         # on padding tokens, nor is arbitrary unconsumed publication allowed.
         assert len({trace[index].pipe for index in notifications}) == 1
-        assert [trace[index].epoch for index in notifications] == [None, *body_epochs]
-        assert [trace[index].epoch for index in acquisitions] == [*body_epochs, None]
         bound = max(ordinal + 1 - sum(precedes(acquire, notify) for acquire in acquisitions)
                     for ordinal, notify in enumerate(notifications))
+        assert bound < 16, (flag, lane, bound)
+        assert all(precedes(notify, acquisitions[-1]) for notify in notifications)
+        if trace[notifications[0]].pipe != "MTE2":
+            # A second GM storage has its own real collective completion;
+            # only the Result WAR has the fixture's exact padding sequence.
+            continue
+        assert [trace[index].epoch for index in notifications] == [None, *body_epochs]
+        assert [trace[index].epoch for index in acquisitions] == [*body_epochs, None]
         # Prefix: one root seed plus the epochs before the first Vector read.
         # Suffix: the last producer-active epoch's release plus two epochs
         # with no Cube writer. The first of those still reads the last result;
@@ -283,8 +322,7 @@ def _completion_graph(mod, *, first):
         prefix_bound = 1 + len(empty_reader_prefix)
         suffix_bound = 1 + len(inactive_writer_suffix)
         assert (prefix_bound, suffix_bound) == (2 + first, 3)
-        assert bound == max(prefix_bound, suffix_bound) < 16, (flag, lane, bound)
-        assert all(precedes(notify, acquisitions[-1]) for notify in notifications)
+        assert bound == max(prefix_bound, suffix_bound), (flag, lane, bound)
     return trace, precedes, owner_flags
 
 
@@ -370,3 +408,52 @@ def test_unproven_output_retains_original_wide_acquire(kwargs):
     for epoch, prepare in prepares.items():
         assert len(acquisitions[epoch]) == 1
         assert acquisitions[epoch][0][0] < prepare
+
+
+def test_storage_only_cuts_preserve_independent_output_feedback_completion():
+    after = transform.InsertSync()(_program(feedback=True))
+    acquisitions, preparation, exports = _acquire_stream(after)
+    release_ids = {event[1] for events in acquisitions.values() for event in events}
+    for epoch, prepare in preparation.items():
+        assert prepare < acquisitions[epoch][0][0] < min(index for index, _, _ in exports[epoch])
+
+    trace, precedes, _ = _completion_graph(after, first=0)
+    reads, writes, tails, feedback, releases, acquires = (defaultdict(list) for _ in range(6))
+    for index, node in enumerate(trace):
+        if node.kind == "read":
+            reads[node.epoch].append(index)
+        elif node.kind == "write":
+            writes[node.epoch].append(index)
+        elif node.kind == "copy" and node.core == 1:
+            tails[node.epoch, node.lane].append(index)
+        elif node.kind == "feedback-read":
+            feedback[node.epoch].append(index)
+        elif (node.kind == "cross-set" and node.core == 1
+              and node.flag[0] in release_ids and node.epoch is not None):
+            releases[node.epoch, node.lane].append(index)
+        elif (node.kind == "cross-wait" and node.core == 2 and node.pipe == "FIX"
+              and node.flag[0] in release_ids and node.epoch is not None):
+            acquires[node.epoch].append(index)
+
+    # Both real Result cuts compose, retaining the slot's RAW and WAR paths.
+    assert set(writes) == set(feedback) == {0, 1, 2}
+    assert set(reads) == {1, 2, 3}
+    assert all(len(events) == 4 for events in [*writes.values(), *reads.values()])
+    for epoch in writes:
+        assert len(feedback[epoch]) == len(acquires[epoch]) == 1
+        assert feedback[epoch][0] < acquires[epoch][0] < min(writes[epoch]), \
+            "Result acquire must stay after the independent feedback preparation"
+        for owner in range(2):
+            assert all(precedes(write, read)
+                       for write in writes[epoch] if trace[write].region[0] == owner
+                       for read in reads[epoch + 1] if trace[read].region[0] == owner)
+    assert all(precedes(read, write) for read in reads[1] for write in writes[2])
+    assert len(feedback[2]) == 1
+    for lane in range(2):
+        assert len(tails[1, lane]) == 2 and len(releases[1, lane]) == 1
+        assert all(precedes(tail, feedback[2][0]) for tail in tails[1, lane]), \
+            "Early Result release cannot replace Output's independent completion"
+        assert all(precedes(read, releases[1, lane][0])
+                   for read in reads[1] if trace[read].lane == lane)
+        assert not precedes(tails[1, lane][-1], releases[1, lane][0]), \
+            "The independent feedback must not widen Result release to phase END"

@@ -38,6 +38,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include <tvm/arith/analyzer.h>
@@ -61,8 +62,8 @@
 #include "./auto_schedule/gm_read_release.h"
 #include "./auto_schedule/gm_write_acquire.h"
 #include "./auto_schedule/kernel_rewriter.h"
-#include "./auto_schedule/l0ab_phase_reuse.h"
 #include "./auto_schedule/l0_operand_slot_pool.h"
+#include "./auto_schedule/l0ab_phase_reuse.h"
 #include "./auto_schedule/multi_buffer.h"
 #include "./auto_schedule/owner_result.h"
 #include "./auto_schedule/scheduled_tir.h"
@@ -381,6 +382,49 @@ struct SingleIterationBinaryPlan {
   bool validated{false};
 };
 
+// These alternatives describe the strength of a point's original endpoints,
+// not its emission mechanism. A GM cut keeps the ordinary event protocol but
+// moves a physical endpoint inside the phase. Its permission applies only to
+// the validated transfer; the old wide edge cannot prove phase completion.
+struct OriginalEndpointProof {};
+
+struct GmStoragePermission {
+  std::optional<size_t> read_release;
+  std::optional<size_t> write_acquire;
+};
+
+class SyncPointProof {
+public:
+  bool HasOriginalEndpoints() const {
+    return std::holds_alternative<OriginalEndpointProof>(proof_);
+  }
+
+  const GmStoragePermission *StoragePermission() const {
+    return std::get_if<GmStoragePermission>(&proof_);
+  }
+
+  void SelectReadRelease(size_t cut) {
+    GmStoragePermission &permission = SelectStoragePermission();
+    ICHECK(!permission.read_release.has_value());
+    permission.read_release = cut;
+  }
+
+  void SelectWriteAcquire(size_t cut) {
+    GmStoragePermission &permission = SelectStoragePermission();
+    ICHECK(!permission.write_acquire.has_value());
+    permission.write_acquire = cut;
+  }
+
+private:
+  GmStoragePermission &SelectStoragePermission() {
+    if (HasOriginalEndpoints())
+      proof_.emplace<GmStoragePermission>();
+    return std::get<GmStoragePermission>(proof_);
+  }
+
+  std::variant<OriginalEndpointProof, GmStoragePermission> proof_;
+};
+
 struct SyncPoint {
   DepEdge edge;
   DependencyKind dependency_kind;
@@ -396,12 +440,7 @@ struct SyncPoint {
   // Emitted by the selected physical pool, not this logical-storage ring.
   // Only an exact child-generation edge can enter the ordinary closure.
   bool operand_pool_release{false};
-  std::optional<size_t> gm_read_release;
-  std::optional<size_t> gm_write_acquire;
-
-  bool IsPrivateGmHandoff() const {
-    return gm_read_release.has_value() || gm_write_acquire.has_value();
-  }
+  SyncPointProof proof;
 
   SyncPoint(DepEdge edge, DependencyKind dependency_kind, int num_versions,
             ControlNode *flag_loop)
@@ -950,8 +989,8 @@ public:
       const EpochDomainRegistry &domains, AscendArchitecture architecture,
       BufferVersionMap manual = {}, ConflictHintList root_conflicts = {},
       L0StorageGroups storage_groups = L0StorageGroups(),
-      const std::vector<OwnerResultPlan> *owner_results = nullptr,
-      const std::vector<OwnerResultPlan> *owner_inputs = nullptr,
+      const std::vector<ValidatedOwnerTransfer> *owner_results = nullptr,
+      const std::vector<ValidatedOwnerTransfer> *owner_inputs = nullptr,
       const std::vector<UnitFlagStreamPlan> *unit_streams = nullptr,
       const std::vector<UnitFlagBoundary> *unit_boundaries = nullptr,
       const std::vector<L0OperandSlotPool> *operand_pools = nullptr,
@@ -1081,18 +1120,20 @@ public:
     return gm_write_acquires_;
   }
 
-  bool HasOwnerResultRelease(const OwnerResultPlan &plan) const {
+  bool HasOwnerResultRelease(const ValidatedOwnerTransfer &plan) const {
     for (const SyncPoint &point : sync_points_) {
-      if (point.gm_read_release) {
-        const auto &cut = gm_read_releases_.at(*point.gm_read_release);
+      if (const auto *permission = point.proof.StoragePermission();
+          permission && permission->read_release) {
+        const auto &cut = gm_read_releases_.at(*permission->read_release);
         if (cut.plan.MatchesResult(plan) &&
             cut.plan.MatchesProtocol(point.flag_loop, point.edge.distance,
                                      point.num_versions,
                                      point.counter_group_id))
           return true;
       }
-      if (point.gm_write_acquire) {
-        const auto &cut = gm_write_acquires_.at(*point.gm_write_acquire);
+      if (const auto *permission = point.proof.StoragePermission();
+          permission && permission->write_acquire) {
+        const auto &cut = gm_write_acquires_.at(*permission->write_acquire);
         if (cut.plan.MatchesResult(plan) &&
             cut.plan.MatchesProtocol(point.flag_loop, point.edge.distance,
                                      point.num_versions,
@@ -1114,10 +1155,11 @@ public:
     return distance <= plan.num_slots - plan.distance;
   }
 
-  bool HasOwnerInputRelease(const OwnerResultPlan &plan) const {
+  bool HasOwnerInputRelease(const ValidatedOwnerTransfer &plan) const {
     for (const SyncPoint &point : sync_points_) {
-      if (point.gm_read_release) {
-        const auto &cut = gm_read_releases_.at(*point.gm_read_release);
+      if (const auto *permission = point.proof.StoragePermission();
+          permission && permission->read_release) {
+        const auto &cut = gm_read_releases_.at(*permission->read_release);
         if (cut.plan.MatchesInput(plan) &&
             cut.plan.MatchesProtocol(point.flag_loop, point.edge.distance,
                                      point.num_versions,
@@ -1192,7 +1234,7 @@ private:
     active.guard = active.guard && plan->active;
     SyncInsertionSite inactive = src;
     inactive.guard = inactive.guard && plan->inactive;
-    point->gm_read_release = gm_read_releases_.size();
+    point->proof.SelectReadRelease(gm_read_releases_.size());
     gm_read_releases_.push_back(
         {std::move(*plan), std::move(active), std::move(inactive)});
   }
@@ -1230,7 +1272,7 @@ private:
     active.guard = active.guard && plan->active;
     SyncInsertionSite inactive = dst;
     inactive.guard = inactive.guard && plan->inactive;
-    point->gm_write_acquire = gm_write_acquires_.size();
+    point->proof.SelectWriteAcquire(gm_write_acquires_.size());
     gm_write_acquires_.push_back(
         {std::move(*plan), std::move(active), std::move(inactive)});
   }
@@ -1868,7 +1910,7 @@ private:
     local_points.reserve(local_sync_points.size());
     for (SyncPoint &sync_point : local_sync_points) {
       size_t sync_point_id = AppendSyncPoint(std::move(sync_point));
-      if (sync_points_[sync_point_id].IsPrivateGmHandoff())
+      if (!sync_points_[sync_point_id].proof.HasOriginalEndpoints())
         continue;
       local_points.push_back(
           {sync_point_id, {sync_points_[sync_point_id].edge}});
@@ -2401,7 +2443,7 @@ private:
           !point.edge.strict || !point.counter_channel.has_value() ||
           point.counter_group_id != info.counter_group_id ||
           point.num_versions != info.num_versions ||
-          point.IsPrivateGmHandoff() || point.local_binary_plan ||
+          !point.proof.HasOriginalEndpoints() || point.local_binary_plan ||
           point.single_iteration_binary_plan ||
           point.unit_boundary != UnitFlagBoundaryRole::kNone ||
           !ffi::StructuralEqual()(point.flag_iteration, clock) ||
@@ -2806,7 +2848,7 @@ private:
                 consumer_core == kCoreVector &&
                 std::any_of(
                     owner_results_->begin(), owner_results_->end(),
-                    [&](const OwnerResultPlan &plan) {
+                    [&](const ValidatedOwnerTransfer &plan) {
                       return plan.storage.same_as(dep.storage.value()) &&
                              plan.producer == producer &&
                              plan.consumer == consumer && plan.epoch == loop &&
@@ -2822,7 +2864,7 @@ private:
                 consumer_core == kCoreCube &&
                 std::any_of(
                     owner_inputs_->begin(), owner_inputs_->end(),
-                    [&](const OwnerResultPlan &plan) {
+                    [&](const ValidatedOwnerTransfer &plan) {
                       return plan.storage.same_as(dep.storage.value()) &&
                              plan.producer == producer &&
                              plan.consumer == consumer && plan.epoch == loop &&
@@ -3065,10 +3107,10 @@ private:
   // A parent carried edge can be the last-to-first subset of a child's
   // persistent binary protocol. Prove the whole finite protocol, rather than
   // treating a child distance of one as one parent iteration by projection.
-  bool CoversNestedLocalProtocol(const SyncPoint &wide,
-                                const SyncPoint &narrow,
-                                ControlNode *parent) const {
-    if (wide.IsPrivateGmHandoff() || narrow.IsPrivateGmHandoff())
+  bool CoversNestedLocalProtocol(const SyncPoint &wide, const SyncPoint &narrow,
+                                 ControlNode *parent) const {
+    if (!wide.proof.HasOriginalEndpoints() ||
+        !narrow.proof.HasOriginalEndpoints())
       return false;
     ControlNode *child = wide.flag_loop;
     auto persistent = [&](const SyncPoint &point) {
@@ -3233,7 +3275,8 @@ private:
 
   bool CoversLocalProtocol(const SyncPoint &wide, const SyncPoint &narrow,
                            ControlNode *loop) const {
-    if (wide.IsPrivateGmHandoff() || narrow.IsPrivateGmHandoff())
+    if (!wide.proof.HasOriginalEndpoints() ||
+        !narrow.proof.HasOriginalEndpoints())
       return false;
     if (architecture_ != AscendArchitecture::kDav2201 || loop == nullptr ||
         wide.counter_group_id != 0 || narrow.counter_group_id != 0 ||
@@ -3314,7 +3357,7 @@ private:
     std::stable_sort(sync_points.begin(), sync_points.end());
     std::vector<SyncPoint> emit;
     for (SyncPoint &sync_point : sync_points) {
-      if (sync_point.IsPrivateGmHandoff()) {
+      if (!sync_point.proof.HasOriginalEndpoints()) {
         // One endpoint moves inside the phase. Retain the event, but never
         // saturate its old wide edge or use it to remove another point.
         emit.push_back(std::move(sync_point));
@@ -3384,7 +3427,7 @@ private:
       const SyncInsertionSite &src = site_registry_.Src(point);
       const SyncInsertionSite &dst = site_registry_.Dst(point);
       const EpochDomain &domain = site_registry_.Domain(src);
-      if (point.IsPrivateGmHandoff() || point.counter_group_id == 0 ||
+      if (!point.proof.HasOriginalEndpoints() || point.counter_group_id == 0 ||
           point.flag_loop != loop || point.edge.distance != 0 ||
           point.dependency_kind != DependencyKind::kData ||
           src.core != kCoreVector || dst.core != src.core || src.pipe != "S" ||
@@ -3664,7 +3707,7 @@ private:
   void OptimizeFlagVersions(std::vector<SyncPoint> &sync_points,
                             const DepClosure &closure, ControlNode *loop) {
     for (SyncPoint &sync_point : sync_points) {
-      if (sync_point.IsPrivateGmHandoff())
+      if (!sync_point.proof.HasOriginalEndpoints())
         continue; // Preserve the original paired clock, seeds and drains.
       const SyncInsertionSite &src = site_registry_.Src(sync_point);
       const SyncInsertionSite &dst = site_registry_.Dst(sync_point);
@@ -3954,7 +3997,7 @@ private:
         point.flag_loop != loop || loop->GetParentControl() != nullptr ||
         loop->HasConditions() || loop->BodyHasLoopBreak() ||
         loop->control->kind != ForKind::kSerial ||
-        point.counter_group_id != 0 || point.IsPrivateGmHandoff() ||
+        point.counter_group_id != 0 || !point.proof.HasOriginalEndpoints() ||
         point.local_binary_plan || point.single_iteration_binary_plan ||
         point.unit_boundary != UnitFlagBoundaryRole::kNone)
       return false;
@@ -4013,7 +4056,7 @@ private:
                                bool for_width = false) const {
     if (architecture_ != AscendArchitecture::kDav2201 || !point.flag_loop ||
         point.edge.distance != 0 || (!for_width && point.num_versions != 1) ||
-        point.IsPrivateGmHandoff() || point.local_binary_plan ||
+        !point.proof.HasOriginalEndpoints() || point.local_binary_plan ||
         point.single_iteration_binary_plan ||
         point.unit_boundary != UnitFlagBoundaryRole::kNone)
       return std::nullopt;
@@ -4153,7 +4196,8 @@ private:
                 bool allow_mixed_iter) const {
     const SyncPoint &lhs_sync = sync_points_[lhs.sync_point_id];
     const SyncPoint &rhs_sync = sync_points_[rhs.sync_point_id];
-    if (lhs_sync.IsPrivateGmHandoff() || rhs_sync.IsPrivateGmHandoff())
+    if (!lhs_sync.proof.HasOriginalEndpoints() ||
+        !rhs_sync.proof.HasOriginalEndpoints())
       return false;
     if (lhs_sync.unit_boundary == UnitFlagBoundaryRole::kDrain ||
         rhs_sync.unit_boundary == UnitFlagBoundaryRole::kDrain)
@@ -4296,8 +4340,8 @@ private:
   MultiBufferOwnerMap multi_buffer_owners_;
   ConflictHintList root_conflicts_;
   std::vector<IRStructure *> root_nodes_;
-  const std::vector<OwnerResultPlan> *owner_results_;
-  const std::vector<OwnerResultPlan> *owner_inputs_;
+  const std::vector<ValidatedOwnerTransfer> *owner_results_;
+  const std::vector<ValidatedOwnerTransfer> *owner_inputs_;
   const std::vector<UnitFlagStreamPlan> *unit_streams_;
   const std::vector<UnitFlagBoundary> *unit_boundaries_;
   const std::vector<L0OperandSlotPool> *operand_pools_;
@@ -5459,8 +5503,8 @@ struct OwnerCompletionEvent {
 };
 
 std::optional<std::vector<OwnerCompletionEvent>>
-AllocateOwnerCompletionEvents(const std::vector<OwnerResultPlan> &plans,
-                              const std::vector<OwnerResultPlan> &inputs,
+AllocateOwnerCompletionEvents(const std::vector<ValidatedOwnerTransfer> &plans,
+                              const std::vector<ValidatedOwnerTransfer> &inputs,
                               const SyncSiteRegistry &site_registry,
                               const std::vector<SyncPoint> &sync_points,
                               const std::vector<FlagAllocation> &allocations,
@@ -5502,7 +5546,7 @@ AllocateOwnerCompletionEvents(const std::vector<OwnerResultPlan> &plans,
         used[base + offset] = true;
     return base;
   };
-  for (const OwnerResultPlan &plan : plans) {
+  for (const ValidatedOwnerTransfer &plan : plans) {
     int base = reserve(2 * plan.num_slots);
     if (base < 0)
       return std::nullopt;
@@ -5528,7 +5572,7 @@ AllocateOwnerCompletionEvents(const std::vector<OwnerResultPlan> &plans,
                       cast(DataType::Int(32), consumer_id), std::nullopt,
                       PrimExpr()});
   }
-  for (const OwnerResultPlan &plan : inputs) {
+  for (const ValidatedOwnerTransfer &plan : inputs) {
     int base = reserve(2 * plan.num_slots);
     if (base < 0)
       return std::nullopt;
@@ -5666,7 +5710,7 @@ private:
       PrimExpr event_id = MakeFlagEventId(sync_point.flag_iteration,
                                           sync_point.num_versions, base_id);
 
-      if (sync_point.IsPrivateGmHandoff()) {
+      if (const auto *permission = sync_point.proof.StoragePermission()) {
         ICHECK(architecture_ == AscendArchitecture::kDav2201 &&
                cross_core_contract_.collective &&
                cross_core_contract_.num_aiv_subcores == 2 &&
@@ -5674,15 +5718,15 @@ private:
         ICHECK_EQ(allocation.sync_points.size(), 1u);
         std::vector<const SyncInsertionSite *> releases{&src};
         std::vector<const SyncInsertionSite *> acquisitions{&dst};
-        if (sync_point.gm_read_release) {
-          const auto &cut = gm_read_releases_.at(*sync_point.gm_read_release);
+        if (permission->read_release) {
+          const auto &cut = gm_read_releases_.at(*permission->read_release);
           ICHECK(cut.plan.MatchesProtocol(
               sync_point.flag_loop, sync_point.edge.distance,
               sync_point.num_versions, sync_point.counter_group_id));
           releases = {&cut.active, &cut.inactive};
         }
-        if (sync_point.gm_write_acquire) {
-          const auto &cut = gm_write_acquires_.at(*sync_point.gm_write_acquire);
+        if (permission->write_acquire) {
+          const auto &cut = gm_write_acquires_.at(*permission->write_acquire);
           ICHECK(cut.plan.MatchesProtocol(
               sync_point.flag_loop, sync_point.edge.distance,
               sync_point.num_versions, sync_point.counter_group_id));
@@ -5960,8 +6004,8 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
   EpochDomainRegistry domains(root, multi_buffer_plan);
   CrossCoreFlagReservation cross_core_flag_reservation =
       CollectExplicitCrossCoreFlags(kernel_body, cross_core_contract);
-  std::vector<OwnerResultPlan> owner_results;
-  std::vector<OwnerResultPlan> owner_inputs;
+  std::vector<ValidatedOwnerTransfer> owner_results;
+  std::vector<ValidatedOwnerTransfer> owner_inputs;
   if (cross_core_contract.collective &&
       cross_core_contract.num_aiv_subcores == 2) {
     owner_results = AnalyzeOwnerResults(
@@ -6068,11 +6112,11 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
       }
       bool releases_proven =
           std::all_of(owner_results.begin(), owner_results.end(),
-                      [&](const OwnerResultPlan &plan) {
+                      [&](const ValidatedOwnerTransfer &plan) {
                         return analyzer->HasOwnerResultRelease(plan);
                       }) &&
           std::all_of(owner_inputs.begin(), owner_inputs.end(),
-                      [&](const OwnerResultPlan &plan) {
+                      [&](const ValidatedOwnerTransfer &plan) {
                         return analyzer->HasOwnerInputRelease(plan);
                       });
       if (!aliases_proven || !releases_proven) {
@@ -6083,7 +6127,7 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
     }
     if (!owner_inputs.empty() &&
         std::any_of(owner_results.begin(), owner_results.end(),
-                    [&](const OwnerResultPlan &plan) {
+                    [&](const ValidatedOwnerTransfer &plan) {
                       return !analyzer->HasOwnerResultRelease(plan);
                     })) {
       // A new optional input cut must not discard an already admissible
@@ -6095,7 +6139,7 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
     size_t candidate_count = owner_results.size();
     owner_results.erase(
         std::remove_if(owner_results.begin(), owner_results.end(),
-                       [&](const OwnerResultPlan &plan) {
+                       [&](const ValidatedOwnerTransfer &plan) {
                          return !analyzer->HasOwnerResultRelease(plan);
                        }),
         owner_results.end());
@@ -6105,7 +6149,7 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
     }
     candidate_count = owner_inputs.size();
     owner_inputs.erase(std::remove_if(owner_inputs.begin(), owner_inputs.end(),
-                                      [&](const OwnerResultPlan &plan) {
+                                      [&](const ValidatedOwnerTransfer &plan) {
                                         return !analyzer->HasOwnerInputRelease(
                                             plan);
                                       }),

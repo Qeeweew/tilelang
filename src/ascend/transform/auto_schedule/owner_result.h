@@ -7,9 +7,11 @@
 #include <tvm/tirx/stmt_functor.h>
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <utility>
 #include <vector>
 
 #include "../aiv_private.h"
@@ -18,11 +20,18 @@
 
 namespace tvm::tl::ascend {
 
-// An owner-indexed transfer. For results the AIC producer traverses owners and
-// the AIV consumer selects SID; for inputs those roles are reversed. This is a
-// geometry/activation proof, not a dependency edge: callers must independently
-// prove the read-completion release before replacing a collective protocol.
-struct OwnerResultPlan {
+// A pass-local fact established by AnalyzeOwnerResults/AnalyzeOwnerInputs.
+// For results the AIC producer traverses owners and the AIV consumer selects
+// SID; for inputs those roles are reversed. Both directions carry the same
+// canonical storage, exact coverage, finite activation, slot separation and
+// two-participant proof. Consumers may select/move facts, but must not mutate
+// them or retain them across changes to tasks, owners, regions or guards.
+// This is not a dependency/completion edge: a caller must independently prove
+// read-completion release before replacing the collective protocol.
+struct ValidatedOwnerTransfer {
+  enum class Direction { kInput, kResult };
+  enum class Endpoint { kProducer, kConsumer };
+
   Var storage;
   TaskNode *producer;
   TaskNode *consumer;
@@ -35,6 +44,42 @@ struct OwnerResultPlan {
   PrimExpr consumer_slot;
   PrimExpr producer_activation;
   PrimExpr consumer_activation;
+  Direction direction;
+  // Optional placement facts proved once from the original guards. A valid
+  // transfer need not support either narrow GM cut.
+  std::optional<PrimExpr> producer_active_epochs;
+  std::optional<PrimExpr> consumer_active_epochs;
+
+  bool IsInput() const { return direction == Direction::kInput; }
+  bool IsResult() const { return direction == Direction::kResult; }
+
+  // Identity within one immutable scheduled snapshot. Slot expressions and
+  // activations belong to the unique validated endpoint pair, rather than
+  // being reconstructed by each placement consumer.
+  bool MatchesTransfer(const ValidatedOwnerTransfer &other) const {
+    return direction == other.direction && storage.same_as(other.storage) &&
+           producer == other.producer && consumer == other.consumer &&
+           epoch == other.epoch && owner == other.owner &&
+           sid.same_as(other.sid) && distance == other.distance &&
+           num_slots == other.num_slots;
+  }
+
+  // The opposite side of this transfer is the existing paired GM WAR. This
+  // only identifies its original lexical protocol; it grants no endpoint
+  // placement, completion, alias or event-sharing permission.
+  bool MatchesPairedWar(ControlNode *flag_loop, int war_distance, int width,
+                        size_t counter_group) const {
+    return flag_loop == epoch && counter_group == 0 &&
+           war_distance == num_slots - distance && war_distance > 0 &&
+           width == war_distance;
+  }
+
+  // Read the proven nonempty interval using only the outer epoch variable.
+  // Local Bind names never escape to an inactive wide END/BEGIN site.
+  const std::optional<PrimExpr> &ActiveEpochs(Endpoint endpoint) const {
+    return endpoint == Endpoint::kProducer ? producer_active_epochs
+                                          : consumer_active_epochs;
+  }
 };
 
 namespace owner_result_detail {
@@ -77,6 +122,25 @@ inline std::optional<int64_t> Constant(const PrimExpr &expr) {
   if (const auto *value = simplified.as<IntImmNode>())
     return value->value;
   return std::nullopt;
+}
+
+// Shared finite epoch bounds for the owner proof and its placement consumers.
+// Simplify before entering the loop or its activation: zero/mutable domains
+// must not become positive through the endpoint's own guard.
+inline std::optional<std::pair<int64_t, int64_t>>
+FiniteEpochBounds(ControlNode *epoch) {
+  if (!epoch || epoch->control->kind != ForKind::kSerial ||
+      epoch->ContainsLoopBreak())
+    return std::nullopt;
+  const For &loop = epoch->control;
+  auto low = Constant(loop->min);
+  auto count = Constant(loop->extent);
+  auto step =
+      Constant(loop->step.value_or(make_const(loop->loop_var.dtype(), 1)));
+  if (!low || !count || !step || *step != 1 || *count <= 0 ||
+      *low > std::numeric_limits<int64_t>::max() - *count)
+    return std::nullopt;
+  return std::pair<int64_t, int64_t>{*low, *low + *count};
 }
 
 inline bool Multiply(int64_t a, int64_t b, int64_t *out) {
@@ -353,6 +417,19 @@ inline bool ExactInterval(PrimExpr guard, const Var &epoch, int64_t low,
   return exact;
 }
 
+// Preserve the placement selector's original guard proof, rather than using
+// a stronger transfer guard conjoined with epoch bounds. Failure only leaves
+// this endpoint's optional cut unavailable; it does not reject the transfer.
+inline std::optional<PrimExpr> ActiveEpochs(const PrimExpr &guard,
+                                         const Var &epoch, int64_t low,
+                                         int64_t high) {
+  int64_t first, last;
+  if (!ExactInterval(guard, epoch, low, high, &first, &last) || first >= last)
+    return std::nullopt;
+  return epoch >= make_const(epoch.dtype(), first) &&
+         epoch < make_const(epoch.dtype(), last);
+}
+
 using Rect = std::vector<std::pair<int64_t, int64_t>>;
 
 inline bool Overlap(const Rect &a, const Rect &b) {
@@ -479,7 +556,7 @@ inline bool Regions(const Endpoint &endpoint, ControlNode *epoch,
   return Enumerate(loops, 0, {}, region, endpoint.occurrence.bindings, result);
 }
 
-inline std::optional<OwnerResultPlan>
+inline std::optional<ValidatedOwnerTransfer>
 Prove(const Var &storage, int slots, const Endpoint &producer,
       const Endpoint &consumer, const Var &sid, bool vector_to_cube = false) {
   const auto &write = producer.occurrence.copy;
@@ -506,18 +583,10 @@ Prove(const Var &storage, int slots, const Endpoint &producer,
       break;
     epoch = producers[i];
   }
-  if (!epoch || epoch->control->kind != ForKind::kSerial ||
-      epoch->ContainsLoopBreak())
+  auto bounds = FiniteEpochBounds(epoch);
+  if (!bounds)
     return std::nullopt;
-  auto epoch_min = Constant(epoch->control->min);
-  auto epoch_extent = Constant(epoch->control->extent);
-  auto epoch_step = Constant(epoch->control->step.value_or(
-      make_const(epoch->control->loop_var.dtype(), 1)));
-  if (!epoch_min || !epoch_extent || !epoch_step || *epoch_step != 1 ||
-      *epoch_extent <= 0 ||
-      *epoch_min > std::numeric_limits<int64_t>::max() - *epoch_extent)
-    return std::nullopt;
-  int64_t epoch_end = *epoch_min + *epoch_extent;
+  const auto [epoch_min, epoch_end] = *bounds;
   Var iteration = epoch->control->loop_var;
 
   const auto &owner_controls = vector_to_cube ? consumers : producers;
@@ -578,14 +647,14 @@ Prove(const Var &storage, int slots, const Endpoint &producer,
     for (int distance = first_distance; distance < end_distance; ++distance) {
       Bindings shift{{iteration, iteration + distance}};
       PrimExpr epoch_bounds =
-          iteration >= make_const(iteration.dtype(), *epoch_min) &&
+          iteration >= make_const(iteration.dtype(), epoch_min) &&
           iteration < make_const(iteration.dtype(), epoch_end);
       PrimExpr source_active = source_guard && epoch_bounds;
       PrimExpr destination_active = destination_guard && epoch_bounds;
       int64_t first, last, destination_first, destination_last;
-      if (!ExactInterval(source_active, iteration, *epoch_min, epoch_end,
-                         &first, &last) ||
-          !ExactInterval(destination_active, iteration, *epoch_min, epoch_end,
+      if (!ExactInterval(source_active, iteration, epoch_min, epoch_end, &first,
+                         &last) ||
+          !ExactInterval(destination_active, iteration, epoch_min, epoch_end,
                          &destination_first, &destination_last) ||
           destination_first - distance != first ||
           destination_last - distance != last || first >= last)
@@ -722,28 +791,33 @@ Prove(const Var &storage, int slots, const Endpoint &producer,
       if (!valid || Volume(box) != std::optional<int64_t>(volume) ||
           !Covers(box, destination_rects))
         continue;
-      return OwnerResultPlan{storage,
-                             producer.task,
-                             consumer.task,
-                             epoch,
-                             owner,
-                             sid,
-                             distance,
-                             slots,
-                             writes[0][slot_axis]->min,
-                             reads[0][slot_axis]->min,
-                             source_guard,
-                             destination_guard};
+      return ValidatedOwnerTransfer{
+          storage,
+          producer.task,
+          consumer.task,
+          epoch,
+          owner,
+          sid,
+          distance,
+          slots,
+          writes[0][slot_axis]->min,
+          reads[0][slot_axis]->min,
+          source_guard,
+          destination_guard,
+          vector_to_cube ? ValidatedOwnerTransfer::Direction::kInput
+                         : ValidatedOwnerTransfer::Direction::kResult,
+          ActiveEpochs(source_guard, iteration, epoch_min, epoch_end),
+          ActiveEpochs(destination_guard, iteration, epoch_min, epoch_end)};
     }
   }
   return std::nullopt;
 }
 
-inline std::vector<OwnerResultPlan>
+inline std::vector<ValidatedOwnerTransfer>
 AnalyzeOwnerTransfers(const std::vector<std::shared_ptr<IRStructure>> &root,
                       const SBlock &kernel_root, const BufferVersionMap &manual,
                       const std::vector<Var> &lanes, bool vector_to_cube) {
-  std::vector<OwnerResultPlan> plans;
+  std::vector<ValidatedOwnerTransfer> plans;
   if (lanes.size() != 1 || !kernel_root.defined())
     return plans;
   Array<Var> private_members = ValidatedAivPrivateData(kernel_root.get());
@@ -822,7 +896,7 @@ AnalyzeOwnerTransfers(const std::vector<std::shared_ptr<IRStructure>> &root,
 // Called only by the 2201 path after MixedKernel(sids=2) and private-UB
 // validation. Any unsupported shape/control/storage use keeps the existing
 // collective protocol: this analysis never makes a malformed proof fatal.
-inline std::vector<OwnerResultPlan>
+inline std::vector<ValidatedOwnerTransfer>
 AnalyzeOwnerResults(const std::vector<std::shared_ptr<IRStructure>> &root,
                     const SBlock &kernel_root, const BufferVersionMap &manual,
                     const std::vector<Var> &lanes) {
@@ -835,7 +909,7 @@ AnalyzeOwnerResults(const std::vector<std::shared_ptr<IRStructure>> &root,
 // retain the ordinary collective read-completion/reuse relation and prove a
 // once-per-activation producer-BEGIN cut after that release before adding the
 // complementary empty participant of an owner-indexed mode2 publication.
-inline std::vector<OwnerResultPlan>
+inline std::vector<ValidatedOwnerTransfer>
 AnalyzeOwnerInputs(const std::vector<std::shared_ptr<IRStructure>> &root,
                    const SBlock &kernel_root, const BufferVersionMap &manual,
                    const std::vector<Var> &lanes) {

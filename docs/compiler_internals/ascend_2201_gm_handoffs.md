@@ -1,5 +1,22 @@
 # 2201 paired GM slot handoffs
 
+## Shared transfer contract
+
+`AnalyzeOwnerInputs` and `AnalyzeOwnerResults` establish one pass-local
+`ValidatedOwnerTransfer`: direction, canonical storage, producer/consumer,
+owner and SID, physical slots, distance, exact coverage and original finite
+activation. Read-release and write-acquire placement consume that same fact
+and its paired WAR identity; neither reconstructs a second transfer proof.
+Facts are consumed before the scheduled IR is rewritten and are never cached
+across changes to tasks, regions, guards or clocks.
+
+InsertSync records a selected cut as a `GmStoragePermission`, distinct from
+the proof for the original endpoints. Both cuts may compose on that permission.
+Completion closure, parent projection and flag-lifetime optimizations require
+the original endpoint proof; only exact transfer-release queries and event
+materialization consume the storage permission. Other retirement contracts,
+including operand slots and full FIX, retain their separate validation.
+
 ## Output write acquire
 
 For an established owner-result relation, InsertSync can delay the paired GM
