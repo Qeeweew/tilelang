@@ -1,4 +1,30 @@
-# 2201 paired GM input read release
+# 2201 paired GM slot handoffs
+
+## Output write acquire
+
+For an established owner-result relation, InsertSync can delay the paired GM
+overwrite acquire from phase entry to the first typed L0C-to-GM FIX. The
+original two-AIV read-release stays at its existing source boundary. An active
+epoch consumes the acquire only at owner zero's first slice; an inactive epoch
+consumes it at the original phase entry. This preserves the original lexical
+clock, reverse WAR distance, event width, seeds and drains, while allowing
+independent input preparation and MAD issue before the GM permission arrives.
+
+Selection requires the current owner-result proof, canonical GM identity, two
+disjoint owner planes and two storage slots, one exact reverse WAR, stage-zero
+positive static serial paths and a finite exact producer activation interval.
+It preserves the ordinary reverse distance `slots - result distance`; it does
+not force a two-event clock for a distance-one result. Automatic/counter GM
+versions and unsupported access geometry retain the original acquire.
+
+The private certificate proves only old GM reads before the next same-slot
+write. It does not prove entry to the whole Cube phase waits for those reads.
+It stays outside completion closure, parent projection, alias retirement and
+flag sharing. C, SPR, local binary lifetime and owner-ready checks remain
+independent. Analysis restores the original acquire before discarding another
+optional input release if any required proof or event allocation fails.
+
+## Input read release
 
 InsertSync can release a paired GM input after its last typed GM-to-L1 copy,
 while later operand loads, MADs and result exports continue. This changes the

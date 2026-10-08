@@ -59,6 +59,7 @@
 #include "./auto_schedule/buffer_alias_analysis.h"
 #include "./auto_schedule/dependency_analysis.h"
 #include "./auto_schedule/gm_read_release.h"
+#include "./auto_schedule/gm_write_acquire.h"
 #include "./auto_schedule/kernel_rewriter.h"
 #include "./auto_schedule/l0ab_phase_reuse.h"
 #include "./auto_schedule/l0_operand_slot_pool.h"
@@ -299,6 +300,14 @@ struct GmReadReleaseCut {
   SyncInsertionSite inactive;
 };
 
+// This private acquire protects the GM write, not entry to its enclosing
+// Cube phase. Independent input preparation can precede the physical wait.
+struct GmWriteAcquireCut {
+  GmWriteAcquirePlan plan;
+  SyncInsertionSite active;
+  SyncInsertionSite inactive;
+};
+
 // Inputs needed to look up a collected insertion site without reconstructing
 // it. Domain ids are pass-local and reconstructed from canonical guards.
 using SyncInsertionSiteKey =
@@ -387,6 +396,11 @@ struct SyncPoint {
   // Only an exact child-generation edge can enter the ordinary closure.
   bool operand_pool_release{false};
   std::optional<size_t> gm_read_release;
+  std::optional<size_t> gm_write_acquire;
+
+  bool IsPrivateGmHandoff() const {
+    return gm_read_release.has_value() || gm_write_acquire.has_value();
+  }
 
   SyncPoint(DepEdge edge, DependencyKind dependency_kind, int num_versions,
             ControlNode *flag_loop)
@@ -940,7 +954,8 @@ public:
       const std::vector<UnitFlagStreamPlan> *unit_streams = nullptr,
       const std::vector<UnitFlagBoundary> *unit_boundaries = nullptr,
       const std::vector<L0OperandSlotPool> *operand_pools = nullptr,
-      bool enable_gm_read_release = true)
+      bool enable_gm_read_release = true,
+      bool enable_gm_write_acquire = true)
       : storage_groups_(std::move(storage_groups)),
         multi_buffer_plan_(multi_buffer_plan), domains_(domains),
         architecture_(architecture), manual_(std::move(manual)),
@@ -949,6 +964,7 @@ public:
         unit_streams_(unit_streams), unit_boundaries_(unit_boundaries),
         operand_pools_(operand_pools),
         enable_gm_read_release_(enable_gm_read_release),
+        enable_gm_write_acquire_(enable_gm_write_acquire),
         site_registry_(domains),
         trace_c_lifetimes_(
             runtime::detail::VerboseLoggingEnabled(__FILE__, 1)) {
@@ -1050,11 +1066,28 @@ public:
     return operand_pool_fallback_required_;
   }
   bool HasGmReadReleases() const { return !gm_read_releases_.empty(); }
+  bool HasGmWriteAcquires() const { return !gm_write_acquires_.empty(); }
+  bool HasPrivateGmHandoffs() const {
+    return HasGmReadReleases() || HasGmWriteAcquires();
+  }
   const std::vector<GmReadReleaseCut> &GmReadReleases() const {
     return gm_read_releases_;
   }
+  const std::vector<GmWriteAcquireCut> &GmWriteAcquires() const {
+    return gm_write_acquires_;
+  }
 
   bool HasOwnerResultRelease(const OwnerResultPlan &plan) const {
+    for (const SyncPoint &point : sync_points_) {
+      if (point.gm_write_acquire) {
+        const auto &cut = gm_write_acquires_.at(*point.gm_write_acquire);
+        if (cut.plan.MatchesResult(plan) &&
+            cut.plan.MatchesProtocol(point.flag_loop, point.edge.distance,
+                                     point.num_versions,
+                                     point.counter_group_id))
+          return true;
+      }
+    }
     int domain = domains_.DomainForStorage(plan.storage, plan.epoch);
     size_t read_end = site_registry_.FindSiteId(
         SyncInsertionSiteKey{plan.consumer->GetChildOnPathFrom(plan.epoch),
@@ -1096,8 +1129,8 @@ public:
   }
 
 private:
-  bool GmReadReleaseNeedsFallback(bool valid) {
-    if (valid || !HasGmReadReleases())
+  bool GmHandoffNeedsFallback(bool valid) {
+    if (valid || !HasPrivateGmHandoffs())
       return false;
     // The private GM cut may remove an unrelated flag's old wide witness.
     // Retry the same owner/unit/pool choices with ordinary GM release first.
@@ -1140,6 +1173,44 @@ private:
     inactive.guard = inactive.guard && plan->inactive;
     point->gm_read_release = gm_read_releases_.size();
     gm_read_releases_.push_back(
+        {std::move(*plan), std::move(active), std::move(inactive)});
+  }
+
+  void SelectGmWriteAcquire(SyncPoint *point, const DepInfo &dep,
+                            TaskNode *reader, TaskNode *writer,
+                            ControlNode *loop) {
+    if (!enable_gm_write_acquire_ || !owner_results_ ||
+        architecture_ != AscendArchitecture::kDav2201 || !loop ||
+        !site_registry_.IsCrossCore(*point))
+      return;
+    const SyncInsertionSite &src = site_registry_.Src(*point);
+    const SyncInsertionSite &dst = site_registry_.Dst(*point);
+    int lexical_domain = domains_.UnconditionalLexicalDomain(loop);
+    const EpochDomain &domain = domains_.Domain(lexical_domain);
+    if (domain.IsCounter() || domain.owner != loop ||
+        !is_one(domain.active_guard) ||
+        src.EpochDomainId() != lexical_domain ||
+        dst.EpochDomainId() != lexical_domain || !is_one(src.GetGuard()) ||
+        !is_one(dst.GetGuard()) || src.core != kCoreVector || src.pipe != "MTE2" ||
+        dst.core != kCoreCube || dst.pipe != "FIX" ||
+        !loop->GetLoopBodyContext().CanProve(
+            point->flag_iteration == CalculateIterationCount(loop)))
+      return;
+    auto plan = AnalyzeGmWriteAcquire(*owner_results_, dep, reader, writer, loop,
+                                     manual_, multi_buffer_plan_);
+    if (!plan || !plan->MatchesProtocol(point->flag_loop, point->edge.distance,
+                                        point->num_versions,
+                                        point->counter_group_id))
+      return;
+    SyncInsertionSite active(plan->writer_boundary, writer, true, kCoreCube,
+                             domain, nullptr, true);
+    if (active.path_end != writer)
+      return;
+    active.guard = active.guard && plan->active;
+    SyncInsertionSite inactive = dst;
+    inactive.guard = inactive.guard && plan->inactive;
+    point->gm_write_acquire = gm_write_acquires_.size();
+    gm_write_acquires_.push_back(
         {std::move(*plan), std::move(active), std::move(inactive)});
   }
 
@@ -1542,7 +1613,7 @@ private:
     local_points.reserve(local_sync_points.size());
     for (SyncPoint &sync_point : local_sync_points) {
       size_t sync_point_id = AppendSyncPoint(std::move(sync_point));
-      if (sync_points_[sync_point_id].gm_read_release)
+      if (sync_points_[sync_point_id].IsPrivateGmHandoff())
         continue;
       local_points.push_back(
           {sync_point_id, {sync_points_[sync_point_id].edge}});
@@ -2221,6 +2292,8 @@ private:
             sync_points.back().operand_pool_release = pool_local_release;
             SelectGmReadRelease(&sync_points.back(), dep, producer, consumer,
                                 loop);
+            SelectGmWriteAcquire(&sync_points.back(), dep, producer, consumer,
+                                 loop);
           }
         }
       }
@@ -2420,7 +2493,7 @@ private:
   bool CoversNestedLocalProtocol(const SyncPoint &wide,
                                 const SyncPoint &narrow,
                                 ControlNode *parent) const {
-    if (wide.gm_read_release || narrow.gm_read_release)
+    if (wide.IsPrivateGmHandoff() || narrow.IsPrivateGmHandoff())
       return false;
     ControlNode *child = wide.flag_loop;
     auto persistent = [&](const SyncPoint &point) {
@@ -2585,7 +2658,7 @@ private:
 
   bool CoversLocalProtocol(const SyncPoint &wide, const SyncPoint &narrow,
                            ControlNode *loop) const {
-    if (wide.gm_read_release || narrow.gm_read_release)
+    if (wide.IsPrivateGmHandoff() || narrow.IsPrivateGmHandoff())
       return false;
     if (architecture_ != AscendArchitecture::kDav2201 || loop == nullptr ||
         wide.counter_group_id != 0 || narrow.counter_group_id != 0 ||
@@ -2666,9 +2739,9 @@ private:
     std::stable_sort(sync_points.begin(), sync_points.end());
     std::vector<SyncPoint> emit;
     for (SyncPoint &sync_point : sync_points) {
-      if (sync_point.gm_read_release) {
-        // Its physical set moves inside the phase. Retain the event, but
-        // never saturate the old phase-END edge or use it to remove a point.
+      if (sync_point.IsPrivateGmHandoff()) {
+        // One endpoint moves inside the phase. Retain the event, but never
+        // saturate its old wide edge or use it to remove another point.
         emit.push_back(std::move(sync_point));
         continue;
       }
@@ -2811,7 +2884,7 @@ private:
   void OptimizeFlagVersions(std::vector<SyncPoint> &sync_points,
                             const DepClosure &closure, ControlNode *loop) {
     for (SyncPoint &sync_point : sync_points) {
-      if (sync_point.gm_read_release)
+      if (sync_point.IsPrivateGmHandoff())
         continue; // Preserve the original paired clock, seeds and drains.
       const SyncInsertionSite &src = site_registry_.Src(sync_point);
       const SyncInsertionSite &dst = site_registry_.Dst(sync_point);
@@ -2915,7 +2988,7 @@ private:
             is_innermost && sync_point.counter_group_id == 0 &&
             loop != nullptr && loop->GetParentControl() == nullptr &&
             !loop->HasConditions() && !loop->BodyHasLoopBreak();
-        if (GmReadReleaseNeedsFallback(shifted_scope))
+        if (GmHandoffNeedsFallback(shifted_scope))
           return;
         ICHECK(shifted_scope)
             << "dav-2201 local binary flag: shifted carried events require "
@@ -2927,7 +3000,7 @@ private:
                             : IntImm(for_node->extent.dtype(), 1);
         bool positive_step =
             loop->task->outer_ctx.CanProve(step > make_zero(step.dtype()));
-        if (GmReadReleaseNeedsFallback(positive_step))
+        if (GmHandoffNeedsFallback(positive_step))
           return;
         ICHECK(positive_step)
             << "dav-2201 local binary flag: loop step must be positive";
@@ -2935,7 +3008,7 @@ private:
             SideEffect(for_node->min) == CallEffectKind::kPure &&
             SideEffect(for_node->extent) == CallEffectKind::kPure &&
             SideEffect(step) == CallEffectKind::kPure;
-        if (GmReadReleaseNeedsFallback(immutable_bounds))
+        if (GmHandoffNeedsFallback(immutable_bounds))
           return;
         ICHECK(immutable_bounds)
             << "dav-2201 local binary flag: loop bounds must be immutable";
@@ -2943,7 +3016,7 @@ private:
                                   make_zero(for_node->extent.dtype()));
         bool signed_clock = sync_point.flag_iteration.dtype().is_int() &&
                             trip_count.dtype().is_int();
-        if (GmReadReleaseNeedsFallback(signed_clock))
+        if (GmHandoffNeedsFallback(signed_clock))
           return;
         ICHECK(signed_clock)
             << "dav-2201 local binary flag: shifted epoch clocks require "
@@ -2952,7 +3025,7 @@ private:
             indexdiv(for_node->loop_var - for_node->min, step);
         bool lexical_clock = loop->GetLoopBodyContext().CanProve(
             sync_point.flag_iteration == lexical_ordinal);
-        if (GmReadReleaseNeedsFallback(lexical_clock))
+        if (GmHandoffNeedsFallback(lexical_clock))
           return;
         ICHECK(lexical_clock)
             << "dav-2201 local binary flag: shifted epoch clock must equal "
@@ -2960,7 +3033,7 @@ private:
             << binary_context();
         std::optional<LocalBinaryEpochSpan> active_span =
             LocalBinaryActiveSpan(sync_point, loop, trip_count, step);
-        if (GmReadReleaseNeedsFallback(active_span.has_value()))
+        if (GmHandoffNeedsFallback(active_span.has_value()))
           return;
         ICHECK(active_span.has_value())
             << "dav-2201 local binary flag: shifted carried events require "
@@ -2972,7 +3045,7 @@ private:
         if (reverse_completion == std::numeric_limits<int>::max()) {
           std::optional<int> finite_width =
               FiniteLocalBinaryWidth(loop, trip_count, distance);
-          if (GmReadReleaseNeedsFallback(finite_width.has_value()))
+          if (GmHandoffNeedsFallback(finite_width.has_value()))
             return;
           ICHECK(finite_width.has_value())
               << "dav-2201 local binary flag: no reverse completion path for "
@@ -2981,7 +3054,7 @@ private:
                  "non-reusing event capacity";
           sync_point.num_versions = *finite_width;
         } else {
-          if (GmReadReleaseNeedsFallback(
+          if (GmHandoffNeedsFallback(
                   reverse_completion <=
                   std::numeric_limits<int>::max() - distance))
             return;
@@ -3034,7 +3107,7 @@ private:
           // The owner clock does not advance within a descendant loop. Its
           // repeated uses of one ID need completion before the next child
           // iteration, irrespective of the owner's physical storage width.
-          if (GmReadReleaseNeedsFallback(min_distance <= 1))
+          if (GmHandoffNeedsFallback(min_distance <= 1))
             return;
           ICHECK_LE(min_distance, 1)
               << "dav-2201 local binary flag: reverse completion is too loose "
@@ -3087,7 +3160,7 @@ private:
                 bool allow_mixed_iter) const {
     const SyncPoint &lhs_sync = sync_points_[lhs.sync_point_id];
     const SyncPoint &rhs_sync = sync_points_[rhs.sync_point_id];
-    if (lhs_sync.gm_read_release || rhs_sync.gm_read_release)
+    if (lhs_sync.IsPrivateGmHandoff() || rhs_sync.IsPrivateGmHandoff())
       return false;
     if (lhs_sync.unit_boundary == UnitFlagBoundaryRole::kDrain ||
         rhs_sync.unit_boundary == UnitFlagBoundaryRole::kDrain)
@@ -3234,6 +3307,8 @@ private:
   const std::vector<L0OperandSlotPool> *operand_pools_;
   const bool enable_gm_read_release_;
   std::vector<GmReadReleaseCut> gm_read_releases_;
+  const bool enable_gm_write_acquire_;
+  std::vector<GmWriteAcquireCut> gm_write_acquires_;
   SyncSiteRegistry site_registry_;
   const bool trace_c_lifetimes_;
   mutable std::unordered_set<size_t> trace_c_sites_;
@@ -4415,13 +4490,15 @@ public:
                    const std::vector<OwnerCompletionEvent> &owner_events,
                    const std::vector<L0OperandSlotPool> &operand_pools,
                    const std::vector<int> &operand_pool_bases,
-                   const std::vector<GmReadReleaseCut> &gm_read_releases)
+                   const std::vector<GmReadReleaseCut> &gm_read_releases,
+                   const std::vector<GmWriteAcquireCut> &gm_write_acquires)
       : site_registry_(site_registry), sync_points_(sync_points),
         allocations_(allocations), architecture_(architecture),
         cross_core_contract_(cross_core_contract),
         lane_variables_(lane_variables), owner_events_(owner_events),
         operand_pools_(operand_pools), operand_pool_bases_(operand_pool_bases),
-        gm_read_releases_(gm_read_releases) {}
+        gm_read_releases_(gm_read_releases),
+        gm_write_acquires_(gm_write_acquires) {}
 
   void Run(std::vector<std::shared_ptr<IRStructure>> &root) {
     InsertSyncPoints();
@@ -4530,6 +4607,33 @@ private:
             dst.path_end,
             MakeAscendCrossCoreWaitFlag(2, "PIPE_MTE3", event_id), true,
             kCoreVector, consumer_guard);
+        continue;
+      }
+
+      if (sync_point.gm_write_acquire) {
+        ICHECK(architecture_ == AscendArchitecture::kDav2201 &&
+               cross_core_contract_.collective &&
+               cross_core_contract_.num_aiv_subcores == 2 &&
+               site_registry_.IsCrossCore(sync_point));
+        ICHECK_EQ(allocation.sync_points.size(), 1u);
+        const auto &cut = gm_write_acquires_.at(*sync_point.gm_write_acquire);
+        ICHECK(cut.plan.MatchesProtocol(
+            sync_point.flag_loop, sync_point.edge.distance,
+            sync_point.num_versions, sync_point.counter_group_id));
+        ValidateCollectiveSite(src);
+        ValidateCollectiveSite(cut.active);
+        ValidateCollectiveSite(cut.inactive);
+        // Both physical AIVs still retire their reads at the original END.
+        InsertStatement(
+            src.path_end,
+            MakeAscendCrossCoreSetFlag(2, "PIPE_MTE2", event_id), false,
+            kCoreVector, producer_guard);
+        for (const SyncInsertionSite *site : {&cut.active, &cut.inactive}) {
+          InsertStatement(
+              site->path_end,
+              MakeAscendCrossCoreWaitFlag(2, "PIPE_FIX", event_id), true,
+              kCoreCube, site->GetGuard());
+        }
         continue;
       }
 
@@ -4692,6 +4796,7 @@ private:
   const std::vector<L0OperandSlotPool> &operand_pools_;
   const std::vector<int> &operand_pool_bases_;
   const std::vector<GmReadReleaseCut> &gm_read_releases_;
+  const std::vector<GmWriteAcquireCut> &gm_write_acquires_;
 };
 
 // ============================================================================
@@ -4782,6 +4887,20 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
   std::unique_ptr<FlagAllocator> flag_allocator;
   std::optional<std::vector<OwnerCompletionEvent>> owner_events;
   bool enable_gm_read_release = true;
+  bool enable_gm_write_acquire = true;
+  auto disable_gm_handoff = [&]() {
+    // Restore the delayed acquire before discarding an independent early
+    // input release. Each retry rebuilds the complete original proof graph.
+    if (analyzer->HasGmWriteAcquires()) {
+      enable_gm_write_acquire = false;
+      return true;
+    }
+    if (analyzer->HasGmReadReleases()) {
+      enable_gm_read_release = false;
+      return true;
+    }
+    return false;
+  };
   for (;;) {
     flag_allocator.reset();
     analyzer = std::make_unique<SyncAnalyzer>(
@@ -4789,10 +4908,9 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
         scheduled_tir.metadata.manual_buffer_versions,
         scheduled_tir.metadata.root_conflict_hints, groups, &owner_results,
         &owner_inputs, &unit_streams, &unit_boundaries, &operand_pools,
-        enable_gm_read_release);
+        enable_gm_read_release, enable_gm_write_acquire);
     if (!analyzer->Analyze(root)) {
-      if (analyzer->HasGmReadReleases()) {
-        enable_gm_read_release = false;
+      if (disable_gm_handoff()) {
         continue;
       }
       if (analyzer->NeedsOperandPoolFallback()) {
@@ -4813,8 +4931,8 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
       owner_results.clear();
       continue;
     }
-    if (analyzer->HasGmReadReleases()) {
-      // Early P completion cannot replace whole-phase alias retirement.
+    if (analyzer->HasPrivateGmHandoffs()) {
+      // A private GM cut cannot replace whole-phase alias retirement.
       // Retry before allocation/materialization if the removed wide edge
       // was needed by a mandatory physical-storage proof.
       bool aliases_proven = true;
@@ -4838,7 +4956,7 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
                         return analyzer->HasOwnerInputRelease(plan);
                       });
       if (!aliases_proven || !releases_proven) {
-        enable_gm_read_release = false;
+        ICHECK(disable_gm_handoff());
         continue;
       }
     }
@@ -4877,9 +4995,8 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
     if (!flag_allocator->Plan(!owner_results.empty() || !owner_inputs.empty() ||
                                   !unit_streams.empty() || !operand_pools.empty(),
                               !unit_streams.empty() || !operand_pools.empty() ||
-                                  analyzer->HasGmReadReleases())) {
-      if (analyzer->HasGmReadReleases()) {
-        enable_gm_read_release = false;
+                                  analyzer->HasPrivateGmHandoffs())) {
+      if (disable_gm_handoff()) {
         continue;
       }
       if (!operand_pools.empty()) {
@@ -4908,8 +5025,7 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
         cross_core_flag_reservation, domains);
     if (owner_events.has_value())
       break;
-    if (analyzer->HasGmReadReleases()) {
-      enable_gm_read_release = false;
+    if (disable_gm_handoff()) {
       continue;
     }
     if (!owner_inputs.empty()) {
@@ -4952,7 +5068,7 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
                    flag_allocator->Allocations(), target_info.architecture,
                    cross_core_contract, lane_variables, owner_events.value(),
                    operand_pools, flag_allocator->OperandPoolBases(),
-                   analyzer->GmReadReleases())
+                   analyzer->GmReadReleases(), analyzer->GmWriteAcquires())
       .Run(root);
   FlagInfoList flag_infos = flag_allocator->TakeFlagInfos();
 
