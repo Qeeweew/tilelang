@@ -83,6 +83,12 @@ def host_codegen(
         # native-device workspace allocations to Bind before legalizing their
         # host-side storage; device functions retain their native dtypes.
         host_mod = tirx.transform.LowerTVMBuiltin()(host_mod)
+        # The device target survives separately from the bound host target.
+        # 2201 workspace aliases use a preferred 512-byte start while frees
+        # retain the producer allocator's original ownership handle.
+        from tilelang.ascend import transform as ascend_transform
+
+        host_mod = ascend_transform.AscendAlignWorkspaceAllocations(context.target)(host_mod)
     host_mod = tirx.transform.FP8StorageLegalize()(host_mod)
     host_mod = tirx.transform.BF16StorageLegalize()(host_mod)
     if context.name != "ascend":

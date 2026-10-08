@@ -112,6 +112,27 @@ normalization then extends its complete matrix axes to the established
 physical allocation and consumes the padding intent. Partial slices and
 empty domains retain their original bounds throughout these phases.
 
+On 2201, host lowering aligns compiler-allocated global workspace starts to
+512 bytes. It reserves up to 511 extra bytes through the existing producer
+DLPack allocator, passes an aligned interior pointer to the device kernel,
+and frees the original allocation handle. Stream ownership and asynchronous
+release use the existing runtime path. The allocation size check includes
+this reservation. This is a performance policy supported by FIX-output
+address experiments, not a minimum legal alignment for arbitrary GM tensors.
+The 3510 allocation path and external tensor arguments retain their existing
+behavior.
+
+Generated GM handoffs round both matrix capacities to complete 16-element
+axes. Their FP32 planes are therefore multiples of 1024 bytes, and FP16/BF16
+planes are multiples of 512 bytes. Group slices and automatic version pitches
+cover whole physical planes, preserving 512-byte-aligned group/version bases.
+Subregion offsets and arbitrary internal strides retain their original
+alignment. Valid tails and AIV row partitions remain ordinary regions; they
+are not expanded to align every reader address. For caller-owned FIX output/workspace tensors,
+the caller controls the actual base and physical strides. The compiler does
+not silently shift an external pointer or copy the entire output merely to
+meet the preferred alignment.
+
 The mixed ownership phase connects ordinary Parallel expressions, copy
 regions, row broadcasts and trailing-axis reductions through their shared UB
 buffers. It gives each AIV a private row capacity and a bounded valid domain,

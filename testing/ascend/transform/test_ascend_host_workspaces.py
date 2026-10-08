@@ -30,6 +30,7 @@ def _mixed_gemm(dtype):
             T.copy(V, v_l1)
             T.gemm(p_l1, v_l1, output_l0, transpose_B=False, clear_accum=True)
             T.copy(output_l0, O)
+
     return main
 
 
@@ -37,7 +38,8 @@ def _nodes(mod, kind):
     found = []
     for function in mod.functions.values():
         tirx.stmt_functor.post_order_visit(
-            function.body, lambda node: found.append(node) if isinstance(node, kind) else None,
+            function.body,
+            lambda node: found.append(node) if isinstance(node, kind) else None,
         )
     return found
 
@@ -48,7 +50,8 @@ def _calls(mod, name):
 
 def _workspace_bindings(mod):
     return [
-        binding for binding in _nodes(mod, tirx.Bind)
+        binding
+        for binding in _nodes(mod, tirx.Bind)
         if isinstance(binding.value, tirx.Call)
         and isinstance(binding.value.op, tvm.ir.Op)
         and binding.value.op.name == "tirx.TVMBackendAllocWorkspace"
@@ -70,6 +73,33 @@ def _assert_workspace_ownership(mod):
     assert len(_calls(mod, "tirx.tvm_call_packed_lowered")) == 2  # set_device + kernel
 
 
+def _assert_aligned_workspace_ownership(mod):
+    bindings = _workspace_bindings(mod)
+    assert len(bindings) == 2
+    assert sorted(int(binding.value.args[2]) for binding in bindings) == [1023, 1535]
+    aliases = [
+        binding
+        for binding in _nodes(mod, tirx.Bind)
+        if isinstance(binding.value, tirx.Call)
+        and isinstance(binding.value.op, tvm.ir.Op)
+        and binding.value.op.name == "tirx.handle_add_byte_offset"
+    ]
+    assert len(aliases) == 2
+    frees = _calls(mod, "tirx.TVMBackendFreeWorkspace")
+    packed_arguments = _calls(mod, "tirx.tvm_struct_set")
+    assert len(frees) == 2
+    for binding in bindings:
+        matching = [alias for alias in aliases if alias.value.args[0].same_as(binding.var)]
+        assert len(matching) == 1
+        (alias,) = matching
+        assert not alias.var.same_as(binding.var)
+        assert sum(free.args[2].same_as(binding.var) for free in frees) == 1
+        assert not any(free.args[2].same_as(alias.var) for free in frees)
+        assert sum(argument.args[3].same_as(alias.var) for argument in packed_arguments) == 1
+        assert not any(argument.args[3].same_as(binding.var) for argument in packed_arguments)
+    assert len(_calls(mod, "tirx.tvm_call_packed_lowered")) == 2
+
+
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 def test_full_host_codegen_preserves_gm_workspace_bytes_and_vars(dtype):
     snapshots, order = {}, []
@@ -79,25 +109,37 @@ def test_full_host_codegen_preserves_gm_workspace_bytes_and_vars(dtype):
         def run_before_pass(self, mod, info):
             if info.name == "tirx.LowerTVMBuiltin":
                 snapshots["before-builtin"] = mod
-            if info.name in ("tirx.LowerTVMBuiltin", "tirx.FP8StorageLegalize", "tirx.BF16StorageLegalize"):
+            if info.name in (
+                "tirx.LowerTVMBuiltin",
+                "tl.AscendAlignWorkspaceAllocations",
+                "tirx.FP8StorageLegalize",
+                "tirx.BF16StorageLegalize",
+            ):
                 order.append(info.name)
 
         def run_after_pass(self, mod, info):
-            if info.name in ("tirx.LowerTVMBuiltin", "tirx.BF16StorageLegalize"):
+            if info.name in ("tirx.LowerTVMBuiltin", "tl.AscendAlignWorkspaceAllocations", "tirx.BF16StorageLegalize"):
                 snapshots[info.name] = mod
 
     with tvm.transform.PassContext(instruments=[Capture()]):
         artifact = tilelang.lower(
-            _mixed_gemm(dtype), target={"kind": "ascend", "arch": "dav-2201"},
-            target_host="c", enable_host_codegen=True, enable_device_compile=False,
+            _mixed_gemm(dtype),
+            target={"kind": "ascend", "arch": "dav-2201"},
+            target_host="c",
+            enable_host_codegen=True,
+            enable_device_compile=False,
         )
-    assert order == ["tirx.LowerTVMBuiltin", "tirx.FP8StorageLegalize", "tirx.BF16StorageLegalize"]
+    assert order == ["tirx.LowerTVMBuiltin", "tl.AscendAlignWorkspaceAllocations", "tirx.FP8StorageLegalize", "tirx.BF16StorageLegalize"]
     allocations = _nodes(snapshots["before-builtin"], tirx.AllocBuffer)
-    assert sorted((str(node.buffer.dtype), int(node.buffer.shape[0])) for node in allocations) == sorted([
-        ("float32", 256), (dtype, 256),
-    ])
+    assert sorted((str(node.buffer.dtype), int(node.buffer.shape[0])) for node in allocations) == sorted(
+        [
+            ("float32", 256),
+            (dtype, 256),
+        ]
+    )
     _assert_workspace_ownership(snapshots["tirx.LowerTVMBuiltin"])
-    _assert_workspace_ownership(snapshots["tirx.BF16StorageLegalize"])
+    _assert_aligned_workspace_ownership(snapshots["tl.AscendAlignWorkspaceAllocations"])
+    _assert_aligned_workspace_ownership(snapshots["tirx.BF16StorageLegalize"])
     assert artifact.host_mod and artifact.kernel_source
 
     # Only host storage carriers are legalized. The native kernel still takes

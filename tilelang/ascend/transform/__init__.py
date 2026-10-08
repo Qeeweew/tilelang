@@ -6,6 +6,18 @@ from tilelang.transform import _ffi_api
 from . import z3_scheduler  # noqa: F401
 
 
+def AscendAlignWorkspaceAllocations(target):
+    """Align compiler-owned host workspace pointers to 512 bytes.
+
+    The Ascend host codegen path runs this once after LowerTVMBuiltin, passing
+    the device target explicitly. Other Ascend architectures remain unchanged.
+    Allocation and free retain the raw owner; kernel arguments use an aligned
+    alias. This is a performance policy, not a minimum legal GM alignment.
+    External tensor pointers and buffer strides are unchanged.
+    """
+    return _ffi_api.AscendAlignWorkspaceAllocations(target)  # type: ignore
+
+
 def AscendValidateTarget():
     """Check frontend operations against the bound Ascend architecture.
 
@@ -293,6 +305,7 @@ def AscendSelectFixpipeConfig():
 
 
 __all__ = [
+    "AscendAlignWorkspaceAllocations",
     "AscendSelectCubeLoads",
     "AscendSelectFixpipeConfig",
     "AscendLowerL1Gemm",
