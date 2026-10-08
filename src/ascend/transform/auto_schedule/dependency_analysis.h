@@ -74,6 +74,11 @@ struct DepInfo {
   // resolves both directed distances from the final stage and physical order.
   int distance;
   DependencyKind kind{DependencyKind::kData};
+  // A positive conflict hint between distinct storage identities.
+  // Synchronization can preserve its requested lexical scope instead of
+  // inferring either buffer's guarded epoch domain. False for invariant SPR
+  // state dependencies.
+  bool cross_storage_conflict{false};
 };
 
 // Per-phase dependency-analysis cache. A ControlNode key represents the

@@ -40,6 +40,7 @@
 #include <vector>
 
 #include "../buffer_alias.h"
+#include "../attr.h"
 #include "./buffer_lifetime_analysis.h"
 #include "./ir_structure.h"
 #include "./memory_detector.h"
@@ -322,7 +323,9 @@ class BufferAliasAnalyzerImpl {
 public:
   explicit BufferAliasAnalyzerImpl(const BufferAliasAnalysisContext &context,
                                    L0StorageGroups groups)
-      : context_(&context), groups_(std::move(groups)) {}
+      : context_(&context), groups_(std::move(groups)),
+        trace_c_lifetimes_(
+            runtime::detail::VerboseLoggingEnabled(__FILE__, 1)) {}
 
   void Collect(const std::vector<std::shared_ptr<IRStructure>> &root) {
     storage_access_info_.clear();
@@ -423,15 +426,72 @@ public:
   void Validate() const { ValidateBufferAliasMap(buffer_aliases_); }
 
 private:
+  bool TraceCLifetime(const StorageAccessInfo &info) const {
+    // Unlike VLOG, the existing runtime selector remains available in Release
+    // builds. This diagnostic only observes the normal proof path.
+    if (!trace_c_lifetimes_)
+      return false;
+    for (const TaskStorageAccess &access : info.accesses)
+      for (const auto *regions : {&access.read_regions, &access.write_regions})
+        for (const BufferRegion &region : *regions)
+          if (IsL0CBuffer(region->buffer) && region->buffer->shape.size() == 2)
+            return true;
+    return false;
+  }
+
+  static std::string LifetimeScopeName(ControlNode *scope) {
+    return scope == nullptr ? "<root>"
+                            : std::string(scope->control->loop_var->name_hint);
+  }
+
+  void TraceCSummary(const StorageAccessInfo &info, ControlNode *scope,
+                     const char *source,
+                     const std::optional<LifetimeSummary> &summary) const {
+    if (!TraceCLifetime(info))
+      return;
+    if (!summary) {
+      LOG(INFO) << "C-lifetime storage=" << info.storage << " scope="
+                << LifetimeScopeName(scope) << " source=" << source
+                << " summary=none";
+      return;
+    }
+    LOG(INFO) << "C-lifetime storage=" << info.storage << " scope="
+              << LifetimeScopeName(scope) << " source=" << source
+              << " valid=" << summary->valid << " live_in=" << summary->live_in
+              << " live_out=" << summary->live_out
+              << " live_through=" << summary->live_through
+              << " control=" << LifetimeScopeName(summary->summary_control)
+              << " components=" << summary->components.size()
+              << " generations=" << summary->generations.size();
+    for (size_t index = 0; index < summary->generations.size(); ++index) {
+      const GenerationLifetime &generation = summary->generations[index];
+      LOG(INFO) << "C-lifetime generation=" << index
+                << " guard=" << generation.guard
+                << " invariant=" << generation.guard_iteration_invariant;
+      for (const auto *events : {&generation.begin_sites,
+                                &generation.end_sites})
+        for (const IterationEvent &event : *events)
+          LOG(INFO) << "C-lifetime "
+                    << (events == &generation.begin_sites ? "begin" : "end")
+                    << " site=" << event.site << " offset=" << event.offset;
+    }
+  }
+
   HappensBeforeQuery MakeHappensBeforeQuery(ControlNode *scope) const {
     return [this, scope](size_t src, size_t dst, int64_t distance) {
       return context_->HappensBefore(scope, src, dst, distance);
     };
   }
 
-  MinimumIterationDistance MakeMinimumDistanceQuery(ControlNode *scope) const {
-    return [this, scope](size_t src, size_t dst) {
-      return context_->MinimumDistance(scope, src, dst);
+  MinimumIterationDistance MakeMinimumDistanceQuery(ControlNode *scope,
+                                                     bool trace = false) const {
+    return [this, scope, trace](size_t src, size_t dst) {
+      auto distance = context_->MinimumDistance(scope, src, dst);
+      if (trace)
+        LOG(INFO) << "C-lifetime minimum scope=" << LifetimeScopeName(scope)
+                  << " src=" << src << " dst=" << dst << " distance="
+                  << (distance ? std::to_string(*distance) : "unproved");
+      return distance;
     };
   }
 
@@ -500,9 +560,208 @@ private:
   }
 
   std::optional<LifetimeSummary>
+  BuildFiniteAccumulationLifetime(const StorageAccessInfo &info,
+                                  ControlNode *result_scope) const {
+    const bool trace = TraceCLifetime(info);
+    auto reject = [&](const char *reason) -> std::optional<LifetimeSummary> {
+      if (trace)
+        LOG(INFO) << "C-finite storage=" << info.storage << " scope="
+                  << LifetimeScopeName(result_scope) << " rejected=" << reason;
+      return std::nullopt;
+    };
+    if (info.opaque || result_scope == nullptr ||
+        result_scope->BodyHasLoopBreak() || info.accesses.size() != 2)
+      return reject(info.opaque ? "opaque" : result_scope == nullptr ? "root"
+                           : result_scope->BodyHasLoopBreak() ? "result-break"
+                                                            : "access-count");
+    for (ControlNode *scope = result_scope; scope != nullptr;
+         scope = scope->GetParentControl()) {
+      auto period = context_->StoragePeriod(info.storage, scope);
+      if (!period || period->iterations != 1)
+        return reject("ancestor-storage-period");
+    }
+
+    auto operation = [](TaskNode *task) -> std::optional<Call> {
+      if (task->IsPerCoreTask() || task->GetCoreMask() != kCoreCube ||
+          task->HasGuards())
+        return std::nullopt;
+      Stmt stmt = task->stmt;
+      while (const auto *attribute = stmt.as<AttrStmtNode>()) {
+        if (attribute->attr_key != attr::kAscendTask)
+          return std::nullopt;
+        stmt = attribute->body;
+      }
+      const auto *evaluate = stmt.as<EvaluateNode>();
+      if (!evaluate || !evaluate->value.as<CallNode>())
+        return std::nullopt;
+      return Downcast<Call>(evaluate->value);
+    };
+    auto full_region = [](const BufferRegion &region, const Buffer &buffer) {
+      if (!region->buffer.same_as(buffer) || region->region.size() != 2)
+        return false;
+      arith::Analyzer analyzer;
+      for (size_t axis = 0; axis < 2; ++axis)
+        if (!analyzer.CanProveEqual(region->region[axis]->min, 0) ||
+            !analyzer.CanProveEqual(region->region[axis]->extent,
+                                   buffer->shape[axis]))
+          return false;
+      return true;
+    };
+    auto reads_c_scalar = [&](const PrimExpr &expr) {
+      bool reads = false;
+      PostOrderVisit(expr, [&](const ObjectRef &node) {
+        if (const auto *load = node.as<BufferLoadNode>())
+          reads |= load->buffer->data.same_as(info.storage);
+        if (const auto *var = node.as<VarNode>())
+          reads |= var == info.storage.get();
+      });
+      return reads;
+    };
+
+    const TaskStorageAccess *producer = nullptr, *reader = nullptr;
+    Gemm gemm{nullptr};
+    for (const TaskStorageAccess &access : info.accesses) {
+      auto call = operation(access.task);
+      if (!call || !access.task->IsWithin(result_scope))
+        return reject(!call ? "operation" : "outside-result");
+      if (access.Writes()) {
+        if (producer != nullptr || !(*call)->op.same_as(Gemm::Get()) ||
+            !access.task->UsesOnlyPipe(ResourcePipe::kCube))
+          return reject("writer-role");
+        gemm = Gemm((*call)->args, (*call)->annotations);
+        const Buffer &c = gemm->c_;
+        if (!IsL0ABuffer(gemm->a_) || !IsL0BBuffer(gemm->b_) ||
+            !IsL0CBuffer(c) || !c->data.same_as(info.storage) ||
+            c->dtype != DataType::Float(32) || c->shape.size() != 2 ||
+            gemm->mbar_.defined() || gemm->wgWait_ != 0 || gemm->isWgmma_ ||
+            gemm->isTcgen05_ || gemm->transA_ ||
+            !full_region(gemm->cRegion_, c) ||
+            !DenseRegionsCover(access.must_write_regions, gemm->cRegion_))
+          return reject("native-full-must-write");
+        arith::Analyzer analyzer;
+        const auto &a = gemm->aRegion_->region;
+        const auto &b = gemm->bRegion_->region;
+        if (gemm->m_ <= 0 || gemm->n_ <= 0 || gemm->k_ <= 0 ||
+            a.size() < 2 || b.size() < 2 ||
+            !analyzer.CanProveEqual(Integer(gemm->m_), c->shape[0]) ||
+            !analyzer.CanProveEqual(Integer(gemm->n_), c->shape[1]) ||
+            !analyzer.CanProveEqual(a[a.size() - 2]->extent, c->shape[0]) ||
+            !analyzer.CanProveEqual(a.back()->extent, Integer(gemm->k_)) ||
+            !analyzer.CanProveEqual(
+                b[gemm->transB_ ? b.size() - 2 : b.size() - 1]->extent,
+                c->shape[1]) ||
+            !analyzer.CanProveEqual(
+                b[gemm->transB_ ? b.size() - 1 : b.size() - 2]->extent,
+                a.back()->extent))
+          return reject("native-geometry");
+        // A true first clear does not kill scalar C reads used to compute its
+        // control/index operands, even if their region hull merges with C.
+        for (size_t index = 3; index < (*call)->args.size(); ++index)
+          if (reads_c_scalar((*call)->args[index]))
+            return reject("scalar-operand-reads-C");
+        for (const BufferRegion &region :
+             {gemm->aRegion_, gemm->bRegion_, gemm->cRegion_})
+          for (const Range &range : region->region)
+            if (reads_c_scalar(range->min) || reads_c_scalar(range->extent))
+              return reject("region-expression-reads-C");
+        for (const auto &[key, value] : (*call)->annotations) {
+          auto expr = value.as<PrimExpr>();
+          if (!expr || reads_c_scalar(expr.value()))
+            return reject("annotation-expression");
+        }
+        producer = &access;
+      } else {
+        if (reader != nullptr || !access.Reads() ||
+            !IsAscendCopyCall(call->get()) ||
+            !access.task->UsesOnlyPipe(ResourcePipe::kFixpipe) ||
+            access.task->GetParent() != result_scope)
+          return reject("reader-role-or-parent");
+        reader = &access;
+      }
+    }
+    if (producer == nullptr || reader == nullptr)
+      return reject("missing-producer-or-reader");
+    auto reader_call = operation(reader->task);
+    AscendCopy copy((*reader_call)->args, (*reader_call)->annotations);
+    if (!IsGlobalBuffer(copy->dst) ||
+        !full_region(BufferRegion(copy->src, copy->src_range), gemm->c_))
+      return reject("full-GM-export");
+
+    // A direct full clear, or one finite K subtree whose first MAD clears,
+    // defines the whole result before its full export. Substitute only K
+    // coordinates: a result/owner/epoch-dependent clear is never turned into
+    // an initialization proof for every result. With no K subtree, a fresh
+    // Analyzer must prove the direct producer's clear without outer bindings.
+    Map<Var, PrimExpr> first_k;
+    IRStructure *subtree = producer->task;
+    IRStructure *parent = producer->task->GetParent();
+    if (parent == nullptr || !parent->IsControl())
+      return reject("missing-K-control");
+    for (ControlNode *control = static_cast<ControlNode *>(parent);
+         control != result_scope; control = control->GetParentControl()) {
+      if (control == nullptr || control->HasGuards() ||
+          control->BodyHasLoopBreak() ||
+          control->control->kind != ForKind::kSerial)
+        return reject("K-control-kind-guard-break");
+      const For &loop = control->control;
+      const auto *extent = loop->extent.as<IntImmNode>();
+      if (!extent || extent->value <= 0 || !is_zero(loop->min) ||
+          !is_one(loop->step.value_or(Integer(1))))
+        return reject("K-control-finite-domain");
+      auto local_period = context_->StoragePeriod(info.storage, control);
+      if (!local_period || local_period->iterations != 1)
+        return reject("K-storage-period");
+      first_k.Set(loop->loop_var, loop->min);
+      subtree = control;
+    }
+    if (first_k.empty() && parent != result_scope)
+      return reject("direct-producer-parent");
+    if (subtree->GetIndex() >= reader->task->GetIndex())
+      return reject("export-order");
+    if (!arith::Analyzer().CanProve(Substitute(gemm->clearAccum_, first_k)))
+      return reject("first-clear");
+
+    LifetimeSummary summary;
+    summary.storage = info.storage;
+    summary.valid = true;
+    // This value remains live across every iteration of the K subtree. A
+    // sibling storage used inside it overlaps that value even when projected
+    // lexical endpoints happen to compare different K occurrences.
+    if (!first_k.empty())
+      summary.read_controls.push_back(static_cast<ControlNode *>(subtree));
+    GenerationLifetime generation;
+    generation.guard = Bool(true);
+    generation.guard_iteration_invariant = true;
+    generation.begin_sites = MakeIterationEvents(
+        context_->ResolveLifetimeEndpoints(info.storage, producer->task, true,
+                                           result_scope));
+    generation.end_sites = MakeIterationEvents(
+        context_->ResolveLifetimeEndpoints(info.storage, producer->task, false,
+                                           result_scope));
+    auto export_ends = MakeIterationEvents(context_->ResolveLifetimeEndpoints(
+        info.storage, reader->task, false, result_scope));
+    generation.end_sites.insert(generation.end_sites.end(), export_ends.begin(),
+                                export_ends.end());
+    SortUnique(&generation.end_sites);
+    // These are actual whole-command endpoints, not unit-ready edges. Keeping
+    // both ends requires later reuse to retire MAD as well as asynchronous FIX.
+    // Existing promotion and happens-before queries still prove separation.
+    summary.generations.push_back(std::move(generation));
+    if (trace)
+      LOG(INFO) << "C-finite storage=" << info.storage << " scope="
+                << LifetimeScopeName(result_scope) << " selected";
+    return summary;
+  }
+
+  std::optional<LifetimeSummary>
   BuildStorageLifetime(const StorageAccessInfo &info, ControlNode *loop,
                        const HappensBeforeQuery &happens_before) const {
+    if (auto accumulation = BuildFiniteAccumulationLifetime(info, loop)) {
+      TraceCSummary(info, loop, "finite", accumulation);
+      return accumulation;
+    }
     LifetimeSummary direct = BuildGenerations(info, loop, loop, happens_before);
+    TraceCSummary(info, loop, "direct", direct);
     if (direct.valid)
       return direct;
 
@@ -515,20 +774,33 @@ private:
         auto child_lifetime = child_scope->second.find(info.storage);
         if (child_lifetime != child_scope->second.end() &&
             child_lifetime->second.components.empty()) {
-          return PromoteControlLifetimeSummary(child_lifetime->second, child,
-                                               loop);
+          auto summary = PromoteControlLifetimeSummary(child_lifetime->second,
+                                                       child, loop);
+          TraceCSummary(info, loop, "promoted", summary);
+          return summary;
         }
       }
     }
-    return BuildCompositeStorageLifetime(info, loop);
+    auto summary = BuildCompositeStorageLifetime(info, loop);
+    TraceCSummary(info, loop, "composite", summary);
+    return summary;
   }
 
   bool CanAliasStorageLifetimes(
       const LifetimeSummary &lhs, const LifetimeSummary &rhs, ControlNode *loop,
       const HappensBeforeQuery &current_happens_before) const {
+    const bool trace = TraceCLifetime(storage_access_info_.at(lhs.storage)) &&
+                       TraceCLifetime(storage_access_info_.at(rhs.storage));
+    auto rejected = [&](const char *reason) {
+      if (trace)
+        LOG(INFO) << "C-alias lhs=" << lhs.storage << " rhs=" << rhs.storage
+                  << " scope=" << LifetimeScopeName(loop)
+                  << " rejected=" << reason;
+      return false;
+    };
     if (lhs.summary_control != nullptr &&
         lhs.summary_control == rhs.summary_control) {
-      return false;
+      return rejected("same-summary-control");
     }
     auto overlaps_read_control = [&](const LifetimeSummary &incoming,
                                       const LifetimeSummary &other) {
@@ -541,11 +813,11 @@ private:
       return false;
     };
     if (overlaps_read_control(lhs, rhs) || overlaps_read_control(rhs, lhs))
-      return false;
+      return rejected("read-control-overlap");
     if (!lhs.components.empty() || !rhs.components.empty()) {
       if (lhs.components.size() != rhs.components.size() ||
           lhs.components.empty()) {
-        return false;
+        return rejected("component-count");
       }
       for (size_t i = 0; i < lhs.components.size(); ++i) {
         const ControlLifetimeComponent &lhs_component = lhs.components[i];
@@ -553,7 +825,7 @@ private:
         if (lhs_component.control != rhs_component.control ||
             lhs_component.generations.empty() ||
             rhs_component.generations.empty()) {
-          return false;
+          return rejected("component-control");
         }
         HappensBeforeQuery component_happens_before =
             MakeHappensBeforeQuery(lhs_component.control);
@@ -564,9 +836,9 @@ private:
         if (!CanAliasGenerations(
                 lhs_component.generations, rhs_component.generations,
                 /*periodic=*/true, component_happens_before,
-                MakeMinimumDistanceQuery(lhs_component.control),
+                MakeMinimumDistanceQuery(lhs_component.control, trace),
                 component_mutually_exclusive)) {
-          return false;
+          return rejected("component-generations");
         }
       }
     }
@@ -624,7 +896,11 @@ private:
     if (lhs.live_through || rhs.live_through || overlap_at_iteration_boundary ||
         !lhs_represented || !rhs_represented ||
         !boundary_compatible(lhs, rhs) || !boundary_compatible(rhs, lhs)) {
-      return false;
+      return rejected(lhs.live_through || rhs.live_through ? "live-through"
+                         : overlap_at_iteration_boundary ? "boundary-overlap"
+                         : !lhs_represented || !rhs_represented
+                             ? "unrepresented"
+                             : "boundary-completion");
     }
     if (lhs.generations.empty() || rhs.generations.empty())
       return true;
@@ -633,10 +909,23 @@ private:
                                                     const PrimExpr &b) {
       return ProveMutuallyExclusive(a, b, loop);
     };
-    return CanAliasGenerations(lhs.generations, rhs.generations,
-                               loop != nullptr, current_happens_before,
-                               MakeMinimumDistanceQuery(loop),
-                               mutually_exclusive);
+    HappensBeforeQuery trace_happens_before =
+        [&](size_t src, size_t dst, int64_t distance) {
+          bool proven = current_happens_before(src, dst, distance);
+          if (trace)
+            LOG(INFO) << "C-lifetime HB scope=" << LifetimeScopeName(loop)
+                      << " src=" << src << " dst=" << dst
+                      << " distance=" << distance << " proven=" << proven;
+          return proven;
+        };
+    bool proven = CanAliasGenerations(
+        lhs.generations, rhs.generations, loop != nullptr, trace_happens_before,
+        MakeMinimumDistanceQuery(loop, trace), mutually_exclusive);
+    if (trace)
+      LOG(INFO) << "C-alias lhs=" << lhs.storage << " rhs=" << rhs.storage
+                << " scope=" << LifetimeScopeName(loop)
+                << " generations-proven=" << proven;
+    return proven;
   }
 
   using VarExprMap =
@@ -1576,6 +1865,7 @@ private:
 
   const BufferAliasAnalysisContext *context_;
   L0StorageGroups groups_;
+  const bool trace_c_lifetimes_;
   StorageAccessInfoMap storage_access_info_;
   std::vector<Var> storage_order_;
   std::map<ControlNode *, LifetimeSummaryMap> lifetime_summaries_;

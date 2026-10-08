@@ -26,7 +26,7 @@ from testing.ascend.auto_schedule.test_owner_result_completion import _name, _re
 from testing.ascend.auto_schedule.test_sync_binary_flags import _prove_binary_protocol
 
 
-_PAIRS = "tl.ascend_l0ab_phase_reuse_pairs"
+_PAIRS = "tl.ascend_l0_phase_reuse_pairs"
 _TARGET = {"kind": "ascend", "arch": "dav-2201"}
 _COPY = "tl.tileop.ascend_copy"
 _LOAD3D = "tl.tileop.ascend_cube_load3d"

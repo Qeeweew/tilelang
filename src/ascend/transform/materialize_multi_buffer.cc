@@ -210,12 +210,7 @@ private:
                         const Buffer &versioned) const {
     if (broadcast_storages_.count(info.storage))
       return make_zero(versioned->shape[0].dtype());
-    PrimExpr iteration =
-        info.UsesCounter()
-            ? PrimExpr(BufferLoad(info.counter, {IntImm(DataType::Int(32), 0)}))
-            : CalculateIterationCount(info.owners.front().loop);
-    PrimExpr version =
-        indexmod(iteration, IntImm(iteration.dtype(), info.num_versions));
+    PrimExpr version = MultiBufferVersionIndex(info);
     DataType index_dtype = versioned->shape[0].dtype();
     return version.dtype() == index_dtype ? version
                                           : cast(index_dtype, version);

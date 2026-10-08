@@ -210,6 +210,21 @@ struct MultiBufferInfo {
   }
 };
 
+// The prepared storage clock is shared by synchronization proofs and physical
+// materialization. Iteration mode includes every ancestor; resetting it at a
+// nested owner's entry would select a different slot after an odd trip count.
+inline PrimExpr MultiBufferIteration(const MultiBufferInfo &info) {
+  if (info.UsesCounter())
+    return BufferLoad(info.counter, {IntImm(DataType::Int(32), 0)});
+  ICHECK_EQ(info.owners.size(), 1U);
+  return CalculateIterationCount(info.owners.front().loop);
+}
+
+inline PrimExpr MultiBufferVersionIndex(const MultiBufferInfo &info) {
+  PrimExpr iteration = MultiBufferIteration(info);
+  return indexmod(iteration, IntImm(iteration.dtype(), info.num_versions));
+}
+
 // Multi-buffer metadata shared by PrepareMultiBuffer, ResolveCore, InsertSync,
 // and MaterializeMultiBuffer. Logical epoch domains are represented separately
 // by loop annotations and EpochDomainRegistry below; they never participate in

@@ -280,20 +280,24 @@ AnalyzeDependencies(std::vector<IRStructure *> nodes, ControlNode *loop,
         ffi::Optional<Var> storage;
         int distance;
         DependencyKind kind;
+        bool cross_storage_conflict;
         std::set<DependencyTaskPair> task_pairs;
       };
       std::vector<PendingDependency> pending;
 
       auto add_pair = [&](const ffi::Optional<Var> &storage, int distance,
                           TaskNode *producer, TaskNode *consumer,
-                          DependencyKind kind = DependencyKind::kData) {
+                          DependencyKind kind = DependencyKind::kData,
+                          bool cross_storage_conflict = false) {
         auto existing = std::find_if(
             pending.begin(), pending.end(), [&](const PendingDependency &dep) {
               return dep.storage.same_as(storage) && dep.distance == distance &&
-                     dep.kind == kind;
+                     dep.kind == kind &&
+                     dep.cross_storage_conflict == cross_storage_conflict;
             });
         if (existing == pending.end()) {
-          pending.push_back({storage, distance, kind, {}});
+          pending.push_back(
+              {storage, distance, kind, cross_storage_conflict, {}});
           existing = std::prev(pending.end());
         }
         existing->task_pairs.emplace(producer, consumer);
@@ -340,7 +344,10 @@ AnalyzeDependencies(std::vector<IRStructure *> nodes, ControlNode *loop,
                 add_pair(storage, owner_exclusion ? 0 : distance, lhs.task,
                          rhs.task,
                          owner_exclusion ? DependencyKind::kOwnerExclusion
-                                         : DependencyKind::kData);
+                                         : DependencyKind::kData,
+                         // Different storages conflict only through a positive
+                         // hint; ordinary region overlap cannot create this.
+                         !lhs_storage.same_as(rhs_storage));
                 break;
               }
             }
@@ -360,7 +367,7 @@ AnalyzeDependencies(std::vector<IRStructure *> nodes, ControlNode *loop,
         deps.push_back({nodes[i], nodes[j], std::move(dep.storage),
                         std::vector<DependencyTaskPair>(dep.task_pairs.begin(),
                                                         dep.task_pairs.end()),
-                        dep.distance, dep.kind});
+                        dep.distance, dep.kind, dep.cross_storage_conflict});
       }
     }
   }

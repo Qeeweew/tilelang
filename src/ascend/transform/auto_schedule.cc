@@ -182,8 +182,8 @@ public:
   // every reader before the other phase may overwrite the same address.
   void SetReserveL0Storage(bool value) { reserve_l0_storage_ = value; }
 
-  void SetL0ABPhaseReuse(std::vector<L0ABPhaseReusePair> pairs) {
-    l0ab_phase_reuse_ = std::move(pairs);
+  void SetL0PhaseReuse(std::vector<L0PhaseReusePair> pairs) {
+    l0_phase_reuse_ = std::move(pairs);
   }
 
   void SetMemoryLimit(const std::string &scope, int64_t bytes) {
@@ -255,8 +255,8 @@ private:
       // Disjoint owners are scheduled independently but share one physical
       // storage ring, so keep enough versions for every owner. Automatic
       // dav-2201 L0 queries reserve other root allocations and carry this
-      // existing count as a hard lower bound before selecting again. Other
-      // scopes and manual schedules retain their existing per-owner policy.
+      // existing count as a hard lower bound before selecting again. Selected
+      // phase contracts also require this reservation in manual ancestors.
       num_versions = std::max((*existing).second, num_versions);
     }
     for (const Var &member : storage_groups_.Members(storage))
@@ -266,7 +266,7 @@ private:
   bool prefer_handoff_issue_{false};
   bool prefer_prefetch_issue_{false};
   bool reserve_l0_storage_{false};
-  std::vector<L0ABPhaseReusePair> l0ab_phase_reuse_;
+  std::vector<L0PhaseReusePair> l0_phase_reuse_;
   L0StorageGroups storage_groups_;
   ffi::Map<Var, PrimExpr> storage_slot_bytes_;
   CompilerWorkspaceStorageSet compiler_workspaces_;
@@ -1038,7 +1038,14 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
   auto get_buffer_size = [&](const Buffer &buffer) {
     return get_storage_size(buffer->data);
   };
-  const bool reserve_l0 = reserve_l0_storage_ && !manual_schedule;
+  // A selected phase pair commits the kernel to one completion-proven shared
+  // bank. Every enclosing query must consume that same max-footprint contract,
+  // including manual ancestors of an automatically versioned child. Otherwise
+  // the ancestor either sums mutually exclusive allocations or loses the
+  // child's established physical ring count. Unselected manual kernels retain
+  // their existing per-query resource policy.
+  const bool reserve_l0 = reserve_l0_storage_ &&
+                          (!manual_schedule || !l0_phase_reuse_.empty());
   auto l0_scope = [](const Var &storage) -> std::string {
     const std::string scope = GetPtrStorageScope(storage);
     if (scope == "shared.l0a" || scope == "shared.l0a.dyn")
@@ -1147,7 +1154,7 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
       ICHECK_LE(bytes, std::numeric_limits<int64_t>::max() / versions);
       return bytes * versions;
     };
-    for (const L0ABPhaseReusePair &pair : l0ab_phase_reuse_) {
+    for (const L0PhaseReusePair &pair : l0_phase_reuse_) {
       auto first = storage_version_id.find(pair.first);
       auto second = storage_version_id.find(pair.second);
       const bool first_variable = first != storage_version_id.end();
@@ -1725,20 +1732,23 @@ static void ScheduleSingleKernel(const Stmt &kernel_body, Target target,
   unit_builder.SetStorageSlotBytes(StorageFootprintCollector::SlotBytes(
       metadata.kernel_root, metadata.manual_buffer_versions));
   const AscendTargetInfo &target_info = GetAscendTargetInfo(target);
-  std::vector<L0ABPhaseReusePair> phase_reuse;
+  std::vector<L0PhaseReusePair> phase_reuse;
   if (!tvm::transform::PassContext::Current()
            ->GetConfig<Bool>(kDisableSharedMemoryReuse, Bool(false))
-           .value())
+           .value()) {
     phase_reuse = AnalyzeL0ABPhaseReuse(*scheduled_tir, target_info);
-  if (!phase_reuse.empty()) {
-    ApplyL0ABPhaseReuseConflicts(phase_reuse, &metadata.root_conflict_hints);
-    Array<Array<Var>> pairs;
-    for (const L0ABPhaseReusePair &pair : phase_reuse)
-      pairs.push_back({pair.first, pair.second});
-    metadata.kernel_root.CopyOnWrite()->annotations.Set(kL0ABPhaseReusePairs,
-                                                        std::move(pairs));
+    auto c_reuse = AnalyzeL0CPhaseReuse(*scheduled_tir, target_info);
+    phase_reuse.insert(phase_reuse.end(), c_reuse.begin(), c_reuse.end());
   }
-  unit_builder.SetL0ABPhaseReuse(std::move(phase_reuse));
+  if (!phase_reuse.empty()) {
+    ApplyL0PhaseReuseConflicts(phase_reuse, &metadata.root_conflict_hints);
+    Array<Array<Var>> pairs;
+    for (const L0PhaseReusePair &pair : phase_reuse)
+      pairs.push_back({pair.first, pair.second});
+    metadata.kernel_root.CopyOnWrite()->annotations.Set(kL0PhaseReusePairs,
+                                                       std::move(pairs));
+  }
+  unit_builder.SetL0PhaseReuse(std::move(phase_reuse));
   unit_builder.SetPreferHandoffIssue(target_info.architecture ==
                                      AscendArchitecture::kDav2201);
   unit_builder.SetPreferPrefetchIssue(target_info.architecture ==

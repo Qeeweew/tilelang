@@ -26,6 +26,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
@@ -928,7 +929,9 @@ public:
         root_conflicts_(std::move(root_conflicts)),
         owner_results_(owner_results), owner_inputs_(owner_inputs),
         unit_streams_(unit_streams), unit_boundaries_(unit_boundaries),
-        site_registry_(domains) {
+        site_registry_(domains),
+        trace_c_lifetimes_(
+            runtime::detail::VerboseLoggingEnabled(__FILE__, 1)) {
     for (const MultiBufferInfo &info : multi_buffer_plan_.Infos()) {
       ICHECK(!info.owners.empty());
       std::vector<ControlNode *> owners;
@@ -955,6 +958,7 @@ public:
       nodes.push_back(child.get());
 
     site_registry_.Collect(nodes);
+    trace_c_sites_.clear();
     scope_closures_.clear();
     lifetime_orders_.clear();
     SyncAnalysisResult root_result = AnalyzeNodeList(nodes, /*loop=*/nullptr);
@@ -1026,6 +1030,60 @@ public:
   }
 
 private:
+  static std::string LifetimeNodeName(IRStructure *node) {
+    if (node == nullptr)
+      return "<root>";
+    std::ostringstream name;
+    if (node->IsControl()) {
+      name << "loop:" << static_cast<ControlNode *>(node)->control->loop_var;
+    } else {
+      auto *task = static_cast<TaskNode *>(node);
+      Stmt body = task->stmt;
+      while (const auto *attribute = body.as<AttrStmtNode>())
+        body = attribute->body;
+      const auto *evaluate = body.as<EvaluateNode>();
+      const auto *call = evaluate ? evaluate->value.as<CallNode>() : nullptr;
+      name << "task:";
+      if (call)
+        name << call->op;
+      else
+        name << body->GetTypeKey();
+    }
+    name << "[index=" << node->GetIndex() << ",stage=" << node->GetStage()
+         << "]";
+    return name.str();
+  }
+
+  bool TraceCStorage(const Var &storage) const {
+    if (!trace_c_lifetimes_)
+      return false;
+    std::string scope = GetPtrStorageScope(storage);
+    return scope == "shared.l0c" || scope == "shared.l0c.dyn";
+  }
+
+  void TraceLifetimeSite(const char *action, const Var &storage,
+                         size_t site_id) const {
+    if (!TraceCStorage(storage))
+      return;
+    trace_c_sites_.insert(site_id);
+    TraceLifetimeSiteFields(action, site_id);
+  }
+
+  void TraceLifetimeSiteFields(const char *action, size_t site_id) const {
+    const SyncInsertionSite &site = site_registry_.Sites()[site_id];
+    const EpochDomain &domain = site_registry_.Domain(site);
+    LOG(INFO) << "C-site action=" << action << " id=" << site_id
+              << " core=" << site.core << " pipe=" << site.pipe
+              << " domain=" << site.domain_id
+              << " owner=" << LifetimeNodeName(domain.owner)
+              << " counter=" << domain.IsCounter()
+              << " active=" << domain.active_guard
+              << " begin=" << site.at_beginning
+              << " path_begin=" << LifetimeNodeName(site.path_begin)
+              << " path_end=" << LifetimeNodeName(site.path_end)
+              << " guard=" << site.GetGuard();
+  }
+
   std::vector<size_t> ResolveLifetimeEndpoints(const Var &storage,
                                                TaskNode *task,
                                                bool at_beginning,
@@ -1049,6 +1107,9 @@ private:
     std::sort(endpoints.begin(), endpoints.end());
     endpoints.erase(std::unique(endpoints.begin(), endpoints.end()),
                     endpoints.end());
+    for (size_t endpoint : endpoints)
+      TraceLifetimeSite(at_beginning ? "resolve-begin" : "resolve-end",
+                        storage, endpoint);
     return endpoints;
   }
 
@@ -1059,11 +1120,14 @@ private:
         domains_.DomainForStorage(storage, control->GetParentControl());
     size_t parent_site =
         site_registry_.FindParentSiteInDomain(site_id, parent_domain_id);
+    TraceLifetimeSite("promote-source", storage, site_id);
+    TraceLifetimeSite("promote-parent", storage, parent_site);
     ICHECK_EQ(site_registry_.Sites()[parent_site].path_begin, control);
     if (!domains_.Domain(parent_domain_id).IsCounter()) {
       size_t lexical_site = site_registry_.FindParentSiteInDomain(
           site_id,
           domains_.UnconditionalLexicalDomain(control->GetParentControl()));
+      TraceLifetimeSite("promote-lexical", storage, lexical_site);
       if (IsUnconditionalControlBoundary(
               lexical_site, control,
               site_registry_.Sites()[site_id].at_beginning)) {
@@ -1073,6 +1137,7 @@ private:
         parent_site = lexical_site;
       }
     }
+    TraceLifetimeSite("promote-selected", storage, parent_site);
     return parent_site;
   }
 
@@ -1108,6 +1173,11 @@ private:
 
   std::optional<int64_t> MinimumDistance(ControlNode *scope, size_t src,
                                          size_t dst) const final {
+    if (trace_c_lifetimes_ && trace_c_sites_.count(src) &&
+        trace_c_sites_.count(dst)) {
+      TraceLifetimeSiteFields("minimum-source", src);
+      TraceLifetimeSiteFields("minimum-destination", dst);
+    }
     if (scope == nullptr)
       return SameIterationHappensBefore(scope, src, dst)
                  ? std::optional<int64_t>(0)
@@ -1536,6 +1606,180 @@ private:
     return lexical_domain;
   }
 
+  // Discharge a storage WAR, not a whole-loop completion relation. With a
+  // direct T-trip iteration owner, equal physical slots across parent
+  // iterations have delta = d*T + k_cons - k_prod > 0, divisible by W.
+  // Consequently delta >= W, and the retained child release protects each
+  // actual overwritten slot, including an odd T. Its last read need not
+  // complete before the next parent's first write (those slots may differ).
+  bool IsParentVersionedWarCovered(const DepInfo &dep,
+                                   const MultiBufferInfo &info,
+                                   TaskNode *reader, TaskNode *writer,
+                                   ControlNode *parent) const {
+    if (architecture_ != AscendArchitecture::kDav2201 || !parent ||
+        dep.kind != DependencyKind::kData || dep.distance != -1 ||
+        dep.cross_storage_conflict || info.UsesCounter() ||
+        info.num_versions <= 1 || info.owners.size() != 1 ||
+        reader->GetCoreMask() != kCoreCube ||
+        writer->GetCoreMask() != kCoreCube ||
+        reader->GetPipeMask() != PipeMask(ResourcePipe::kMTE1) ||
+        writer->GetPipeMask() != PipeMask(ResourcePipe::kMTE2))
+      return false;
+    ControlNode *child = info.owners.front().loop;
+    auto finite_loop = [](ControlNode *loop) {
+      const ForNode *node = loop->control.get();
+      const auto *extent = node->extent.as<IntImmNode>();
+      PrimExpr step = node->step.has_value() ? node->step.value()
+                                             : IntImm(node->extent.dtype(), 1);
+      return loop->GetStage() == 0 && loop->GetGuards().empty() &&
+             !loop->BodyHasLoopBreak() && node->kind == ForKind::kSerial &&
+             is_zero(node->min) && is_one(step) && extent && extent->value > 0;
+    };
+    if (child->GetParentControl() != parent || dep.prod_node != child ||
+        dep.cons_node != child || reader->GetParent() != child ||
+        writer->GetParent() != child || !finite_loop(parent) ||
+        !finite_loop(child) ||
+        child->control->extent.as<IntImmNode>()->value < info.num_versions ||
+        !reader->GetGuards().empty() || !writer->GetGuards().empty())
+      return false;
+
+    auto uses_storage = [&](const ObjectRef &expression) {
+      bool found = false;
+      PostOrderVisit(expression, [&](const ObjectRef &node) {
+        if (const auto *load = node.as<BufferLoadNode>())
+          found |= load->buffer->data.same_as(info.storage);
+        if (const auto *store = node.as<BufferStoreNode>())
+          found |= store->buffer->data.same_as(info.storage);
+        if (const auto *var = node.as<VarNode>())
+          found |= var == info.storage.get();
+      });
+      return found;
+    };
+    auto storage_region = [&](TaskNode *task,
+                              bool writing) -> Optional<BufferRegion> {
+      Stmt body = task->stmt;
+      while (const auto *attribute = body.as<AttrStmtNode>())
+        body = attribute->body;
+      const auto *evaluate = body.as<EvaluateNode>();
+      const auto *call = evaluate ? evaluate->value.as<CallNode>() : nullptr;
+      if (!call || !(call->op.same_as(AscendCopy::Get()) ||
+                     call->op.same_as(Copy::Get()) ||
+                     (!writing && call->op.same_as(AscendCubeLoad3D::Get()))))
+        return std::nullopt;
+      // Typed regions declare the only storage accesses. A scalar load or
+      // data-pointer escape in an index, hint, or other argument is additional
+      // work even if its region hull happens to merge into the full tile.
+      for (const PrimExpr &argument : call->args) {
+        const auto *region_call = argument.as<CallNode>();
+        if (region_call && region_call->op.same_as(region())) {
+          BufferRegion bounds =
+              NormalizeToBufferRegion(GetRef<Call>(region_call));
+          for (const Range &range : bounds->region)
+            if (uses_storage(range->min) || uses_storage(range->extent))
+              return std::nullopt;
+        } else if (uses_storage(argument)) {
+          return std::nullopt;
+        }
+      }
+      for (const auto &[key, value] : call->annotations) {
+        auto expression = value.as<PrimExpr>();
+        if (!expression || uses_storage(*expression))
+          return std::nullopt;
+      }
+      TileOperator operation = ParseOperator(GetRef<Call>(call));
+      BufferRegion source, destination;
+      if (const auto *copy = operation.as<CopyNode>()) {
+        source = BufferRegion(copy->src, copy->src_range);
+        destination = BufferRegion(copy->dst, copy->dst_range);
+      } else if (const auto *load = operation.as<AscendCubeLoad3DNode>()) {
+        source = load->src;
+        destination = load->dst;
+      } else {
+        return std::nullopt;
+      }
+      if (writing ? (source->buffer.scope() != "global" ||
+                     destination->buffer.scope() != "shared.l1")
+                  : (source->buffer.scope() != "shared.l1" ||
+                     (destination->buffer.scope() != "shared.l0a" &&
+                      destination->buffer.scope() != "shared.l0b")))
+        return std::nullopt;
+      BufferRegion result = writing ? destination : source;
+      if (!result->buffer->data.same_as(info.storage) ||
+          result->region.size() != result->buffer->shape.size())
+        return std::nullopt;
+      for (size_t axis = 0; axis < result->region.size(); ++axis)
+        if (!is_zero(result->region[axis]->min) ||
+            !ffi::StructuralEqual()(result->region[axis]->extent,
+                                    result->buffer->shape[axis]))
+          return std::nullopt;
+      return result;
+    };
+    auto read = storage_region(reader, false);
+    auto write = storage_region(writer, true);
+    if (!read || !write || !read.value()->buffer.same_as(write.value()->buffer))
+      return false;
+    std::function<bool(IRStructure *)> closed_accesses =
+        [&](IRStructure *node) {
+          if (node->GuardsTouchStorage(info.storage))
+            return false;
+          if (node->IsTask())
+            return node == reader || node == writer ||
+                   !uses_storage(static_cast<TaskNode *>(node)->stmt);
+          auto *control = static_cast<ControlNode *>(node);
+          if (uses_storage(control->control->min) ||
+              uses_storage(control->control->extent) ||
+              (control->control->step.has_value() &&
+               uses_storage(control->control->step.value())))
+            return false;
+          return std::all_of(control->children.begin(), control->children.end(),
+                             [&](const auto &nested) {
+                               return closed_accesses(nested.get());
+                             });
+        };
+    if (!closed_accesses(parent))
+      return false;
+
+    PrimExpr clock = MultiBufferIteration(info);
+    auto full_ring_point = [&](const SyncPoint &point, bool release) {
+      const auto &src = site_registry_.Src(point);
+      const auto &dst = site_registry_.Dst(point);
+      return point.flag_loop == child &&
+             point.dependency_kind == DependencyKind::kData &&
+             point.edge.strict && point.counter_group_id == 0 &&
+             !point.local_binary_plan && !point.single_iteration_binary_plan &&
+             point.unit_boundary == UnitFlagBoundaryRole::kNone &&
+             point.num_versions == info.num_versions &&
+             point.edge.distance == (release ? info.num_versions : 0) &&
+             ffi::StructuralEqual()(point.flag_iteration, clock) &&
+             src.path_end == (release ? reader : writer) &&
+             dst.path_end == (release ? writer : reader) &&
+             src.path_begin == src.path_end && dst.path_begin == dst.path_end &&
+             src.core == kCoreCube && dst.core == kCoreCube &&
+             src.pipe == (release ? "MTE1" : "MTE2") &&
+             dst.pipe == (release ? "MTE2" : "MTE1") &&
+             is_one(src.GetGuard()) && is_one(dst.GetGuard()) &&
+             !site_registry_.Domain(src).IsCounter() &&
+             !site_registry_.Domain(dst).IsCounter() &&
+             is_one(site_registry_.Domain(src).active_guard) &&
+             is_one(site_registry_.Domain(dst).active_guard);
+    };
+    auto closure = scope_closures_.find(child);
+    if (closure == scope_closures_.end())
+      return false;
+    bool ready = false, released = false;
+    // These points were appended only after child optimization and ordinary
+    // binary validation. Both real protocols (including root seed/drain)
+    // remain emitted; no parent completion edge is manufactured here.
+    for (const SyncPoint &point : sync_points_) {
+      ready |= full_ring_point(point, false);
+      if (full_ring_point(point, true) &&
+          MinCompletionDistance(closure->second, point.edge.dst,
+                                point.edge.src) == 0)
+        released = true;
+    }
+    return ready && released;
+  }
+
   std::vector<SyncPoint>
   CollectSyncPoints(const std::vector<IRStructure *> &nodes,
                     ControlNode *loop) {
@@ -1664,8 +1908,22 @@ private:
                                             counter_owner->loop));
       }
       for (const auto &[producer, consumer] : dep.task_pairs) {
+        if (info != nullptr &&
+            IsParentVersionedWarCovered(dep, *info, producer, consumer, loop))
+          continue;
+        // A forced conflict between distinct storages requests ordering in
+        // this scope. Its phase envelope also spans inactive epochs.
+        // Emit a real boundary protocol in the lexical clock rather than an
+        // active-only task protocol that cannot retire the previous FIX at
+        // the next phase entry. Storage-free SPR dependencies retain their
+        // ordinary shared activation domain.
+        bool scope_conflict =
+            architecture_ == AscendArchitecture::kDav2201 && loop != nullptr &&
+            dep.cross_storage_conflict;
         int pair_domain_id =
-            dependency_domain_id.has_value()
+            scope_conflict
+                ? domains_.UnconditionalLexicalDomain(loop)
+            : dependency_domain_id.has_value()
                 ? dependency_domain_id.value()
                 : FindSharedDependencyDomain(producer, consumer, loop);
         std::string producer_pipe =
@@ -2707,6 +2965,8 @@ private:
   const std::vector<UnitFlagStreamPlan> *unit_streams_;
   const std::vector<UnitFlagBoundary> *unit_boundaries_;
   SyncSiteRegistry site_registry_;
+  const bool trace_c_lifetimes_;
+  mutable std::unordered_set<size_t> trace_c_sites_;
   std::vector<SyncPoint> sync_points_;
   std::set<std::pair<size_t, size_t>> reusable_pairs_;
   DependencyCache dependency_cache_;
@@ -4097,7 +4357,7 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
     owner_results.clear();
   }
   if (auto selected = scheduled_tir.metadata.kernel_root->annotations.Get(
-          kL0ABPhaseReusePairs)) {
+          kL0PhaseReusePairs)) {
     for (const Array<Var> &pair : selected.value().cast<Array<Array<Var>>>()) {
       ICHECK_EQ(pair.size(), 2u);
       bool proven =
@@ -4118,7 +4378,7 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
           << "; max-budget scheduling cannot deploy independent allocations";
     }
     scheduled_tir.metadata.kernel_root.CopyOnWrite()->annotations.erase(
-        kL0ABPhaseReusePairs);
+        kL0PhaseReusePairs);
   }
   scheduled_tir.metadata.root_conflict_hints = {};
   scheduled_tir.metadata.buffer_aliases = analyzer->BufferAliases();

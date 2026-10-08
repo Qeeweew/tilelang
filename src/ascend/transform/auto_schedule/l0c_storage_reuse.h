@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "./multi_buffer.h"
+#include "./l0ab_phase_reuse.h"
 #include "./scheduled_tir.h"
 #include "ascend/layout/ascend_layouts.h"
 #include "ascend/op/copy.h"
@@ -506,6 +507,205 @@ inline SBlock TryCoalesceL0CStorage(const ScheduledTIR &scheduled,
     versions.Set(storage, 1);
   result.CopyOnWrite()->annotations.Set(kBufferVersionsMap, versions);
   return result;
+}
+
+namespace l0c_phase_reuse_detail {
+
+using namespace l0ab_phase_reuse_detail;
+
+inline bool CanonicalC(const Buffer &buffer, const LayoutMap &layouts,
+                       int64_t capacity) {
+  if (buffer->dtype != DataType::Float(32) || buffer->shape.size() != 2 ||
+      !buffer->strides.empty() || !buffer->axis_separators.empty() ||
+      Constant(buffer->elem_offset) != 0)
+    return false;
+  auto rows = Constant(buffer->shape[0]), cols = Constant(buffer->shape[1]);
+  if (!rows || !cols || *rows <= 0 || *cols <= 0 || *rows % 16 || *cols % 16 ||
+      *rows > capacity / 4 / *cols)
+    return false;
+  auto layout = layouts.Get(buffer);
+  return layout && layout.value()->IsEqual(MakeAscendL0CLayout(buffer).get());
+}
+
+// One full-clear native K chain followed by one full FIX per result. This is
+// initialization/region admission, not a native-unit or asynchronous completion
+// proof. InsertSync must still establish all cross-phase completion edges.
+inline bool CompleteResult(TaskNode *mad, TaskNode *fix) {
+  ControlNode *result = ParentControl(fix);
+  if (!result || !mad->IsWithin(result) || mad->HasGuards() || fix->HasGuards())
+    return false;
+  IRStructure *producer = mad->GetChildOnPathFrom(result);
+  if (producer->GetIndex() >= fix->GetIndex())
+    return false;
+  Map<Var, PrimExpr> first_k;
+  for (ControlNode *loop = ParentControl(mad); loop != result;
+       loop = loop->GetParentControl()) {
+    if (!loop || loop->HasGuards() || !PositiveStaticLoop(loop))
+      return false;
+    first_k.Set(loop->control->loop_var, loop->control->min);
+  }
+  auto operation = Operation(mad);
+  if (!operation)
+    return false;
+  Gemm gemm((*operation)->args, (*operation)->annotations);
+  return arith::Analyzer().CanProve(Substitute(gemm->clearAccum_, first_k));
+}
+
+inline bool NativeCWriter(const TaskNode *task, const Buffer &buffer,
+                          const Call &call) {
+  if (!call->op.same_as(Gemm::Get()) ||
+      !task->UsesOnlyPipe(ResourcePipe::kCube) ||
+      !DefaultAnnotations(call->annotations))
+    return false;
+  Gemm gemm(call->args, call->annotations);
+  if (!IsL0ABuffer(gemm->a_) || !IsL0BBuffer(gemm->b_) ||
+      !gemm->c_.same_as(buffer) ||
+      (gemm->a_->dtype != DataType::Float(16) &&
+       !gemm->a_->dtype.is_bfloat16()) ||
+      gemm->a_->dtype != gemm->b_->dtype || gemm->transA_ ||
+      gemm->mbar_.defined() || gemm->wgWait_ != 0 || gemm->isWgmma_ ||
+      gemm->isTcgen05_ || gemm->kPack_ != 1 ||
+      !FullAllocation(buffer, gemm->cRegion_->region))
+    return false;
+  const auto &a = gemm->aRegion_->region;
+  const auto &b = gemm->bRegion_->region;
+  if (a.size() < 2 || b.size() < 2)
+    return false;
+  auto m = Constant(buffer->shape[0]), n = Constant(buffer->shape[1]);
+  auto k = Constant(a.back()->extent);
+  return k && *k > 0 && *k % 16 == 0 &&
+         Constant(a[a.size() - 2]->extent) == m &&
+         Constant(b[gemm->transB_ ? b.size() - 2 : b.size() - 1]->extent) == n &&
+         Constant(b[gemm->transB_ ? b.size() - 1 : b.size() - 2]->extent) == k;
+}
+
+inline bool OrdinaryFixAnnotations(const Map<String, ObjectRef> &annotations) {
+  for (const auto &[key, value] : annotations) {
+    auto expression = value.as<PrimExpr>();
+    if (!expression ||
+        !((key == "unit_flag_ctrl" && Constant(expression.value()) == 0) ||
+          (key == kRootFixpipeConfig && Constant(expression.value()) == 1)))
+      return false;
+  }
+  return true;
+}
+
+} // namespace l0c_phase_reuse_detail
+
+// Independent canonical C geometries keep their original Buffer, data and
+// layout identities. Only late byte allocation may co-locate them after real
+// FIX/MAD completion has been proved. The older same-M repair above remains
+// a separate, unchanged early shared-data route for unannotated lifetimes.
+inline std::vector<L0PhaseReusePair>
+AnalyzeL0CPhaseReuse(const ScheduledTIR &scheduled,
+                     const AscendTargetInfo &target) {
+  using namespace l0c_phase_reuse_detail;
+  std::vector<L0PhaseReusePair> plans;
+  const auto &metadata = scheduled.metadata;
+  if (target.architecture != AscendArchitecture::kDav2201 ||
+      metadata.has_buffer_aliases || !metadata.root_conflict_hints.empty() ||
+      metadata.kernel_root->annotations.count(kL0PhaseReusePairs) ||
+      std::find(metadata.unlimit_memory_scopes.begin(),
+                metadata.unlimit_memory_scopes.end(), String("shared.l0c")) !=
+          metadata.unlimit_memory_scopes.end())
+    return plans;
+  StorageMap<Buffer> buffers;
+  for (const Buffer &buffer : metadata.kernel_root->alloc_buffers)
+    if (StorageScope(buffer->data) == "shared.l0c" &&
+        !buffers.emplace(buffer->data, buffer).second)
+      return plans;
+  if (buffers.size() != 2)
+    return plans;
+  KernelAudit audit(buffers);
+  audit(metadata.kernel_root);
+  if (audit.unsafe_metadata)
+    return plans;
+  std::vector<Buffer> members;
+  for (const Buffer &buffer : metadata.kernel_root->alloc_buffers)
+    if (buffers.count(buffer->data))
+      members.push_back(buffer);
+  if (GetPtrStorageScope(members[0]->data) !=
+      GetPtrStorageScope(members[1]->data))
+    return plans;
+  std::vector<ControlNode *> controls;
+  CollectControls(scheduled.tree, &controls);
+  for (const Buffer &buffer : members) {
+    auto version = metadata.buffer_versions.Get(buffer->data);
+    if (!version || version.value() != 1 ||
+        metadata.manual_buffer_versions.count(buffer->data) ||
+        metadata.buffer_version_modes.count(buffer->data) ||
+        audit.allocations[buffer->data] != 1 ||
+        audit.invalid.count(buffer->data) ||
+        !CanonicalC(buffer, audit.layouts, target.l0c_bytes))
+      return plans;
+    if (auto padding = metadata.kernel_root->annotations.Get(attr::kSafeValueMap))
+      if (padding.value().cast<Map<Var, PrimExpr>>().count(buffer->data))
+        return plans;
+    for (ControlNode *control : controls)
+      if (control->IsMultiBufferEligible(buffer->data))
+        return plans;
+  }
+  std::vector<TaskNode *> tasks;
+  CollectAllTaskNodes(scheduled.tree, tasks);
+  ControlNode *epoch = nullptr;
+  IRStructure *phases[2] = {nullptr, nullptr};
+  for (size_t index = 0; index < 2; ++index) {
+    const Buffer &buffer = members[index];
+    TaskNode *mad = nullptr, *fix = nullptr;
+    for (TaskNode *task : tasks) {
+      bool reads = false, writes = false;
+      for (const BufferRegion &region : task->GetReadRegions())
+        if (region->buffer->data.same_as(buffer->data)) {
+          if (!region->buffer.same_as(buffer))
+            return {};
+          reads = true;
+        }
+      for (const BufferRegion &region : task->GetWriteRegions())
+        if (region->buffer->data.same_as(buffer->data)) {
+          if (!region->buffer.same_as(buffer))
+            return {};
+          writes = true;
+        }
+      if (!reads && !writes)
+        continue;
+      auto operation = Operation(task);
+      if (!operation || !StableGuards(task, task) ||
+          !LocateClosedPhase(task, &epoch, &phases[index]))
+        return {};
+      const Call &call = *operation;
+      if (writes) {
+        if (mad || !NativeCWriter(task, buffer, call))
+          return {};
+        mad = task;
+      } else {
+        if (fix || !reads || !IsAscendCopyCall(call.get()) ||
+            !OrdinaryFixAnnotations(call->annotations) ||
+            !task->UsesOnlyPipe(ResourcePipe::kFixpipe))
+          return {};
+        AscendCopy copy(call->args, call->annotations);
+        if (!copy->src.same_as(buffer) || !IsGlobalBuffer(copy->dst) ||
+            copy->src->dtype != copy->dst->dtype ||
+            copy->dual_dst_ctl || copy->transpose || copy->data_select ||
+            (copy->sub_blockid.defined() &&
+             Constant(copy->sub_blockid) != 0) || copy->dst_block.has_value() ||
+            copy->pad_value.has_value() || copy->src_oob_safe_value.has_value() ||
+            !FullAllocation(buffer, copy->src_range))
+          return {};
+        fix = task;
+      }
+    }
+    if (!mad || !fix || !CompleteResult(mad, fix))
+      return {};
+  }
+  if (!epoch || !phases[0] || !phases[1] || phases[0] == phases[1])
+    return plans;
+  if (phases[0]->GetIndex() < phases[1]->GetIndex())
+    plans.push_back({members[0]->data, members[1]->data, "shared.l0c", epoch,
+                     phases[0], phases[1]});
+  else
+    plans.push_back({members[1]->data, members[0]->data, "shared.l0c", epoch,
+                     phases[1], phases[0]});
+  return plans;
 }
 
 } // namespace ascend

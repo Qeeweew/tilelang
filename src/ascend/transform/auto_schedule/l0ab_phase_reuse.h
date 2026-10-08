@@ -40,15 +40,16 @@
 namespace tvm::tl::ascend {
 
 // Root Array<Array<Var>>, with two storage Vars per selected reuse pair.
-// InsertSync consumes it only after proving the corresponding positive alias.
-constexpr const char *kL0ABPhaseReusePairs = "tl.ascend_l0ab_phase_reuse_pairs";
+// Operand and accumulator phases share one max-budget/final-alias contract,
+// without sharing logical layouts or version clocks.
+constexpr const char *kL0PhaseReusePairs = "tl.ascend_l0_phase_reuse_pairs";
 
 // An early address-reuse choice, not an alias proof or a shared version clock.
 // Keep both logical allocations/layouts through native lowering. InsertSync
 // must prove HasBufferAlias(first, second) before the max-budget choice can be
 // used by the late allocator. Exactly two allocations in this scope make that
 // positive proof sufficient for the existing clique packer to co-locate them.
-struct L0ABPhaseReusePair {
+struct L0PhaseReusePair {
   Var first, second;
   std::string scope;
   ControlNode *epoch{nullptr};
@@ -78,6 +79,15 @@ inline std::string Scope(const Var &storage) {
   if (scope == "shared.l0b" || scope == "shared.l0b.dyn")
     return "shared.l0b";
   return "";
+}
+
+inline std::string StorageScope(const Var &storage) {
+  std::string scope = Scope(storage);
+  if (!scope.empty())
+    return scope;
+  scope = GetPtrStorageScope(storage);
+  return scope == "shared.l0c" || scope == "shared.l0c.dyn" ? "shared.l0c"
+                                                          : "";
 }
 
 inline bool StageZero(const IRStructure *node) {
@@ -213,7 +223,10 @@ inline std::optional<Call> Operation(const TaskNode *task) {
 class KernelAudit : public StmtExprVisitor {
 public:
   explicit KernelAudit(StorageMap<Buffer> buffers)
-      : buffers_(std::move(buffers)) {}
+      : buffers_(std::move(buffers)) {
+    for (const auto &[storage, _] : buffers_)
+      scopes_.insert(StorageScope(storage));
+  }
   StorageMap<int> allocations;
   StorageSet invalid;
   LayoutMap layouts;
@@ -236,7 +249,7 @@ private:
     StmtExprVisitor::VisitStmt_(op);
   }
   void VisitBufferDef(const Buffer &buffer, bool alloc_data) final {
-    if (alloc_data && !Scope(buffer->data).empty() &&
+    if (alloc_data && scopes_.count(StorageScope(buffer->data)) &&
         !buffers_.count(buffer->data))
       unsafe_metadata = true;
     if (alloc_data && buffers_.count(buffer->data))
@@ -317,7 +330,7 @@ private:
       if (buffers_.count(load->buffer->data) &&
           !load->buffer.same_as(buffers_.at(load->buffer->data)))
         invalid.insert(load->buffer->data);
-      if (!Scope(load->buffer->data).empty() &&
+      if (scopes_.count(StorageScope(load->buffer->data)) &&
           !buffers_.count(load->buffer->data))
         unsafe_metadata = true;
       for (const PrimExpr &index : load->indices)
@@ -330,6 +343,7 @@ private:
         VisitExpr(expression.value());
   }
   StorageMap<Buffer> buffers_;
+  std::unordered_set<std::string> scopes_;
 };
 
 inline bool CanonicalAllocation(const Buffer &buffer, const LayoutMap &layouts,
@@ -429,19 +443,46 @@ CollectControls(const std::vector<std::shared_ptr<IRStructure>> &nodes,
     }
 }
 
+// Locate the existing lexical phase without changing any of its activation
+// predicates. Completion and final address reuse remain downstream proofs.
+inline bool LocateClosedPhase(TaskNode *task, ControlNode **epoch,
+                              IRStructure **phase) {
+  ControlNode *outer = ParentControl(task);
+  if (!outer)
+    return false;
+  outer = outer->GetOutermostControl();
+  if (!ClosedEpoch(outer) || (*epoch && *epoch != outer))
+    return false;
+  IRStructure *child = task->GetChildOnPathFrom(outer);
+  if (!child->IsControl() || !StageZero(child) || (*phase && *phase != child))
+    return false;
+  auto *phase_loop = static_cast<ControlNode *>(child);
+  if (!PositiveStaticLoop(phase_loop) ||
+      !StableGuards(phase_loop, phase_loop->task.get()))
+    return false;
+  for (ControlNode *parent = ParentControl(task); parent != outer;
+       parent = parent->GetParentControl())
+    if (!parent || !PositiveStaticLoop(parent) ||
+        !StableGuards(parent, parent->task.get()))
+      return false;
+  *epoch = outer;
+  *phase = child;
+  return true;
+}
+
 } // namespace l0ab_phase_reuse_detail
 
 // Called before ScheduleBuilder mutates stages/versions. This only chooses
 // disjoint lexical phases: no benchmark/kernel names or source pointer tricks.
-inline std::vector<L0ABPhaseReusePair>
+inline std::vector<L0PhaseReusePair>
 AnalyzeL0ABPhaseReuse(const ScheduledTIR &scheduled,
                       const AscendTargetInfo &target) {
   using namespace l0ab_phase_reuse_detail;
-  std::vector<L0ABPhaseReusePair> plans;
+  std::vector<L0PhaseReusePair> plans;
   const auto &metadata = scheduled.metadata;
   if (target.architecture != AscendArchitecture::kDav2201 ||
       metadata.has_buffer_aliases || !metadata.root_conflict_hints.empty() ||
-      metadata.kernel_root->annotations.count(kL0ABPhaseReusePairs))
+      metadata.kernel_root->annotations.count(kL0PhaseReusePairs))
     return plans;
   StorageMap<Buffer> buffers;
   std::unordered_map<std::string, std::vector<Buffer>> scopes;
@@ -512,39 +553,7 @@ AnalyzeL0ABPhaseReuse(const ScheduledTIR &scheduled,
           valid = false;
           break;
         }
-        ControlNode *outer = ParentControl(task);
-        if (!outer) {
-          valid = false;
-          break;
-        }
-        outer = outer->GetOutermostControl();
-        if (!ClosedEpoch(outer) || (epoch && epoch != outer)) {
-          valid = false;
-          break;
-        }
-        epoch = outer;
-        IRStructure *phase = task->GetChildOnPathFrom(epoch);
-        if (!phase->IsControl() || !StageZero(phase) ||
-            (phases[index] && phases[index] != phase)) {
-          valid = false;
-          break;
-        }
-        auto *phase_loop = static_cast<ControlNode *>(phase);
-        if (!PositiveStaticLoop(phase_loop) ||
-            !StableGuards(phase_loop, phase_loop->task.get())) {
-          valid = false;
-          break;
-        }
-        // Every enclosing domain is finite and statically nonempty. Descendant
-        // pipelines may offset their own native load/MAD tasks normally.
-        for (ControlNode *parent = ParentControl(task); parent != epoch;
-             parent = parent->GetParentControl())
-          if (!parent || !PositiveStaticLoop(parent) ||
-              !StableGuards(parent, parent->task.get())) {
-            valid = false;
-            break;
-          }
-        phases[index] = phase;
+        valid &= LocateClosedPhase(task, &epoch, &phases[index]);
       }
       valid &= has_read && has_write;
     }
@@ -564,9 +573,9 @@ AnalyzeL0ABPhaseReuse(const ScheduledTIR &scheduled,
 // Their unconditional lexical sites surround the phase Control nodes, so
 // inactive data phases still participate in the finite boundary protocol.
 inline void
-ApplyL0ABPhaseReuseConflicts(const std::vector<L0ABPhaseReusePair> &plans,
-                             ConflictHintList *root_conflicts) {
-  for (const L0ABPhaseReusePair &plan : plans) {
+ApplyL0PhaseReuseConflicts(const std::vector<L0PhaseReusePair> &plans,
+                           ConflictHintList *root_conflicts) {
+  for (const L0PhaseReusePair &plan : plans) {
     Array<ffi::Any> hint{plan.first, plan.second, Integer(-1), Bool(true)};
     auto *control = plan.epoch->control.CopyOnWrite();
     ConflictHintList hints;

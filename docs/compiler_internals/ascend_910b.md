@@ -407,9 +407,14 @@ and deeper scheduled controls when the typed MAD chain, complete C
 definition/export and unit boundaries remain valid. The result and its direct
 child controls remain unshifted. Each deeper control's incoming stage is
 validated against its direct parent's consumed stage bound and offset policy;
-its own bound only governs its children. Any shifted control or MAD requires
-one logical MAD task chain. Existing recursive schedule lowering supplies
-fill, drain and logical clear/final predicates, including an outer cache
+its own bound only governs its children. Typed MTE1/MTE2 inputs may also
+receive a positive stage inside that validated static nest, provided their
+own condition cannot skip a producer occurrence. Zero-stage guarded inputs
+retain their existing contract. Any shifted task or control, including a
+sibling input subtree, requires one logical MAD task chain. Direct result
+children and the complete FIX export remain at stage zero.
+Existing recursive schedule lowering supplies fill, drain and logical
+clear/final predicates, including an outer cache
 prefetch and an inner native-K shift together. A local ready event in a
 single-iteration child still needs a lifetime proof across repeated parent
 activations: synchronization
@@ -440,12 +445,56 @@ manual physical rings, and a common eligible owner for both allocations retain
 the conservative reservation. Disabling shared-memory reuse also disables this
 selection.
 
+Two independent canonical FP32 L0C allocations can use the same phase
+contract when both request one fixed version. Each result must start with a
+full-clear native MAD chain and end with a full C-to-GM FIX export. Admission
+requires exactly two root C allocations, no views, opaque accesses, manual
+rings or additional C users, and distinct closed phases in one static epoch.
+Their individual physical footprints must fit L0C. The scheduler reserves
+their maximum footprint; synchronization must then prove both alias
+directions before the late byte allocator can share their base address.
+Every query consumes this selected physical reservation, including a manual
+ancestor of an automatically pipelined child; established ring counts remain
+hard lower bounds.
+
+A finite K accumulation is one result lifetime. Its first logical iteration
+must clear the full physical C region. The lifetime includes every subsequent
+accumulation and the final FIX read, and retains both MAD and FIX completion
+endpoints. A dynamic clear remains a possible C read in physical effect
+analysis; proving the first-iteration definition does not erase later reads.
+Native unit readiness does not establish whole-MAD or whole-FIX completion.
+A direct full-clear native MAD followed by its unique full GM export has the
+same closed lifetime without a descendant K loop. Its clear predicate must
+prove true without substituting result or owner coordinates. Both actual
+completion endpoints remain required when checking later physical reuse.
+Guarded, partial, escaping or multiversioned accumulations retain conservative
+lifetime analysis.
+
+Each Buffer keeps its own canonical shape and M pitch through native MAD and
+FIX lowering. Different M pitches cannot be implemented by reinterpreting a
+prefix of the larger Buffer. The older same-M early storage coalescing path
+retains its separate eligibility rules.
+
 The selected pair adds the existing cross-storage conflict contract at its
 common epoch. Ordinary dependency and completion analysis therefore retires
-every prior MAD reader before the other phase's MTE1 overwrite, including the
-next-epoch boundary. The enclosing lexical synchronization remains balanced
-when a phase has no active data work. Internal pipeline loads and MADs still
-use their own slot clocks and dependencies.
+every prior MAD reader before the other phase's MTE1 overwrite, and every
+prior FIX reader before the other phase's C write, including the next-epoch
+boundary. A dependency retains whether it came from an explicit conflict
+between different storages. On 2201 that scope-wide conflict uses the
+unconditional lexical epoch domain, so the emitted event covers the same
+physical phase envelope as the lifetime proof. Guarded buffer dependencies
+and invariant SPR dependencies keep their own domain selection. The enclosing
+lexical synchronization remains balanced when a phase has no active data work.
+Internal pipeline loads and MADs still use their own slot clocks and dependencies.
+
+A retained child ring can cover a direct parent's WAR for that same storage.
+The prepared version clock and physical materialization use the same complete
+ancestor iteration count, so an odd child trip count does not reset the slot.
+This requires a unique iteration owner, static unguarded positive loops,
+full typed GM-to-L1 and L1-to-L0 accesses, and the actual retained RAW and
+full-ring release protocols. Other accesses, counters and unsupported domains
+retain the parent obligation. This coverage removes only the redundant storage
+WAR; it adds no whole-loop completion edge and cannot prove C phase reuse.
 
 A persistent 2201 local binary handshake in a static positive child loop can
 also cover its parent's exact last-to-first boundary. The synchronization
@@ -483,7 +532,7 @@ the control's extent alone supplies no alias proof.
 The resource query charges the maximum of both complete versioned physical
 sizes. A query with one variable member constrains that member normally and
 checks its fixed mate independently; two variable members are outside this
-selection. The internal root marker `tl.ascend_l0ab_phase_reuse_pairs` carries
+selection. The internal root marker `tl.ascend_l0_phase_reuse_pairs` carries
 the chosen pair to InsertSync, which requires a symmetric alias proof from its
 final completion graph before consuming the marker. Missing proof is a
 selected-contract error: it cannot silently deploy the independently allocated
