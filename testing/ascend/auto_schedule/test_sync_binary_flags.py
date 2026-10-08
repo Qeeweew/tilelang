@@ -96,6 +96,13 @@ def _completion_trace(mod, parameters=None, *, scalar_vector=False):
             else:
                 assert scalar_vector and statement.buffer.scope() == "shared.dyn"
                 result.append(_Completion("S", "mask_write", slot=slot(statement.buffer[tuple(statement.indices)])))
+        elif scalar_vector and isinstance(statement, tirx.Bind):
+            def scalar_read(node):
+                if isinstance(node, tirx.BufferLoad):
+                    assert node.buffer.scope() == "shared.dyn"
+                    result.append(_Completion("S", "scalar_read", slot=slot(node)))
+
+            tirx.stmt_functor.post_order_visit(statement.value, scalar_read)
         elif isinstance(statement, tirx.Evaluate):
             call = statement.value
             if isinstance(call, tirx.IntImm):
@@ -114,6 +121,8 @@ def _completion_trace(mod, parameters=None, *, scalar_vector=False):
                 result.append(_Completion(str(call.args[0].value).removeprefix("PIPE_"), "barrier"))
             elif scalar_vector and name == "tl.ascend_membase.select_bits":
                 result.append(_Completion("V", "mask_read", slot=slot(call.args[3].args[0])))
+            elif scalar_vector and name == "tl.ascend_membase.duplicate":
+                result.append(_Completion("V", "vector_write", slot=slot(call.args[0].args[0])))
             else:
                 assert name == "tl.tileop.ascend_copy", f"Unexpected instruction in DMA fixture: {name}"
                 source, destination = (argument.args[0] for argument in call.args)
@@ -151,7 +160,8 @@ def _prove_binary_protocol(trace):
             if node.kind in ("wait", "barrier"):
                 vector_admission.append(index)
         elif node.pipe in last_pipe:
-            # DMA completion FIFO and blocking Scalar admission.
+            # DMA completion FIFO and Scalar instruction order. Cross-pipe
+            # Scalar wait admission is a separate flag-lifetime graph below.
             successors[last_pipe[node.pipe]].add(index)
         last_pipe[node.pipe] = index
         if node.kind in ("set", "wait"):
@@ -162,21 +172,7 @@ def _prove_binary_protocol(trace):
         for notify, acquire in zip(sets[flag], waits[flag]):
             successors[notify].add(acquire)
 
-    indegrees = [0] * len(trace)
-    for outgoing in successors:
-        for destination in outgoing:
-            indegrees[destination] += 1
-    ready, visited = deque(index for index, count in enumerate(indegrees) if count == 0), 0
-    while ready:
-        source = ready.popleft()
-        visited += 1
-        for destination in successors[source]:
-            indegrees[destination] -= 1
-            if indegrees[destination] == 0:
-                ready.append(destination)
-    assert visited == len(trace), "Local waits deadlock the finite DMA completion graph"
-
-    def precedes(source, destination):
+    def reachable(graph, source, destination):
         frontier, seen = [source], set()
         while frontier:
             current = frontier.pop()
@@ -184,13 +180,40 @@ def _prove_binary_protocol(trace):
                 return True
             if current not in seen:
                 seen.add(current)
-                frontier.extend(successors[current] - seen)
+                frontier.extend(graph[current] - seen)
         return False
+
+    # A real destination-S wait consumes its bit before Scalar resumes
+    # dispatching subsequent asynchronous notifications. This proves flag
+    # lifetime only: it does not order two ordinary Vector data completions.
+    # In particular a V/MTE destination wait does not stall Scalar dispatch.
+    lifetime = [set(outgoing) for outgoing in successors]
+    scalar_wait = None
+    for index, node in enumerate(trace):
+        if scalar_wait is not None and node.kind == "set":
+            lifetime[scalar_wait].add(index)
+        if node.kind == "wait" and node.pipe == "S":
+            scalar_wait = index
+
+    for graph in (successors, lifetime):
+        indegrees = [0] * len(trace)
+        for outgoing in graph:
+            for destination in outgoing:
+                indegrees[destination] += 1
+        ready, visited = deque(index for index, count in enumerate(indegrees) if count == 0), 0
+        while ready:
+            source = ready.popleft()
+            visited += 1
+            for destination in graph[source]:
+                indegrees[destination] -= 1
+                if indegrees[destination] == 0:
+                    ready.append(destination)
+        assert visited == len(trace), "Local waits deadlock the finite DMA completion graph"
 
     for flag in sets:
         for consumed, reused in zip(waits[flag], sets[flag][1:]):
-            assert precedes(consumed, reused), f"Binary flag {flag} may be set again before its prior wait completes"
-    return precedes
+            assert reachable(lifetime, consumed, reused), f"Binary flag {flag} may be set again before its prior wait completes"
+    return lambda source, destination: reachable(successors, source, destination)
 
 
 def _prove_data_epochs(trace, precedes, expected):
@@ -447,6 +470,10 @@ def test_counter_mask_completion_gates_repeated_owner_and_every_reader(sid_value
         without_completion = [node for node in trace if node.flag is None or node.flag[0] != "V_S"]
         with pytest.raises(AssertionError, match="set again before its prior wait completes"):
             _prove_binary_protocol(without_completion)
+        without_ready = [node for node in trace if node.flag is None or node.flag[0] != "S_V"]
+        with pytest.raises(AssertionError, match="Mask read before Scalar write completion"):
+            _prove_mask_epochs(without_ready, _prove_binary_protocol(without_ready),
+                               activations, readers, expected_ticks=activations if versions > 1 else 0)
 
 
 @pytest.mark.parametrize("tick", ["add-two", "reset", "other-group", "wrong-core", "guard-mismatch", "shifted", "early"])
@@ -454,6 +481,124 @@ def test_counter_mask_completion_rejects_noncanonical_or_mismatched_tick(tick):
     before, _ = _counter_mask_program(tick=tick)
     snapshot = tvm.ir.save_json(before)
     with pytest.raises(tvm.error.InternalError, match="dav-2201 local binary flag: no reverse completion path for S->V"):
+        with tvm.transform.PassContext(config={"tl.disable_shared_memory_reuse": True}):
+            transform.InsertSync()(before)
+    assert tvm.ir.save_json(before) == snapshot
+
+
+def _scalar_wait_phases_program(*, rows=2, guarded=False, nested=False, read_placement="flat", root_pairs=3):
+    """Closed phases with distinct storage epochs and conservative root IDs.
+
+    Each Scalar read consumes three independent Vector writers through a
+    real notification. The root pairs run once and have no overwrite WAR;
+    their IDs stay outside the loop-phase certificate's admission set.
+    """
+    outer, sid = tirx.Var("phase_epoch", "int32"), tirx.Var("sid", "int32")
+    storage = [[tirx.decl_buffer((16,), "float32", name=f"phase{phase}_lane{lane}", scope="shared.dyn")
+                for lane in range(3)] for phase in range(2)]
+    phases = []
+    for phase, buffers in enumerate(storage):
+        row = tirx.Var(f"phase_row{phase}", "int32")
+        writers = [unit(tirx.Evaluate(tirx.Call("void", tvm.ir.Op.get("tl.ascend_membase.duplicate"), [
+            tirx.Call("handle", tvm.ir.Op.get("tl.access_ptr"), [buffer[0], 16, 2]),
+            tirx.const(phase + lane + 1, "float32"), tirx.IntImm("uint32", 16)])))
+            for lane, buffer in enumerate(buffers)]
+        read = unit(tirx.Bind(tirx.Var(f"scalar{phase}", "float32"),
+                              buffers[0][0] + buffers[1][0] + buffers[2][0]))
+        if read_placement != "flat":
+            scalar_row = tirx.Var(f"scalar_row{phase}", "int32")
+            count = 2 if read_placement == "first-leaf" else 1 - sid
+            read = unit(tirx.For(scalar_row, 0, count, tirx.ForKind.SERIAL, read), core=None)
+        owner_rows = rows if read_placement == "lifted-entry" else rows * (1 - sid)
+        owner = tirx.For(row, 0, owner_rows, tirx.ForKind.SERIAL, seq(*writers, read), annotations={
+            "multi_buffer_eligible": [buffer.data for buffer in buffers],
+            "tl.storage_epoch_guard_map": {buffer.data: tirx.const(True, "bool") for buffer in buffers},
+        })
+        phases.append(unit(owner, core=None, guard=outer % 3 != 1 if guarded else None))
+    body = unit(tirx.For(outer, 0, 17, tirx.ForKind.SERIAL, seq(*phases)), core=None)
+    if nested:
+        repeat = tirx.Var("phase_repeat", "int32")
+        body = unit(tirx.For(repeat, 0, 2, tirx.ForKind.SERIAL, body), core=None)
+    roots = [tirx.decl_buffer((16,), "float32", name=f"root{index}", scope="shared.dyn")
+             for index in range(root_pairs)]
+    prefix = []
+    for index, buffer in enumerate(roots):
+        prefix.extend([
+            unit(tirx.Evaluate(tirx.Call("void", tvm.ir.Op.get("tl.ascend_membase.duplicate"), [
+                tirx.Call("handle", tvm.ir.Op.get("tl.access_ptr"), [buffer[0], 16, 2]),
+                tirx.const(index + 1, "float32"), tirx.IntImm("uint32", 16)]))),
+            unit(tirx.Bind(tirx.Var(f"root_scalar{index}", "float32"), buffer[0])),
+        ])
+    body = seq(*prefix, body)
+    buffers = [buffer for phase in storage for buffer in phase]
+    mod = kernel(body, buffers=[*buffers, *roots], annotations={
+        "tl.buffer_versions_map": {buffer.data: 1 for buffer in buffers},
+    })
+    thread = tirx.IterVar(tvm.ir.Range(0, 2), sid, tirx.IterVar.ThreadIndex, "cthread")
+    mod["main"] = mod["main"].with_body(tirx.AttrStmt(thread, "thread_extent", 2, mod["main"].body))
+    mod["main"] = mod["main"].with_attr("target", tvm.target.Target({"kind": "ascend", "arch": "dav-2201"}))
+    return mod, sid, storage
+
+
+def _prove_scalar_read_epochs(trace, precedes, expected_reads, expected_writes):
+    latest_writes, previous_reads = {}, {}
+    reads = writes = 0
+    for index, node in enumerate(trace):
+        if node.kind == "vector_write":
+            writes += 1
+            if node.slot in previous_reads:
+                assert precedes(previous_reads[node.slot], index), "Vector overwrite before its Scalar reader completes"
+            latest_writes[node.slot] = index
+        elif node.kind == "scalar_read":
+            reads += 1
+            assert node.slot in latest_writes and precedes(latest_writes[node.slot], index), "Scalar read before Vector completion"
+            previous_reads[node.slot] = index
+    assert (reads, writes) == (expected_reads, expected_writes)
+
+
+@pytest.mark.parametrize("sid_value", [0, 1], ids=["active", "empty"])
+@pytest.mark.parametrize("guarded", [False, True], ids=["every-epoch", "activation-holes"])
+@pytest.mark.parametrize("read_placement", ["flat", "first-leaf", "lifted-entry"])
+def test_closed_scalar_wait_phases_share_across_storage_epochs_without_overlap(sid_value, guarded, read_placement):
+    # An unconditional lifted entry needs no outer V_S carry channels. Its
+    # two local channels therefore need seven one-shot root IDs to create
+    # the same nine-slot pressure as the other prepared layouts.
+    root_pairs = 7 if read_placement == "lifted-entry" and not guarded else 3
+    before, sid, storage = _scalar_wait_phases_program(
+        guarded=guarded, read_placement=read_placement, root_pairs=root_pairs)
+    snapshot = tvm.ir.save_json(before)
+    trace = _completion_trace(_lower_protocol(before, prepared=True), {sid: sid_value}, scalar_vector=True)
+    assert tvm.ir.save_json(before) == snapshot
+    precedes = _prove_binary_protocol(trace)
+    activations = sum(not guarded or outer % 3 != 1 for outer in range(17))
+    read_rows = 2 if read_placement == "first-leaf" else 1
+    _prove_scalar_read_epochs(trace, precedes,
+                              root_pairs + (6 * 2 * read_rows * activations if sid_value == 0 else 0),
+                              root_pairs + (6 * 2 * activations if sid_value == 0 or read_placement == "lifted-entry" else 0))
+    notifications = [node.flag for node in trace if node.kind == "set" and node.flag[0] == "V_S"]
+    assert len(set(notifications)) <= 8
+    if sid_value == 0:
+        local_flags = []
+        for buffers in storage:
+            first_read = next(index for index, node in enumerate(trace)
+                              if node.kind == "scalar_read" and node.slot[0].same_as(buffers[0].data))
+            local_flags.append(next(node.flag for node in reversed(trace[:first_read])
+                                    if node.kind == "wait" and node.flag[0] == "V_S"))
+        assert len(set(local_flags)) == 1, "Disjoint closed phases must reuse under V_S capacity pressure"
+    elif read_placement == "lifted-entry":
+        first_write = next(index for index, node in enumerate(trace)
+                           if node.kind == "vector_write" and
+                           any(node.slot[0].same_as(buffer.data) for buffers in storage for buffer in buffers))
+        for operation in ("set", "wait"):
+            assert any(node.kind == operation and node.flag[0] == "V_S"
+                       for node in trace[first_write:]), "Empty reader loop lost its real entry notification/wait"
+
+
+def test_closed_scalar_wait_phases_preserve_shifted_nested_carry_rejection():
+    before, _, _ = _scalar_wait_phases_program(guarded=True, nested=True)
+    snapshot = tvm.ir.save_json(before)
+    with pytest.raises(tvm.error.InternalError, match="(?s)dav-2201 local binary flag:.*"
+                       "shifted carried events require an unconditional outermost lexical loop"):
         with tvm.transform.PassContext(config={"tl.disable_shared_memory_reuse": True}):
             transform.InsertSync()(before)
     assert tvm.ir.save_json(before) == snapshot
@@ -489,5 +634,44 @@ def test_binary_oracle_does_not_treat_lexical_alternation_as_completion():
     flag = ("MTE2_MTE1", 0)
     trace = [_Completion("MTE2", "set", flag), _Completion("MTE1", "wait", flag),
              _Completion("MTE2", "set", flag), _Completion("MTE1", "wait", flag)]
+    with pytest.raises(AssertionError, match="set again before its prior wait completes"):
+        _prove_binary_protocol(trace)
+
+
+def test_binary_oracle_accepts_real_scalar_wait_admission_only_for_flag_lifetime():
+    flag = ("V_S", 0)
+    trace = [_Completion("V", "set", flag), _Completion("S", "wait", flag),
+             _Completion("V", "set", flag), _Completion("S", "wait", flag)]
+    data_precedes = _prove_binary_protocol(trace)
+    assert not data_precedes(1, 2), "Flag admission must not become a general data-completion edge"
+
+
+@pytest.mark.parametrize("event", ["S_V", "V_MTE3"])
+def test_binary_oracle_does_not_promote_non_scalar_wait_to_scalar_admission(event):
+    source, destination = event.split("_")
+    flag = (event, 0)
+    trace = [_Completion(source, "set", flag), _Completion(destination, "wait", flag),
+             _Completion(source, "set", flag), _Completion(destination, "wait", flag)]
+    with pytest.raises(AssertionError, match="set again before its prior wait completes"):
+        _prove_binary_protocol(trace)
+
+
+def test_scalar_admission_does_not_complete_an_unretired_vector_read():
+    ready, retired = ("S_V", 0), ("V_S", 0)
+    mask = ("mask", 0)
+    trace = [_Completion("S", "mask_write", slot=mask),
+             _Completion("S", "mask_write", slot=("mask", 1)),
+             _Completion("S", "set", ready), _Completion("V", "wait", ready),
+             _Completion("V", "mask_read", slot=mask),
+             _Completion("S", "mask_write", slot=mask),
+             _Completion("V", "set", retired), _Completion("S", "wait", retired)]
+    with pytest.raises(AssertionError, match="Mask overwritten before its Vector reader completes"):
+        _prove_mask_epochs(trace, _prove_binary_protocol(trace), 1, 1, expected_ticks=0)
+
+
+def test_scalar_wait_lifetime_oracle_rejects_two_overlapping_phases_on_one_id():
+    flag = ("V_S", 0)
+    trace = [_Completion("V", "set", flag), _Completion("V", "set", flag),
+             _Completion("S", "wait", flag), _Completion("S", "wait", flag)]
     with pytest.raises(AssertionError, match="set again before its prior wait completes"):
         _prove_binary_protocol(trace)

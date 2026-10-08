@@ -3654,6 +3654,145 @@ private:
     }
   }
 
+  struct ClosedScalarWaitPhase {
+    ControlNode *scope;
+    IRStructure *first;
+    IRStructure *last;
+  };
+
+  std::optional<ClosedScalarWaitPhase>
+  ComputeClosedScalarWaitPhase(const SyncPoint &point) const {
+    if (architecture_ != AscendArchitecture::kDav2201 || !point.flag_loop ||
+        point.edge.distance != 0 || point.num_versions != 1 ||
+        point.IsPrivateGmHandoff() || point.local_binary_plan ||
+        point.single_iteration_binary_plan ||
+        point.unit_boundary != UnitFlagBoundaryRole::kNone)
+      return std::nullopt;
+    const SyncInsertionSite &src = site_registry_.Src(point);
+    const SyncInsertionSite &dst = site_registry_.Dst(point);
+    ControlNode *scope = point.flag_loop;
+    if (src.core != kCoreVector || dst.core != src.core || src.pipe != "V" ||
+        dst.pipe != "S" || src.at_beginning || !dst.at_beginning ||
+        src.path_begin != src.path_end || !src.path_end->IsTask() ||
+        src.path_begin->GetParent() != scope ||
+        dst.path_begin->GetParent() != scope ||
+        src.path_begin->GetIndex() >= dst.path_begin->GetIndex())
+      return std::nullopt;
+    // PerCoreTask materialization can migrate a site into several guarded
+    // internal tasks. The ordinary-task sibling insertion contract used by
+    // this certificate does not establish those occurrences' activation.
+    if (static_cast<TaskNode *>(src.path_end)->IsPerCoreTask() ||
+        (dst.path_end->IsTask() &&
+         static_cast<TaskNode *>(dst.path_end)->IsPerCoreTask()))
+      return std::nullopt;
+
+    auto stable = [&](const PrimExpr &guard, const TaskNode *task) {
+      PrimExpr expanded = owner_result_detail::Expand(
+          guard, owner_result_detail::TaskBindings(task));
+      return StableLocalBinaryBoundary(expanded, scope, true)
+                 ? std::optional<PrimExpr>(std::move(expanded))
+                 : std::nullopt;
+    };
+    auto activation = [&](const SyncInsertionSite &site)
+        -> std::optional<PrimExpr> {
+      PrimExpr guard = site.GetGuard();
+      ffi::Map<Var, PrimExpr> entries;
+      // The existing insertion-site constructor descends a control only
+      // after proving it nonempty and attaches its first-iteration selector.
+      // Recover the activation by substituting those entry coordinates. A
+      // site that stopped at a Control is already outside its loop/guard;
+      // retain that real boundary, including execution for an empty loop.
+      for (IRStructure *node : site.path_end->PathFrom(site.path_begin)) {
+        if (node->GetStage() != 0)
+          return std::nullopt;
+        if (node == site.path_end)
+          break;
+        if (!node->IsControl())
+          return std::nullopt;
+        auto *control = static_cast<ControlNode *>(node);
+        if (control->BodyHasLoopBreak() ||
+            control->control->kind != ForKind::kSerial ||
+            SideEffect(control->control->min) != CallEffectKind::kPure ||
+            SideEffect(control->control->extent) != CallEffectKind::kPure)
+          return std::nullopt;
+        guard = guard && control->GetConditionGuard();
+        entries.Set(control->control->loop_var,
+                    Substitute(control->control->min, entries));
+        guard = Substitute(guard, entries);
+      }
+      const TaskNode *endpoint =
+          site.path_end->IsTask()
+              ? static_cast<TaskNode *>(site.path_end)
+              : static_cast<ControlNode *>(site.path_end)->task.get();
+      return stable(guard, endpoint);
+    };
+    auto source_activation = activation(src);
+    auto wait_activation = activation(dst);
+    if (!source_activation || !wait_activation ||
+        !GuardsEquivalent(*source_activation, *wait_activation,
+                          scope->GetLoopBodyContext()))
+      return std::nullopt;
+    return ClosedScalarWaitPhase{scope, src.path_begin, dst.path_begin};
+  }
+
+  const std::optional<ClosedScalarWaitPhase> &
+  GetClosedScalarWaitPhase(size_t index) const {
+    auto it = closed_scalar_wait_phases_.find(index);
+    if (it == closed_scalar_wait_phases_.end())
+      it = closed_scalar_wait_phases_
+               .emplace(index, ComputeClosedScalarWaitPhase(sync_points_[index]))
+               .first;
+    return it->second;
+  }
+
+  bool CanReuseClosedScalarWaitPhases(size_t lhs, size_t rhs) const {
+    const auto &left = GetClosedScalarWaitPhase(lhs);
+    const auto &right = GetClosedScalarWaitPhase(rhs);
+    if (!left || !right)
+      return false;
+    IRStructure *ancestor =
+        left->scope->GetLowestCommonAncestor(right->scope);
+    if (!ancestor || !ancestor->IsControl())
+      return false;
+    auto *common = static_cast<ControlNode *>(ancestor);
+    auto unshifted_path = [&](ControlNode *scope) {
+      for (;;) {
+        if (scope->GetStage() != 0 || scope->BodyHasLoopBreak() ||
+            scope->control->kind != ForKind::kSerial)
+          return false;
+        PrimExpr guard = owner_result_detail::Expand(
+            scope->GetConditionGuard(),
+            owner_result_detail::TaskBindings(scope->task.get()));
+        if (!StableLocalBinaryBoundary(guard, common, true) ||
+            SideEffect(scope->control->min) != CallEffectKind::kPure ||
+            SideEffect(scope->control->extent) != CallEffectKind::kPure ||
+            (scope->control->step.has_value() &&
+             SideEffect(scope->control->step.value()) != CallEffectKind::kPure))
+          return false;
+        if (scope == common)
+          return true;
+        scope = scope->GetParentControl();
+        ICHECK(scope != nullptr);
+      }
+    };
+    if (!unshifted_path(left->scope) || !unshifted_path(right->scope))
+      return false;
+    auto span = [&](const ClosedScalarWaitPhase &phase) {
+      IRStructure *first = phase.first->GetChildOnPathFrom(common);
+      IRStructure *last = phase.last->GetChildOnPathFrom(common);
+      return std::pair<int, int>{first->GetIndex(), last->GetIndex()};
+    };
+    auto [left_first, left_last] = span(*left);
+    auto [right_first, right_last] = span(*right);
+    // Each phase clears its single notification before leaving its own
+    // activation. A real WaitFlag(V,S) stalls Scalar, which dispatches later
+    // asynchronous commands: its consumption precedes a disjoint phase's
+    // later V notification, including the next enclosing-loop activation.
+    // This is a flag-lifetime admission inference, not Vector data completion.
+    // Storage epoch domains and DepClosure are deliberately unchanged.
+    return left_last < right_first || right_last < left_first;
+  }
+
   bool CanReuse(const VisibleSyncPoint &lhs, const VisibleSyncPoint &rhs,
                 const DepClosure &closure, bool allow_cross_iter,
                 bool allow_mixed_iter) const {
@@ -3675,6 +3814,8 @@ private:
         !site_registry_.HasCompatibleFlagKind(lhs_sync, rhs_sync)) {
       return false;
     }
+    if (CanReuseClosedScalarWaitPhases(lhs.sync_point_id, rhs.sync_point_id))
+      return true;
 
     auto by_domain = [&](const VisibleSyncPoint &visible) {
       std::map<int, DepEdge> result;
@@ -3814,6 +3955,8 @@ private:
   mutable std::unordered_set<size_t> trace_c_sites_;
   std::vector<SyncPoint> sync_points_;
   std::set<std::pair<size_t, size_t>> reusable_pairs_;
+  mutable std::map<size_t, std::optional<ClosedScalarWaitPhase>>
+      closed_scalar_wait_phases_;
   DependencyCache dependency_cache_;
   std::map<ControlNode *, DepClosure> scope_closures_;
   std::map<ControlNode *, IterationOrder> lifetime_orders_;

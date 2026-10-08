@@ -54,6 +54,21 @@ the conservative whole-function union for that direction, so common code and
 core-specific code cannot receive inconsistent renamings. The dav-3510 mutex
 spill policy retains its existing namespace and reservation rules.
 
+A stage-zero, single-slot `V_S` channel can also have a closed physical phase:
+its Vector set and Scalar wait execute once per matching owner activation,
+and the wait finishes before leaving that phase. Scalar dispatches subsequent
+asynchronous instructions, so this real Scalar wait precedes a later phase's
+Vector notification. Strictly disjoint physical phases can therefore share
+one ID even when their storage epoch domains differ. The certificate uses the
+actual insertion sites: a loop-entry wait executes even for an empty loop,
+whereas a wait inside its first iteration requires established nonempty
+activation. Nested phases use conservative spans at their common serial
+scope. Overlapping, carried, shifted, seeded/drained and root-completion
+channels are excluded from this rule. It changes flag allocation only;
+Scalar admission does not establish Vector data completion or merge storage
+domains. The certificate currently accepts ordinary Task endpoints;
+PerCoreTask internal occurrences require a separate proof.
+
 ## A carried edge
 
 Let `src(i) -> dst(i+d)` be a dependency in one epoch domain. If the completion
