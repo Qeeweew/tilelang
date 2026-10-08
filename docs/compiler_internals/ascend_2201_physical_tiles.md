@@ -105,9 +105,14 @@ different from the old 2D transpose bit. Partial M for A, partial N for B,
 unproved bounds, unsupported layouts and annotated copies keep their existing
 copy path. These recipes are specific to 2201.
 
-FMATRIX_A and FMATRIX_B have independent invariant widths. Selection requires
-width consensus separately for each bank. A conflicting bank keeps its exact
-ordinary copies while a compatible bank can still use native loads; if neither
+FMATRIX_A and FMATRIX_B have independent invariant widths. A conflicting bank
+may select one width group while restoring every other copy verbatim. Groups
+are ranked by saved Load2D descriptor count times a finite static loop trip
+upper bound; the descriptor count comes from ordinary copy lowering, including
+its shared contiguous-B rule. Guards may reduce actual execution. This is
+neither a latency estimate nor calibrated hardware throughput. Unknown bounds,
+overflow, zero savings and tied winners retain the original conflicting-bank
+path; an independent compatible bank can still use native loads. If neither
 bank qualifies, the original kernel is retained. One root AIC scalar task sets
 both registers and the shared repeat, padding and size
 state. `InsertSync` acquires that initialization once through a real root

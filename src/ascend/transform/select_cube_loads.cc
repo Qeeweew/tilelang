@@ -9,6 +9,8 @@
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/tirx/transform.h>
 
+#include <limits>
+#include <optional>
 #include <unordered_map>
 #include <vector>
 
@@ -54,18 +56,19 @@ public:
     if (existing_state || unknown_state)
       return root;
     SBlock rewritten = Downcast<SBlock>(operator()(root));
-    const bool select_a =
-        fmatrix_a_width_.defined() && !different_a_configurations_;
-    const bool select_b =
-        fmatrix_b_width_.defined() && !different_b_configurations_;
+    Optional<PrimExpr> a_width = SelectWidth(true);
+    Optional<PrimExpr> b_width = SelectWidth(false);
+    const bool select_a = a_width.defined();
+    const bool select_b = b_width.defined();
     if (!select_a && !select_b)
       return root;
-    // FMATRIX_A and FMATRIX_B are independent banks. Keep every conflicting
-    // bank on its original copy path without discarding the other bank's
-    // invariant configuration. Geometry and effects were proved only once.
+    // FMATRIX_A and FMATRIX_B are independent banks. Each selected bank has
+    // one invariant configuration; restore every other width's exact copy.
+    // Geometry and effects were proved only once.
     std::unordered_map<const CallNode *, Stmt> fallbacks;
     for (const SelectedLoad &load : selected_loads_)
-      if (!(load.is_l0a ? select_a : select_b))
+      if (const auto &width = load.is_l0a ? a_width : b_width;
+          !width.defined() || !Equal(width.value(), load.width))
         fallbacks.emplace(load.selected.get(), load.original);
     if (!fallbacks.empty()) {
       class RestoreCopies : public StmtExprMutator {
@@ -88,8 +91,8 @@ public:
     ascend::TaskMetadata ownership;
     ownership.core_mask = kCoreCube;
     Stmt setup = Evaluate(Call(DataType::Void(), ascend_set_load3d_config(),
-                               {select_a ? fmatrix_a_width_.value() : Integer(1),
-                                select_b ? fmatrix_b_width_.value() : Integer(1)}));
+                               {select_a ? a_width.value() : Integer(1),
+                                select_b ? b_width.value() : Integer(1)}));
     setup = AttrStmt(ascend::MergeTaskMetadata(ownership, Integer(0)),
                      attr::kAscendTask, Integer(1), setup);
     rewritten.CopyOnWrite()->body = SeqStmt({setup, rewritten->body});
@@ -98,6 +101,46 @@ public:
 
 private:
   using Parent = arith::IRMutatorWithAnalyzer;
+
+  static std::optional<int64_t> Multiply(int64_t lhs, int64_t rhs) {
+    if (lhs < 0 || rhs < 0 ||
+        (rhs && lhs > std::numeric_limits<int64_t>::max() / rhs))
+      return std::nullopt;
+    return lhs * rhs;
+  }
+
+  Stmt VisitStmt_(const ForNode *op) final {
+    auto saved = execution_bound_;
+    // Count before entering the body: its extent>0 constraint must not erase
+    // a zero-trip domain. Guards can only reduce this static upper bound.
+    PrimExpr extent = analyzer_->Simplify(op->extent);
+    PrimExpr step = analyzer_->Simplify(op->step.value_or(Integer(1)));
+    const auto *count = extent.as<IntImmNode>();
+    const auto *stride = step.as<IntImmNode>();
+    if (execution_bound_ && *execution_bound_ == 0) {
+      // An unreachable enclosing loop also bounds unknown descendants.
+    } else if (execution_bound_ && count && count->value >= 0 && stride &&
+               stride->value > 0) {
+      // ceildiv without an overflowing extent+step-1 intermediate.
+      int64_t trips =
+          count->value / stride->value + (count->value % stride->value != 0);
+      execution_bound_ = Multiply(*execution_bound_, trips);
+    } else {
+      execution_bound_ = std::nullopt;
+    }
+    Stmt result = Parent::VisitStmt_(op);
+    execution_bound_ = saved;
+    return result;
+  }
+
+  Stmt VisitStmt_(const WhileNode *op) final {
+    auto saved = execution_bound_;
+    if (!execution_bound_ || *execution_bound_ != 0)
+      execution_bound_ = std::nullopt;
+    Stmt result = Parent::VisitStmt_(op);
+    execution_bound_ = saved;
+    return result;
+  }
 
   Stmt VisitStmt_(const AttrStmtNode *op) final {
     bool atomic = op->attr_key == attr::kAscendTask ||
@@ -150,6 +193,82 @@ private:
     for (const Range &range : ranges)
       args.push_back(range->extent);
     return Call(DataType::Handle(), region(), args);
+  }
+
+  std::optional<int64_t>
+  DescriptorSaving(const AscendCopy &copy, const Layout &src_layout,
+                   const Layout &dst_layout,
+                   const AscendFractalLayoutInfo &src_info,
+                   const AscendFractalLayoutInfo &dst_info, bool is_l0a) {
+    if (!execution_bound_)
+      return std::nullopt;
+    AscendFractalRegionInfo src_region, dst_region;
+    if (!TryExtractAscendFractalRegion(src_layout, copy->src_range,
+                                       &src_region) ||
+        !TryExtractAscendFractalRegion(dst_layout, copy->dst_range,
+                                       &dst_region))
+      return std::nullopt;
+    // Match Copy::Lower's exact 2201 descriptor organization, including its
+    // shared contiguous-B rule. A selected Load3D emits one descriptor.
+    bool needs_transpose = src_info.c0_axis != dst_info.c0_axis;
+    bool merge_b = !is_l0a && ascend::CanMerge2201L0BLoad(
+                                  copy->src_range, src_info, src_region,
+                                  dst_region, needs_transpose, analyzer_);
+    PrimExpr descriptor_count =
+        is_l0a ? dst_region.outer1->extent : dst_region.outer0->extent;
+    if (merge_b)
+      descriptor_count = Integer(1);
+    PrimExpr count = analyzer_->Simplify(descriptor_count);
+    const auto *descriptors = count.as<IntImmNode>();
+    if (!descriptors || descriptors->value < 1)
+      return std::nullopt;
+    return Multiply(descriptors->value - 1, *execution_bound_);
+  }
+
+  Optional<PrimExpr> SelectWidth(bool is_l0a) {
+    Optional<PrimExpr> first_width;
+    bool conflicting = false;
+    for (const auto &load : selected_loads_) {
+      if (load.is_l0a != is_l0a)
+        continue;
+      if (first_width.defined() && !Equal(first_width.value(), load.width))
+        conflicting = true;
+      first_width = load.width;
+    }
+    // Preserve the established uniform-bank path, including dynamic loops.
+    if (!conflicting)
+      return first_width;
+    std::unordered_map<int64_t, int64_t> savings;
+    for (const auto &load : selected_loads_) {
+      if (load.is_l0a != is_l0a)
+        continue;
+      if (!load.descriptor_saving)
+        return std::nullopt;
+      int64_t &total = savings[load.width.as<IntImmNode>()->value];
+      if (total > std::numeric_limits<int64_t>::max() - *load.descriptor_saving)
+        return std::nullopt;
+      total += *load.descriptor_saving;
+    }
+    int64_t best = 0, best_width = 0;
+    bool tied = false;
+    for (const auto &[width, saving] : savings) {
+      if (saving > best) {
+        best = saving;
+        best_width = width;
+        tied = false;
+      } else if (saving == best) {
+        tied = true;
+      }
+    }
+    // Descriptor savings are an upper-bound count, not a latency estimate.
+    // No strict winner (or unknown/overflow above) keeps the old fallback.
+    if (!best || tied)
+      return std::nullopt;
+    for (const auto &load : selected_loads_)
+      if (load.is_l0a == is_l0a &&
+          load.width.as<IntImmNode>()->value == best_width)
+        return load.width;
+    return std::nullopt;
   }
 
   Stmt VisitStmt_(const EvaluateNode *op) final {
@@ -229,13 +348,6 @@ private:
     PrimExpr configured_width = analyzer_->Simplify(physical_rows);
     if (!configured_width.as<IntImmNode>())
       return Parent::VisitStmt_(op);
-    auto &side_width = is_l0a ? fmatrix_a_width_ : fmatrix_b_width_;
-    auto &side_conflict =
-        is_l0a ? different_a_configurations_ : different_b_configurations_;
-    if (side_width.defined() && !Equal(side_width.value(), configured_width))
-      side_conflict = true;
-    side_width = configured_width;
-
     Array<Range> reads = copy->src_range, writes = copy->dst_range;
     // Consume the shared NormalizeCubeCopyFootprints contract verbatim.
     // Selection never invents or enlarges a hardware read/write region.
@@ -244,7 +356,10 @@ private:
                    Region(copy->dst, writes, kAccessWrite), physical_rows,
                    physical_cols},
                   call->annotations);
-    selected_loads_.push_back({selected, GetRef<Stmt>(op), is_l0a});
+    selected_loads_.push_back(
+        {selected, GetRef<Stmt>(op), is_l0a, configured_width,
+         DescriptorSaving(copy, src_layout.value(), dst_layout.value(),
+                          src_info, dst_info, is_l0a)});
     return Evaluate(selected, op->span);
   }
 
@@ -252,11 +367,12 @@ private:
     Call selected;
     Stmt original;
     bool is_l0a;
+    PrimExpr width;
+    std::optional<int64_t> descriptor_saving;
   };
   LayoutMap layouts_;
-  Optional<PrimExpr> fmatrix_a_width_, fmatrix_b_width_;
   std::vector<SelectedLoad> selected_loads_;
-  bool different_a_configurations_{false}, different_b_configurations_{false};
+  std::optional<int64_t> execution_bound_{1};
   int atomic_depth_{0};
 };
 } // namespace

@@ -416,7 +416,7 @@ def test_read_only_load_requires_a_root_initializer():
         transform.InsertSync()(mod)
 
 
-def test_different_kernel_local_fmatrix_values_fall_back_together():
+def test_different_kernel_local_fmatrix_values_keep_one_profitable_group():
     first, second = _fixture(m=32), _fixture(m=64)
     roots = [x["main"].body.block for x in [first, second]]
     layouts = {key: layout for root in roots for key, layout in root.annotations["layout_map"].items()}
@@ -424,9 +424,9 @@ def test_different_kernel_local_fmatrix_values_fall_back_together():
                       buffers=[b for root in roots for b in root.alloc_buffers],
                       annotations={"layout_map": layouts})
     selected = _select(combined)
-    assert not calls(selected, NATIVE)
-    assert not calls(selected, CFG)
-    assert len(calls(selected, "tl.tileop.ascend_copy")) == 2
+    # One M64 copy removes three 2D descriptors; M32 removes only one.
+    _equal(calls(selected, CFG)[0].args, [64, 1])
+    _assert_selected_sources(selected, [first, second], {1})
 
 
 def test_explicit_atomic_copy_retains_2d_path():
@@ -617,7 +617,7 @@ def test_a_and_b_configure_independent_fmatrix_widths():
 
 
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
-def test_conflicting_a_bank_keeps_invariant_b_native_regions(dtype):
+def test_conflicting_a_bank_selects_descriptor_saving_group_and_keeps_b(dtype):
     roots = [mod["main"].body.block for mod in
              (_fixture(dtype, m=32), _fixture(dtype, m=64), _b_fixture(dtype))]
     combined = kernel(seq(*(root.body for root in roots)),
@@ -625,15 +625,15 @@ def test_conflicting_a_bank_keeps_invariant_b_native_regions(dtype):
                       annotations={"layout_map": {buffer: layout for root in roots
                                                  for buffer, layout in root.annotations["layout_map"].items()}})
     selected = _select(combined)
-    (native,) = calls(selected, NATIVE)
+    native_a, native_b = calls(selected, NATIVE)
     (config,) = calls(selected, CFG)
-    _equal(config.args, [1, 1024])
-    tvm.ir.assert_structural_equal(native.args[:2], calls(roots[2], "tl.tileop.ascend_copy")[0].args)
-    _equal(native.args[2:], [1024, 64])
+    _equal(config.args, [64, 1024])
+    tvm.ir.assert_structural_equal(native_a.args[:2], calls(roots[1], "tl.tileop.ascend_copy")[0].args)
+    tvm.ir.assert_structural_equal(native_b.args[:2], calls(roots[2], "tl.tileop.ascend_copy")[0].args)
+    _equal(native_b.args[2:], [1024, 64])
     fallback = calls(selected, "tl.tileop.ascend_copy")
-    assert len(fallback) == 2
-    for actual, root in zip(fallback, roots[:2]):
-        tvm.ir.assert_structural_equal(actual, calls(root, "tl.tileop.ascend_copy")[0])
+    assert len(fallback) == 1
+    tvm.ir.assert_structural_equal(fallback[0], calls(roots[0], "tl.tileop.ascend_copy")[0])
     assert not calls(seq(*list(selected["main"].body.block.body.seq)[1:]), CFG)
     tvm.ir.assert_structural_equal(transform.AscendSelectCubeLoads()(selected), selected)
 
@@ -658,6 +658,156 @@ def test_conflicting_b_bank_keeps_invariant_a_native_regions(dtype):
         tvm.ir.assert_structural_equal(actual, calls(root, "tl.tileop.ascend_copy")[0])
     assert not calls(seq(*list(selected["main"].body.block.body.seq)[1:]), CFG)
     tvm.ir.assert_structural_equal(transform.AscendSelectCubeLoads()(selected), selected)
+
+
+def _selection_groups(modules, trips, *, guards=None, steps=None, params=()):
+    """Keep distinct real copies/layouts while varying their enclosing domains."""
+    roots = [mod["main"].body.block for mod in modules]
+    bodies = []
+    guards = guards or [None] * len(roots)
+    steps = steps or [()] * len(roots)
+    for index, (root, counts, guard) in enumerate(zip(roots, trips, guards)):
+        body = root.body
+        if guard is not None:
+            body = tirx.IfThenElse(guard, body, None)
+        for depth, count in reversed(list(enumerate(counts))):
+            var = tirx.Var(f"load_{index}_{depth}", "int64")
+            extent = count if isinstance(count, tirx.PrimExpr) else tirx.IntImm("int64", count)
+            step = steps[index][depth] if steps[index] else None
+            body = tirx.For(var, tirx.IntImm("int64", 0), extent, tirx.ForKind.SERIAL, body, step=step)
+        bodies.append(body)
+    return kernel(seq(*bodies), params=params,
+                  buffers=[buffer for root in roots for buffer in root.alloc_buffers],
+                  annotations={"layout_map": {buffer: layout for root in roots
+                                             for buffer, layout in root.annotations["layout_map"].items()}})
+
+
+def _assert_selected_sources(selected, modules, chosen):
+    native = calls(selected, NATIVE)
+    ordinary = calls(selected, "tl.tileop.ascend_copy")
+    assert len(native) == len(chosen)
+    assert len(ordinary) == len(modules) - len(chosen)
+    for actual, index in zip(native, sorted(chosen)):
+        original = calls(modules[index], "tl.tileop.ascend_copy")[0]
+        tvm.ir.assert_structural_equal(actual.args[:2], original.args)
+    for actual, index in zip(ordinary, [i for i in range(len(modules)) if i not in chosen]):
+        tvm.ir.assert_structural_equal(actual, calls(modules[index], "tl.tileop.ascend_copy")[0])
+    tvm.ir.assert_structural_equal(transform.AscendSelectCubeLoads()(selected), selected)
+
+
+def test_static_loop_work_selects_smaller_a_width_with_more_descriptors_removed():
+    # Four M64 copies replace sixteen 2D descriptors; one M128 copy replaces
+    # eight. The invariant group with the larger reduction is M64.
+    modules = [_fixture(m=64), _fixture(m=128), _b_fixture()]
+    selected = _select(_selection_groups(modules, [(4,), (), ()]))
+    _equal(calls(selected, CFG)[0].args, [64, 1024])
+    _assert_selected_sources(selected, modules, {0, 2})
+    with selected["main"].attrs["target"]:
+        lowered = transform.AscendLowerTileOp()(selected)
+    assert len(calls(lowered, "tl.ascend_load_cbuf_to_ca_3d")) == 1
+    (ordinary_loop,) = [loop for loop in nodes(lowered, tirx.For)
+                        if calls(loop.body, "tl.ascend_load_cbuf_to_ca_2d")]
+    _equal([ordinary_loop.extent], [8])
+
+
+def test_positive_loop_step_counts_actual_iterations_without_ceildiv_overflow():
+    modules = [_fixture(m=64), _fixture(m=128)]
+    selected = _select(_selection_groups(modules, [(8,), ()], steps=[(4,), ()]))
+    # Two M64 iterations remove six descriptors, versus seven for M128.
+    _equal(calls(selected, CFG)[0].args, [128, 1])
+    _assert_selected_sources(selected, modules, {1})
+    huge = (1 << 63) - 1
+    selected = _select(_selection_groups(modules, [(huge,), ()], steps=[(huge,), ()]))
+    _equal(calls(selected, CFG)[0].args, [128, 1])
+    _assert_selected_sources(selected, modules, {1})
+
+
+@pytest.mark.parametrize("step", [0, -1, tirx.Var("unknown_step", "int64")])
+def test_unproved_positive_step_keeps_conflicting_bank_original(step):
+    modules = [_fixture(m=64), _fixture(m=128), _b_fixture()]
+    params = [step] if isinstance(step, tirx.Var) else []
+    selected = _select(_selection_groups(modules, [(4,), (), ()],
+                                         steps=[(step,), (), ()], params=params))
+    _equal(calls(selected, CFG)[0].args, [1, 1024])
+    _assert_selected_sources(selected, modules, {2})
+
+
+def test_same_width_sites_aggregate_descriptor_reduction():
+    modules = [_fixture(m=32), _fixture(m=128), _fixture(m=32)]
+    selected = _select(_selection_groups(modules, [(4,), (), (4,)]))
+    _equal(calls(selected, CFG)[0].args, [32, 1])
+    _assert_selected_sources(selected, modules, {0, 2})
+
+
+def test_equal_descriptor_reduction_keeps_conflicting_bank_original():
+    # M32: three copies save three descriptors; M64: one saves three.
+    modules = [_fixture(m=32), _fixture(m=64), _b_fixture()]
+    selected = _select(_selection_groups(modules, [(3,), (), ()]))
+    _equal(calls(selected, CFG)[0].args, [1, 1024])
+    _assert_selected_sources(selected, modules, {2})
+
+
+def test_b_width_groups_use_k_slice_descriptor_count_and_static_work():
+    modules = [_fixture(m=128), _b_fixture(cache_k=512), _b_fixture(cache_k=1024)]
+    selected = _select(_selection_groups(modules, [(), (3,), ()]))
+    _equal(calls(selected, CFG)[0].args, [128, 512])
+    _assert_selected_sources(selected, modules, {0, 1})
+
+
+def test_conflicting_banks_choose_widths_independently():
+    modules = [_fixture(m=64), _fixture(m=128),
+               _b_fixture(cache_k=512), _b_fixture(cache_k=1024)]
+    selected = _select(_selection_groups(modules, [(4,), (), (3,), ()]))
+    _equal(calls(selected, CFG)[0].args, [64, 512])
+    _assert_selected_sources(selected, modules, {0, 2})
+
+
+def test_guarded_work_is_a_loop_upper_bound_and_guard_is_preserved():
+    enabled = tirx.Var("enabled", "bool")
+    modules = [_fixture(m=64), _fixture(m=128)]
+    selected = _select(_selection_groups(modules, [(4,), ()],
+                                         guards=[enabled, None], params=[enabled]))
+    _equal(calls(selected, CFG)[0].args, [64, 1])
+    _assert_selected_sources(selected, modules, {0})
+    (guard,) = nodes(selected, tirx.IfThenElse)
+    tvm.ir.assert_structural_equal(guard.condition, enabled)
+    assert len(calls(guard.then_case, NATIVE)) == 1
+
+
+@pytest.mark.parametrize("counts", [
+    (tirx.Var("unknown_trip", "int64"),),
+    (1 << 32, 1 << 32),  # finite loop product cannot be represented safely
+    (1 << 62,),          # descriptor saving multiplication would overflow
+])
+def test_unknown_or_overflow_work_keeps_conflicting_bank_original(counts):
+    modules = [_fixture(m=64), _fixture(m=128), _b_fixture()]
+    params = [value for value in counts if isinstance(value, tirx.Var)]
+    selected = _select(_selection_groups(modules, [counts, (), ()], params=params))
+    _equal(calls(selected, CFG)[0].args, [1, 1024])
+    _assert_selected_sources(selected, modules, {2})
+
+
+def test_same_width_accumulated_work_overflow_keeps_bank_original():
+    modules = [_fixture(m=32), _fixture(m=32), _fixture(m=32),
+               _fixture(m=64), _b_fixture()]
+    selected = _select(_selection_groups(modules, [(1 << 62,)] * 3 + [(), ()]))
+    _equal(calls(selected, CFG)[0].args, [1, 1024])
+    _assert_selected_sources(selected, modules, {4})
+
+
+def test_zero_trip_group_does_not_take_the_invariant_configuration():
+    modules = [_fixture(m=128), _fixture(m=64)]
+    selected = _select(_selection_groups(modules, [(0,), ()]))
+    _equal(calls(selected, CFG)[0].args, [64, 1])
+    _assert_selected_sources(selected, modules, {1})
+
+
+def test_uniform_bank_still_selects_native_inside_dynamic_loop():
+    trip = tirx.Var("trip", "int64")
+    modules = [_fixture(m=64)]
+    selected = _select(_selection_groups(modules, [(trip,)], params=[trip]))
+    _equal(calls(selected, CFG)[0].args, [64, 1])
+    _assert_selected_sources(selected, modules, {0})
 
 
 @pytest.mark.parametrize("activation", ["periodic", "late", "runtime"])

@@ -85,8 +85,13 @@ RAW edges; InsertSync emits one real root S-to-MTE1 acquire before all data
 controls. Conditional and empty readers therefore inherit initialization
 without repeatedly consuming a one-shot event. This readiness protocol adds
 no buffer version, hidden event number or whole-MTE1 data completion. Different
-widths on the same side retain ordinary loads; live reconfiguration is
-unsupported. External and unmodeled opaque calls prevent selection, and an
+widths on the same side can select one invariant group, leaving the other
+copies unchanged. Selection ranks the static upper bound on saved Load2D
+descriptors, using the ordinary lowering recipe and finite loop trip counts.
+This is an instruction-count objective, not measured latency or bandwidth;
+unknown bounds, overflow and ties retain the original conflicting-bank path.
+Live reconfiguration is unsupported. External and unmodeled opaque calls
+prevent selection, and an
 already selected kernel diagnoses them at synchronization lowering because
 they could overwrite the invariant state.
 
