@@ -377,6 +377,7 @@ enum class UnitFlagBoundaryRole {
 // after that parent's ordinary carried completion edges have been established.
 struct SingleIterationBinaryPlan {
   ControlNode *parent;
+  PrimExpr activation{Bool(true)};
   bool validated{false};
 };
 
@@ -2862,8 +2863,53 @@ private:
     sync_points = std::move(emit);
   }
 
+  std::optional<PrimExpr>
+  SingleIterationBinaryActivation(const SyncPoint &point,
+                                  ControlNode *loop) const {
+    const SyncInsertionSite &src = site_registry_.Src(point);
+    const SyncInsertionSite &dst = site_registry_.Dst(point);
+    const auto *producer = static_cast<const TaskNode *>(src.path_end);
+    const auto *consumer = static_cast<const TaskNode *>(dst.path_end);
+    auto expand = [&](const PrimExpr &expr, const TaskNode *task) {
+      // Expand definitions, not the endpoint's assumed If predicate. Merging
+      // both endpoint contexts could make mismatched guards vacuously equal.
+      return owner_result_detail::Expand(
+          expr, owner_result_detail::TaskBindings(task));
+    };
+    PrimExpr source = expand(loop->GetConditionGuard() && src.GetGuard() &&
+                                 site_registry_.Domain(src).active_guard,
+                             producer);
+    PrimExpr destination = expand(loop->GetConditionGuard() && dst.GetGuard() &&
+                                      site_registry_.Domain(dst).active_guard,
+                                  consumer);
+    std::unordered_set<const VarNode *> iteration_vars;
+    for (ControlNode *scope = loop; scope; scope = scope->GetParentControl())
+      iteration_vars.insert(scope->control->loop_var.get());
+    auto immutable = [&](const PrimExpr &expr) {
+      bool producer_load = false;
+      PostOrderVisit(expr, [&](const ObjectRef &node) {
+        producer_load |= node.as<ProducerLoadNode>() != nullptr;
+      });
+      return !producer_load && owner_result_detail::Immutable(expr) &&
+             !UsesVar(expr, [&](const VarNode *var) {
+               return iteration_vars.count(var) == 0;
+             });
+    };
+    const ConstrSet &context = loop->GetLoopBodyContext();
+    if (!immutable(source) || !immutable(destination) ||
+        !GuardImplies(source, destination, context) ||
+        !GuardImplies(destination, source, context) ||
+        !GuardImplies(source, expand(producer->GetConditionGuard(), producer),
+                      context) ||
+        !GuardImplies(destination,
+                      expand(consumer->GetConditionGuard(), consumer), context))
+      return std::nullopt;
+    return source;
+  }
+
   ControlNode *SingleIterationBinaryParent(const SyncPoint &point,
-                                          ControlNode *loop) const {
+                                           ControlNode *loop,
+                                           PrimExpr *activation) const {
     if (!loop || point.flag_loop != loop || point.edge.distance != 0 ||
         point.counter_group_id != 0 || point.local_binary_plan ||
         point.unit_boundary != UnitFlagBoundaryRole::kNone)
@@ -2871,18 +2917,16 @@ private:
     ControlNode *parent = loop->GetParentControl();
     if (!parent)
       return nullptr;
-    // Keep the first support domain exact: no conditional, empty, mutable,
-    // counter-driven or breaking repetition. This proves one matched set/wait
-    // per invocation, not completion between successive invocations.
-    for (ControlNode *scope = loop; scope;
-         scope = scope->GetParentControl()) {
-      if (scope->HasConditions() || scope->BodyHasLoopBreak() ||
-          scope->GetStage() != 0)
+    // A conditional singleton may emit zero or one matched pair. Its enclosing
+    // clock still has static positive, unshifted, unguarded repetition. This
+    // does not prove completion between successive invocations.
+    for (ControlNode *scope = loop; scope; scope = scope->GetParentControl()) {
+      if ((scope != loop && scope->HasConditions()) ||
+          scope->BodyHasLoopBreak() || scope->GetStage() != 0)
         return nullptr;
       const ForNode *node = scope->control.get();
-      PrimExpr step = node->step.has_value()
-                          ? node->step.value()
-                          : IntImm(node->extent.dtype(), 1);
+      PrimExpr step = node->step.has_value() ? node->step.value()
+                                             : IntImm(node->extent.dtype(), 1);
       const auto *extent = node->extent.as<IntImmNode>();
       const auto *stride = step.as<IntImmNode>();
       if (!extent || !stride || extent->value <= 0 || stride->value <= 0 ||
@@ -2893,20 +2937,31 @@ private:
     const SyncInsertionSite &src = site_registry_.Src(point);
     const SyncInsertionSite &dst = site_registry_.Dst(point);
     const ConstrSet &context = loop->GetLoopBodyContext();
-    if (src.path_begin != src.path_end || dst.path_begin != dst.path_end ||
+    if (!src.path_end->IsTask() || !dst.path_end->IsTask() ||
+        src.path_begin != src.path_end || dst.path_begin != dst.path_end ||
         src.path_begin->GetParent() != loop ||
         dst.path_begin->GetParent() != loop ||
         site_registry_.Domain(src).IsCounter() ||
         site_registry_.Domain(dst).IsCounter() ||
         site_registry_.Domain(src).owner != loop ||
         site_registry_.Domain(dst).owner != loop ||
-        !context.CanProve(src.GetGuard()) ||
-        !context.CanProve(dst.GetGuard()) ||
-        !context.CanProve(site_registry_.Domain(src).active_guard) ||
-        !context.CanProve(site_registry_.Domain(dst).active_guard) ||
         SideEffect(point.flag_iteration) != CallEffectKind::kPure ||
-        !context.CanProve(point.flag_iteration == CalculateIterationCount(parent)))
+        !context.CanProve(point.flag_iteration ==
+                          CalculateIterationCount(parent)))
       return nullptr;
+    bool unconditional =
+        !loop->HasConditions() && context.CanProve(src.GetGuard()) &&
+        context.CanProve(dst.GetGuard()) &&
+        context.CanProve(site_registry_.Domain(src).active_guard) &&
+        context.CanProve(site_registry_.Domain(dst).active_guard);
+    if (unconditional) {
+      *activation = Bool(true);
+    } else {
+      auto matched = SingleIterationBinaryActivation(point, loop);
+      if (!matched)
+        return nullptr;
+      *activation = *matched;
+    }
     return parent;
   }
 
@@ -2915,7 +2970,6 @@ private:
       const DepClosure &closure, ControlNode *parent) {
     if (!parent)
       return;
-    int parent_domain = domains_.UnconditionalLexicalDomain(parent);
     for (const auto &points : child_points) {
       for (const VisibleSyncPoint &visible : points) {
         SyncPoint &point = sync_points_[visible.sync_point_id];
@@ -2927,15 +2981,32 @@ private:
         for (const DepEdge &edge : visible.projected_edges) {
           const SyncInsertionSite &src = site_registry_.Src(edge);
           const SyncInsertionSite &dst = site_registry_.Dst(edge);
-          // Use actual leaf endpoints in the parent's unconditional domain.
-          // No loop-boundary substitution or manufactured unit C completion.
-          if (src.EpochDomainId() != parent_domain ||
-              dst.EpochDomainId() != parent_domain ||
+          // A wider, real parent completion may protect this activation
+          // subset. Query its unchanged physical leaf endpoints; do not
+          // project the child's conditional forward edge into that closure.
+          if (site_registry_.Domain(src).IsCounter() ||
+              site_registry_.Domain(dst).IsCounter() ||
+              site_registry_.Domain(src).owner != parent ||
+              site_registry_.Domain(dst).owner != parent ||
               src.path_end != site_registry_.Src(point).path_end ||
               dst.path_end != site_registry_.Dst(point).path_end ||
-              !domains_.CanProjectDomain(
-                  site_registry_.Src(point).EpochDomainId(), parent_domain,
-                  parent))
+              src.core != site_registry_.Src(point).core ||
+              dst.core != site_registry_.Dst(point).core ||
+              src.pipe != site_registry_.Src(point).pipe ||
+              dst.pipe != site_registry_.Dst(point).pipe)
+            continue;
+          const auto *producer = static_cast<const TaskNode *>(src.path_end);
+          const auto *consumer = static_cast<const TaskNode *>(dst.path_end);
+          PrimExpr parent_guard =
+              owner_result_detail::Expand(
+                  site_registry_.Domain(src).active_guard && src.GetGuard(),
+                  owner_result_detail::TaskBindings(producer)) &&
+              owner_result_detail::Expand(
+                  site_registry_.Domain(dst).active_guard && dst.GetGuard(),
+                  owner_result_detail::TaskBindings(consumer));
+          if (!GuardImplies(point.single_iteration_binary_plan->activation,
+                            parent_guard,
+                            point.flag_loop->GetLoopBodyContext()))
             continue;
           reverse = std::min(
               reverse, MinCompletionDistance(closure, edge.dst, edge.src));
@@ -2962,9 +3033,9 @@ private:
         ICHECK_GT(reverse, 0)
             << "dav-2201 local binary flag: nonpositive parent reverse "
                "completion distance";
-        // With d=0 and identical flattened clocks, r parent iterations is
-        // exactly r notifications. Keep the complete r-wide ring; storage
-        // width or a single child trip is not a substitute for this proof.
+        // With d=0 and identical flattened clocks, the r-wide parent ring
+        // remains sufficient when matched activations skip notifications.
+        // Storage width or a single child trip cannot replace this proof.
         point.num_versions = reverse;
         point.single_iteration_binary_plan->validated = true;
       }
@@ -3032,9 +3103,11 @@ private:
       };
 
       if (local_binary && min_distance == std::numeric_limits<int>::max()) {
-        if (ControlNode *parent = SingleIterationBinaryParent(sync_point, loop)) {
+        PrimExpr activation;
+        if (ControlNode *parent =
+                SingleIterationBinaryParent(sync_point, loop, &activation)) {
           sync_point.single_iteration_binary_plan =
-              SingleIterationBinaryPlan{parent};
+              SingleIterationBinaryPlan{parent, std::move(activation)};
           continue;
         }
       }
@@ -3186,7 +3259,7 @@ private:
         }
         ICHECK_NE(min_distance, std::numeric_limits<int>::max())
             << "dav-2201 local binary flag: no reverse completion path for "
-            << src.pipe << "->" << dst.pipe;
+            << src.pipe << "->" << dst.pipe << binary_context();
         ICHECK_GT(min_distance, 0)
             << "dav-2201 local binary flag: nonpositive reverse completion "
                "distance for "
