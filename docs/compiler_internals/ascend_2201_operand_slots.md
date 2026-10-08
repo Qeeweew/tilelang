@@ -67,7 +67,10 @@ Synchronization and materialization retain the same prepared flattened clock.
 For an output loop, `P` K-panels and `T` native operand loads per panel, it is
 `output * P * T + panel * T + native`, with physical slot `clock % W`.
 A common outer stage translates the affected invocation and both event
-endpoints together. Odd trip products must rotate slots across invocations
+endpoints together. For full L0 operands, the enclosing parent itself can have
+a nonnegative outer stage: its complete rectangle, prepared clock and retained
+events translate together. This does not extend the sliced-L1 certificate to
+shifted parents. Odd trip products must rotate slots across invocations
 rather than reset them. Equal slots in successive enclosing invocations differ
 by a positive multiple of `W`, so the actual slot release protects the next
 overwrite even when the enclosing scope's last MAD uses a different slot.

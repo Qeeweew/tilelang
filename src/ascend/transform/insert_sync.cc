@@ -2498,7 +2498,7 @@ private:
     };
     if (child == parent || !child->IsWithin(parent) ||
         reader->GetParent() != child || writer->GetParent() != child ||
-        !finite_loop(parent, false, operand) ||
+        !finite_loop(parent, operand, operand) ||
         !reader->GetGuards().empty() || !writer->GetGuards().empty())
       return false;
     IRStructure *projection = child->GetChildOnPathFrom(parent);
@@ -2516,8 +2516,11 @@ private:
     if (child->control->extent.as<IntImmNode>()->value < info.num_versions)
       return false;
 
-    // A child's outer stage translates this entire owner invocation by the
-    // same parent epoch. It does not reset its flattened physical slot clock:
+    // An operand parent's outer stage translates this entire closed rectangle,
+    // including its prepared clock and both retained event endpoints, by the
+    // same enclosing epoch. Its own inner stride T is unchanged. A child's
+    // outer stage likewise translates the entire owner invocation by the
+    // same parent epoch. Neither resets the flattened physical slot clock:
     // (p - offset) * T + k advances by T at the next invocation, so equal slots
     // still differ by a positive multiple of W. LowerScheduledTIR applies
     // that translation to the retained ready/release events and both typed
