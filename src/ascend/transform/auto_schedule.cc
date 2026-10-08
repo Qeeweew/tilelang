@@ -61,6 +61,8 @@
 #include "./auto_schedule/l0ab_phase_reuse.h"
 #include "./auto_schedule/l0c_storage_reuse.h"
 #include "./auto_schedule/multi_buffer.h"
+#include "./auto_schedule/manual_schedule_completion.h"
+#include "./auto_schedule/optimization_diagnostic.h"
 #include "./auto_schedule/scheduled_tir.h"
 #include "./auto_schedule/task_analysis.h"
 #include "./auto_schedule/task_annotations.h"
@@ -959,11 +961,14 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
     }
   }
 
-  static std::optional<ffi::Function> z3_schedule_loop_func =
-      ffi::Function::GetGlobal("tl.transform.z3_schedule_loop_python");
-  if (!z3_schedule_loop_func.has_value()) {
-    LOG(FATAL) << "Python Z3 loop scheduler not registered, falling back "
-                  "to topological sort";
+  bool preserve_issue_order = false;
+  if (auto intent = ctrl->control->annotations.Get(kPreserveIssueOrder))
+    preserve_issue_order = intent.value().cast<bool>();
+  if (preserve_issue_order) {
+    ICHECK(manual_schedule)
+        << kPreserveIssueOrder << " requires explicit T.Stage scopes";
+    ICHECK(!ctrl->GetParentControl())
+        << kPreserveIssueOrder << " currently supports only the outermost loop";
   }
 
   // Prepare input data
@@ -1038,14 +1043,26 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
   auto get_buffer_size = [&](const Buffer &buffer) {
     return get_storage_size(buffer->data);
   };
+  auto consume_fixed_capacity = [&](int group, int64_t slot_bytes,
+                                    int versions) {
+    if (preserve_issue_order) {
+      __int128 bytes = __int128(slot_bytes) * versions;
+      ICHECK(bytes <= group_capacities[group])
+          << "Explicit Ascend source issue order is not legal: "
+             "source-order-memory-capacity for fixed storage";
+      group_capacities[group] -= static_cast<int64_t>(bytes);
+    } else {
+      group_capacities[group] -= slot_bytes * versions;
+    }
+  };
   // A selected phase pair commits the kernel to one completion-proven shared
   // bank. Every enclosing query must consume that same max-footprint contract,
   // including manual ancestors of an automatically versioned child. Otherwise
   // the ancestor either sums mutually exclusive allocations or loses the
   // child's established physical ring count. Unselected manual kernels retain
   // their existing per-query resource policy.
-  const bool reserve_l0 = reserve_l0_storage_ &&
-                          (!manual_schedule || !l0_phase_reuse_.empty());
+  const bool reserve_l0 =
+      reserve_l0_storage_ && (!manual_schedule || !l0_phase_reuse_.empty());
   auto l0_scope = [](const Var &storage) -> std::string {
     const std::string scope = GetPtrStorageScope(storage);
     if (scope == "shared.l0a" || scope == "shared.l0a.dyn")
@@ -1087,6 +1104,20 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
   for (const StorageResource &resource : storage_resources) {
     const Var &storage = resource.storage;
     const Buffer &buffer = resource.representative;
+    if (preserve_issue_order && !manual_buffer_versions_.count(storage)) {
+      auto requested = buffer_version_overrides_.Get(storage);
+      // Stage order defines logical access order in the existing API. A
+      // read-first recurrence therefore cannot acquire an automatic version
+      // owner just because source-order completion was requested. The partial
+      // scheduler warns about an unapplied override; the complete contract
+      // must reject it rather than silently publish fewer physical versions.
+      ICHECK(!requested.has_value() || requested.value() <= 1 ||
+             multi_buffer_owners_.count(storage))
+          << "Explicit Ascend source issue order is not legal: "
+             "source-order-unowned-fixed-version for storage "
+          << storage->name_hint
+          << "; the requested ring has no eligible loop owner";
+    }
     if (compiler_workspaces_.count(storage)) {
       if (!ctrl->IsMultiBufferEligible(storage))
         continue;
@@ -1124,17 +1155,25 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
       // These buffers cannot be multi-buffered, and cannot share memory with
       // other buffers either, so we directly reduce the capacity of the
       // memory group by their size
-      if (!root_l0)
-        group_capacities[group_id] -= get_buffer_size(buffer);
+      if (!root_l0) {
+        int versions = preserve_issue_order ? reserved_versions(storage) : 1;
+        consume_fixed_capacity(group_id, get_buffer_size(buffer), versions);
+      }
     } else {
       auto override_it = buffer_version_overrides_.find(storage);
       if (override_it != buffer_version_overrides_.end()) {
         int override_val = (*override_it).second;
+        if (root_l0 && preserve_issue_order)
+          ICHECK_GE(override_val, reserved_versions(storage))
+              << "Explicit Ascend source issue order has a fixed version count "
+                 "smaller than an already selected shared ring for storage "
+              << storage->name_hint;
         if (root_l0)
           override_val = std::max(override_val, reserved_versions(storage));
         annotated_storage_versions[storage] = override_val;
         if (!root_l0)
-          group_capacities[group_id] -= get_buffer_size(buffer) * override_val;
+          consume_fixed_capacity(group_id, get_buffer_size(buffer),
+                                 override_val);
       } else {
         size_t id = storage_sizes.size();
         storage_version_id.emplace(storage, id);
@@ -1208,6 +1247,21 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
           << " physical versions)";
       remaining -= bytes * versions;
     }
+  }
+
+  if (preserve_issue_order) {
+    // Completion must budget the actual shared ring, including decisions
+    // already made by independent nested owners. It cannot shrink that ring
+    // merely because this owner's fixed order needs fewer versions.
+    for (const auto &[storage, id] : storage_version_id)
+      storage_min_versions[id] =
+          std::max<int64_t>(storage_min_versions[id],
+                            selected_buffer_versions_.Get(storage).value_or(1));
+    for (const auto &[storage, fixed] : annotated_storage_versions)
+      ICHECK_LE(selected_buffer_versions_.Get(storage).value_or(1), fixed)
+          << "Explicit fixed buffer version count conflicts with an existing "
+             "owner for "
+          << storage->name_hint;
   }
 
   // Validate buffer capacities upfront: every eligible buffer needs at least
@@ -1483,26 +1537,99 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
     tvm_memory_groups.push_back({std::numeric_limits<int64_t>::max(), id});
   }
 
-  // Extract results
-  // Python function returns (start_times, storage_versions, best_ii) as a
-  // 3-tuple. Stages are computed in C++ from start_times and II — see below.
-  auto return_val =
-      z3_schedule_loop_func
-          .value()(num_stages, tvm_latencies, tvm_iis, tvm_resource_flags,
-                   tvm_data_deps, tvm_resource_deps, tvm_owner_exclusion_deps,
-                   tvm_pipe_order_deps, tvm_storage_sizes, tvm_memory_groups,
-                   tvm_stage_order_deps, enable_offset, tvm_manual_stages,
-                   manual_schedule, stage_horizon, tvm_issue_priority_pairs,
-                   tvm_prefetch_priority_pairs, tvm_storage_min_versions)
-          .cast<ffi::Tuple<ffi::Array<int64_t>, ffi::Array<int>, int64_t>>();
-
-  ffi::Array<int64_t> start_times = return_val.get<0>();
-  ffi::Array<int> storage_versions = return_val.get<1>();
+  ffi::Array<int64_t> start_times;
+  ffi::Array<int> storage_versions;
+  int64_t ii = 0;
+  if (preserve_issue_order) {
+    std::vector<std::vector<int64_t>> completion_memory_groups;
+    for (const auto &group : tvm_memory_groups)
+      completion_memory_groups.emplace_back(group.begin(), group.end());
+    ManualCompletionResult completion = CompleteManualSourceOrder(
+        manual_stages, latencies, iis, resource_flags, data_deps, resource_deps,
+        owner_exclusion_deps, pipe_order_deps, stage_order_deps, enable_offset,
+        storage_sizes, storage_min_versions, completion_memory_groups,
+        num_stages);
+    ICHECK(completion.plan.has_value())
+        << "Explicit Ascend source issue order is not legal: "
+        << completion.reason;
+    start_times = ffi::Array<int64_t>(completion.plan->starts);
+    storage_versions = ffi::Array<int>(completion.plan->versions);
+    ii = completion.plan->ii;
+    OptimizationDiagnostics diagnostics;
+    diagnostics.Record("manual-source-order", OptimizationStatus::kAccepted,
+                       completion.reason, {}, ctrl);
+  } else {
+    // A Stage-only schedule leaves cross-pipe order and possibly versions
+    // unspecified, so it keeps the existing partial-completion path.
+    static std::optional<ffi::Function> z3_schedule_loop_func =
+        ffi::Function::GetGlobal("tl.transform.z3_schedule_loop_python");
+    ICHECK(z3_schedule_loop_func.has_value())
+        << "Python Z3 loop scheduler is not registered";
+    auto return_val =
+        z3_schedule_loop_func
+            .value()(num_stages, tvm_latencies, tvm_iis, tvm_resource_flags,
+                     tvm_data_deps, tvm_resource_deps, tvm_owner_exclusion_deps,
+                     tvm_pipe_order_deps, tvm_storage_sizes, tvm_memory_groups,
+                     tvm_stage_order_deps, enable_offset, tvm_manual_stages,
+                     manual_schedule, stage_horizon, tvm_issue_priority_pairs,
+                     tvm_prefetch_priority_pairs, tvm_storage_min_versions)
+            .cast<ffi::Tuple<ffi::Array<int64_t>, ffi::Array<int>, int64_t>>();
+    start_times = return_val.get<0>();
+    storage_versions = return_val.get<1>();
+    ii = return_val.get<2>();
+  }
+  ICHECK_EQ(start_times.size(), n);
+  ICHECK_GT(ii, 0);
   ICHECK_EQ(storage_versions.size(), storage_min_versions.size());
   for (size_t i = 0; i < storage_versions.size(); ++i)
     ICHECK_GE(storage_versions[i], storage_min_versions[i])
         << "AutoSchedule returned fewer versions than the shared storage ring";
-  int64_t ii = return_val.get<2>();
+
+  // Automatic plans have no fixed absolute origin. Use a common origin
+  // for stages and timestamps: subtracting only from timestamps changes the
+  // emitted physical phase. A cut at the first issue makes globally shifted
+  // solver witnesses identical, provided it preserves every residue/stage
+  // constraint. Otherwise remove whole periods and retain the original cut.
+  if (!manual_schedule) {
+    int64_t first = *std::min_element(start_times.begin(), start_times.end());
+    ICHECK_GE(first, 0);
+    std::vector<int64_t> relative, residues, stages;
+    for (int64_t start : start_times) {
+      relative.push_back(start - first);
+      residues.push_back((start - first) % ii);
+      stages.push_back((start - first) / ii);
+    }
+    const char *rejection = nullptr;
+    using Wide = __int128;
+    for (const auto &[u, v] : resource_deps) {
+      Wide difference = Wide(residues[v]) - residues[u];
+      if (!((difference >= iis[u] && Wide(ii) - difference >= iis[v]) ||
+            (-difference >= iis[v] && Wide(ii) + difference >= iis[u])))
+        rejection = "resource-wrap";
+    }
+    for (const auto &[u, v, forward, reverse] : owner_exclusion_deps) {
+      Wide difference = Wide(residues[v]) - residues[u];
+      if (!((difference >= forward && Wide(ii) - difference >= reverse) ||
+            (-difference >= reverse && Wide(ii) + difference >= forward)))
+        rejection = "owner-wrap";
+    }
+    for (const auto &[u, v] : pipe_order_deps)
+      if (residues[u] > residues[v])
+        rejection = "pipe-order";
+    for (const auto &[u, v] : stage_order_deps)
+      if (stages[u] > stages[v])
+        rejection = "let-stage-order";
+    int64_t origin = rejection ? (first / ii) * ii : first;
+    if (rejection)
+      for (size_t i = 0; i < n; ++i)
+        relative[i] = start_times[i] - origin;
+    start_times = ffi::Array<int64_t>(relative);
+    OptimizationDiagnostics diagnostics;
+    diagnostics.Record("automatic-schedule-origin",
+                       rejection ? OptimizationStatus::kRejected
+                                 : OptimizationStatus::kAccepted,
+                       rejection ? rejection : "first-issue-origin", {}, ctrl);
+  }
 
   // Derive a per-task stage from (start_time / ii). Z3 schedules
   // `start = k * ii + r` so `start_time / ii` recovers k. Producers (low k,
@@ -1523,10 +1650,10 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
     nodes[i]->SetStage(manual_schedule
                            ? static_cast<int>(manual_stages[i])
                            : (enable_offset ? (raw_k[i] - min_k_raw) : 0));
-    // Adjust start_time to be relative to the earliest start_time, so that
-    // the first task starts at 0.
-    GetAutoScheduleExtraInfo(nodes[i])->SetStartTime(start_times[i] -
-                                                     min_start_time);
+    // Automatic stage and timestamp origins were normalized together.
+    // Stage-only/manual schedules retain their existing timestamp policy.
+    GetAutoScheduleExtraInfo(nodes[i])->SetStartTime(
+        manual_schedule ? start_times[i] - min_start_time : start_times[i]);
   }
   // Intent has now become the native task stages and kernel buffer-version
   // plan. Downstream consumers use those facts rather than selecting again.
@@ -1658,14 +1785,49 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
   ctrl->children.insert(ctrl->children.begin(), new_clones.begin(),
                         new_clones.end());
 
+  // Deterministic completion used synthetic coordinates only to preserve
+  // stage and residue order. Replace all scratch timing with a conservative
+  // serial cost summary before an enclosing sequence reads task timestamps.
+  if (preserve_issue_order) {
+    int64_t serial_ii = 0;
+    for (const auto &child : ctrl->children) {
+      int64_t span = std::max(child->GetLatency(), child->GetII());
+      ICHECK_LE(span, std::numeric_limits<int64_t>::max() - serial_ii);
+      serial_ii += span;
+    }
+    serial_ii = std::max<int64_t>(serial_ii, 1);
+    int64_t prefix = 0;
+    for (const auto &child : ctrl->children) {
+      __int128 timestamp = __int128(child->GetStage()) * serial_ii + prefix;
+      ICHECK(timestamp <= std::numeric_limits<int64_t>::max() -
+                              std::max(child->GetLatency(), child->GetII()))
+          << "Explicit manual schedule cost summary overflows int64";
+      GetAutoScheduleExtraInfo(child.get())
+          ->SetStartTime(static_cast<int64_t>(timestamp));
+      prefix += std::max(child->GetLatency(), child->GetII());
+    }
+    ii = serial_ii;
+    ctrl->control.CopyOnWrite()->annotations.erase(kPreserveIssueOrder);
+  }
+
   // Estimate overall latency across loop iterations.
   int64_t overall_latency = 0;
   for (const auto &child : ctrl->children) {
     int64_t start_time = GetAutoScheduleExtraInfo(child.get())->GetStartTime();
-    overall_latency =
-        std::max(overall_latency, start_time + child->GetLatency());
+    int64_t span = preserve_issue_order
+                       ? std::max(child->GetLatency(), child->GetII())
+                       : child->GetLatency();
+    overall_latency = std::max(overall_latency, start_time + span);
   }
-  overall_latency += ii * (ctrl->GetTripCount() - 1);
+  if (preserve_issue_order) {
+    __int128 total =
+        __int128(overall_latency) + __int128(ii) * (ctrl->GetTripCount() - 1);
+    ICHECK(total >= 0 && total <= std::numeric_limits<int64_t>::max())
+        << "Explicit manual schedule loop cost summary overflows int64";
+    overall_latency = static_cast<int64_t>(total);
+  } else {
+    overall_latency += ii * (ctrl->GetTripCount() - 1);
+  }
 
   ctrl->SetII(overall_latency);
   ctrl->SetLatency(overall_latency);

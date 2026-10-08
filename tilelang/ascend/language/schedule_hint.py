@@ -129,6 +129,18 @@ def Stage(stage: int):
     no separate order annotation is required. Nested child lists select
     automatic or manual scheduling independently.
 
+    To also fix global source issue order, an outermost serial loop may carry
+    ``annotations={"tl.ascend_preserve_issue_order": True}``. This opt-in path
+    preserves explicit buffer counts and deterministically completes unspecified
+    counts, including compiler scratch, from the fixed stages and dependencies.
+    It validates the order, version bounds, and capacity without optimizing II.
+    A requested count greater than one requires an eligible version owner;
+    otherwise this complete mode rejects the unapplied count. Stage ordering
+    retains its existing logical access semantics, including read-first recurrences.
+    An illegal or over-capacity request is diagnosed; it is never silently
+    reordered. Nested automatic pipelines remain independent. Omitting this
+    annotation retains the partial scheduling behavior described above.
+
     ``T.Stage`` must wrap complete scheduler tasks. It must not appear inside
     ``T.Task``, ``T.SimtVF``, ``T.SimdVF``, an SBlock, or a parallel loop. In
     Python's multi-context form, put ``T.Stage`` first so it is the outer scope:
