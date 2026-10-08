@@ -1616,14 +1616,18 @@ private:
                                    const MultiBufferInfo &info,
                                    TaskNode *reader, TaskNode *writer,
                                    ControlNode *parent) const {
+    const bool operand =
+        reader->GetPipeMask() == PipeMask(ResourcePipe::kCube) &&
+        writer->GetPipeMask() == PipeMask(ResourcePipe::kMTE1);
     if (architecture_ != AscendArchitecture::kDav2201 || !parent ||
         dep.kind != DependencyKind::kData || dep.distance != -1 ||
         dep.cross_storage_conflict || info.UsesCounter() ||
         info.num_versions <= 1 || info.owners.size() != 1 ||
         reader->GetCoreMask() != kCoreCube ||
         writer->GetCoreMask() != kCoreCube ||
-        reader->GetPipeMask() != PipeMask(ResourcePipe::kMTE1) ||
-        writer->GetPipeMask() != PipeMask(ResourcePipe::kMTE2))
+        (!operand &&
+         (reader->GetPipeMask() != PipeMask(ResourcePipe::kMTE1) ||
+          writer->GetPipeMask() != PipeMask(ResourcePipe::kMTE2))))
       return false;
     ControlNode *child = info.owners.front().loop;
     auto finite_loop = [](ControlNode *loop) {
@@ -1664,7 +1668,9 @@ private:
       const auto *call = evaluate ? evaluate->value.as<CallNode>() : nullptr;
       if (!call || !(call->op.same_as(AscendCopy::Get()) ||
                      call->op.same_as(Copy::Get()) ||
-                     (!writing && call->op.same_as(AscendCubeLoad3D::Get()))))
+                     (operand && !writing && call->op.same_as(Gemm::Get())) ||
+                     ((!writing || operand) &&
+                      call->op.same_as(AscendCubeLoad3D::Get()))))
         return std::nullopt;
       // Typed regions declare the only storage accesses. A scalar load or
       // data-pointer escape in an index, hint, or other argument is additional
@@ -1688,7 +1694,17 @@ private:
       }
       TileOperator operation = ParseOperator(GetRef<Call>(call));
       BufferRegion source, destination;
-      if (const auto *copy = operation.as<CopyNode>()) {
+      if (operand && !writing) {
+        const auto *gemm = operation.as<GemmNode>();
+        if (!gemm)
+          return std::nullopt;
+        bool a = gemm->a_->data.same_as(info.storage);
+        bool b = gemm->b_->data.same_as(info.storage);
+        if (a == b || gemm->c_->data.same_as(info.storage))
+          return std::nullopt;
+        source = a ? gemm->aRegion_ : gemm->bRegion_;
+        destination = gemm->cRegion_;
+      } else if (const auto *copy = operation.as<CopyNode>()) {
         source = BufferRegion(copy->src, copy->src_range);
         destination = BufferRegion(copy->dst, copy->dst_range);
       } else if (const auto *load = operation.as<AscendCubeLoad3DNode>()) {
@@ -1697,7 +1713,15 @@ private:
       } else {
         return std::nullopt;
       }
-      if (writing ? (source->buffer.scope() != "global" ||
+      if (operand) {
+        bool l0_operand =
+            (writing ? destination : source)->buffer.scope() == "shared.l0a" ||
+            (writing ? destination : source)->buffer.scope() == "shared.l0b";
+        if (!l0_operand ||
+            (writing ? source->buffer.scope() != "shared.l1"
+                     : destination->buffer.scope() != "shared.l0c"))
+          return std::nullopt;
+      } else if (writing ? (source->buffer.scope() != "global" ||
                      destination->buffer.scope() != "shared.l1")
                   : (source->buffer.scope() != "shared.l1" ||
                      (destination->buffer.scope() != "shared.l0a" &&
@@ -1751,12 +1775,16 @@ private:
              point.num_versions == info.num_versions &&
              point.edge.distance == (release ? info.num_versions : 0) &&
              ffi::StructuralEqual()(point.flag_iteration, clock) &&
-             src.path_end == (release ? reader : writer) &&
-             dst.path_end == (release ? writer : reader) &&
+             (release ? src.path_end == reader : dst.path_end == reader) &&
+             ((release ? dst.path_end : src.path_end) == writer ||
+              (operand && (release ? dst.path_end : src.path_end)->IsTask() &&
+               (release ? dst.path_end : src.path_end)->GetParent() == child)) &&
              src.path_begin == src.path_end && dst.path_begin == dst.path_end &&
              src.core == kCoreCube && dst.core == kCoreCube &&
-             src.pipe == (release ? "MTE1" : "MTE2") &&
-             dst.pipe == (release ? "MTE2" : "MTE1") &&
+             src.pipe == (release ? (operand ? "M" : "MTE1")
+                                 : (operand ? "MTE1" : "MTE2")) &&
+             dst.pipe == (release ? (operand ? "MTE1" : "MTE2")
+                                 : (operand ? "M" : "MTE1")) &&
              is_one(src.GetGuard()) && is_one(dst.GetGuard()) &&
              !site_registry_.Domain(src).IsCounter() &&
              !site_registry_.Domain(dst).IsCounter() &&
@@ -1777,7 +1805,23 @@ private:
                                 point.edge.src) == 0)
         released = true;
     }
-    return ready && released;
+    if (!ready || !released)
+      return false;
+    if (!operand)
+      return true;
+    // Child optimization may put one ready after the last operand load and
+    // one release wait before the first. Consume the existing complete paths
+    // for this exact Buffer's writer; MTE1 issue order alone is insufficient.
+    // The strict segment must still come from the retained real hard events.
+    int domain = domains_.DomainForStorage(info.storage, child);
+    auto site = [&](TaskNode *task, bool beginning) {
+      return site_registry_.FindSiteId(
+          SyncInsertionSiteKey{task, task, beginning, kCoreCube, domain});
+    };
+    return MinCompletionDistance(closure->second, site(writer, false),
+                                  site(reader, true)) == 0 &&
+           MinCompletionDistance(closure->second, site(reader, false),
+                                  site(writer, true)) <= info.num_versions;
   }
 
   std::vector<SyncPoint>
@@ -3269,6 +3313,68 @@ public:
     for (const auto &[domain, total] : next_intra_core_id) {
       if (total <= kIntraCoreFlagLimit)
         continue;
+      // TVM_LOG_DEBUG controls this diagnostic. Report the already allocated
+      // protocols without performing any additional dependency/proof query.
+      if (runtime::detail::VerboseLoggingEnabled(__FILE__, 1)) {
+        auto node_name = [](IRStructure *node) {
+          if (node == nullptr)
+            return std::string("<root>");
+          std::ostringstream name;
+          if (node->IsControl()) {
+            name << "loop:"
+                 << static_cast<ControlNode *>(node)->control->loop_var;
+          } else {
+            Stmt body = static_cast<TaskNode *>(node)->stmt;
+            while (const auto *attribute = body.as<AttrStmtNode>())
+              body = attribute->body;
+            const auto *evaluate = body.as<EvaluateNode>();
+            const auto *call =
+                evaluate ? evaluate->value.as<CallNode>() : nullptr;
+            name << "task:";
+            const auto *op = call ? call->op.as<OpNode>() : nullptr;
+            if (op)
+              name << op->name;
+            else
+              name << body->GetTypeKey();
+          }
+          name << "[index=" << node->GetIndex() << ",stage=" << node->GetStage()
+               << "]";
+          return name.str();
+        };
+        for (size_t allocation_index = 0;
+             allocation_index < allocations_.size(); ++allocation_index) {
+          const FlagAllocation &allocation = allocations_[allocation_index];
+          for (size_t point_index : allocation.sync_points) {
+            const SyncPoint &point = sync_points_[point_index];
+            if (FlagDomain(point) != domain)
+              continue;
+            const SyncInsertionSite &src = site_registry_.Src(point);
+            const SyncInsertionSite &dst = site_registry_.Dst(point);
+            LOG(INFO) << "Flag-capacity domain=" << domain << " total=" << total
+                      << " allocation=" << allocation_index << " ids=["
+                      << allocation.base_id << ","
+                      << allocation.base_id + allocation.num_versions - 1
+                      << "] point=" << point_index
+                      << " versions=" << point.num_versions
+                      << " distance=" << point.edge.distance
+                      << " flag_loop=" << node_name(point.flag_loop)
+                      << " clock=" << point.flag_iteration
+                      << " counter_group=" << point.counter_group_id
+                      << " unit_boundary="
+                      << static_cast<int>(point.unit_boundary)
+                      << " src=" << node_name(src.path_begin) << "/"
+                      << node_name(src.path_end) << " src_pipe=" << src.pipe
+                      << " src_domain=" << src.EpochDomainId()
+                      << " src_guard=" << src.GetGuard() << " src_active="
+                      << site_registry_.Domain(src).active_guard
+                      << " dst=" << node_name(dst.path_begin) << "/"
+                      << node_name(dst.path_end) << " dst_pipe=" << dst.pipe
+                      << " dst_domain=" << dst.EpochDomainId()
+                      << " dst_guard=" << dst.GetGuard() << " dst_active="
+                      << site_registry_.Domain(dst).active_guard;
+          }
+        }
+      }
       if (require_intra_core_capacity) {
         LOG(WARNING) << "Optional unit stream exceeds local hard-event "
                         "capacity after safe reuse: domain="

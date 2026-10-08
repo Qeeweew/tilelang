@@ -491,10 +491,17 @@ A retained child ring can cover a direct parent's WAR for that same storage.
 The prepared version clock and physical materialization use the same complete
 ancestor iteration count, so an odd child trip count does not reset the slot.
 This requires a unique iteration owner, static unguarded positive loops,
-full typed GM-to-L1 and L1-to-L0 accesses, and the actual retained RAW and
-full-ring release protocols. Other accesses, counters and unsupported domains
+full typed GM-to-L1/L1-to-L0 copies or L1-to-L0/native-MAD operand accesses,
+and the actual retained RAW and full-ring release protocols. A MAD operand
+must be the same complete canonical Buffer as the load destination; its
+release is the real whole-MAD `M` completion, independent of partial C-ready
+unit flags. Other accesses, counters and unsupported domains
 retain the parent obligation. This coverage removes only the redundant storage
 WAR; it adds no whole-loop completion edge and cannot prove C phase reuse.
+This distinction matters when two operand versions cross a row-part boundary:
+the next row part may overwrite a different slot before the previous part's
+last MAD completes, while every same-slot overwrite still consumes its own
+retained release. Parent owner and physical phase obligations remain separate.
 
 A persistent 2201 local binary handshake in a static positive child loop can
 also cover its parent's exact last-to-first boundary. The synchronization
