@@ -38,6 +38,28 @@ def test_independent_core_cliques_are_bounded_separately():
     assert _bound([2, 3, 4, 5], [2] * 4, [(0, 1), (2, 3)]) == 9
 
 
+@pytest.mark.parametrize("high_bit", [2 << 7, 1 << 35])
+def test_core_pipe_namespaces_retain_each_explicit_resource_clique(high_bit):
+    # Cube MTE2 and another core's MTE2 have independent cyclic resources.
+    # Summing all four would be unsound; ignoring the high-bit clique would
+    # miss its stronger bound. No conflict is inferred across namespaces.
+    intervals = [2, 3, 4, 5]
+    flags = [2, 2, high_bit, high_bit]
+    resources = [(0, 1), (2, 3)]
+    assert _bound(intervals, flags, resources) == 9
+    lower, upper = z3_scheduler._straight_line_makespan_bounds(
+        intervals, intervals, flags, [], resources, [], [],
+    )
+    assert lower == upper == 9
+
+
+@pytest.mark.parametrize("bit", [2, 2 << 7, 1 << 35])
+def test_resource_window_bound_uses_supplied_low_or_high_namespace(bit):
+    assert _window([1, 2, 3, 1], [0, bit, bit, 0],
+                   [(0, 1, 0, 2), (0, 2, 0, 2), (1, 3, 0, 4), (2, 3, 0, 4)],
+                   [(1, 2)]) == 9
+
+
 def test_resource_window_bound_accounts_for_earliest_release():
     # Three mutually exclusive vector issues all wait for one producer.
     assert _window([1] * 4, [2, 16, 16, 16],
@@ -138,6 +160,51 @@ def test_selected_plan_retains_forward_and_wrap_gaps():
     assert versions == []
     assert starts[1] - starts[0] >= 1
     assert starts[0] - starts[1] + ii >= 2
+
+
+@pytest.mark.parametrize("high_bit", [2 << 7, 1 << 35])
+def test_no_offset_windows_are_independent_across_core_pipe_namespaces(high_bit):
+    intervals, resources = [1] * 4, [(0, 1), (2, 3)]
+    starts, versions, ii = z3_scheduler.z3_schedule_loop_python(**_inputs(
+        num_stages=3, stage_horizon=3, enable_offset=False,
+        latencies=[1, 1, 4, 1], iis=intervals,
+        resource_flags=[2, 2, high_bit, high_bit], resource_deps=resources,
+        data_deps=[(0, 2, 0, 4)],
+    ))
+    # [0, 1, 4, 5] is a finite SAT witness at II=2. Each core fits its own
+    # window, while an artificial shared MTE2 window would exclude this II.
+    witness = [0, 1, 4, 5]
+    assert ii == 2 and versions == []
+    for selected in (witness, starts):
+        assert selected[2] - selected[0] >= 4
+        assert max(selected) - min(selected) >= ii
+        for i, j in resources:
+            assert abs(selected[j] - selected[i]) < ii
+            assert _pair_legal([start % ii for start in selected], ii, intervals, (i, j))
+
+
+@pytest.mark.parametrize("bit", [2, 2 << 7, 1 << 35])
+def test_no_offset_window_still_constrains_each_core_pipe(bit):
+    starts, _, ii = z3_scheduler.z3_schedule_loop_python(**_inputs(
+        num_stages=3, stage_horizon=3, enable_offset=False,
+        latencies=[4, 1], iis=[1, 1], resource_flags=[bit, bit],
+        data_deps=[(0, 1, 0, 4)], resource_deps=[(0, 1)],
+    ))
+    assert ii == 5  # The same resource's required span is four, hence II > 4.
+    assert 4 <= starts[1] - starts[0] < ii
+    assert _pair_legal([start % ii for start in starts], ii, [1, 1], (0, 1))
+
+
+@pytest.mark.parametrize("bit", [2, 2 << 7, 1 << 35])
+def test_resource_masks_do_not_create_unsupplied_core_pipe_exclusions(bit):
+    starts, _, ii = z3_scheduler.z3_schedule_loop_python(**_inputs(
+        iis=[2, 3], latencies=[2, 3], resource_flags=[bit, bit],
+        data_deps=[], resource_deps=[],
+    ))
+    assert _bound([2, 3], [bit, bit], []) == ii == 3
+    # A shared mask is insufficient proof of exclusion. II=3 cannot fit
+    # both intervals without overlap, so inferred exclusion would fail here.
+    assert not _pair_legal(starts, ii, [2, 3], (0, 1))
 
 
 def test_single_stage_window_bounds_issue_residues_without_changing_native_completion():

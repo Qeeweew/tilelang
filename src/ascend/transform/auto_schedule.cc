@@ -133,11 +133,6 @@ bool SameVar(const Var &a, const Var &b);
 // Check if there is a variable dependency between two IRStructures
 bool HasVarDependency(const IRStructure *a, const IRStructure *b);
 
-// Check if two IRStructures have resource dependency (use same hardware
-// resource)
-bool HasResourceDependency(const IRStructure *a, const IRStructure *b,
-                           uint16_t mask = UINT16_MAX);
-
 // Builder that schedules TaskNode/ControlNode children in IRStructure
 class ScheduleBuilder {
 private:
@@ -361,16 +356,41 @@ bool HasVarDependency(const IRStructure *a, const IRStructure *b) {
 }
 
 bool HasResourceDependency(const IRStructure *a, const IRStructure *b,
-                           uint16_t mask) {
-  if (((a->GetPipeMask() & b->GetPipeMask()) & mask) != 0)
-    return true;
-  return (a->GetHbmMask() & b->GetHbmMask()) != 0;
+                           uint16_t shared_pipes) {
+  return shared_pipes != 0 || (a->GetHbmMask() & b->GetHbmMask()) != 0;
 }
 
 CoreMask TaskExecutionCore(const TaskNode *task) {
   CoreMask candidate = GetTaskCandidateCoreMask(task);
   CoreMask lexical = task->GetCoreMask();
   return lexical == kCoreUnassigned ? candidate : candidate & lexical;
+}
+
+// Solver resources name a physical core's pipe, not just a pipe kind. Keep
+// the original pipe facts for lowering and synchronization; derive this mask
+// once at the scheduling boundary from the same leaf ownership facts used by
+// AssignCore. In particular, AIC:MTE2 and AIV:MTE2 are independent engines.
+// Vector tasks describe the common instruction stream of the private AIVs.
+constexpr unsigned kVectorResourceShift = 7;
+
+uint16_t SchedulingPipeMask(IRStructure *node) {
+  uint16_t result = 0;
+  std::vector<TaskNode *> leaves;
+  CollectAllTaskNodes(node, leaves);
+  for (const TaskNode *task : leaves) {
+    CoreMask core = TaskExecutionCore(task);
+    ICHECK_NE(core, kCoreUnassigned)
+        << "Task ownership is incompatible with its execution resources: "
+        << task->stmt;
+    uint16_t pipes = task->GetPipeMask();
+    if (core & kCoreCube)
+      result |= pipes;
+    if (core & kCoreVector)
+      result |= pipes << kVectorResourceShift;
+  }
+  // Combine leaf (core, pipe) pairs instead of crossing a compound node's
+  // aggregate core and pipe masks, which would invent resource occupancy.
+  return result;
 }
 
 CoreMask NodeExecutionCore(IRStructure *node) {
@@ -701,8 +721,7 @@ std::vector<std::shared_ptr<IRStructure>> ScheduleBuilder::Z3SchedulePython(
       latencies.push_back(node->GetLatency());
       iis.push_back(node->GetII());
 
-      // Pass pipe mask directly as resource flags
-      resource_flags.push_back(static_cast<int64_t>(node->GetPipeMask()));
+      resource_flags.push_back(SchedulingPipeMask(nodes[i]));
     }
 
     // Variable (Let-var write -> read) data dependencies
@@ -767,9 +786,8 @@ std::vector<std::shared_ptr<IRStructure>> ScheduleBuilder::Z3SchedulePython(
     // Collect resource dependencies
     for (size_t i = 0; i < n; ++i) {
       for (size_t j = i + 1; j < n; ++j) {
-        uint16_t shared_pipes =
-            nodes[i]->GetPipeMask() & nodes[j]->GetPipeMask();
-        if (HasResourceDependency(nodes[i], nodes[j])) {
+        uint16_t shared_pipes = resource_flags[i] & resource_flags[j];
+        if (HasResourceDependency(nodes[i], nodes[j], shared_pipes)) {
           resource_deps.emplace_back(i, j);
         }
         if (manual_schedule && shared_pipes != 0) {
@@ -996,7 +1014,7 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
     const IRStructure *node = nodes[i];
     latencies.push_back(node->GetLatency());
     iis.push_back(node->GetII());
-    resource_flags.push_back(static_cast<int64_t>(node->GetPipeMask()));
+    resource_flags.push_back(SchedulingPipeMask(nodes[i]));
   }
 
   // Keep one representative Buffer per storage for shape/scope accounting.
@@ -1431,9 +1449,12 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
   // Collect resource dependencies
   for (size_t i = 0; i < n; ++i) {
     for (size_t j = i + 1; j < n; ++j) {
-      uint16_t shared_pipes = nodes[i]->GetPipeMask() & nodes[j]->GetPipeMask();
+      uint16_t shared_pipes = resource_flags[i] & resource_flags[j];
+      constexpr uint16_t scalar_pipes =
+          PipeMask(ResourcePipe::kScalar) |
+          (PipeMask(ResourcePipe::kScalar) << kVectorResourceShift);
       if (HasResourceDependency(nodes[i], nodes[j],
-                                ~((uint16_t)ResourcePipe::kScalar))) {
+                                shared_pipes & ~scalar_pipes)) {
         resource_deps.emplace_back(i, j);
       }
       if (manual_schedule && shared_pipes != 0) {

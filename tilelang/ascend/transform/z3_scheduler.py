@@ -64,6 +64,19 @@ def _convert_int_tuples(values, arity: int) -> list[tuple[int, ...]]:
     return result
 
 
+def _resource_bits(resource_flags):
+    """Enumerate supplied resource namespaces without inferring conflicts."""
+    remaining = 0
+    for flags in resource_flags:
+        remaining |= int(flags)
+    if remaining < 0:
+        raise ValueError("Resource masks must be nonnegative")
+    while remaining:
+        bit = remaining & -remaining
+        yield bit
+        remaining ^= bit
+
+
 def _reduce_straight_line_orders(
     latencies, iis, resource_flags, data_deps, resource_deps,
     owner_exclusion_deps, pipe_order_deps,
@@ -197,7 +210,7 @@ def _straight_line_makespan_bounds(latencies, iis, resource_flags, data_deps, re
             tails[i] = max(tails[i], weight + tails[j])
     lower = max([0, *(head + tail for head, tail in zip(heads, tails))])
     resources = {(i, j) for i, j in resource_deps if i < j}
-    for bit in (1, 2, 4, 8, 16, 32, 64):
+    for bit in _resource_bits(resource_flags):
         group = [i for i in range(n) if resource_flags[i] & bit]
         # The actual supplied exclusions, including explicit API inputs, are
         # authoritative; a resource mask alone never adds a hard constraint.
@@ -240,8 +253,10 @@ def z3_schedule_python(
     iis : list[int]
         Task issue intervals in the same units as ``latencies``.
     resource_flags : list[int]
-        Resource pipe mask for each task (bitmask of ResourcePipe values):
+        Nonnegative resource mask for each task. Legacy ResourcePipe bits are:
         MTE1=1, MTE2=2, MTE3=4, Cube=8, Vector=16, Fixpipe=32, Scalar=64.
+        Higher bits may distinguish independent core/pipe namespaces. Only
+        supplied resource_deps establish mutual exclusion.
     data_deps : list[tuple[int, int, int]]
         Directed ``(i, j, latency)`` constraints requiring task ``j`` to start
         at least ``latency`` cost-model units after task ``i``.
@@ -670,7 +685,7 @@ def _loop_resource_ii_lower_bound(iis, resource_flags, resource_deps):
     if any(interval < 0 for interval in iis):
         return lower
     resources = {(i, j) for i, j in resource_deps if i < j}
-    for bit in (1, 2, 4, 8, 16, 32, 64):
+    for bit in _resource_bits(resource_flags):
         remaining = {i for i, flags in enumerate(resource_flags) if flags & bit}
         while remaining:
             # Independent cores commonly form separate complete components
@@ -869,8 +884,10 @@ def z3_schedule_loop_python(
     iis : list[int]
         Task issue intervals in the same units as ``latencies``.
     resource_flags : list[int]
-        Resource pipe mask for each task (bitmask of ResourcePipe values):
+        Nonnegative resource mask for each task. Legacy ResourcePipe bits are:
         MTE1=1, MTE2=2, MTE3=4, Cube=8, Vector=16, Fixpipe=32, Scalar=64.
+        Higher bits may distinguish independent core/pipe namespaces. Only
+        supplied resource_deps establish mutual exclusion.
     data_deps : list[tuple[int, int, int, int]]
         Directed ``(i, j, distance, latency)`` constraints. Negative distances
         encode automatic buffer-version variables.
@@ -1100,8 +1117,7 @@ def z3_schedule_loop_python(
         # max(start) - min(start) < II among that resource's tasks. For a set,
         # max - min < II is equivalent to |start_a - start_b| < II for all pairs.
         if not enable_offset:
-            pipe_bits = [1, 2, 4, 8, 16, 32, 64]  # MTE1, MTE2, MTE3, Cube, Vector, Fixpipe, Scalar
-            for bit in pipe_bits:
+            for bit in _resource_bits(resource_flags):
                 group = [i for i in range(n) if resource_flags[i] & bit]
                 for a in range(len(group)):
                     for b in range(a + 1, len(group)):

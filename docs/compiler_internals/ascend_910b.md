@@ -371,6 +371,18 @@ the supplied model's units, including dimensionless 2201 weights. A solver
 `unknown` result reports its reason separately from `unsat` and retains the
 existing fallback policy.
 
+Issue resources are `(core, pipe)` pairs. AIC and AIV MTE2 engines and Scalar
+units have separate occupancy; using the same pipe name does not serialize
+their work. AutoSchedule derives these pairs from each leaf's capability and
+lexical ownership before final core assignment. Compound nodes union their
+leaf pairs, without inventing every combination of their aggregate cores and
+pipes. The same resource masks govern exclusions, manual pipe order,
+bounds on resource work and disabled-offset windows. The automatic stage horizon
+still counts pipe kinds as a conservative search limit. HBM contention remains
+a separate scheduling policy, and all data, storage release and collective
+completion dependencies remain hard constraints. Removing a false pipe
+exclusion alone does not prove useful C/V overlap or a latency improvement.
+
 Modulo search bounds II by the total issue work of verified resource cliques.
 Pipe masks nominate groups; only actual pairwise exclusions establish a
 clique, and independent cores are bounded separately. With automatic stage
