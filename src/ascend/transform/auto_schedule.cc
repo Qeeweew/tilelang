@@ -174,6 +174,11 @@ public:
   // Structural GM prefetch preference for ordinary dav-2201 auto pipelines.
   void SetPreferPrefetchIssue(bool value) { prefer_prefetch_issue_ = value; }
 
+  // First/last issue summaries are admitted only for the 2201 AIC contract.
+  void SetUseHierarchicalResources(bool value) {
+    use_hierarchical_resources_ = value;
+  }
+
   // Whole-kernel L0 admission for dav-2201 automatic loops. Separate phase
   // allocations remain reserved unless a selected reuse contract retires
   // every reader before the other phase may overwrite the same address.
@@ -266,6 +271,7 @@ private:
 
   bool prefer_handoff_issue_{false};
   bool prefer_prefetch_issue_{false};
+  bool use_hierarchical_resources_{false};
   bool reserve_l0_storage_{false};
   bool reserve_ub_storage_{false};
   std::vector<L0PhaseReusePair> l0_phase_reuse_;
@@ -284,6 +290,17 @@ private:
 // Scratch timing state used only while AutoSchedule is solving and ordering an
 // IRStructure tree. Task latency and II live directly on IRStructure because
 // they are ordinary T.Task metadata.
+// Half-open issue spans, in the existing cost model's units. These never
+// replace a task's completion latency. kind 0 names a core/pipe bit; kind 1
+// names an existing HBM contention-policy bit.
+struct IssueResourceSpan {
+  int64_t kind;
+  int64_t bit;
+  int64_t first;
+  int64_t last;
+};
+using IssueResourceProfile = std::vector<IssueResourceSpan>;
+
 class AutoScheduleExtraInfo final : public IRExtraInfo {
 public:
   std::unique_ptr<IRExtraInfo> Clone() const final {
@@ -294,10 +311,17 @@ public:
   int64_t GetStartTime() const { return start_time_; }
   void SetIIperIter(int64_t ii_per_iter) { ii_per_iter_ = ii_per_iter; }
   int64_t GetIIperIter() const { return ii_per_iter_; }
+  void SetResourceProfile(IssueResourceProfile profile) {
+    resource_profile_ = std::move(profile);
+  }
+  const std::optional<IssueResourceProfile> &GetResourceProfile() const {
+    return resource_profile_;
+  }
 
 private:
   int64_t start_time_{0};
   int64_t ii_per_iter_{0};
+  std::optional<IssueResourceProfile> resource_profile_;
 };
 
 AutoScheduleExtraInfo *GetAutoScheduleExtraInfo(IRStructure *node) {
@@ -413,6 +437,130 @@ CoreMask NodeExecutionCore(IRStructure *node) {
   return result;
 }
 
+IssueResourceProfile EnvelopeResourceProfile(IRStructure *node) {
+  IssueResourceProfile result;
+  auto append = [&](int64_t kind, uint16_t bits) {
+    while (bits) {
+      uint16_t bit = bits & -bits;
+      result.push_back({kind, bit, 0, node->GetII()});
+      bits ^= bit;
+    }
+  };
+  constexpr uint16_t scalar =
+      PipeMask(ResourcePipe::kScalar) |
+      (PipeMask(ResourcePipe::kScalar) << kVectorResourceShift);
+  append(0, SchedulingPipeMask(node) & ~scalar);
+  append(1, node->GetHbmMask());
+  return result;
+}
+
+bool IsPureCubeIssueTask(TaskNode *task) {
+  uint16_t pipes = task->GetPipeMask();
+  constexpr uint16_t allowed =
+      PipeMask(ResourcePipe::kMTE1) | PipeMask(ResourcePipe::kMTE2) |
+      PipeMask(ResourcePipe::kCube) | PipeMask(ResourcePipe::kFixpipe);
+  return TaskExecutionCore(task) == kCoreCube && pipes && !(pipes & ~allowed) &&
+         !(pipes & (pipes - 1)) && task->GetSpecialWriteMask() == 0 &&
+         task->GetII() > 0;
+}
+
+bool HasOnlyCubeIssueTasks(IRStructure *node) {
+  std::vector<TaskNode *> leaves;
+  CollectAllTaskNodes(node, leaves);
+  return !leaves.empty() &&
+         std::all_of(leaves.begin(), leaves.end(), IsPureCubeIssueTask);
+}
+
+bool HasPureControlHeader(ControlNode *ctrl) {
+  PrimExpr step = ctrl->control->step.has_value()
+                      ? ctrl->control->step.value()
+                      : IntImm(DataType::Int(32), 1);
+  for (const PrimExpr &bound :
+       {ctrl->control->min, ctrl->control->extent, step})
+    if (!bound.dtype().is_scalar() ||
+        !(bound.dtype().is_int() || bound.dtype().is_uint()) ||
+        SideEffect(bound) != CallEffectKind::kPure)
+      return false;
+  // DecodeControl always creates this context/For metadata task. It does not
+  // represent a Scalar command merely because it is non-null. Header reads
+  // of immutable variables are bookkeeping; memory, SPR or device resources
+  // still reject a precise issue summary.
+  if (const auto &header = ctrl->task)
+    return !header->HasGuards() && header->GetReadRegions().empty() &&
+           header->GetWriteRegions().empty() &&
+           header->GetWriteVars().empty() &&
+           !(header->GetPipeMask() & ~PipeMask(ResourcePipe::kScalar)) &&
+           header->GetHbmMask() == 0 && header->GetSpecialWriteMask() == 0 &&
+           header->GetExplicitSpecialReadMask() == 0 &&
+           !header->ReadsPadValueRegister() && !header->ReadsAtomicRegister();
+  return true;
+}
+
+// A finite AIC-only automatic child remains an atomic source block. Reserve
+// each resource from its first to its last actual issue, including all child
+// iterations/stages, without opening holes for parent instructions. Scalar
+// tasks, guards, dynamic loops and unknown descendants keep the old envelope;
+// in particular this does not model A2 cross-core dispatch gates.
+std::optional<IssueResourceProfile>
+SummarizeAutomaticChildResources(ControlNode *ctrl) {
+  if (!HasPureControlHeader(ctrl) || ctrl->HasGuards() ||
+      ctrl->BodyHasLoopBreak() || NodeExecutionCore(ctrl) != kCoreCube)
+    return std::nullopt;
+  const int64_t *extent = as_const_int(ctrl->control->extent);
+  PrimExpr step = ctrl->control->step.has_value()
+                      ? ctrl->control->step.value()
+                      : IntImm(DataType::Int(32), 1);
+  const int64_t *stride = as_const_int(step);
+  if (!extent || !stride || *extent <= 0 || *stride <= 0)
+    return std::nullopt;
+  int64_t trips = *extent / *stride + (*extent % *stride != 0);
+  int64_t period = GetAutoScheduleExtraInfo(ctrl)->GetIIperIter();
+  if (period <= 0)
+    return std::nullopt;
+  using Wide = __int128;
+  Wide repeat_offset = Wide(trips - 1) * period;
+  std::map<std::pair<int64_t, int64_t>, std::pair<int64_t, int64_t>> spans;
+  for (const auto &child : ctrl->children) {
+    if (child->HasGuards() || child->GetSpecialWriteMask() != 0)
+      return std::nullopt;
+    IssueResourceProfile profile;
+    if (child->IsTask()) {
+      auto *task = static_cast<TaskNode *>(child.get());
+      if (!IsPureCubeIssueTask(task))
+        return std::nullopt;
+      profile = EnvelopeResourceProfile(task);
+    } else {
+      const auto &nested =
+          GetAutoScheduleExtraInfo(child.get())->GetResourceProfile();
+      if (!nested.has_value())
+        return std::nullopt;
+      profile = nested.value();
+    }
+    int64_t start = GetAutoScheduleExtraInfo(child.get())->GetStartTime();
+    for (const auto &span : profile) {
+      Wide first = Wide(start) + span.first;
+      Wide last = Wide(start) + repeat_offset + span.last;
+      if (first < 0 || last <= first || last > ctrl->GetII())
+        return std::nullopt;
+      auto key = std::make_pair(span.kind, span.bit);
+      auto [entry, inserted] = spans.try_emplace(
+          key, static_cast<int64_t>(first), static_cast<int64_t>(last));
+      if (!inserted) {
+        entry->second.first =
+            std::min(entry->second.first, static_cast<int64_t>(first));
+        entry->second.second =
+            std::max(entry->second.second, static_cast<int64_t>(last));
+      }
+    }
+  }
+  IssueResourceProfile result;
+  for (const auto &[key, span] : spans)
+    result.push_back({key.first, key.second, span.first, span.second});
+  return result.empty()
+             ? std::nullopt
+             : std::optional<IssueResourceProfile>(std::move(result));
+}
+
 // Derive an issue-quality preference from the shared leaf access facts. This
 // does not add, erase or redirect a completion dependency. A forward handoff is
 // a concrete-core writer -> other-core reader of the dependency storage. The
@@ -510,7 +658,8 @@ std::vector<std::pair<int64_t, int64_t>> CollectPrefetchIssuePreferences(
     const std::vector<IRStructure *> &nodes, const std::vector<DepInfo> &deps,
     const std::unordered_map<Var, size_t, ObjectPtrHash, ObjectPtrEqual>
         &storage_version_id,
-    const MultiBufferOwnerMap &owners, ControlNode *loop) {
+    const MultiBufferOwnerMap &owners, ControlNode *loop,
+    const std::unordered_set<IRStructure *> &profiled_children) {
   std::unordered_map<IRStructure *, size_t> index;
   std::vector<CoreMask> cores;
   for (size_t i = 0; i < nodes.size(); ++i) {
@@ -550,7 +699,8 @@ std::vector<std::pair<int64_t, int64_t>> CollectPrefetchIssuePreferences(
       continue;
     size_t i = index.at(dep.prod_node), j = index.at(dep.cons_node);
     if (i == j || !IsConcreteCore(cores[i]) || cores[i] != cores[j] ||
-        (nodes[i]->GetPipeMask() & nodes[j]->GetPipeMask()) != 0 ||
+        ((nodes[i]->GetPipeMask() & nodes[j]->GetPipeMask()) != 0 &&
+         !profiled_children.count(nodes[j])) ||
         nodes[i]->ReadsStorage(storage) || nodes[j]->WritesStorage(storage))
       continue;
     for (const auto &[producer, consumer] : dep.task_pairs) {
@@ -1017,6 +1167,30 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
     resource_flags.push_back(SchedulingPipeMask(nodes[i]));
   }
 
+  // Only automatic AIC-only parents consume the supported child's resource
+  // summary. Every other node retains its complete envelope. Supplying all
+  // resources (including HBM) lets Python check a complete pair, rather than
+  // accidentally dropping another shared resource while shortening MTE2.
+  std::unordered_set<IRStructure *> profiled_children;
+  std::vector<IssueResourceProfile> resource_profiles;
+  if (use_hierarchical_resources_ && auto_pipeline && enable_offset &&
+      !manual_schedule && stage_horizon > 1 && !ctrl->HasGuards() &&
+      HasPureControlHeader(ctrl) && HasOnlyCubeIssueTasks(ctrl) &&
+      std::all_of(iis.begin(), iis.end(), [](int64_t ii) { return ii > 0; })) {
+    for (IRStructure *node : nodes) {
+      const auto &profile =
+          GetAutoScheduleExtraInfo(node)->GetResourceProfile();
+      if (profile.has_value()) {
+        profiled_children.insert(node);
+        resource_profiles.push_back(profile.value());
+      } else {
+        resource_profiles.push_back(EnvelopeResourceProfile(node));
+      }
+    }
+    if (profiled_children.empty())
+      resource_profiles.clear();
+  }
+
   // Keep one representative Buffer per storage for shape/scope accounting.
   // Version variables and dependency distances are keyed directly by storage.
   struct StorageResource {
@@ -1196,7 +1370,10 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
       // memory group by their size
       if (!root_l0) {
         int versions =
-            preserve_issue_order || root_ub ? reserved_versions(storage) : 1;
+            preserve_issue_order || root_ub ||
+                    (!resource_profiles.empty() && IsL1Buffer(buffer))
+                ? reserved_versions(storage)
+                : 1;
         consume_fixed_capacity(group_id, get_buffer_size(buffer), versions);
       }
     } else {
@@ -1476,7 +1653,8 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
   if (prefer_prefetch_issue_ && auto_pipeline && enable_offset &&
       !manual_schedule && num_stages > 1)
     prefetch_priority_pairs = CollectPrefetchIssuePreferences(
-        nodes, deps, storage_version_id, multi_buffer_owners_, ctrl);
+        nodes, deps, storage_version_id, multi_buffer_owners_, ctrl,
+        profiled_children);
 
   // Stage-order constraints for copied Let variables.
   //
@@ -1529,6 +1707,8 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
   ffi::Array<ffi::Array<int64_t>> tvm_pipe_order_deps;
   ffi::Array<ffi::Array<int64_t>> tvm_issue_priority_pairs;
   ffi::Array<ffi::Array<int64_t>> tvm_prefetch_priority_pairs;
+  ffi::Array<ffi::Array<int64_t>> tvm_resource_reservations;
+  ffi::Array<int64_t> tvm_resource_hbm_masks;
   ffi::Array<int64_t> tvm_storage_sizes;
   ffi::Array<int64_t> tvm_storage_min_versions;
   ffi::Array<int64_t> tvm_manual_stages;
@@ -1574,6 +1754,13 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
     tvm_issue_priority_pairs.push_back({producer, consumer});
   for (const auto &[producer, consumer] : prefetch_priority_pairs)
     tvm_prefetch_priority_pairs.push_back({producer, consumer});
+  for (size_t i = 0; i < resource_profiles.size(); ++i)
+    for (const auto &span : resource_profiles[i])
+      tvm_resource_reservations.push_back({int64_t(i), span.kind, span.bit,
+                                           span.first, span.last - span.first});
+  if (!resource_profiles.empty())
+    for (IRStructure *node : nodes)
+      tvm_resource_hbm_masks.push_back(node->GetHbmMask());
   ffi::Array<ffi::Array<int64_t>> tvm_stage_order_deps;
   for (const auto &dep : stage_order_deps) {
     ffi::Array<int64_t> pair;
@@ -1636,15 +1823,31 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
         ffi::Function::GetGlobal("tl.transform.z3_schedule_loop_python");
     ICHECK(z3_schedule_loop_func.has_value())
         << "Python Z3 loop scheduler is not registered";
+    using LoopResult =
+        ffi::Tuple<ffi::Array<int64_t>, ffi::Array<int>, int64_t>;
     auto return_val =
-        z3_schedule_loop_func
-            .value()(num_stages, tvm_latencies, tvm_iis, tvm_resource_flags,
-                     tvm_data_deps, tvm_resource_deps, tvm_owner_exclusion_deps,
-                     tvm_pipe_order_deps, tvm_storage_sizes, tvm_memory_groups,
-                     tvm_stage_order_deps, enable_offset, tvm_manual_stages,
-                     manual_schedule, stage_horizon, tvm_issue_priority_pairs,
-                     tvm_prefetch_priority_pairs, tvm_storage_min_versions)
-            .cast<ffi::Tuple<ffi::Array<int64_t>, ffi::Array<int>, int64_t>>();
+        resource_profiles.empty()
+            ? z3_schedule_loop_func
+                  .value()(
+                      num_stages, tvm_latencies, tvm_iis, tvm_resource_flags,
+                      tvm_data_deps, tvm_resource_deps,
+                      tvm_owner_exclusion_deps, tvm_pipe_order_deps,
+                      tvm_storage_sizes, tvm_memory_groups,
+                      tvm_stage_order_deps, enable_offset, tvm_manual_stages,
+                      manual_schedule, stage_horizon, tvm_issue_priority_pairs,
+                      tvm_prefetch_priority_pairs, tvm_storage_min_versions)
+                  .cast<LoopResult>()
+            : z3_schedule_loop_func
+                  .value()(
+                      num_stages, tvm_latencies, tvm_iis, tvm_resource_flags,
+                      tvm_data_deps, tvm_resource_deps,
+                      tvm_owner_exclusion_deps, tvm_pipe_order_deps,
+                      tvm_storage_sizes, tvm_memory_groups,
+                      tvm_stage_order_deps, enable_offset, tvm_manual_stages,
+                      manual_schedule, stage_horizon, tvm_issue_priority_pairs,
+                      tvm_prefetch_priority_pairs, tvm_storage_min_versions,
+                      tvm_resource_reservations, tvm_resource_hbm_masks)
+                  .cast<LoopResult>();
     start_times = return_val.get<0>();
     storage_versions = return_val.get<1>();
     ii = return_val.get<2>();
@@ -1655,6 +1858,34 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
   for (size_t i = 0; i < storage_versions.size(); ++i)
     ICHECK_GE(storage_versions[i], storage_min_versions[i])
         << "AutoSchedule returned fewer versions than the shared storage ring";
+
+  // Independently check the physical order about to be emitted. This check
+  // uses selected starts, not the solver's resource orientation Booleans.
+  // Prefix/suffix summaries permit no parent task inside a child source block.
+  if (!resource_profiles.empty()) {
+    using Wide = __int128;
+    for (const auto &profile : resource_profiles)
+      for (const auto &span : profile)
+        ICHECK(Wide(span.last) - span.first <= Wide(ii))
+            << "Hierarchical resource self collision";
+    for (const auto &[i, j] : resource_deps) {
+      int64_t ri = start_times[i] % ii, rj = start_times[j] % ii;
+      int64_t ki = start_times[i] / ii, kj = start_times[j] / ii;
+      bool before = ri < rj || (ri == rj && (ki > kj || (ki == kj && i < j)));
+      for (const auto &a : resource_profiles[i]) {
+        for (const auto &b : resource_profiles[j]) {
+          if (a.kind != b.kind || a.bit != b.bit)
+            continue;
+          Wide forward = before ? Wide(rj) + b.first - ri - a.last
+                                : Wide(ri) + a.first - rj - b.last;
+          Wide wrap = before ? Wide(ii) + ri + a.first - rj - b.last
+                             : Wide(ii) + rj + b.first - ri - a.last;
+          ICHECK(forward >= 0 && wrap >= 0)
+              << "Hierarchical resource plan violates atomic source order";
+        }
+      }
+    }
+  }
 
   // Automatic plans have no fixed absolute origin. Use a common origin
   // for stages and timestamps: subtracting only from timestamps changes the
@@ -1671,6 +1902,11 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
       stages.push_back((start - first) / ii);
     }
     const char *rejection = nullptr;
+    // Resource spans share the child's origin. A residue cut may rotate an
+    // atomic block across another block or its own wrap; keep whole periods
+    // for this first slice, preserving the already checked physical order.
+    if (!resource_profiles.empty())
+      rejection = "hierarchical-resource-origin";
     using Wide = __int128;
     for (const auto &[u, v] : resource_deps) {
       Wide difference = Wide(residues[v]) - residues[u];
@@ -1903,6 +2139,9 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
   ctrl->SetII(overall_latency);
   ctrl->SetLatency(overall_latency);
   GetAutoScheduleExtraInfo(ctrl)->SetIIperIter(ii);
+  if (use_hierarchical_resources_ && auto_pipeline && !manual_schedule)
+    if (auto profile = SummarizeAutomaticChildResources(ctrl))
+      GetAutoScheduleExtraInfo(ctrl)->SetResourceProfile(std::move(*profile));
   for (const StorageResource &resource : storage_resources) {
     const Var &storage = resource.storage;
     auto annotated = annotated_storage_versions.find(storage);
@@ -1986,6 +2225,8 @@ static void ScheduleSingleKernel(const Stmt &kernel_body, Target target,
                                      AscendArchitecture::kDav2201);
   unit_builder.SetPreferPrefetchIssue(target_info.architecture ==
                                       AscendArchitecture::kDav2201);
+  unit_builder.SetUseHierarchicalResources(target_info.architecture ==
+                                           AscendArchitecture::kDav2201);
   unit_builder.SetReserveL0Storage(target_info.architecture ==
                                    AscendArchitecture::kDav2201);
   unit_builder.SetReserveUBStorage(target_info.architecture ==

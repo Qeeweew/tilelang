@@ -707,6 +707,87 @@ def _loop_resource_ii_lower_bound(iis, resource_flags, resource_deps):
     return lower
 
 
+def _loop_resource_profiles(resource_reservations, resource_flags, iis, resource_hbm_masks=None):
+    """Validate complete per-node resource summaries supplied by native lowering.
+
+    Rows are (node, kind, one-hot bit, first issue, span width). kind 0 uses
+    core/pipe namespaces, kind 1 the existing HBM contention policy. A span
+    includes every child issue on that resource; its holes remain reserved.
+    Empty input deliberately leaves the old scheduling path unchanged.
+    """
+    if not resource_reservations:
+        return None
+    if (resource_hbm_masks is None or len(resource_hbm_masks) != len(iis)
+            or any(not isinstance(mask, int) or isinstance(mask, bool) or mask < 0 or mask & ~7
+                   for mask in resource_hbm_masks)):
+        raise ValueError("Hierarchical resource summaries require complete native HBM masks")
+    profiles = [dict() for _ in iis]
+    for node, kind, bit, first, width in resource_reservations:
+        if (node < 0 or node >= len(iis) or kind not in (0, 1)
+                or bit <= 0 or bit & (bit - 1) or first < 0 or width <= 0
+                or first + width > iis[node] or (kind == 1 and bit not in (1, 2, 4))):
+            raise ValueError("Invalid hierarchical issue resource reservation")
+        key = kind, bit
+        if key in profiles[node]:
+            raise ValueError("Duplicate hierarchical resource summary")
+        profiles[node][key] = first, first + width
+    scalar_bits = 64 | (64 << 7)
+    for node, flags in enumerate(resource_flags):
+        supplied = sum(bit for kind, bit in profiles[node] if kind == 0)
+        if supplied != (flags & ~scalar_bits):
+            raise ValueError("Incomplete hierarchical core/pipe resource summary")
+        hbm = sum(bit for kind, bit in profiles[node] if kind == 1)
+        if hbm != resource_hbm_masks[node]:
+            raise ValueError("Incomplete hierarchical HBM resource summary")
+    return profiles
+
+
+def _loop_profile_constraints(ctx, ii, k_vars, r_vars, profiles, resource_deps):
+    """Protect atomic block order, forward/wrap handoffs and self overlap.
+
+    The emitter sorts whole parent blocks by (residue, -stage, source index).
+    Per-resource offsets share one child origin. An independent parent task
+    may precede or follow a child, but may never splice into its internal holes.
+    Completion and storage-release constraints are supplied separately.
+    """
+    assertions, covered = [], set()
+    for profile in profiles:
+        for first, last in profile.values():
+            assertions.append(z3.BoolVal(ii >= last - first, ctx))
+    for i, j in resource_deps:
+        common = profiles[i].keys() & profiles[j].keys()
+        if not common:
+            continue  # An unknown/opaque conflict keeps its original envelope.
+        covered.add((i, j))
+        before = _loop_issue_before(ctx, k_vars, r_vars, i, j)
+        assertions.append(z3.Bool(f"O_{i}_{j}", ctx) == before)
+        for key in common:
+            first_i, last_i = profiles[i][key]
+            first_j, last_j = profiles[j][key]
+            assertions.extend([
+                z3.Implies(before, r_vars[j] + first_j >= r_vars[i] + last_i),
+                z3.Implies(before, ii + r_vars[i] + first_i >= r_vars[j] + last_j),
+                z3.Implies(z3.Not(before), r_vars[i] + first_i >= r_vars[j] + last_j),
+                z3.Implies(z3.Not(before), ii + r_vars[j] + first_j >= r_vars[i] + last_i),
+            ])
+    return assertions, covered
+
+
+def _loop_profile_ii_lower_bound(profiles, resource_deps, iis):
+    """Use issue spans for resource bounds, never shorten completion edges."""
+    resources = {(min(i, j), max(i, j)) for i, j in resource_deps}
+    lower = max([1, *(last - first for profile in profiles for first, last in profile.values())])
+    for key in {key for profile in profiles for key in profile}:
+        group = [i for i, profile in enumerate(profiles) if key in profile]
+        # A clique certifies disjoint resource spans; a non-clique does not.
+        if all((i, j) in resources for offset, i in enumerate(group) for j in group[offset + 1:]):
+            lower = max(lower, sum(profiles[i][key][1] - profiles[i][key][0] for i in group))
+    for i, j in resource_deps:
+        if not (profiles[i].keys() & profiles[j].keys()):
+            lower = max(lower, iis[i] + iis[j])
+    return lower
+
+
 def _single_stage_loop_ii_lower_bound(iis, resource_flags, data_deps, resource_deps, pipe_order_deps):
     """Bound the residue window by distance-zero releases and completion tails.
 
@@ -853,6 +934,8 @@ def z3_schedule_loop_python(
     issue_priority_pairs: list[tuple[int, int]] | None = None,
     prefetch_priority_pairs: list[tuple[int, int]] | None = None,
     buffer_min_versions: list[int] | None = None,
+    resource_reservations: list[tuple[int, int, int, int, int]] | None = None,
+    resource_hbm_masks: list[int] | None = None,
 ) -> tuple[list[int], list[int], int]:
     """Schedule a loop body with modulo, stage, and storage constraints.
 
@@ -907,6 +990,15 @@ def z3_schedule_loop_python(
         Physical ring widths already selected by other owners. Keep these
         lower bounds through solving, refinement and final recalculation;
         they may exceed this owner's bound for newly allocated versions.
+    resource_reservations : list[tuple[int, int, int, int, int]] | None
+        Optional native child issue summaries (node, kind, bit, first, width).
+        They reserve first-to-last issue per core/pipe and HBM resource while
+        keeping child completion/data latency unchanged. Whole parent blocks
+        retain the emitter's physical order; child holes are not insertion
+        points. Empty input uses the original resource model exactly.
+    resource_hbm_masks : list[int] | None
+        Exact native HBM mask for every node, required with issue summaries.
+        HBM occupancy cannot be inferred from a core/pipe resource mask.
     stage_order_deps : list[tuple[int, int]] | None
         Stage-order constraints (u, w) requiring k_u <= k_w (same or earlier
         iteration-stage).
@@ -945,6 +1037,9 @@ def z3_schedule_loop_python(
         raise RuntimeError("Z3 loop scheduling failed: n too small")
     if stage_horizon is not None and stage_horizon < 1:
         raise ValueError("Automatic pipeline stage_horizon must be positive")
+    resource_profiles = _loop_resource_profiles(resource_reservations, resource_flags, iis, resource_hbm_masks)
+    if resource_profiles is not None and (manual_schedule or not enable_offset):
+        raise ValueError("Hierarchical issue resources require an automatic offset pipeline")
     if buffer_min_versions is None:
         buffer_min_versions = [1] * len(buffer_sizes)
     if (len(buffer_min_versions) != len(buffer_sizes)
@@ -1004,14 +1099,16 @@ def z3_schedule_loop_python(
     # but must not be reported as a proof of infeasibility or minimality.
     # A sequential schedule must cover both dependency latency and the issue
     # intervals of tasks sharing a resource.
-    ii_lower = _loop_resource_ii_lower_bound(iis, resource_flags, resource_deps)
+    ii_lower = (_loop_resource_ii_lower_bound(iis, resource_flags, resource_deps)
+                if resource_profiles is None else
+                _loop_profile_ii_lower_bound(resource_profiles, resource_deps, iis))
     ii_upper = max(sum(latencies), sum(iis)) + 1
     best_ii = ii_upper
     best_model = None
     best_start_vars = None
     unknown_checks = []
     ordered_resources, unordered_resources = [], resource_deps
-    if stage_horizon == 1 and not manual_schedule:
+    if stage_horizon == 1 and not manual_schedule and resource_profiles is None:
         ii_lower = max(ii_lower, _single_stage_loop_ii_lower_bound(
             iis, resource_flags, data_deps, resource_deps, pipe_order_deps,
         ))
@@ -1069,10 +1166,18 @@ def z3_schedule_loop_python(
         # Add resource dependency constraints
         # For tasks i and j that use same resource, they cannot execute simultaneously
         # We create ordering variable O_i,j (True means i before j, False means j before i)
+        profiled_pairs = set()
+        if resource_profiles is not None:
+            profile_hard, profiled_pairs = _loop_profile_constraints(
+                ctx, ii, k_vars, r_vars, resource_profiles, resource_deps,
+            )
+            assertions.extend(profile_hard)
         for previous, current in ordered_resources:
             assertions.append(r_vars[current] - r_vars[previous] >= iis[previous])
             assertions.append(r_vars[previous] - r_vars[current] + ii >= iis[current])
         for i, j in unordered_resources:
+            if (i, j) in profiled_pairs:
+                continue
             if i < j:  # Only consider each pair once
                 ii_i = iis[i]
                 ii_j = iis[j]
@@ -1179,7 +1284,7 @@ def z3_schedule_loop_python(
         )
         if candidate is not None:
             candidate_starts, candidate_ii = candidate
-            if candidate_ii < ii_upper:
+            if candidate_ii < ii_upper or resource_profiles is not None:
                 assertions, k_vars, r_vars, start_vars, buffer_vars = build_problem(candidate_ii)
                 model = z3.Model(ctx=ctx)
                 for variable in k_vars:
@@ -1210,6 +1315,11 @@ def z3_schedule_loop_python(
             raise RuntimeError(
                 "Manual schedule constraints are infeasible; check per-pipe source order, T.Stage values, dependencies, and resource usage"
             )
+        if resource_profiles is not None:
+            # The structural witness above uses the conservative envelopes and
+            # is checked against all profile/data/version constraints. Never
+            # publish the old unchecked sequential fallback on this new path.
+            raise RuntimeError("No verified hierarchical issue schedule after bounded search")
         # No feasible II found. Fall back to a trivial sequential (non-pipelined)
         # schedule: each task starts right after the previous one finishes, in
         # index order. II = sum(latencies) makes successive loop iterations
@@ -1269,6 +1379,20 @@ def z3_schedule_loop_python(
             # Stages and version counts stay unchanged; only residues may move.
             start_times = [best_model.eval(best_start_vars[i]).as_long() - offset * best_ii
                            for i in range(n)]
+
+        if resource_profiles is not None:
+            # Validate the emitted counts, not a solver's larger slack rings.
+            # Refinements and fallback witnesses obey the same original hard
+            # data/owner/resource/stage/capacity assertions. Do not complete
+            # missing free symbols with arbitrary values to make a proof pass.
+            emitted = z3.Model(ctx=ctx)
+            for declaration in best_model.decls():
+                emitted.update_value(declaration(), best_model[declaration])
+            for variable, count in zip(best_buffer_vars, buffer_versions):
+                emitted.update_value(variable, z3.IntVal(count, ctx))
+            if any(not z3.is_true(emitted.eval(value, model_completion=False))
+                   for value in best_assertions):
+                raise RuntimeError("Emitted hierarchical plan violates a hard scheduling constraint")
 
     # Sort tasks by start time (and by index as tie-breaker)
     task_indices = list(range(n))
@@ -1495,6 +1619,8 @@ def z3_schedule_loop_ffi(
     issue_priority_pairs=None,
     prefetch_priority_pairs=None,
     buffer_min_versions=None,
+    resource_reservations=None,
+    resource_hbm_masks=None,
 ):
     """FFI wrapper for z3_schedule_loop_python.
 
@@ -1529,6 +1655,8 @@ def z3_schedule_loop_ffi(
     issue_priority_pairs_list = _convert_int_tuples(issue_priority_pairs, 2)
     prefetch_priority_pairs_list = _convert_int_tuples(prefetch_priority_pairs, 2)
     buffer_min_versions_list = None if buffer_min_versions is None else [int(value) for value in buffer_min_versions]
+    resource_reservations_list = _convert_int_tuples(resource_reservations, 5)
+    resource_hbm_masks_list = None if resource_hbm_masks is None else [int(mask) for mask in resource_hbm_masks]
 
     # Call the actual scheduler (Z3 is not thread-safe, serialize access)
     with _z3_lock:
@@ -1552,6 +1680,8 @@ def z3_schedule_loop_ffi(
             issue_priority_pairs=issue_priority_pairs_list,
             prefetch_priority_pairs=prefetch_priority_pairs_list,
             buffer_min_versions=buffer_min_versions_list,
+            resource_reservations=resource_reservations_list,
+            resource_hbm_masks=resource_hbm_masks_list,
         )
 
     # Return start_times and buffer_versions as separate arrays for easier FFI handling
