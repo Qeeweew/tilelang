@@ -14,6 +14,8 @@ def runtime_divisor_copy():
         num_cols: T.int32,
     ):
         with T.Kernel(1):
+            # The runtime divisor must define an in-bounds, nonnegative row.
+            T.assume(num_cols > 0)
             buf = T.alloc_shared((4, 8), "float32")
             for i in T.serial(4):
                 row = i // num_cols

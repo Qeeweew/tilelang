@@ -5,6 +5,7 @@
 #include <initializer_list>
 #include <string>
 
+#include "kernel_execution_topology.h"
 #include "target/source/codegen_c.h"
 #include <tvm/arith/analyzer.h>
 
@@ -107,8 +108,6 @@ private:
   int simdvf_helper_counter_{0};
   VFMode vf_mode_{VFMode::kNone};
 
-  bool has_gemm_l0_{false};
-  bool has_gemm_l1_{false};
   bool has_gemm_l1_included_{false};
   bool has_nd2nz_copy_{false};
   bool has_nd2nz_copy_included_{false};
@@ -125,7 +124,8 @@ private:
       unroll_factor_;
 
   ffi::Array<Var> CollectVFCaptures(const SBlockNode *op) const;
-  void EmitCthreadBindings(const Stmt &body, bool vf_local_bindings = false);
+  void EmitCthreadBindings(const std::vector<Var> &variables,
+                           bool vf_local_bindings = false);
   void EmitVFFunction(const SBlockNode *op, const ffi::Array<Var> &captures,
                       const std::string &helper_name,
                       const std::string &func_attrs, VFMode vf_mode);
@@ -165,9 +165,7 @@ private:
   std::string GetGmBypassPtr(DataType dtype, const BufferNode *buffer,
                              PrimExpr index);
 
-  enum class AscendKernelMode { kVector, kCube, kMix };
-  AscendKernelMode kernel_mode_{AscendKernelMode::kVector};
-  int mix_aiv_count_{2};
+  KernelExecutionTopology kernel_topology_;
   bool enable_fast_math_{false};
   bool is_dav2201_{false};
   // Permission for one direct native call, never a fact propagated through

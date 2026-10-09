@@ -30,6 +30,15 @@ separate. Public CANN declarations alone do not prove that a route exists on
 2201: direct L0C-to-UB and L1-to-UB transfers are unsupported. CANN's UB-to-L1
 Matmul helper uses a software GM handoff rather than a direct DMA instruction.
 
+The launch grid counts groups in a mixed kernel and individual AIVs in a pure
+Vector kernel. `T.Vector(vector=1|2)` declares the active width inside a mixed
+group, with one consistent width per kernel. A pure Vector kernel requires
+`vector=1`, whose hardware SID is zero; use `T.Kernel(N)` and its block index
+for N independent AIVs. A two-participant SID domain cannot create another
+AIV in a pure launch. Final code generation resolves the actual core regions,
+active width and SID domains together. Automatic scheduling retains explicitly
+declared widths when materializing those regions, including pure Vector output.
+
 ## Lowering and stage contracts
 
 The frontend expresses tile sizes, traversal, cache reuse and the algorithm.

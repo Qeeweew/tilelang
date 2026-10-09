@@ -1,5 +1,7 @@
 """Two AIVs share logical rows while keeping independent compact UB storage."""
 
+import re
+
 import pytest
 import tilelang
 from tilelang import tvm
@@ -394,6 +396,54 @@ def test_pure_vector_barrier_does_not_require_mixed_row_ownership(pipe, auto_sch
         assert source.count("asc_sync();") == 1
     else:
         assert "asc_sync_pipe(" + pipe + ");" in source
+
+
+def _pure_vector_grid_program(vector_width):
+    @T.prim_func
+    def main(Input: T.Tensor((2, 64), "float32"), Output: T.Tensor((2, 64), "float32")):
+        with T.Kernel(2) as block:
+            x = T.alloc_shared((64,), "float32")
+            if vector_width is None:
+                T.copy(Input[block, :], x)
+                T.copy(x, Output[block, :])
+            else:
+                with T.Vector(vector=vector_width):
+                    T.copy(Input[block, :], x)
+                    T.copy(x, Output[block, :])
+    return main
+
+
+@pytest.mark.parametrize("auto_schedule", [False, True], ids=["no-auto", "auto"])
+def test_pure_vector_dsl_rejects_two_active_aivs(auto_schedule):
+    with tvm.transform.PassContext(config={"tl.enable_auto_schedule": auto_schedule}):
+        with pytest.raises(tvm.error.InternalError, match="pure Vector.*vector_count 1"):
+            tilelang.lower(
+                _pure_vector_grid_program(2), target={"kind": "ascend", "arch": "dav-2201"},
+                enable_host_codegen=False, enable_device_compile=False,
+            )
+
+
+@pytest.mark.parametrize("vector_width,auto_schedule", [(1, False), (1, True), (None, True)],
+                         ids=["explicit-no-auto", "explicit-auto", "ordinary-auto"])
+def test_single_aiv_grid_retains_each_blocks_full_output_tile(vector_width, auto_schedule):
+    with tvm.transform.PassContext(config={"tl.enable_auto_schedule": auto_schedule}):
+        artifact = tilelang.lower(
+            _pure_vector_grid_program(vector_width), target={"kind": "ascend", "arch": "dav-2201"},
+            enable_host_codegen=False, enable_device_compile=False,
+        )
+    source = artifact.kernel_source
+    assert "__vector__" in source and "__mix__" not in source
+    load, = [line for line in source.splitlines() if "asc_copy_gm2ub_align(" in line]
+    store, = [line for line in source.splitlines() if "asc_copy_ub2gm_align(" in line]
+    for line, buffer in ((load, "Input"), (store, "Output")):
+        index = re.search(r"\b" + buffer + r"\[([^\]]+)\]", line)
+        assert index, line
+        # Both DMA endpoints address 64 elements per logical block, with no
+        # sub-block division/offset. Grid blocks 0 and 1 cover [0,64),[64,128).
+        expression = re.sub(r"\(int(?:32|64)_t\)", "", index.group(1))
+        expression = re.sub(r"[\s()]", "", expression)
+        assert expression == "block_idx*64", line
+        assert ",1,256,0,0,0,0);" in re.sub(r"\s", "", line), line
 
 
 def test_repeated_pass_is_idempotent():

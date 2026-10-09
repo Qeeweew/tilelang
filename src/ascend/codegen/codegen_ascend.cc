@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -82,18 +83,48 @@ bool IsVectorPipeBarrier(const CallNode *call) {
   return pipe && pipe->value == "PIPE_V";
 }
 
-// LowerScheduledTIR can clone a cthread binding into several core regions.
-// These bind the same immutable hardware SID, rather than defining new SSA
-// values. Collect them within one emitted function so their declarations
-// dominate nested and sibling C++ scopes. VF regions emit separate functions.
-class CthreadBindingCollector : public tirx::StmtVisitor {
+// Resolve the execution domain and its emitted-function SID projections once.
+// A cthread is an immutable hardware SID binding, not a separate launch grid.
+// VF helpers share the kernel domain but own their C++ binding declarations.
+class KernelTopologyCollector : public tirx::StmtExprVisitor {
 public:
-  explicit CthreadBindingCollector(arith::Analyzer *analyzer)
-      : analyzer_(analyzer) {}
-
-  std::vector<Var> variables;
+  static KernelExecutionTopology Analyze(const Stmt &body, int aiv_per_aic) {
+    KernelTopologyCollector collector;
+    collector(body);
+    collector.Resolve(aiv_per_aic);
+    return std::move(collector.topology_);
+  }
 
 private:
+  void RecordVectorCount(const ffi::Any &value) {
+    auto count = value.try_cast<Integer>();
+    ICHECK(!value.as<bool>().has_value() && count.has_value() &&
+           !count.value()->dtype.is_bool() &&
+           (count.value()->value == 1 || count.value()->value == 2))
+        << "Ascend core region vector_count must be the integer 1 or 2";
+    ICHECK(!vector_count_.has_value() ||
+           vector_count_.value() == count.value()->value)
+        << "Conflicting Ascend core region vector_count values";
+    vector_count_ = count.value()->value;
+  }
+
+  void VisitStmt_(const SBlockNode *op) final {
+    if (op->name_hint == "CUBE") {
+      has_cube_ = true;
+    } else if (op->name_hint == "VECTOR") {
+      has_vector_ = true;
+      if (auto count = op->annotations.Get("vector_count"))
+        RecordVectorCount(count.value());
+    }
+    const SBlockNode *saved_scope = vf_scope_;
+    if (op->name_hint == "SIMT_VF" || op->name_hint == "SIMD_VF") {
+      vf_scope_ = op;
+      topology_.vf_sid_bindings.try_emplace(op);
+    }
+    tirx::StmtExprVisitor::VisitStmt_(op);
+    vf_scope_ = saved_scope;
+  }
+
   void VisitStmt_(const AttrStmtNode *op) final {
     if (op->attr_key == tirx::attr::thread_extent ||
         op->attr_key == s_tir::attr::virtual_thread) {
@@ -103,28 +134,112 @@ private:
         ICHECK(var.dtype().lanes() == 1 &&
                (var.dtype().is_int() || var.dtype().is_uint()))
             << "Ascend cthread binding requires a scalar integer variable";
-        auto [it, inserted] = extents_.emplace(var.get(), op->value);
+        auto [it, inserted] = extents_[vf_scope_].emplace(var.get(), op->value);
         if (inserted) {
-          variables.push_back(var);
+          binding_extents_.push_back(op->value);
+          if (vf_scope_)
+            topology_.vf_sid_bindings[vf_scope_].push_back(var);
+          else
+            topology_.kernel_sid_bindings.push_back(var);
         } else {
-          ICHECK(analyzer_->CanProveEqual(it->second, op->value))
+          ICHECK(analyzer_.CanProveEqual(it->second, op->value))
               << "Repeated Ascend cthread binding for " << var
               << " has inconsistent extents: " << it->second << " and "
               << op->value;
         }
       }
     }
-    tirx::StmtVisitor::VisitStmt_(op);
+    tirx::StmtExprVisitor::VisitStmt_(op);
   }
 
-  void VisitStmt_(const SBlockNode *op) final {
-    if (op->name_hint != "SIMT_VF" && op->name_hint != "SIMD_VF") {
-      tirx::StmtVisitor::VisitStmt_(op);
+  void VisitExpr_(const CallNode *op) final {
+    auto &native = topology_.native;
+    native.gemm_l1 |= op->op.same_as(tl::ascend_gemm_l1()) ||
+                      op->op.same_as(tl::ascend_blockscaled_gemm_l1());
+    native.gemm_l0 |=
+        op->op.same_as(tl::ascend_mad()) || op->op.same_as(tl::ascend_mad_mx());
+    native.nd2nz_copy |= op->op.same_as(tl::ascend_nd2nz_scatter()) ||
+                         op->op.same_as(tl::ascend_nd2nz_post_copy());
+    native.nd2nz_post_copy |= op->op.same_as(tl::ascend_nd2nz_post_copy());
+    native.gm_bypass_dcache |=
+        op->op.same_as(tl::ascend_read_gm_bypass_dcache()) ||
+        op->op.same_as(tl::ascend_write_gm_bypass_dcache());
+    native.philox_rng |= op->op.same_as(tl::rng_init());
+    native.cooperative_groups |= op->op.same_as(tl::sync_warp());
+    tirx::StmtExprVisitor::VisitExpr_(op);
+  }
+
+  void Resolve(int aiv_per_aic) {
+    if (has_cube_ && has_vector_) {
+      topology_.kind = KernelExecutionKind::kMix;
+    } else if (has_cube_) {
+      topology_.kind = KernelExecutionKind::kCube;
+    } else if (has_vector_) {
+      topology_.kind = KernelExecutionKind::kVector;
+    } else if (topology_.native.gemm_l0 || topology_.native.gemm_l1 ||
+               topology_.native.nd2nz_post_copy) {
+      // Preserve the native fallback: ND2NZ scatter alone stays Vector.
+      topology_.kind = KernelExecutionKind::kCube;
+    }
+
+    if (topology_.kind == KernelExecutionKind::kCube) {
+      // This slice does not tighten legacy Cube-only SID declarations.
+      // There is no active AIV in a Cube-only launch.
+      topology_.physical_aiv_count = 0;
+      topology_.active_aiv_count = 0;
+      return;
+    }
+    std::vector<int64_t> binding_widths;
+    for (const PrimExpr &extent : binding_extents_) {
+      PrimExpr simplified = analyzer_.Simplify(extent);
+      const auto *count = simplified.as<IntImmNode>();
+      if (topology_.kind == KernelExecutionKind::kVector) {
+        ICHECK(count && !count->dtype.is_bool() && count->value == 1)
+            << "Ascend pure Vector kernel requires vector_count 1; cthread "
+               "extent must match active AIV domain 1, got "
+            << extent;
+      } else {
+        ICHECK(count && !count->dtype.is_bool() &&
+               (count->value == 1 || count->value == 2))
+            << "Ascend cthread extent " << extent
+            << " must match an active AIV domain of 1 or 2";
+      }
+      binding_widths.push_back(count->value);
+    }
+    if (topology_.kind == KernelExecutionKind::kVector) {
+      ICHECK(!vector_count_.has_value() || vector_count_.value() == 1)
+          << "Ascend pure Vector kernel requires vector_count 1";
+      topology_.physical_aiv_count = 1;
+      topology_.active_aiv_count = 1;
+    } else {
+      topology_.physical_aiv_count = aiv_per_aic;
+      // A cthread binding is an explicit width even without vector_count.
+      // Unannotated mixed kernels without SID bindings retain the target
+      // default.
+      topology_.active_aiv_count = vector_count_.value_or(
+          binding_widths.empty() ? aiv_per_aic : binding_widths.front());
+      ICHECK(topology_.active_aiv_count <= topology_.physical_aiv_count)
+          << "Ascend vector_count exceeds the physical AIV domain";
+    }
+    for (size_t i = 0; i < binding_widths.size(); ++i) {
+      ICHECK(binding_widths[i] == topology_.active_aiv_count)
+          << "Ascend cthread extent " << binding_extents_[i]
+          << " does not match active AIV domain " << topology_.active_aiv_count;
     }
   }
 
-  arith::Analyzer *analyzer_;
-  std::unordered_map<const VarNode *, PrimExpr> extents_;
+  KernelExecutionTopology topology_;
+  bool has_cube_{false};
+  bool has_vector_{false};
+  std::optional<int> vector_count_;
+  arith::Analyzer analyzer_;
+  const SBlockNode *vf_scope_{nullptr};
+  // Repeated-binding SSA checks belong to each emitted function. All unique
+  // binding occurrences still participate in the Vector/Mix domain check.
+  std::unordered_map<const SBlockNode *,
+                     std::unordered_map<const VarNode *, PrimExpr>>
+      extents_;
+  std::vector<PrimExpr> binding_extents_;
 };
 
 bool IsSimdOp(const CallNode *op, std::string *op_name = nullptr) {
@@ -431,16 +546,17 @@ void CodeGenTileLangAscend::Init(bool output_ssa) {
 
 void CodeGenTileLangAscend::PrintFuncPrefix(std::ostream &os) {
   os << "extern \"C\" ";
-  switch (kernel_mode_) {
-  case AscendKernelMode::kMix:
+  switch (kernel_topology_.kind) {
+  case KernelExecutionKind::kMix:
     // dav-3510's direct AIC-to-AIV data paths require the physical 1:2 group.
-    // mix_aiv_count_ controls how many of those AIVs execute the vector body.
-    os << "__global__ __mix__(1, 2) ";
+    // The validated active width controls which AIVs execute the vector body.
+    os << "__global__ __mix__(1, " << kernel_topology_.physical_aiv_count
+       << ") ";
     break;
-  case AscendKernelMode::kVector:
+  case KernelExecutionKind::kVector:
     os << "__global__ __vector__ ";
     break;
-  case AscendKernelMode::kCube:
+  case KernelExecutionKind::kCube:
     os << "__global__ __cube__ ";
     break;
   }
@@ -641,8 +757,6 @@ void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
   is_dav2201_ = tl::GetAscendTargetInfo(target).architecture ==
                 tl::AscendArchitecture::kDav2201;
   reuse_normal_full_mask_ = false;
-  has_gemm_l0_ = false;
-  has_gemm_l1_ = false;
   unroll_factor_.clear();
   ReserveKeywordsAsUnique();
   name_supply_->ReserveName("block_idx");
@@ -655,58 +769,15 @@ void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
     }
   }
 
-  // Pre-scan body to determine kernel mode (Mix / Vector / Cube)
-  bool has_cube = false, has_vector = false;
-  bool has_nd2nz_post_copy = false;
-  bool has_cooperative_groups = false;
-  int vector_count = 2;
-  tirx::PostOrderVisit(f->body, [&](const ffi::ObjectRef &n) {
-    if (const auto *block = n.as<SBlockNode>()) {
-      if (block->name_hint == "CUBE")
-        has_cube = true;
-      else if (block->name_hint == "VECTOR") {
-        has_vector = true;
-        if (auto opt = block->annotations.Get("vector_count")) {
-          const auto *count = opt.value().as<IntImmNode>();
-          ICHECK(count != nullptr && (count->value == 1 || count->value == 2))
-              << "Mixed-kernel vector_count must be the constant integer 1 or "
-                 "2, got "
-              << opt.value();
-          vector_count = count->value;
-        }
-      }
-    }
-    if (const auto *call = n.as<CallNode>()) {
-      if (call->op.same_as(tl::ascend_gemm_l1()) ||
-          call->op.same_as(tl::ascend_blockscaled_gemm_l1())) {
-        has_gemm_l1_ = true;
-      }
-      if (call->op.same_as(tl::ascend_mad()) ||
-          call->op.same_as(tl::ascend_mad_mx())) {
-        has_gemm_l0_ = true;
-      }
-      if (call->op.same_as(tl::ascend_nd2nz_scatter()) ||
-          call->op.same_as(tl::ascend_nd2nz_post_copy())) {
-        has_nd2nz_copy_ = true;
-      }
-      if (call->op.same_as(tl::ascend_nd2nz_post_copy())) {
-        has_nd2nz_post_copy = true;
-      }
-      if (call->op.same_as(tl::ascend_read_gm_bypass_dcache()) ||
-          call->op.same_as(tl::ascend_write_gm_bypass_dcache())) {
-        has_gm_bypass_dcache_ = true;
-      }
-      if (call->op.same_as(tl::rng_init())) {
-        has_philox_rng_ = true;
-      }
-      if (call->op.same_as(tl::sync_warp())) {
-        has_cooperative_groups = true;
-      }
-    }
-  });
+  kernel_topology_ = KernelTopologyCollector::Analyze(
+      f->body, tl::GetAscendTargetInfo(target).aiv_per_aic);
+  // These include requirements accumulate across all module entries.
+  has_nd2nz_copy_ |= kernel_topology_.native.nd2nz_copy;
+  has_gm_bypass_dcache_ |= kernel_topology_.native.gm_bypass_dcache;
+  has_philox_rng_ |= kernel_topology_.native.philox_rng;
 
   // Conditionally include gemm.h when ascend_gemm_l1 is used
-  if (has_gemm_l1_ && !has_gemm_l1_included_) {
+  if (kernel_topology_.native.gemm_l1 && !has_gemm_l1_included_) {
     decl_stream << "#include <tl_templates/ascend/gemm.h>\n";
     has_gemm_l1_included_ = true;
   }
@@ -731,24 +802,10 @@ void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
   }
 
   // sync_warp lowers to cooperative_groups::coalesced_threads().sync().
-  if (has_cooperative_groups && !has_cooperative_groups_included_) {
+  if (kernel_topology_.native.cooperative_groups &&
+      !has_cooperative_groups_included_) {
     decl_stream << "#include <simt_api/cooperative_groups.h>\n";
     has_cooperative_groups_included_ = true;
-  }
-
-  if (has_cube && has_vector) {
-    kernel_mode_ = AscendKernelMode::kMix;
-    mix_aiv_count_ = vector_count;
-  } else if (has_cube) {
-    kernel_mode_ = AscendKernelMode::kCube;
-  } else if (has_vector) {
-    kernel_mode_ = AscendKernelMode::kVector;
-  } else if (has_gemm_l0_ || has_gemm_l1_ || has_nd2nz_post_copy) {
-    // ND2NZ scatter executes on the Vector core and must not make a
-    // scatter-only kernel Cube. Preserve the existing post-copy classification.
-    kernel_mode_ = AscendKernelMode::kCube;
-  } else {
-    kernel_mode_ = AscendKernelMode::kVector;
   }
 
   auto global_symbol = f->GetAttr<ffi::String>(tvm::attr::kGlobalSymbol);
@@ -801,7 +858,7 @@ void CodeGenTileLangAscend::AddFunction(const PrimFunc &f) {
   stream << ") {\n";
   this->PreFunctionBody(f);
   int func_scope = this->BeginScope();
-  EmitCthreadBindings(f->body);
+  EmitCthreadBindings(kernel_topology_.kernel_sid_bindings);
   this->PrintStmt(f->body);
   // Native Cube/MTE/Vector instructions issue asynchronously. The entry must
   // drain them before returning, just as the AscendC TPipe teardown does. This
@@ -830,11 +887,9 @@ void CodeGenTileLangAscend::PreFunctionBody(const PrimFunc &f) {
   }
 }
 
-void CodeGenTileLangAscend::EmitCthreadBindings(const Stmt &body,
-                                                bool vf_local_bindings) {
-  CthreadBindingCollector collector(&analyzer_);
-  collector(body);
-  if (collector.variables.empty()) {
+void CodeGenTileLangAscend::EmitCthreadBindings(
+    const std::vector<Var> &variables, bool vf_local_bindings) {
+  if (variables.empty()) {
     return;
   }
 
@@ -843,7 +898,7 @@ void CodeGenTileLangAscend::EmitCthreadBindings(const Stmt &body,
   stream << "const ";
   PrintType(DataType::Int(64), stream);
   stream << " " << sid << " = asc_get_sub_block_id();\n";
-  for (const Var &var : collector.variables) {
+  for (const Var &var : variables) {
     // VF emission temporarily inherits the enclosing name map. A binding
     // local to the helper must not refer to a declaration in the kernel body.
     if (vf_local_bindings) {
@@ -944,7 +999,7 @@ void CodeGenTileLangAscend::EmitVFFunction(const SBlockNode *op,
     // the helper signature use the surrounding kernel ABI, so keeping them in
     // VF mode can change scalar capture types (for example fp8_e4_t).
     VFModeScope vf_mode_scope(this, vf_mode);
-    EmitCthreadBindings(op->body, true);
+    EmitCthreadBindings(kernel_topology_.BindingsForVf(op), true);
     this->VisitStmt(op->body);
     helper_body = FixIndent(stream.str());
   }
@@ -1011,7 +1066,7 @@ void CodeGenTileLangAscend::EmitVFFunction(const SBlockNode *op,
 
 void CodeGenTileLangAscend::VisitStmt_(const SBlockNode *op) {
   if (op->name_hint == "CUBE") {
-    if (kernel_mode_ == AscendKernelMode::kMix) {
+    if (kernel_topology_.kind == KernelExecutionKind::kMix) {
       PrintIndent();
       stream << "if ASC_IS_AIC {\n";
       int scope = BeginScope();
@@ -1025,11 +1080,11 @@ void CodeGenTileLangAscend::VisitStmt_(const SBlockNode *op) {
     return;
   }
   if (op->name_hint == "VECTOR") {
-    if (kernel_mode_ == AscendKernelMode::kMix) {
+    if (kernel_topology_.kind == KernelExecutionKind::kMix) {
       PrintIndent();
       stream << "if ASC_IS_AIV {\n";
       int scope = BeginScope();
-      if (mix_aiv_count_ == 1) {
+      if (kernel_topology_.active_aiv_count == 1) {
         PrintIndent();
         stream << "if (asc_get_sub_block_id() == 0) {\n";
         int active_aiv_scope = BeginScope();

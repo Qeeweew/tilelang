@@ -657,7 +657,8 @@ private:
 };
 
 Stmt LowerScheduledKernel(const Stmt &scheduled_body,
-                          Optional<Var> external_sid, int vector_count) {
+                          Optional<Var> external_sid,
+                          std::optional<int> requested_vector_count) {
   Optional<Stmt> vector_body = LowerCore(scheduled_body, kCoreVector);
   Optional<Stmt> cube_body = LowerCore(scheduled_body, kCoreCube);
   if (!vector_body.has_value() && !cube_body.has_value()) {
@@ -669,6 +670,7 @@ Stmt LowerScheduledKernel(const Stmt &scheduled_body,
                             /*broadcast_establishes_stream=*/true);
   }
   if (vector_body.has_value() && cube_body.has_value()) {
+    int vector_count = requested_vector_count.value_or(2);
     Array<Stmt> blocks;
     blocks.push_back(SBlock({}, {}, {}, "CUBE", cube_body.value(), std::nullopt,
                             {}, {}, {}));
@@ -690,8 +692,12 @@ Stmt LowerScheduledKernel(const Stmt &scheduled_body,
     return SeqStmt(blocks);
   }
   if (vector_body.has_value()) {
+    Map<String, ffi::Any> vector_annotations;
+    if (requested_vector_count.has_value())
+      vector_annotations.Set("vector_count",
+                             Integer(requested_vector_count.value()));
     return SBlock({}, {}, {}, "VECTOR", vector_body.value(), std::nullopt, {},
-                  {}, {});
+                  {}, vector_annotations);
   }
   if (cube_body.has_value()) {
     return SBlock({}, {}, {}, "CUBE", cube_body.value(), std::nullopt, {}, {},
@@ -712,15 +718,14 @@ tvm::transform::Pass LowerScheduledTIR() {
           SBlock root = context.root;
           ScheduledTIR scheduled_tir =
               DecodeScheduledTIR(root, context.outer_ctx);
-          int vector_count =
-              scheduled_tir.metadata.num_aiv_subcores.value_or(2);
           Optional<BufferAliasMap> aliases;
           if (auto value = root->annotations.Get(kBufferAliasMap)) {
             aliases = value.value().cast<BufferAliasMap>();
             ValidateBufferAliasMap(aliases.value());
           }
           Stmt body =
-              LowerScheduledKernel(root->body, context.outer_sid, vector_count);
+              LowerScheduledKernel(root->body, context.outer_sid,
+                                   scheduled_tir.metadata.num_aiv_subcores);
           SBlockNode *writer = root.CopyOnWrite();
           if (aliases.has_value()) {
             Map<String, ffi::Any> annotations = writer->annotations;

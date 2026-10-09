@@ -35,11 +35,15 @@ def Cube() -> CubeFrame:
 class VectorFrame(TIRFrame):
     """Frame for Vector (AIV) execution region.
 
-    In Mix mode, provides a subblock ID variable via ``as`` binding::
+    Provides the group's hardware subblock ID via ``as`` binding. A mixed
+    group can activate one or two AIVs::
 
         with T.Vector(vector=2) as sid:
             # sid = asc_get_sub_block_id()
             ...
+
+    A pure Vector kernel has one AIV per grid block. Use ``vector=1`` there;
+    ``T.Kernel(N)`` supplies N independent AIV blocks and ``sid`` is zero.
     """
 
     def __enter__(self):
@@ -53,7 +57,9 @@ def Vector(vector: int = 2) -> VectorFrame:
     Parameters
     ----------
     vector : int
-        Number of AIV cores (1 or 2). Default 2.
+        Active AIV width within a mixed group (1 or 2). Default 2.
+        All Vector regions in a kernel must agree. A pure Vector kernel
+        requires 1; its parallel block count is specified by ``T.Kernel``.
 
     Returns
     -------
