@@ -442,6 +442,15 @@ the supplied model's units, including dimensionless 2201 weights. A solver
 `unknown` result reports its reason separately from `unsat` and retains the
 existing fallback policy.
 
+Before a straight-line result changes timestamps or sibling order, native
+validation consumes those same original weighted data, resource, owner and
+manual pipe-order constraints. It checks nonnegative starts and representable
+completion coordinates; repeated owner pairs retain one common orientation.
+It does not rerun dependency analysis or impose the solver's search reductions.
+An invalid automatic result keeps source order and zero straight-line metadata;
+an invalid manual result reports the failed contract. Source-order fallback is
+not a graph topological sort.
+
 Issue resources are `(core, pipe)` pairs. AIC and AIV MTE2 engines and Scalar
 units have separate occupancy; using the same pipe name does not serialize
 their work. AutoSchedule derives these pairs from each leaf's capability and

@@ -60,6 +60,7 @@
 #include "./auto_schedule/kernel_rewriter.h"
 #include "./auto_schedule/l0ab_phase_reuse.h"
 #include "./auto_schedule/l0c_storage_reuse.h"
+#include "./auto_schedule/list_schedule_validation.h"
 #include "./auto_schedule/loop_schedule_validation.h"
 #include "./auto_schedule/manual_schedule_completion.h"
 #include "./auto_schedule/multi_buffer.h"
@@ -833,7 +834,7 @@ std::vector<std::shared_ptr<IRStructure>> ScheduleBuilder::Z3SchedulePython(
       ICHECK(!manual_schedule)
           << "Python Z3 scheduler is required for manual AutoSchedule";
       LOG(WARNING) << "Python Z3 scheduler not registered, falling back to "
-                      "topological sort";
+                      "source order";
       return scheduled;
     }
 
@@ -993,16 +994,21 @@ std::vector<std::shared_ptr<IRStructure>> ScheduleBuilder::Z3SchedulePython(
                      tvm_pipe_order_deps)
             .cast<ffi::Array<int64_t>>();
 
-    if (start_times.size() != n) {
+    ListScheduleConstraints constraints{latencies, iis, data_deps, resource_deps,
+                                       owner_exclusion_deps, pipe_order_deps};
+    const char *failure = ValidateListSchedule(
+        constraints,
+        std::vector<int64_t>(start_times.begin(), start_times.end()));
+    if (failure) {
       ICHECK(!manual_schedule)
-          << "Python Z3 scheduler returned invalid manual schedule results";
-      LOG(WARNING) << "Python Z3 scheduler returned invalid results (size "
-                      "mismatch), falling back to topological sort";
+          << "Invalid Ascend list schedule: " << failure;
+      LOG(WARNING) << "Invalid Ascend list schedule: " << failure
+                   << ", falling back to source order";
       return scheduled;
     }
 
-    // Write start_times onto the scheduled nodes, then sort them in place by
-    // start_time (stable: ties keep original program order).
+    // Publish only the validated plan. Rejection leaves the original order
+    // and zeroed straight-line metadata intact. Ties retain source order.
     for (size_t i = 0; i < n; ++i) {
       GetAutoScheduleExtraInfo(nodes[i])->SetStartTime(start_times[i]);
     }
@@ -1020,13 +1026,13 @@ std::vector<std::shared_ptr<IRStructure>> ScheduleBuilder::Z3SchedulePython(
     ICHECK(!manual_schedule)
         << "Manual per-pipe scheduling failed: " << e.what();
     LOG(WARNING) << "Python Z3 scheduler failed with exception: " << e.what()
-                 << ", falling back to topological sort";
+                 << ", falling back to source order";
     return scheduled;
   } catch (...) {
     ICHECK(!manual_schedule)
         << "Manual per-pipe scheduling failed with unknown exception";
     LOG(WARNING) << "Python Z3 scheduler failed with unknown exception, "
-                    "falling back to topological sort";
+                    "falling back to source order";
     return scheduled;
   }
 }
