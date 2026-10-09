@@ -19,6 +19,8 @@
 
 #pragma once
 
+#include <numeric>
+
 #include "./l0ab_phase_reuse.h"
 #include "./multi_buffer.h"
 #include "./optimization_diagnostic.h"
@@ -38,6 +40,7 @@ struct L0OperandSlotMember {
   const MultiBufferInfo *versions{nullptr};
   PrimExpr slot;
   PrimExpr last_reader{Bool(true)};
+  int credit_span{1};
 };
 
 struct L0OperandSlotPool {
@@ -409,20 +412,25 @@ inline std::vector<L0OperandSlotPool> AnalyzeL0OperandSlotPools(
     int av = a->versions ? a->versions->num_versions : 1;
     int bv = b->versions ? b->versions->num_versions : 1;
     int64_t ab = bytes(a->buffer), bb = bytes(b->buffer);
-    // With equal pitches every version is one identical byte interval. A
-    // fixed smaller tile may occupy a prefix of slot zero, never another slot.
-    if ((av > 1 && bv > 1 && ab != bb) || (av > 1 && bb > ab) ||
-        (bv > 1 && ab > bb)) {
-      record(OptimizationStatus::kRejected, "incompatible-version-pitches",
-             a->epoch);
-      continue;
-    }
-    int slots = std::max(av, bv);
     int64_t pitch = std::max(ab, bb);
-    if (pitch * slots > capacity) {
+    bool same_intervals = !((av > 1 && bv > 1 && ab != bb) ||
+                            (av > 1 && bb > ab) || (bv > 1 && ab > bb));
+    // Keep the existing single-credit interval for equal slots and a fixed
+    // smaller prefix. Otherwise partition both physical rings at their common
+    // byte boundary. A larger load acquires every intersecting interval and
+    // its last whole MAD releases each one. Logical version pitches never
+    // change, including when one slot overlaps two slots of the other ring.
+    if (!same_intervals) {
+      pitch = std::gcd(ab, bb);
+      a->credit_span = ab / pitch;
+      b->credit_span = bb / pitch;
+    }
+    int64_t physical_bytes = std::max(ab * av, bb * bv);
+    if (physical_bytes > capacity) {
       record(OptimizationStatus::kRejected, "storage-capacity", a->epoch);
       continue;
     }
+    int slots = (physical_bytes + pitch - 1) / pitch;
     pools.push_back({*a, *b, slots, pitch});
     record(OptimizationStatus::kSelected, "physical-slot-candidate", a->epoch);
   }

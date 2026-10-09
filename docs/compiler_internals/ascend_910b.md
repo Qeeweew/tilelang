@@ -256,10 +256,12 @@ plan. The pass responsibilities are:
 | Layout, OOB and native copy normalization | Physical layouts, valid logical domains and actual instruction regions |
 | Vector and reduce lowering | Native task effects and explicit private UB scratch |
 | MaterializeScheduleUnits | Dependency-bearing task boundaries and explicit core/pipe facts |
-| AutoSchedule | Selected task order, stages and storage version counts |
+| Version-owner analysis | Eligible task generations and their loop/counter clocks, separate from persistent state regions |
+| AutoSchedule | Selected task order, stages and storage version counts; common loop/list validation |
 | PrepareMultiBuffer and ResolveCore | Concrete version epochs and core streams |
 | InsertSync | Completion and reuse dependencies, including finite fill/drain boundaries |
 | MaterializeMultiBuffer | Physical addresses from the selected version plan |
+| LowerScheduledTIR | Stage-shifted indices, accesses, guards and sync; physical fill/drain interval |
 | Codegen | Native instructions for the established layout and schedule |
 
 Codegen does not partition logical work or choose buffer versions. Resource
@@ -685,7 +687,18 @@ L0A/B can share physical addresses across two closed AIC phases while keeping
 their different canonical Buffers, layouts and version clocks. Early admission
 requires exactly two root allocations in the same physical scope, FP16/BF16
 canonical operands, typed L1 writers and native MAD readers, and separate
-direct phase children of one unconditional positive static outer loop. Escaped
+direct phase children of one unconditional positive static outer loop. An
+explicit offset loop may place those phases at different logical stages.
+Before scheduling, ordinary automatic pipeline intent may name that same
+static epoch. Prepared resource proofs require the intent to have been
+consumed into the validated plan; an unconsumed search request is not a proof.
+The shared offset policy reads automatic intent and an optional explicit
+override. AutoSchedule retains the selected `enable_offset` value after
+consuming intent, so later ownership and reuse analysis uses the same clock.
+Selection records the storage pairs on that epoch as well as the root;
+shared dependency analysis treats their physical lifetimes as exclusions,
+rather than inventing a logical value flow between unrelated allocations.
+The final order and stages determine the directed completion distances. Escaped
 or aliased views, opaque or raw Cube accesses, MX scales, mutable activation,
 manual physical rings, and a common eligible owner for both allocations retain
 the conservative reservation. Disabling shared-memory reuse also disables this
@@ -699,6 +712,14 @@ rings or additional C users, and distinct closed phases in one static epoch.
 Their individual physical footprints must fit L0C. The scheduler reserves
 their maximum footprint; synchronization must then prove both alias
 directions before the late byte allocator can share their base address.
+Shifted phases retain independent C allocations when their sum already fits;
+pressure-driven selection still requires the complete alias proof. A real
+completing pipe's direct order may have a negative logical iteration distance
+between different stages. Lifetime analysis retains that exact physical
+order alongside its nonnegative composed graph. Issue-only MTE/FIX order
+does not provide this completion fact. In the selected C-byte protocol the
+matching full FIX first completes into the real M drain, which then precedes
+the next phase's MAD; unit readiness alone cannot shorten the lifetime.
 Every query consumes this selected physical reservation, including a manual
 ancestor of an automatically pipelined child; established ring counts remain
 hard lower bounds.
@@ -732,6 +753,17 @@ physical phase envelope as the lifetime proof. Guarded buffer dependencies
 and invariant SPR dependencies keep their own domain selection. The enclosing
 lexical synchronization remains balanced when a phase has no active data work.
 Internal pipeline loads and MADs still use their own slot clocks and dependencies.
+
+For a selected canonical L0A/B pair with unique full loads and MAD readers,
+physical byte credits can replace the whole-phase envelope. Equal pitches
+retain one credit per slot. Different version pitches are partitioned at
+common byte boundaries: a larger load acquires every interval it overwrites,
+and its last whole MAD releases each interval. Both logical rings keep their
+original layout and generation clocks. Fill/drain and inactive epochs use the
+same finite seed/drain protocol. Credits consume actual local `M_MTE1` event
+capacity; they do not invent completion edges for disjoint slots or FIX.
+The final alias and capacity gates remain mandatory. Selection facts are
+consumed after successful synchronization, before later IR rewrites.
 
 A retained child ring can cover a direct parent's WAR for that same storage.
 The prepared version clock and physical materialization use the same complete

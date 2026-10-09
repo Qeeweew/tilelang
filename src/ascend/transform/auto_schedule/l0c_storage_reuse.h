@@ -699,6 +699,15 @@ AnalyzeL0CPhaseReuse(const ScheduledTIR &scheduled,
   }
   if (!epoch || !phases[0] || !phases[1] || phases[0] == phases[1])
     return plans;
+  // Shifted phases need no extra accumulator exclusion when both independent
+  // allocations already fit. Preserve their separate lifetimes in that case.
+  if (resource_epoch_detail::UsesStageOffsets(epoch)) {
+    int64_t bytes = 0;
+    for (const Buffer &buffer : members)
+      bytes += *Constant(buffer->shape[0]) * *Constant(buffer->shape[1]) * 4;
+    if (bytes <= target.l0c_bytes)
+      return plans;
+  }
   if (phases[0]->GetIndex() < phases[1]->GetIndex())
     plans.push_back({members[0]->data, members[1]->data, "shared.l0c", epoch,
                      phases[0], phases[1]});

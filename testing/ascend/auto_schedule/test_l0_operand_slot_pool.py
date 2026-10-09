@@ -20,9 +20,10 @@ from testing.ascend.auto_schedule.test_owner_result_completion import _name, _re
 from testing.ascend.auto_schedule.test_sync_binary_flags import _prove_binary_protocol
 
 
-def _program(dtype="float16", unit_streams=True, extra_reader=False, active_epochs=3):
+def _program(dtype="float16", unit_streams=True, extra_reader=False, active_epochs=3,
+             logical_stages=False, pv_native_k=256):
     # The unsupported-reader case must also fit without a C phase alias.
-    q_rows = 64 if extra_reader else 128
+    q_rows = 64 if extra_reader or logical_stages else 128
 
     @T.prim_func
     def main(Q: T.Tensor((3, 2, q_rows, 64), dtype),
@@ -38,15 +39,17 @@ def _program(dtype="float16", unit_streams=True, extra_reader=False, active_epoc
             v_l1 = T.alloc_l1((1024, 64), dtype)
             aq = T.alloc_l0a((q_rows, 64), dtype)
             bq = T.alloc_l0b((256, 64), dtype)
-            ap = T.alloc_l0a((64, 256), dtype)
-            bp = T.alloc_l0b((256, 64), dtype)
+            ap = T.alloc_l0a((64, pv_native_k), dtype)
+            bp = T.alloc_l0b((pv_native_k, 64), dtype)
             cq = T.alloc_l0c((q_rows, 256), "float32")
             cp = T.alloc_l0c((64, 64), "float32")
             T.annotate_buffer_versions({q_l1: 1, k_l1: 1, p_l1: 1, v_l1: 1,
                                         aq: 1, bq: 2, cq: 1, cp: 1})
             if not unit_streams:
                 T.set_mmad_direction("m")
-            for epoch in T.serial(active_epochs + 2):
+            for epoch in T.serial(active_epochs if logical_stages else active_epochs + 2,
+                                  annotations={"enable_offset": logical_stages,
+                                               "tl.ascend_preserve_issue_order": logical_stages}):
                 with T.Stage(0):
                     if epoch < active_epochs:
                         T.copy(K[epoch, :, :], k_l1)
@@ -59,20 +62,20 @@ def _program(dtype="float16", unit_streams=True, extra_reader=False, active_epoc
                                 if extra_reader:
                                     T.gemm(aq, bq, cq, transpose_B=True, clear_accum=True)
                                 T.copy(cq, Score[epoch, qk_owner, :, qk_n * 256:(qk_n + 1) * 256])
-                with T.Stage(0):
-                    if 1 <= epoch and epoch < active_epochs + 1:
-                        T.copy(V[epoch - 1, :, :], v_l1)
+                with T.Stage(1 if logical_stages else 0):
+                    if (0 if logical_stages else 1) <= epoch and epoch < active_epochs + (0 if logical_stages else 1):
+                        T.copy(V[epoch - (0 if logical_stages else 1), :, :], v_l1)
                         for pv_owner in T.serial(2):
                             for m_part in T.serial(2):
-                                T.copy(P[epoch - 1, pv_owner, m_part * 64:(m_part + 1) * 64, :], p_l1)
-                                for pv_k in T.Pipelined(4, max_stages=2):
+                                T.copy(P[epoch - (0 if logical_stages else 1), pv_owner, m_part * 64:(m_part + 1) * 64, :], p_l1)
+                                for pv_k in T.Pipelined(1024 // pv_native_k, max_stages=2):
                                     with T.Task(latency=2, ii=1):
-                                        T.copy(p_l1[:, pv_k * 256:(pv_k + 1) * 256], ap)
+                                        T.copy(p_l1[:, pv_k * pv_native_k:(pv_k + 1) * pv_native_k], ap)
                                     with T.Task(latency=2, ii=1):
-                                        T.copy(v_l1[pv_k * 256:(pv_k + 1) * 256, :], bp)
+                                        T.copy(v_l1[pv_k * pv_native_k:(pv_k + 1) * pv_native_k, :], bp)
                                     with T.Task(latency=3, ii=1):
                                         T.gemm(ap, bp, cp, transpose_B=False, clear_accum=pv_k == 0)
-                                T.copy(cp, Result[epoch - 1, pv_owner, m_part * 64:(m_part + 1) * 64, :])
+                                T.copy(cp, Result[epoch - (0 if logical_stages else 1), pv_owner, m_part * 64:(m_part + 1) * 64, :])
     return main
 
 
@@ -95,7 +98,8 @@ def _physical(argument, env):
     return buffer.scope(), tuple(range(slot * plane // 256, (slot + 1) * plane // 256))
 
 
-def _check_physical_completions(mod, active, *, extra_reader=False):
+def _check_physical_completions(mod, active, *, extra_reader=False, pv_native_k=256,
+                                check_prefetch=True):
     trace, payload, readers, loaded = [], {}, defaultdict(list), {}
     native_counts, exports, phase_starts, phase_ends = Counter(), Counter(), {}, {}
     pending_reads = []
@@ -120,7 +124,7 @@ def _check_physical_completions(mod, active, *, extra_reader=False):
                 epoch, owner = coords["epoch"], coords[phase + "_owner"]
                 part = coords.get("m_part", 0)
                 tile = (None if dst.name == "aq" else source_min[-2] // 256) if phase == "qk" else (
-                    source_min[-1 if dst.name == "ap" else -2] // 256)
+                    source_min[-1 if dst.name == "ap" else -2] // pv_native_k)
                 bank, blocks = _physical(call.args[1], env)
                 identity = phase, epoch, owner, part, tile
                 index = len(trace)
@@ -168,9 +172,9 @@ def _check_physical_completions(mod, active, *, extra_reader=False):
     precedes = _prove_binary_protocol(trace)
     assert all(precedes(source, destination) for source, destination in pending_reads), (
         "Every load needs completion before MAD; every overwritten byte needs its last MAD completion")
-    assert sum(native_counts.values()) == active * (32 if extra_reader else 24)
+    assert sum(native_counts.values()) == active * ((16 if extra_reader else 8) + 4 * (1024 // pv_native_k))
     assert exports == (Counter({"qk": active * 8, "pv": active * 4}) if active else Counter())
-    if active >= 3:
+    if active >= 3 and check_prefetch:
         for epoch in range(2, active):
             first = phase_starts["qk", epoch]
             last_mad = max(index for index, item in enumerate(trace)
@@ -207,3 +211,34 @@ def test_physical_pool_covers_fixed_counter_and_shifted_iteration_owners(dtype, 
 def test_additional_operand_reader_keeps_conservative_completion_protocol():
     _, snapshots = _lower(_program(unit_streams=False, extra_reader=True))
     _check_physical_completions(snapshots["tl.LowerScheduledTIR"], 3, extra_reader=True)
+
+
+@pytest.mark.parametrize("active", [1, 3])
+@pytest.mark.parametrize("pv_native_k", [128, 256], ids=["overlapping-pitches", "equal-pitches"])
+def test_logical_phase_offsets_preserve_physical_operand_credits(active, pv_native_k):
+    _, snapshots = _lower(_program(logical_stages=True, active_epochs=active, pv_native_k=pv_native_k))
+    _check_physical_completions(snapshots["tl.LowerScheduledTIR"], active, pv_native_k=pv_native_k)
+
+
+def test_automatic_phases_share_the_static_epoch_and_physical_credits():
+    from tvm import tirx
+    program = _program(logical_stages=True, active_epochs=3, pv_native_k=128)
+
+    def post(node):
+        if isinstance(node, tirx.For) and node.loop_var.name == "epoch":
+            annotations = dict(node.annotations)
+            annotations.pop("tl.ascend_preserve_issue_order")
+            annotations.pop("enable_offset")  # Ordinary Pipelined's default.
+            annotations.update({"tl.ascend_auto_pipeline": True, "num_stages": 4})
+            return tirx.For(node.loop_var, node.min, node.extent, node.kind, node.body,
+                            annotations=annotations, step=node.step)
+        if isinstance(node, tirx.AttrStmt) and node.attr_key == "tl.ascend_stage":
+            return node.body
+
+    program = program.with_body(tirx.stmt_functor.ir_transform(program.body, None, post))
+    _, snapshots = _lower(program)
+    # Automatic selection may choose another relative phase stage. Check its
+    # actual payloads and all readers; the manual tests above additionally
+    # require the specific next-slot prefetch allowed by their chosen stages.
+    _check_physical_completions(snapshots["tl.LowerScheduledTIR"], 3,
+                                pv_native_k=128, check_prefetch=False)

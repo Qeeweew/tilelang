@@ -112,7 +112,8 @@ struct DependencyTaskPair {
 enum class DependencyKind {
   // A directed producer-to-consumer data dependency.
   kData,
-  // Two disjoint owners of one multi-buffer-eligible storage.
+  // Two disjoint owners of one multi-buffer-eligible storage, or selected
+  // physical aliases in independently shifted phases.
   // `prod_node` and `cons_node` only establish a stable pair orientation;
   // `task_pairs` stores matching accesses on those two sides. Scheduling must
   // choose either direction and keep both storage lifetimes disjoint.

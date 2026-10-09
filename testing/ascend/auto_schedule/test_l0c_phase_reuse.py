@@ -34,7 +34,7 @@ _COPY = "tl.tileop.ascend_copy"
 _LOAD3D = "tl.tileop.ascend_cube_load3d"
 
 
-def _program(dtype, unit_streams):
+def _program(dtype, unit_streams, logical_stages=False):
     @T.prim_func
     def main(Q: T.Tensor((3, 2, 128, 64), dtype),
              K: T.Tensor((3, 2, 1024, 64), dtype),
@@ -52,13 +52,19 @@ def _program(dtype, unit_streams):
             cq = T.alloc_l0c((128, 256), "float32")
             cp = T.alloc_l0c((64, 64), "float32")
             T.annotate_buffer_versions({q_l1: 1, k_l1: 1, v_l1: 1, aq: 1, bq: 1, cq: 1, cp: 1})
+            if logical_stages:
+                # Isolate the shifted C contract within the same finite event
+                # budget as the cached full-P policy. The separate physical
+                # phase regression retains automatic chunk-cache versions.
+                T.annotate_buffer_versions({p_l1: 1})
             if not unit_streams:
                 # Isolate ordinary whole-M/FIX completion from the separately
                 # checked native unit protocol; explicit unit0 is not opt-out.
                 T.set_mmad_direction("m")
-            for epoch in T.serial(3):
+            for epoch in T.serial(2 if logical_stages else 3, annotations={"enable_offset": logical_stages,
+                                                "tl.ascend_preserve_issue_order": logical_stages}):
                 with T.Stage(0):
-                    if epoch < 2:
+                    if epoch < (3 if logical_stages else 2):
                         for qk_owner in T.serial(2):
                             T.copy(Q[epoch, qk_owner, :, :], q_l1)
                             T.copy(K[epoch, qk_owner, :, :], k_l1)
@@ -67,8 +73,8 @@ def _program(dtype, unit_streams):
                                 T.copy(k_l1[qk_n * 256:(qk_n + 1) * 256, :], bq)
                                 T.gemm(aq, bq, cq, transpose_B=True, clear_accum=True)
                                 T.copy(cq, Score[epoch, qk_owner, :, qk_n * 256:(qk_n + 1) * 256])
-                with T.Stage(0):
-                    if epoch < 2:
+                with T.Stage(1 if logical_stages else 0):
+                    if epoch < (3 if logical_stages else 2):
                         for pv_owner in T.serial(2):
                             T.copy(V[epoch, pv_owner, :, :], v_l1)
                             for row_part in T.serial(2):
@@ -280,6 +286,13 @@ def test_independent_c_pitches_share_late_bytes_with_completed_phases(dtype, uni
         _unit_completion(snapshots["tl.LowerScheduledTIR"])
     else:
         _ordinary_completion(snapshots["tl.LowerScheduledTIR"])
+
+
+def test_logical_phases_retain_full_c_byte_retirement():
+    artifact, snapshots = _lower(_program("bfloat16", True, logical_stages=True))
+    _assert_storage_contract(artifact, snapshots)
+    _unit_completion(snapshots["tl.LowerScheduledTIR"])
+    assert all(_MARKER not in loop.annotations for loop in nodes(snapshots["tl.InsertSync"], tirx.For))
 
 
 def test_manual_ancestor_reserves_the_selected_childs_full_physical_rings(monkeypatch):

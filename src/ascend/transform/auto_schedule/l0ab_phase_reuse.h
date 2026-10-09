@@ -426,7 +426,9 @@ LocateClosedPhase(TaskNode *task, ControlNode **epoch, IRStructure **phase,
   if (!epoch_decision.Accepted() || (*epoch && *epoch != outer))
     return false;
   IRStructure *child = task->GetChildOnPathFrom(outer);
-  if (!child->IsControl() || !StageZero(child) || (*phase && *phase != child))
+  bool shifted = resource_epoch_detail::UsesStageOffsets(outer);
+  if (!child->IsControl() || (!shifted && !StageZero(child)) ||
+      (*phase && *phase != child))
     return false;
   auto *phase_loop = static_cast<ControlNode *>(child);
   if (!PositiveStaticLoop(phase_loop) ||
@@ -557,6 +559,11 @@ ApplyL0PhaseReuseConflicts(const std::vector<L0PhaseReusePair> &plans,
       hints = previous.value().cast<ConflictHintList>();
     hints.push_back(hint);
     control->annotations.Set("conflict_hint", std::move(hints));
+    Array<Array<Var>> pairs;
+    if (auto previous = control->annotations.Get(kL0PhaseReusePairs))
+      pairs = previous.value().cast<Array<Array<Var>>>();
+    pairs.push_back({plan.first, plan.second});
+    control->annotations.Set(kL0PhaseReusePairs, std::move(pairs));
     root_conflicts->push_back(std::move(hint));
   }
 }

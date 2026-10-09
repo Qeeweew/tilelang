@@ -1490,12 +1490,7 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
   // single II window (max(start) - min(start) < II). Sourced from the loop's
   // "enable_offset" annotation. Automatic Pipelined intent enables offsets;
   // otherwise preserve upstream's false default (constraint applied).
-  bool enable_offset = auto_pipeline;
-  auto enable_offset_val =
-      ctrl->control.get()->annotations.Get("enable_offset");
-  if (enable_offset_val.has_value()) {
-    enable_offset = enable_offset_val.value().cast<bool>();
-  }
+  bool enable_offset = resource_epoch_detail::UsesStageOffsets(ctrl);
   if (!auto_pipeline && !manual_schedule && !num_stages_val.has_value() &&
       !enable_offset) {
     // A plain serial loop (including explicit Pipelined(num_stages=0))
@@ -1846,6 +1841,21 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
         owner_exclusion_deps, pipe_order_deps, stage_order_deps, enable_offset,
         storage_budget.slot_bytes, storage_budget.min_versions,
         storage_budget.memory_groups, num_stages);
+    if (!completion.plan &&
+        runtime::detail::VerboseLoggingEnabled(__FILE__, 1)) {
+      for (const auto &[u, v, distance, latency] : data_deps) {
+        LOG(INFO) << "Manual constraint loop=" << ctrl->control->loop_var
+                  << " producer=" << u << " stage=" << manual_stages[u]
+                  << " consumer=" << v << " stage=" << manual_stages[v]
+                  << " distance=" << distance << " latency=" << latency;
+      }
+      for (const auto &dep : deps) {
+        LOG(INFO) << "Manual memory producer=" << node_idx[dep.prod_node]
+                  << " consumer=" << node_idx[dep.cons_node]
+                  << " storage=" << dep.storage << " distance=" << dep.distance
+                  << " kind=" << int(dep.kind);
+      }
+    }
     ICHECK(completion.plan.has_value())
         << "Explicit Ascend source issue order is not legal: "
         << completion.reason;
@@ -1958,6 +1968,9 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
   // Intent has now become the native task stages and kernel buffer-version
   // plan. Downstream consumers use those facts rather than selecting again.
   ctrl->control.CopyOnWrite()->annotations.erase(kAutoPipeline);
+  if (auto_pipeline)
+    ctrl->control.CopyOnWrite()->annotations.Set("enable_offset",
+                                                 enable_offset);
   auto phys_time = [&](const std::shared_ptr<IRStructure> &c) -> int64_t {
     return GetAutoScheduleExtraInfo(c.get())->GetStartTime() -
            c->GetStage() * ii;

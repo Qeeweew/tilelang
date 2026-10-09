@@ -15,7 +15,7 @@ from testing.ascend.auto_schedule.test_owner_result_completion import _name, _re
 from testing.ascend.auto_schedule.test_sync_binary_flags import _Completion, _prove_binary_protocol
 
 
-def _program(pairs, kvs, *, wrong_owner=False):
+def _program(pairs, kvs, *, wrong_owner=False, mode="complete"):
     @T.prim_func
     def main(A: T.Tensor((2 * pairs * kvs, 64), "float32"),
              History: T.Tensor((2 * pairs * kvs, 64), "float32"),
@@ -39,6 +39,18 @@ def _program(pairs, kvs, *, wrong_owner=False):
                     slot_out = query_out % 2 if wrong_owner else (t // kvs) % 2
                     if t % kvs == kvs - 1:
                         T.copy(state[slot_out, :], O[query_out, :])
+    if mode != "complete":
+        def post(node):
+            if isinstance(node, tirx.For) and node.loop_var.name == "t":
+                annotations = dict(node.annotations)
+                annotations.pop("tl.ascend_preserve_issue_order")
+                if mode == "auto":
+                    annotations.update({"tl.ascend_auto_pipeline": True, "num_stages": 4})
+                return tirx.For(node.loop_var, node.min, node.extent, node.kind, node.body,
+                                annotations=annotations, step=node.step)
+            if mode == "auto" and isinstance(node, tirx.AttrStmt) and node.attr_key == "tl.ascend_stage":
+                return node.body
+        main = main.with_body(tirx.stmt_functor.ir_transform(main.body, None, post))
     return main.with_attr("target", tvm.target.Target({"kind": "ascend", "arch": "dav-2201"}))
 
 
@@ -96,9 +108,11 @@ def _check_payload_and_completion(after, pairs, kvs):
 
 
 @pytest.mark.parametrize("pairs,kvs", [(1, 1), (2, 2), (3, 3), (5, 1)])
-def test_delayed_grouped_state_payload_and_completion(monkeypatch, pairs, kvs):
-    monkeypatch.setattr(z3_scheduler, "Z3_AVAILABLE", False)
-    after = schedule(_program(pairs, kvs), through="LowerScheduledTIR")
+@pytest.mark.parametrize("mode", ["complete", "stage-only", "auto"])
+def test_delayed_grouped_state_payload_and_completion(monkeypatch, pairs, kvs, mode):
+    if mode == "complete":
+        monkeypatch.setattr(z3_scheduler, "Z3_AVAILABLE", False)
+    after = schedule(_program(pairs, kvs, mode=mode), through="LowerScheduledTIR")
     _check_payload_and_completion(after, pairs, kvs)
 
 

@@ -1282,7 +1282,8 @@ private:
   const L0OperandSlotMember *PoolMemoryObligationMember(
       const DepInfo &dep, TaskNode *source, TaskNode *destination,
       ControlNode *loop) const {
-    if (!operand_pools_ || dep.kind != DependencyKind::kData)
+    if (!operand_pools_ ||
+        (dep.kind != DependencyKind::kData && !dep.cross_storage_conflict))
       return nullptr;
     for (const auto &pool : *operand_pools_) {
       for (const auto *member : {&pool.first, &pool.second}) {
@@ -1416,8 +1417,9 @@ private:
   bool IsClosedCByteConflict(const DepInfo &dep, TaskNode *producer,
                             TaskNode *consumer) const {
     if (!closed_c_byte_retirement_ || !unit_streams_ ||
-        dep.kind != DependencyKind::kData || !dep.cross_storage_conflict ||
-        dep.storage.has_value() || (dep.distance != 0 && dep.distance != -1))
+        !dep.cross_storage_conflict || dep.storage.has_value() ||
+        (dep.kind == DependencyKind::kData && dep.distance != 0 &&
+         dep.distance != -1))
       return false;
     const UnitFlagStreamPlan *old_result = nullptr, *new_result = nullptr;
     for (const auto &plan : *unit_streams_) {
@@ -1551,16 +1553,24 @@ private:
     auto order = lifetime_orders_.find(scope);
     if (order == lifetime_orders_.end())
       return std::nullopt;
-    return order->second.MinimumDistance(src, dst);
+    auto minimum = order->second.MinimumDistance(src, dst);
+    // The composed graph uses nonnegative logical distances. A concrete
+    // completing pipe also proves its direct physical issue order, which may
+    // cross a negative logical distance when the later phase has a larger
+    // stage. Keep that exact primitive rather than clamping it to iteration
+    // zero: C's completed export/drain can precede another phase's first MAD
+    // in the same physical step. Issue-only MTE/FIX pipes grant no such proof.
+    if (HasImplicitCompletionOrder(src, dst)) {
+      int64_t direct = int64_t(sites[src].path_begin->GetStage()) -
+                       sites[dst].path_begin->GetStage() + (src < dst ? 0 : 1);
+      if (!minimum || direct < *minimum)
+        minimum = direct;
+    }
+    return minimum;
   }
 
   bool HappensBefore(ControlNode *scope, size_t src, size_t dst,
                      int64_t distance) const final {
-    // A negative query is not the same-iteration query. The nonnegative path
-    // model cannot prove it; retaining that distinction is essential when
-    // subtracting two generation endpoint offsets.
-    if (distance < 0)
-      return false;
     if (distance == 0)
       return SameIterationHappensBefore(scope, src, dst);
     if (scope == nullptr)
@@ -2701,14 +2711,14 @@ private:
         second_to_first.reserve(first_to_second.size());
         for (const auto &pair : first_to_second)
           second_to_first.push_back(pair.Reversed());
-        directed_deps.push_back({first, second, dep.storage,
-                                 std::move(first_to_second), forward_distance,
-                                 DependencyKind::kOwnerExclusion, false,
-                                 first_access, second_access});
+        directed_deps.push_back(
+            {first, second, dep.storage, std::move(first_to_second),
+             forward_distance, DependencyKind::kOwnerExclusion,
+             dep.cross_storage_conflict, first_access, second_access});
         directed_deps.push_back(
             {second, first, dep.storage, std::move(second_to_first),
-             1 - forward_distance, DependencyKind::kOwnerExclusion, false,
-             second_access, first_access});
+             1 - forward_distance, DependencyKind::kOwnerExclusion,
+             dep.cross_storage_conflict, second_access, first_access});
       }
       deps = std::move(directed_deps);
     }
@@ -3391,7 +3401,15 @@ private:
         LOG(FATAL) << "InsertSync cannot materialize an uncovered multi-buffer "
                       "owner exclusion at logical distance "
                    << sync_point.edge.distance << " (paired distance "
-                   << 1 - sync_point.edge.distance << ")";
+                   << 1 - sync_point.edge.distance << ") from "
+                   << LifetimeNodeName(
+                          site_registry_.Sites()[sync_point.edge.src].path_end)
+                   << " (" << site_registry_.Sites()[sync_point.edge.src].pipe
+                   << ") to "
+                   << LifetimeNodeName(
+                          site_registry_.Sites()[sync_point.edge.dst].path_end)
+                   << " (" << site_registry_.Sites()[sync_point.edge.dst].pipe
+                   << "); closed C retirement=" << closed_c_byte_retirement_;
       }
       SaturateDependencyEdge(closure, sync_point.edge, max_distance,
                              projection_scope);
@@ -5636,14 +5654,17 @@ public:
     for (size_t index = 0; index < operand_pools_.size(); ++index) {
       const auto &pool = operand_pools_[index];
       for (const auto *member : {&pool.first, &pool.second}) {
-        PrimExpr event = member->slot + Integer(operand_pool_bases_[index]);
         // Each endpoint keeps its own task stage. MaterializeMultiBuffer and
         // LowerScheduledTIR therefore shift the operand pointer and its credit
         // by exactly the same prepared iteration/counter clock.
-        InsertStatement(member->writer, MakeAscendWaitFlag("M_MTE1", event),
-                        true, kCoreCube);
-        InsertStatement(member->reader, MakeAscendSetFlag("M_MTE1", event),
-                        false, kCoreCube, member->last_reader);
+        for (int interval = 0; interval < member->credit_span; ++interval) {
+          PrimExpr event = member->slot * member->credit_span +
+                           Integer(operand_pool_bases_[index] + interval);
+          InsertStatement(member->writer, MakeAscendWaitFlag("M_MTE1", event),
+                          true, kCoreCube);
+          InsertStatement(member->reader, MakeAscendSetFlag("M_MTE1", event),
+                          false, kCoreCube, member->last_reader);
+        }
       }
     }
     for (const OwnerCompletionEvent &event : owner_events_) {
@@ -6331,6 +6352,14 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
           enable_c_byte_retirement && kernel_direction &&
           HasClosedCByteRetirement(scheduled_tir.metadata, selected_reuse,
                                    unit_streams);
+      if (runtime::detail::VerboseLoggingEnabled(__FILE__, 1)) {
+        LOG(INFO) << "Unit streams=" << unit_streams.size()
+                  << " kernel direction=" << kernel_direction
+                  << " closed C retirement=" << closed_c_byte_retirement;
+        for (const auto &plan : unit_streams)
+          LOG(INFO) << "Unit result=" << plan.result_loop->control->loop_var
+                    << " C=" << plan.c->data << " mads=" << plan.mads.size();
+      }
       ApplyUnitFlagStreams(unit_streams);
       InsertUnitFlagBoundaries(root, nullptr, unit_streams, &unit_boundaries,
                                kernel_direction, closed_c_byte_retirement);
@@ -6397,6 +6426,10 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
   if (selected_reuse.Present()) {
     scheduled_tir.metadata.kernel_root.CopyOnWrite()->annotations.erase(
         kL0PhaseReusePairs);
+    std::vector<ControlNode *> controls;
+    l0ab_phase_reuse_detail::CollectControls(root, &controls);
+    for (ControlNode *control : controls)
+      control->control.CopyOnWrite()->annotations.erase(kL0PhaseReusePairs);
   }
   for (const auto &pool : operand_pools)
     diagnostics->Record("l0-operand-slot-pool", OptimizationStatus::kAccepted,

@@ -23,6 +23,7 @@
  */
 
 #include "./dependency_analysis.h"
+#include "./resource_epoch.h"
 
 #include <algorithm>
 #include <iterator>
@@ -361,6 +362,24 @@ AnalyzeDependencies(std::vector<IRStructure *> nodes, ControlNode *loop,
     return lhs_owner != nullptr && rhs_owner != nullptr &&
            lhs_owner != rhs_owner;
   };
+  // Selected physical aliases are lifetime exclusions, not logical values
+  // passed between two unrelated allocations. Their final physical order is
+  // resolved after scheduling, just like disjoint owners of one ring.
+  auto is_phase_exclusion = [&](const Var &lhs, const Var &rhs) {
+    if (!loop || lhs.same_as(rhs))
+      return false;
+    if (!resource_epoch_detail::UsesStageOffsets(loop))
+      return false;
+    auto selected =
+        loop->control->annotations.Get("tl.ascend_l0_phase_reuse_pairs");
+    if (!selected)
+      return false;
+    for (const auto &pair : selected.value().cast<Array<Array<Var>>>())
+      if ((pair[0].same_as(lhs) && pair[1].same_as(rhs)) ||
+          (pair[1].same_as(lhs) && pair[0].same_as(rhs)))
+        return true;
+    return false;
+  };
 
   for (size_t i = 0; i < n; ++i) {
     for (size_t j = 0; j < n; ++j) {
@@ -420,7 +439,8 @@ AnalyzeDependencies(std::vector<IRStructure *> nodes, ControlNode *loop,
             if (lhs_storage.same_as(rhs_storage))
               storage = lhs_storage;
             bool owner_exclusion =
-                is_owner_exclusion(storage, lhs.task, rhs.task);
+                is_owner_exclusion(storage, lhs.task, rhs.task) ||
+                is_phase_exclusion(lhs_storage, rhs_storage);
             // The i<j visit sees every cross-owner write/read, write/write,
             // and read/write conflict once. Such conflicts are undirected:
             // the scheduler chooses one physical owner order.

@@ -44,6 +44,18 @@ inline bool StageZero(const IRStructure *node) {
   return node->GetStage() == kUnscheduledStage || node->GetStage() == 0;
 }
 
+// Use the same policy before scheduling and after intent is consumed. A
+// durable explicit value overrides automatic Pipelined's default offsets.
+inline bool UsesStageOffsets(const ControlNode *control) {
+  bool enabled = false;
+  if (auto automatic =
+          control->control->annotations.Get("tl.ascend_auto_pipeline"))
+    enabled = automatic.value().cast<bool>();
+  if (auto explicit_value = control->control->annotations.Get("enable_offset"))
+    enabled = explicit_value.value().cast<bool>();
+  return enabled;
+}
+
 inline bool PositiveStaticLoop(const ControlNode *control) {
   const For &loop = control->control;
   auto extent = Constant(loop->extent);
@@ -148,7 +160,8 @@ public:
       if (key == kMultiBufferEligible ||
           key == "tl.ascend_preserve_issue_order")
         continue;
-      if (prepared && (key == "conflict_hint" || key == kStorageEpochGuardMap))
+      if (prepared && (key == "conflict_hint" || key == kStorageEpochGuardMap ||
+                       key == "tl.ascend_l0_phase_reuse_pairs"))
         continue;
       if (key == kMultiBufferCounterMap) {
         if (!prepared || !plan_)
@@ -158,10 +171,13 @@ public:
           return counters;
         continue;
       }
-      if (key == "num_stages" && Constant(value.cast<PrimExpr>()) == 1)
+      if (key == "num_stages" &&
+          Constant(value.cast<PrimExpr>()).value_or(0) > 0)
         continue;
-      if ((key == "enable_offset" || key == "tl.ascend_auto_pipeline") &&
-          !value.cast<bool>())
+      // Before scheduling, automatic intent may select this same static
+      // epoch. Prepared proofs require the request to have been consumed.
+      if (key == "enable_offset" || (key == "tl.ascend_auto_pipeline" &&
+                                     (!prepared || !value.cast<bool>())))
         continue;
       return {ResourceEpochRejection::kUnrecognizedAnnotation, Var()};
     }
