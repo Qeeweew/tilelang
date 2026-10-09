@@ -486,7 +486,12 @@ two BlockReduce compactions and a masked row reduction; a smaller two-level
 WholeReduce plan remains available when the larger scratch does not fit.
 The reduction pass owns the actual partials and non-final combine buffers;
 VectorTiles consumes explicit binary assignments. Candidate headroom uses
-their shared physical footprints, without predicting later scratch. Bounded
+their shared physical footprints, without predicting later scratch. An
+independent buffer with an explicitly fixed compiler version count reserves
+that many aligned logical slots, rather than disabling native row reduction.
+Manual physical rings retain their own slot-padding rules. A versioned native
+reduction operand still needs its late layout and keeps the ordinary fallback;
+unknown footprints and insufficient headroom also retain that fallback. Bounded
 dynamic rows use static maximum capacity and guarded active effects; unknown
 row bounds, partial or strided layouts and clear-false reductions retain the
 ordinary row plan. Resource planning and final allocation still validate all

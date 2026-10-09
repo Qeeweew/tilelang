@@ -580,6 +580,9 @@ private:
       if (auto versions = manual_versions_.Get(data);
           versions.has_value() && versions.value() > 1)
         return false;
+      if (auto versions = fixed_versions_.Get(data);
+          versions.has_value() && versions.value() > 1)
+        return false;
     }
     int64_t remaining = ub_capacity_bytes_ - ub_owner_bytes_.value();
     auto charge = [&](int64_t bytes) {
@@ -882,12 +885,16 @@ private:
     auto saved_bytes = ub_owner_bytes_;
     auto saved_slots = ub_slots_;
     auto saved_manual_versions = manual_versions_;
+    auto saved_fixed_versions = fixed_versions_;
     auto saved_private = aiv_private_;
     if (root) {
       aiv_private_ = ascend::ValidatedAivPrivateData(op);
       manual_versions_ = {};
       if (auto value = op->annotations.Get(kManualMultiBuffer))
         manual_versions_ = value.value().cast<BufferVersionMap>();
+      fixed_versions_ = {};
+      if (auto value = op->annotations.Get(kBufferVersionsMap))
+        fixed_versions_ = value.value().cast<BufferVersionMap>();
       // Reuse the common allocation/storage facts: owner aliases are charged
       // once at their maximum footprint, including layout output and alignment.
       // Manual rings already reserve their physical storage. Include their
@@ -900,20 +907,21 @@ private:
           continue;
         PrimExpr simplified = analyzer_.Simplify(footprint);
         const auto *bytes = simplified.as<IntImmNode>();
+        int versions = fixed_versions_.Get(storage).value_or(1);
+        // An explicitly fixed automatic count reserves copies of this
+        // logical slot. An unrelated ring must not disable native reduction
+        // rows, but every aligned copy must fit. Native operand rings still
+        // need their late layout and retain the ordinary fallback above.
+        bool conflicting_ring = versions > 1 &&
+                                manual_versions_.Get(storage).value_or(1) > 1;
         if (!bytes || bytes->value < 0 ||
-            bytes->value > ub_capacity_bytes_ - ub_owner_bytes_.value()) {
+            versions <= 0 || conflicting_ring ||
+            bytes->value >
+                (ub_capacity_bytes_ - ub_owner_bytes_.value()) / versions) {
           ub_owner_bytes_ = std::nullopt;
           break;
         }
-        ub_owner_bytes_ = ub_owner_bytes_.value() + bytes->value;
-      }
-      if (auto value = op->annotations.Get(kBufferVersionsMap)) {
-        for (const auto &[storage, versions] :
-             value.value().cast<BufferVersionMap>()) {
-          if (versions > 1 &&
-              ascend::AscendScopeAlignBytes(GetPtrStorageScope(storage)) == 32)
-            ub_owner_bytes_ = std::nullopt;
-        }
+        ub_owner_bytes_ = ub_owner_bytes_.value() + bytes->value * versions;
       }
     }
     if (auto map = op->annotations.Get(attr::kLayoutMap))
@@ -932,6 +940,7 @@ private:
       ub_owner_bytes_ = saved_bytes;
       ub_slots_ = saved_slots;
       manual_versions_ = saved_manual_versions;
+      fixed_versions_ = saved_fixed_versions;
       aiv_private_ = saved_private;
     }
     return block;
@@ -943,6 +952,7 @@ private:
   Array<Var> aiv_private_;
   ffi::Map<Var, PrimExpr> ub_slots_;
   BufferVersionMap manual_versions_;
+  BufferVersionMap fixed_versions_;
   std::optional<int64_t> ub_owner_bytes_;
   int64_t ub_capacity_bytes_{0};
   int next_temporary_{0};

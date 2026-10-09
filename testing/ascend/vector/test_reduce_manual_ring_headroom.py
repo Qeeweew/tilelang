@@ -110,21 +110,47 @@ def test_flat_manual_owner_aliases_are_charged_once_at_their_maximum_footprint(p
 
 @pytest.mark.parametrize("operand", ["source", "output"])
 @pytest.mark.parametrize("columns", [128, 1024])
-def test_manual_native_operand_keeps_existing_plan_until_its_layout_is_known(operand, columns):
+@pytest.mark.parametrize("automatic", [False, True])
+def test_native_operand_keeps_existing_plan_until_its_layout_is_known(operand, columns, automatic):
     # A leading version axis may acquire a different row stride later. In
     # particular output[2] needs 32B per result when it is a two-slot ring.
-    before, _ = _program(rows=2, columns=columns, versioned_operand=operand)
+    before, _ = _program(rows=2, columns=columns, versioned_operand=operand,
+                         automatic=automatic)
     after = transform.AscendLowerVectorReduce()(before)
     assert not _strided(after)
     assert [int(call.args[-1]) for call in _count(after)] == [columns, columns // 64]
 
 
 @pytest.mark.parametrize("columns", [128, 1024])
-def test_automatic_future_versions_remain_conservative_even_for_another_owner(columns):
+def test_independent_fixed_versions_keep_native_rows(columns):
     before, _ = _program(columns=columns, automatic=True)
     after = transform.AscendLowerVectorReduce()(before)
-    assert not _strided(after)
-    assert [int(call.args[-1]) for call in _count(after)] == [columns, columns // 64]
+    assert len(_strided(after)) == (2 if columns == 128 else 1)
+    assert not _count(after)
+
+
+@pytest.mark.parametrize("kind", ["sum", "max"])
+@pytest.mark.parametrize("fits", [False, True])
+@pytest.mark.parametrize("padded_alias", [False, True])
+def test_fixed_logical_slots_charge_aligned_owner_maximum(kind, fits, padded_alias):
+    # Each logical 4B slot needs 32B; the padded alias raises it to 64B.
+    # Fixed counts expand logical slots, unlike a user's physical manual ring.
+    ring_bytes = (64 if padded_alias else 32) * 2
+    filler_bytes = 196608 - (1536 + 32 + ring_bytes) - 64 + (0 if fits else 32)
+    before, owners = _program(kind=kind, ring_shape=(1,), automatic=True,
+                              filler_bytes=filler_bytes)
+    ring = owners[2]
+    alias = tirx.decl_buffer((1,), "float32", "ring_alias", scope="shared.dyn", data=ring.data)
+    annotations = dict(before["main"].body.block.annotations.items())
+    annotations["layout_map"] = {
+        ring: Layout([1], lambda i: [i]),
+        alias: Layout([1], lambda i: [i + (8 if padded_alias else 0)]),
+    }
+    mod = kernel(before["main"].body.block.body, buffers=owners, annotations=annotations)
+    mod["main"] = mod["main"].with_attr("target", tvm.target.Target(TARGET))
+    after = transform.AscendLowerVectorReduce()(mod)
+    assert len(_strided(after, kind)) == (2 if fits else 0)
+    assert bool(_count(after, kind)) != fits
 
 
 @pytest.mark.parametrize("columns", [128, 1024])
