@@ -233,6 +233,13 @@ priorities. A retry can retain proven owner transfers while removing only those
 without a release witness. Undoing a unit stream restarts from the tree captured
 before unit rewrites and root markers, rebuilding candidates and epoch domains.
 Only the successful attempt's proofs and analysis sites reach materialization.
+An attempt returns either value-only failure observations or one complete plan.
+Failed sites and partial allocations are destroyed before the selection policy
+changes a protocol. The successful plan owns the analyzer and the allocator
+that borrows its sites, together with owner events; the allocator is destroyed
+first. It permits moving construction, not reassignment. Mandatory alias and
+event-capacity gates complete before publication. Outer epoch domains, selected
+protocols and the root remain valid until materialization consumes the plan.
 
 The early L0 max-budget choice is a required physical-alias contract, not
 evidence that storage can already overlap. A typed storage-pair snapshot owns

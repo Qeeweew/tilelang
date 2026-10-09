@@ -1098,6 +1098,7 @@ public:
   const SyncSiteRegistry &SiteRegistry() const { return site_registry_; }
 
   std::vector<SyncPoint> &SyncPoints() { return sync_points_; }
+  const std::vector<SyncPoint> &SyncPoints() const { return sync_points_; }
 
   const std::set<std::pair<size_t, size_t>> &ReusablePairs() const {
     return reusable_pairs_;
@@ -5913,6 +5914,12 @@ struct KernelSyncFailure {
   const char *reason;
   // Indices refer only to the current selection, never to an analysis site.
   std::vector<size_t> rejected_owner_plans;
+  // Value-only observations from this failed attempt, not enable switches or
+  // borrowed proof sites. The attempt is destroyed before selection changes.
+  bool has_gm_write_acquire;
+  bool has_gm_read_release;
+  bool needs_operand_pool_fallback;
+  bool needs_unit_fallback;
 };
 
 enum class KernelSyncFallback {
@@ -5944,25 +5951,24 @@ struct KernelSyncSelection {
   bool enable_gm_write_acquire{true};
 
   std::optional<KernelSyncFallback>
-  GmFallback(const SyncAnalyzer &analyzer) const {
+  GmFallback(const KernelSyncFailure &failure) const {
     // Restore the delayed acquire before discarding an independent early
     // release. Use cuts selected by this attempt, not the enable switches.
-    if (analyzer.HasGmWriteAcquires())
+    if (failure.has_gm_write_acquire)
       return KernelSyncFallback::kGmWriteAcquire;
-    if (analyzer.HasGmReadReleases())
+    if (failure.has_gm_read_release)
       return KernelSyncFallback::kGmReadRelease;
     return std::nullopt;
   }
 
-  KernelSyncFallback SelectFallback(const KernelSyncFailure &failure,
-                                    const SyncAnalyzer &analyzer) const {
+  KernelSyncFallback SelectFallback(const KernelSyncFailure &failure) const {
     switch (failure.kind) {
     case KernelSyncFailureKind::kAnalysis:
       if (closed_c_byte_retirement)
         return KernelSyncFallback::kCByteRetirement;
-      if (auto gm = GmFallback(analyzer))
+      if (auto gm = GmFallback(failure))
         return *gm;
-      if (analyzer.NeedsOperandPoolFallback()) {
+      if (failure.needs_operand_pool_fallback) {
         ICHECK(!operand_pools.empty());
         return KernelSyncFallback::kOperandPools;
       }
@@ -5970,14 +5976,14 @@ struct KernelSyncSelection {
         return KernelSyncFallback::kOwnerInputs;
       // Analysis failure can require undoing the stream before discarding an
       // owner result. Capacity failure below has the opposite priority.
-      if (analyzer.NeedsUnitFallback())
+      if (failure.needs_unit_fallback)
         return KernelSyncFallback::kUnitStreams;
       ICHECK(!owner_results.empty());
       return KernelSyncFallback::kOwnerResults;
     case KernelSyncFailureKind::kCByteAlias:
       return KernelSyncFallback::kCByteRetirement;
     case KernelSyncFailureKind::kPrivateGmProof: {
-      auto gm = GmFallback(analyzer);
+      auto gm = GmFallback(failure);
       ICHECK(gm.has_value());
       return *gm;
     }
@@ -5990,7 +5996,7 @@ struct KernelSyncSelection {
     case KernelSyncFailureKind::kFlagCapacity:
       if (closed_c_byte_retirement)
         return KernelSyncFallback::kCByteRetirement;
-      if (auto gm = GmFallback(analyzer))
+      if (auto gm = GmFallback(failure))
         return *gm;
       if (!operand_pools.empty())
         return KernelSyncFallback::kOperandPools;
@@ -6002,7 +6008,7 @@ struct KernelSyncSelection {
       // not exhaust 2201's eight local IDs; they cannot spill to 3510 mutexes.
       return KernelSyncFallback::kUnitStreams;
     case KernelSyncFailureKind::kOwnerEventCapacity:
-      if (auto gm = GmFallback(analyzer))
+      if (auto gm = GmFallback(failure))
         return *gm;
       if (!owner_inputs.empty())
         return KernelSyncFallback::kOwnerInputs;
@@ -6078,6 +6084,170 @@ struct KernelSyncSelection {
     return std::nullopt;
   }
 };
+
+// A complete attempt owns the site graph before the allocator that borrows
+// it. Inputs and selected protocols remain owned by this InsertKernelSync
+// invocation; selection and the root stay unchanged until materialization.
+class KernelSyncPlan {
+public:
+  KernelSyncPlan(std::unique_ptr<SyncAnalyzer> analyzer,
+                 std::unique_ptr<FlagAllocator> allocator,
+                 std::vector<OwnerCompletionEvent> owner_events)
+      : analyzer_(std::move(analyzer)), allocator_(std::move(allocator)),
+        owner_events_(std::move(owner_events)) {
+    ICHECK(analyzer_ && allocator_);
+  }
+
+  KernelSyncPlan(KernelSyncPlan &&) = default;
+  // Default assignment would destroy the old analyzer before its allocator.
+  KernelSyncPlan &operator=(KernelSyncPlan &&) = delete;
+  KernelSyncPlan(const KernelSyncPlan &) = delete;
+  KernelSyncPlan &operator=(const KernelSyncPlan &) = delete;
+
+  const SyncAnalyzer &Analysis() const { return *analyzer_; }
+  FlagAllocator &Allocator() { return *allocator_; }
+  const std::vector<OwnerCompletionEvent> &OwnerEvents() const {
+    return owner_events_;
+  }
+
+private:
+  // Reverse destruction releases borrowed allocation state before its sites.
+  std::unique_ptr<SyncAnalyzer> analyzer_;
+  std::unique_ptr<FlagAllocator> allocator_;
+  std::vector<OwnerCompletionEvent> owner_events_;
+};
+
+using KernelSyncAttempt = std::variant<KernelSyncFailure, KernelSyncPlan>;
+
+// Failed attempts return only retry observations. Their sites, proofs and
+// partial allocations have already been destroyed when selection changes.
+// Only the complete plan crosses the publication/materialization boundary.
+KernelSyncAttempt TryPlanKernelSync(
+    const ScheduledTIR &scheduled_tir, const MultiBufferPlan &multi_buffer_plan,
+    const EpochDomainRegistry &domains, const AscendTargetInfo &target_info,
+    const CrossCoreSyncContract &cross_core_contract,
+    const CrossCoreFlagReservation &cross_core_flag_reservation,
+    const L0StorageGroups &groups, const SelectedL0PhaseReuse &selected_reuse,
+    const std::vector<UnitFlagStreamPlan> &unit_streams,
+    const std::vector<UnitFlagBoundary> &unit_boundaries,
+    const KernelSyncSelection &selection) {
+  const auto &root = scheduled_tir.tree;
+  const auto &operand_pools = selection.operand_pools;
+  const auto &owner_results = selection.owner_results;
+  const auto &owner_inputs = selection.owner_inputs;
+  bool closed_c_byte_retirement = selection.closed_c_byte_retirement;
+  auto analyzer = std::make_unique<SyncAnalyzer>(
+      multi_buffer_plan, domains, target_info.architecture,
+      scheduled_tir.metadata.manual_buffer_versions,
+      scheduled_tir.metadata.root_conflict_hints, groups, &owner_results,
+      &owner_inputs, &unit_streams, &unit_boundaries, &operand_pools,
+      selection.enable_gm_read_release, selection.enable_gm_write_acquire,
+      closed_c_byte_retirement);
+  auto fail = [&](KernelSyncFailureKind kind, const char *reason,
+                  std::vector<size_t> rejected_owner_plans = {}) {
+    return KernelSyncFailure{kind,
+                             reason,
+                             std::move(rejected_owner_plans),
+                             analyzer->HasGmWriteAcquires(),
+                             analyzer->HasGmReadReleases(),
+                             analyzer->NeedsOperandPoolFallback(),
+                             analyzer->NeedsUnitFallback()};
+  };
+  if (!analyzer->Analyze(root)) {
+    return fail(KernelSyncFailureKind::kAnalysis, "completion-proof", {});
+  }
+  // Alias facts belong to this analysis attempt. Every optional protocol
+  // and final publication consumes this one result; retries rebuild it.
+  std::vector<size_t> unproven_phase_aliases =
+      selected_reuse.UnprovenPairs(analyzer->BufferAliases());
+  if (closed_c_byte_retirement && !unproven_phase_aliases.empty()) {
+    return fail(KernelSyncFailureKind::kCByteAlias, "mandatory-storage-alias",
+                {});
+  }
+  if (analyzer->HasPrivateGmHandoffs()) {
+    // A private GM cut cannot replace whole-phase alias retirement.
+    // Retry before allocation/materialization if the removed wide edge
+    // was needed by a mandatory physical-storage proof.
+    bool aliases_proven = unproven_phase_aliases.empty();
+    bool releases_proven =
+        std::all_of(owner_results.begin(), owner_results.end(),
+                    [&](const ValidatedOwnerTransfer &plan) {
+                      return analyzer->HasOwnerResultRelease(plan);
+                    }) &&
+        std::all_of(owner_inputs.begin(), owner_inputs.end(),
+                    [&](const ValidatedOwnerTransfer &plan) {
+                      return analyzer->HasOwnerInputRelease(plan);
+                    });
+    if (!aliases_proven || !releases_proven) {
+      return fail(KernelSyncFailureKind::kPrivateGmProof,
+                  !aliases_proven ? "mandatory-storage-alias"
+                                  : "owner-release-proof",
+                  {});
+    }
+  }
+  if (!owner_inputs.empty() &&
+      std::any_of(owner_results.begin(), owner_results.end(),
+                  [&](const ValidatedOwnerTransfer &plan) {
+                    return !analyzer->HasOwnerResultRelease(plan);
+                  })) {
+    // A new optional input cut must not discard an already admissible
+    // result protocol by removing one of its ordinary release witnesses.
+    return fail(KernelSyncFailureKind::kPreserveOwnerResult,
+                "preserve-owner-result-release", {});
+  }
+  std::vector<size_t> rejected_owner_plans;
+  for (size_t i = 0; i < owner_results.size(); ++i)
+    if (!analyzer->HasOwnerResultRelease(owner_results[i]))
+      rejected_owner_plans.push_back(i);
+  if (!rejected_owner_plans.empty()) {
+    return fail(KernelSyncFailureKind::kOwnerResultRelease,
+                "missing-release-witness", std::move(rejected_owner_plans));
+  }
+  for (size_t i = 0; i < owner_inputs.size(); ++i)
+    if (!analyzer->HasOwnerInputRelease(owner_inputs[i]))
+      rejected_owner_plans.push_back(i);
+  if (!rejected_owner_plans.empty()) {
+    return fail(KernelSyncFailureKind::kOwnerInputRelease,
+                "missing-release-witness", std::move(rejected_owner_plans));
+  }
+  auto flag_allocator = std::make_unique<FlagAllocator>(
+      analyzer->SiteRegistry(), analyzer->SyncPoints(),
+      analyzer->ReusablePairs(), cross_core_flag_reservation,
+      cross_core_contract, operand_pools, target_info.architecture);
+  if (!flag_allocator->Plan(!owner_results.empty() || !owner_inputs.empty() ||
+                                !unit_streams.empty() || !operand_pools.empty(),
+                            !unit_streams.empty() || !operand_pools.empty() ||
+                                analyzer->HasPrivateGmHandoffs())) {
+    return fail(KernelSyncFailureKind::kFlagCapacity, "flag-capacity", {});
+  }
+  auto owner_events = AllocateOwnerCompletionEvents(
+      owner_results, owner_inputs, analyzer->SiteRegistry(),
+      analyzer->SyncPoints(), flag_allocator->Allocations(),
+      cross_core_flag_reservation, domains);
+  if (!owner_events.has_value())
+    return fail(KernelSyncFailureKind::kOwnerEventCapacity,
+                "owner-event-capacity");
+  if (selected_reuse.Present()) {
+    for (size_t index : unproven_phase_aliases) {
+      const auto &pair = selected_reuse.Pairs()[index];
+      if (!unit_streams.empty()) {
+        std::ostringstream loops;
+        for (const auto &plan : unit_streams)
+          loops << " " << plan.result_loop->control->loop_var->name_hint;
+        LOG(WARNING) << "L0 phase alias proof failed with "
+                     << unit_streams.size()
+                     << " active unit streams:" << loops.str();
+      }
+      LOG(FATAL)
+          << "Selected L0 phase reuse lacks a completion-proven physical "
+             "alias between "
+          << pair[0]->name_hint << " and " << pair[1]->name_hint
+          << "; max-budget scheduling cannot deploy independent allocations";
+    }
+  }
+  return KernelSyncPlan(std::move(analyzer), std::move(flag_allocator),
+                        std::move(owner_events.value()));
+}
 
 SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
                         Target target, const std::vector<Var> &lane_variables,
@@ -6180,131 +6350,29 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
         root, scheduled_tir.metadata.kernel_root,
         scheduled_tir.metadata.manual_buffer_versions, lane_variables);
   }
-  std::unique_ptr<SyncAnalyzer> analyzer;
-  std::unique_ptr<FlagAllocator> flag_allocator;
-  std::optional<std::vector<OwnerCompletionEvent>> owner_events;
-  std::optional<std::vector<size_t>> unproven_phase_aliases;
-  auto analyze_attempt = [&]() -> std::optional<KernelSyncFailure> {
-    // Allocation borrows this analyzer's sites. Destroy it first, then build
-    // all proofs again after any selection or root-tree change.
-    flag_allocator.reset();
-    unproven_phase_aliases.reset();
-    analyzer = std::make_unique<SyncAnalyzer>(
-        multi_buffer_plan, domains, target_info.architecture,
-        scheduled_tir.metadata.manual_buffer_versions,
-        scheduled_tir.metadata.root_conflict_hints, groups, &owner_results,
-        &owner_inputs, &unit_streams, &unit_boundaries, &operand_pools,
-        selection.enable_gm_read_release, selection.enable_gm_write_acquire,
-        closed_c_byte_retirement);
-    if (!analyzer->Analyze(root)) {
-      return KernelSyncFailure{KernelSyncFailureKind::kAnalysis,
-                               "completion-proof", {}};
+  std::optional<KernelSyncPlan> completed_plan;
+  while (!completed_plan) {
+    KernelSyncAttempt attempt = TryPlanKernelSync(
+        scheduled_tir, multi_buffer_plan, domains, target_info,
+        cross_core_contract, cross_core_flag_reservation, groups, selected_reuse,
+        unit_streams, unit_boundaries, selection);
+    if (const auto *failure = std::get_if<KernelSyncFailure>(&attempt)) {
+      KernelSyncFallback action = selection.SelectFallback(*failure);
+      // A root retry starts from the pre-unit snapshot, including fresh
+      // candidates, domains and enabled GM proofs, rather than this selection.
+      if (auto retry = selection.ApplyFallback(action, *failure, diagnostics))
+        return InsertKernelSync(
+            kernel_body, std::move(unit_fallback.value()), target, lane_variables,
+            retry->enable_unit_streams, retry->enable_c_byte_retirement,
+            diagnostics);
+    } else {
+      completed_plan.emplace(std::get<KernelSyncPlan>(std::move(attempt)));
     }
-    // Alias facts belong to this analysis attempt. Every optional protocol
-    // and final publication consumes this one result; retries rebuild it.
-    unproven_phase_aliases =
-        selected_reuse.UnprovenPairs(analyzer->BufferAliases());
-    if (closed_c_byte_retirement && !unproven_phase_aliases->empty()) {
-      return KernelSyncFailure{
-          KernelSyncFailureKind::kCByteAlias, "mandatory-storage-alias", {}};
-    }
-    if (analyzer->HasPrivateGmHandoffs()) {
-      // A private GM cut cannot replace whole-phase alias retirement.
-      // Retry before allocation/materialization if the removed wide edge
-      // was needed by a mandatory physical-storage proof.
-      bool aliases_proven = unproven_phase_aliases->empty();
-      bool releases_proven =
-          std::all_of(owner_results.begin(), owner_results.end(),
-                      [&](const ValidatedOwnerTransfer &plan) {
-                        return analyzer->HasOwnerResultRelease(plan);
-                      }) &&
-          std::all_of(owner_inputs.begin(), owner_inputs.end(),
-                      [&](const ValidatedOwnerTransfer &plan) {
-                        return analyzer->HasOwnerInputRelease(plan);
-                      });
-      if (!aliases_proven || !releases_proven) {
-        return KernelSyncFailure{KernelSyncFailureKind::kPrivateGmProof,
-                                 !aliases_proven ? "mandatory-storage-alias"
-                                                 : "owner-release-proof",
-                                 {}};
-      }
-    }
-    if (!owner_inputs.empty() &&
-        std::any_of(owner_results.begin(), owner_results.end(),
-                    [&](const ValidatedOwnerTransfer &plan) {
-                      return !analyzer->HasOwnerResultRelease(plan);
-                    })) {
-      // A new optional input cut must not discard an already admissible
-      // result protocol by removing one of its ordinary release witnesses.
-      return KernelSyncFailure{KernelSyncFailureKind::kPreserveOwnerResult,
-                               "preserve-owner-result-release", {}};
-    }
-    std::vector<size_t> rejected_owner_plans;
-    for (size_t i = 0; i < owner_results.size(); ++i)
-      if (!analyzer->HasOwnerResultRelease(owner_results[i]))
-        rejected_owner_plans.push_back(i);
-    if (!rejected_owner_plans.empty()) {
-      return KernelSyncFailure{KernelSyncFailureKind::kOwnerResultRelease,
-                               "missing-release-witness",
-                               std::move(rejected_owner_plans)};
-    }
-    for (size_t i = 0; i < owner_inputs.size(); ++i)
-      if (!analyzer->HasOwnerInputRelease(owner_inputs[i]))
-        rejected_owner_plans.push_back(i);
-    if (!rejected_owner_plans.empty()) {
-      return KernelSyncFailure{KernelSyncFailureKind::kOwnerInputRelease,
-                               "missing-release-witness",
-                               std::move(rejected_owner_plans)};
-    }
-    flag_allocator = std::make_unique<FlagAllocator>(
-        analyzer->SiteRegistry(), analyzer->SyncPoints(),
-        analyzer->ReusablePairs(), cross_core_flag_reservation,
-        cross_core_contract, operand_pools, target_info.architecture);
-    if (!flag_allocator->Plan(!owner_results.empty() || !owner_inputs.empty() ||
-                                  !unit_streams.empty() ||
-                                  !operand_pools.empty(),
-                              !unit_streams.empty() || !operand_pools.empty() ||
-                                  analyzer->HasPrivateGmHandoffs())) {
-      return KernelSyncFailure{KernelSyncFailureKind::kFlagCapacity,
-                               "flag-capacity", {}};
-    }
-    owner_events = AllocateOwnerCompletionEvents(
-        owner_results, owner_inputs, analyzer->SiteRegistry(),
-        analyzer->SyncPoints(), flag_allocator->Allocations(),
-        cross_core_flag_reservation, domains);
-    if (owner_events.has_value())
-      return std::nullopt;
-    return KernelSyncFailure{KernelSyncFailureKind::kOwnerEventCapacity,
-                             "owner-event-capacity", {}};
-  };
-  while (auto failure = analyze_attempt()) {
-    KernelSyncFallback action = selection.SelectFallback(*failure, *analyzer);
-    // A root retry starts again from the pre-unit snapshot, including fresh
-    // candidates, domains and enabled GM proofs, rather than this selection.
-    if (auto root_retry = selection.ApplyFallback(action, *failure, diagnostics))
-      return InsertKernelSync(
-          kernel_body, std::move(unit_fallback.value()), target, lane_variables,
-          root_retry->enable_unit_streams, root_retry->enable_c_byte_retirement,
-          diagnostics);
   }
+  const SyncAnalyzer &analyzer = completed_plan->Analysis();
+  FlagAllocator &flag_allocator = completed_plan->Allocator();
+  const auto &owner_events = completed_plan->OwnerEvents();
   if (selected_reuse.Present()) {
-    ICHECK(unproven_phase_aliases.has_value());
-    for (size_t index : unproven_phase_aliases.value()) {
-      const auto &pair = selected_reuse.Pairs()[index];
-      if (!unit_streams.empty()) {
-        std::ostringstream loops;
-        for (const auto &plan : unit_streams)
-          loops << " " << plan.result_loop->control->loop_var->name_hint;
-        LOG(WARNING) << "L0 phase alias proof failed with "
-                     << unit_streams.size()
-                     << " active unit streams:" << loops.str();
-      }
-      LOG(FATAL)
-          << "Selected L0 phase reuse lacks a completion-proven physical "
-             "alias between "
-          << pair[0]->name_hint << " and " << pair[1]->name_hint
-          << "; max-budget scheduling cannot deploy independent allocations";
-    }
     scheduled_tir.metadata.kernel_root.CopyOnWrite()->annotations.erase(
         kL0PhaseReusePairs);
   }
@@ -6322,18 +6390,18 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
   accepted("c-byte-retirement", closed_c_byte_retirement);
   accepted("owner-input", !owner_inputs.empty());
   accepted("owner-result", !owner_results.empty());
-  accepted("gm-read-release", analyzer->HasGmReadReleases());
-  accepted("gm-write-acquire", analyzer->HasGmWriteAcquires());
+  accepted("gm-read-release", analyzer.HasGmReadReleases());
+  accepted("gm-write-acquire", analyzer.HasGmWriteAcquires());
   scheduled_tir.metadata.root_conflict_hints = {};
-  scheduled_tir.metadata.buffer_aliases = analyzer->BufferAliases();
+  scheduled_tir.metadata.buffer_aliases = analyzer.BufferAliases();
   scheduled_tir.metadata.has_buffer_aliases = true;
-  SyncMaterializer(analyzer->SiteRegistry(), analyzer->SyncPoints(),
-                   flag_allocator->Allocations(), target_info.architecture,
-                   cross_core_contract, lane_variables, owner_events.value(),
-                   operand_pools, flag_allocator->OperandPoolBases(),
-                   analyzer->GmReadReleases(), analyzer->GmWriteAcquires())
+  SyncMaterializer(analyzer.SiteRegistry(), analyzer.SyncPoints(),
+                   flag_allocator.Allocations(), target_info.architecture,
+                   cross_core_contract, lane_variables, owner_events,
+                   operand_pools, flag_allocator.OperandPoolBases(),
+                   analyzer.GmReadReleases(), analyzer.GmWriteAcquires())
       .Run(root);
-  FlagInfoList flag_infos = flag_allocator->TakeFlagInfos();
+  FlagInfoList flag_infos = flag_allocator.TakeFlagInfos();
 
   std::vector<std::shared_ptr<IRStructure>> prefix;
   std::vector<std::shared_ptr<IRStructure>> suffix;
