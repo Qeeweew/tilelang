@@ -19,7 +19,9 @@
 #include <vector>
 
 #include "ascend/op/oob_padding.h"
+#include "ascend/op/register_state.h"
 #include "ascend/op/utils.h"
+#include "ascend/op/vector_reduce.h"
 #include "ascend/target_utils.h"
 #include "ascend/transform/aiv_private.h"
 #include "ascend/transform/attr.h"
@@ -44,12 +46,18 @@ TVM_REGISTER_OP("tl.ascend_membase.repeat_reduce_sum")
     .set_num_inputs(3)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque))
+    .set_attr<ascend::TRegisterStatePreservation>(
+        ascend::kRegisterStatePreservationAttr,
+        Integer(ascend::kPreserveCubeRegisterStates))
     .set_attr<TGlobalSymbol>("TGlobalSymbol", "asc_repeat_reduce_sum");
 
 TVM_REGISTER_OP("tl.ascend_membase.repeat_reduce_max_only_value")
     .set_num_inputs(3)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque))
+    .set_attr<ascend::TRegisterStatePreservation>(
+        ascend::kRegisterStatePreservationAttr,
+        Integer(ascend::kPreserveCubeRegisterStates))
     .set_attr<TGlobalSymbol>("TGlobalSymbol",
                              "asc_repeat_reduce_max_only_value");
 
@@ -60,24 +68,18 @@ TVM_REGISTER_OP("tl.ascend_membase.datablock_reduce_sum")
     .set_num_inputs(3)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque))
+    .set_attr<ascend::TRegisterStatePreservation>(
+        ascend::kRegisterStatePreservationAttr,
+        Integer(ascend::kPreserveCubeRegisterStates))
     .set_attr<TGlobalSymbol>("TGlobalSymbol", "asc_datablock_reduce_sum");
 TVM_REGISTER_OP("tl.ascend_membase.datablock_reduce_max")
     .set_num_inputs(3)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque))
+    .set_attr<ascend::TRegisterStatePreservation>(
+        ascend::kRegisterStatePreservationAttr,
+        Integer(ascend::kPreserveCubeRegisterStates))
     .set_attr<TGlobalSymbol>("TGlobalSymbol", "asc_datablock_reduce_max");
-
-// Normal-mask repeats retain exact [rows, valid_lanes] source regions.
-// Unlike the count overload, the physical row stride and active lanes are
-// independently represented. No inactive lane is part of the memory effect.
-TVM_REGISTER_OP("tl.ascend_membase.repeat_reduce_sum_rows_f32")
-    .set_num_inputs(5)
-    .set_attr<TCallEffectKind>("TCallEffectKind",
-                               Integer(CallEffectKind::kOpaque));
-TVM_REGISTER_OP("tl.ascend_membase.repeat_reduce_max_rows_f32")
-    .set_num_inputs(5)
-    .set_attr<TCallEffectKind>("TCallEffectKind",
-                               Integer(CallEffectKind::kOpaque));
 
 namespace {
 
@@ -339,9 +341,9 @@ private:
         plan = IfThenElse(row_extent > make_zero(row_extent.dtype()), plan);
       return plan;
     };
-    const Op &intrinsic = Op::Get(
-        op->type->IsSum() ? "tl.ascend_membase.repeat_reduce_sum_rows_f32"
-                          : "tl.ascend_membase.repeat_reduce_max_rows_f32");
+    const auto row_reduce_kind = op->type->IsSum()
+                                     ? ascend::RepeatRowReduceF32Kind::kSum
+                                     : ascend::RepeatRowReduceF32Kind::kMax;
     // This plan writes the user's destination through the native row op,
     // unlike the chunk tree's ordinary vector combine. Its raw Buffer must
     // satisfy the same compact/aligned contract as its mapped layout.
@@ -449,12 +451,11 @@ private:
           dst_base, make_const(DataType::Int(32), kAccessWrite)};
       for (const Range &range : dst_ranges)
         destination_args.push_back(range->extent);
-      tasks.push_back(Evaluate(
-          Call(DataType::Void(), intrinsic,
-               {Call(DataType::Handle(), tl::region(), destination_args),
-                partial_region, repeats,
-                make_const(DataType::UInt(16), chunks / 8),
-                make_const(DataType::UInt(8), chunks)})));
+      tasks.push_back(Evaluate(ascend::MakeRepeatRowReduceF32(
+          row_reduce_kind,
+          Call(DataType::Handle(), tl::region(), destination_args),
+          partial_region, repeats, make_const(DataType::UInt(16), chunks / 8),
+          make_const(DataType::UInt(8), chunks))));
       return active_plan(MakeSeq(tasks));
     }
 
@@ -497,11 +498,10 @@ private:
                 make_const(DataType::Int(32), kAccessWrite),
                 make_const(DataType::Int(32), 1),
                 row_extent});
-      tasks.push_back(
-          Evaluate(Call(DataType::Void(), intrinsic,
-                        {destination_region, source_region, repeats,
-                         make_const(DataType::UInt(16), input_count / 8),
-                         make_const(DataType::UInt(8), 64)})));
+      tasks.push_back(Evaluate(ascend::MakeRepeatRowReduceF32(
+          row_reduce_kind, destination_region, source_region, repeats,
+          make_const(DataType::UInt(16), input_count / 8),
+          make_const(DataType::UInt(8), 64))));
     }
 
     // Each chunk performs the native 64-lane tree. Preserve that balanced

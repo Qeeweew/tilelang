@@ -13,12 +13,6 @@
 namespace tvm {
 namespace tl {
 
-namespace ascend {
-// Shared invariant-state admission for native selection and synchronization.
-// Even a pure external call has no verified Load3D SPR preservation contract.
-bool PreservesLoad3DConfig(const tirx::CallNode *call);
-} // namespace ascend
-
 // Created only after layout normalization and OOB padding. The regions cover
 // the actual padded hardware transfer; the GEMM keeps its effective domain.
 class AscendCubeLoad3DNode : public TileOperatorNode {

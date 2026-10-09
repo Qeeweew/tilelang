@@ -28,6 +28,7 @@
 #include "aiv_private.h"
 #include "ascend/op/copy.h"
 #include "ascend/op/oob_padding.h"
+#include "ascend/op/register_state.h"
 #include "ascend/op/utils.h"
 #include "ascend/target_utils.h"
 #include "ascend/transform/storage_footprint.h"
@@ -52,6 +53,9 @@ using ffi::GetRef;
       .set_num_inputs(Inputs)                                                  \
       .set_attr<TCallEffectKind>("TCallEffectKind",                            \
                                  Integer(CallEffectKind::kOpaque))             \
+      .set_attr<ascend::TRegisterStatePreservation>(                           \
+          ascend::kRegisterStatePreservationAttr,                              \
+          Integer(ascend::kPreserveCubeRegisterStates))                        \
       .set_attr<TGlobalSymbol>("TGlobalSymbol", "asc_" #Name)
 
 REGISTER_MEMBASE_OP(add, 4);
@@ -82,30 +86,48 @@ REGISTER_MEMBASE_OP(min_scalar, 4);
 // These operations retain typed FP32 regions. Only native code generation
 // bitcasts the single Brcb instruction's operands to uint32_t pointers.
 TVM_REGISTER_OP("tl.ascend_membase.brcb_f32")
+    .set_attr<ascend::TRegisterStatePreservation>(
+        ascend::kRegisterStatePreservationAttr,
+        Integer(ascend::kPreserveCubeRegisterStates))
     .set_num_inputs(3)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 TVM_REGISTER_OP("tl.ascend_membase.sub_rows_f32")
+    .set_attr<ascend::TRegisterStatePreservation>(
+        ascend::kRegisterStatePreservationAttr,
+        Integer(ascend::kPreserveCubeRegisterStates))
     .set_num_inputs(6)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 TVM_REGISTER_OP("tl.ascend_membase.mul_rows_f32")
+    .set_attr<ascend::TRegisterStatePreservation>(
+        ascend::kRegisterStatePreservationAttr,
+        Integer(ascend::kPreserveCubeRegisterStates))
     .set_num_inputs(6)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
 TVM_REGISTER_OP("tl.ascend_membase.div_rows_f32")
+    .set_attr<ascend::TRegisterStatePreservation>(
+        ascend::kRegisterStatePreservationAttr,
+        Integer(ascend::kPreserveCubeRegisterStates))
     .set_num_inputs(6)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
 TVM_REGISTER_OP("tl.ascend_membase.select_bits")
+    .set_attr<ascend::TRegisterStatePreservation>(
+        ascend::kRegisterStatePreservationAttr,
+        Integer(ascend::kPreserveCubeRegisterStates))
     .set_num_inputs(5)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque))
     .set_attr<TGlobalSymbol>("TGlobalSymbol", "tl_ascend_membase_select_bits");
 
 TVM_REGISTER_OP("tl.ascend_membase.copy_bits")
+    .set_attr<ascend::TRegisterStatePreservation>(
+        ascend::kRegisterStatePreservationAttr,
+        Integer(ascend::kPreserveCubeRegisterStates))
     .set_num_inputs(3)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque))

@@ -66,8 +66,11 @@ def test_automatic_pipeline_emits_native_cube_dma_signatures(dtype, transpose_b)
     if transpose_b:
         assert len(_call_arguments(source, "asc_copy_l12l0b")) == 6, source
     else:
-        transpose_args = _call_arguments(source, "load_cbuf_to_cb")
-        assert len(transpose_args) == 9 and transpose_args[7] == "1", source
+        # The compact NN tile uses the selected Load3D recipe and FMATRIX_B.
+        b_args = _call_arguments(source, "asc_copy_l12l0b")
+        assert len(b_args) == 17, source
+        assert b_args[2:4] == ["48", "64"] and b_args[15:] == ["1", "48"], source
+        assert "asc_set_l13d_fmatrix_b(" in source, source
     assert len(_call_arguments(source, "asc_copy_l0c2gm")) == 11, source
     assert _call_arguments(source, "asc_set_l0c_copy_params") == ["1", "0", "0"], source
     ordered = ["asc_set_l0c_copy_params(", "asc_sync_notify(PIPE_S, PIPE_FIX,",

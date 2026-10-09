@@ -256,10 +256,15 @@ def test_explicit_direction_keeps_the_ordinary_protocol():
     assert sum(_is_export(call, facts) for call, _, _ in records) == 24
 
 
-def test_registered_opaque_scalar_keeps_scoped_direction():
+@pytest.mark.parametrize("name", [
+    "testing.ascend.unit_direction_opaque_state",
+    "tl.ascend_membase.test_unit_direction_opaque_state",
+], ids=["generic-op", "membase-prefix"])
+def test_registered_opaque_scalar_keeps_scoped_direction(name):
     # This is a registered TGlobalSymbol, not call_extern. A name/registration
-    # alone cannot establish that the operation preserves CTRL51.
-    name = "testing.ascend.unit_direction_opaque_state"
+    # or a native pipe-name prefix cannot establish preservation of CTRL51.
+    # The fixture extension is an opaque Scalar call assigned to AIC; its name
+    # is not a declaration that it executes a physical Vector instruction.
     tvm.ir.register_op_attr(name, "TGlobalSymbol", "test_unit_direction_opaque_state")
     tvm.ir.register_op_attr(name, "TCallEffectKind", tirx.IntImm("int32", 3))
     opaque_op = tvm.ir.Op.get(name)
@@ -280,3 +285,10 @@ def test_registered_opaque_scalar_keeps_scoped_direction():
     assert next(i for i, (call, _, _) in enumerate(records) if _name(call) == name) < directions[0][0]
     mads = [call for call, _, _ in records if _name(call) == _GEMM]
     assert len(mads) == 72 and all("unit_flag_ctrl" in call.annotations for call in mads)
+    if name == "tl.ascend_membase.test_unit_direction_opaque_state":
+        # _commands admits only known typed calls and cannot model this
+        # extension. It has no fixture memory operands: omit this one node,
+        # without inventing completion edges or removing real data/flags.
+        ordinary_records = [record for record in records if _name(record[0]) != name]
+        assert len(ordinary_records) == len(records) - 1
+        _prove_completions(_commands(ordinary_records))

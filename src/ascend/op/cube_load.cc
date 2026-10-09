@@ -11,44 +11,14 @@
 #include <tvm/tirx/op_attr_types.h>
 
 #include "ascend/op/builtin.h"
+#include "ascend/op/register_state.h"
 #include "ascend/op/utils.h"
 #include "ascend/target_utils.h"
-#include "ascend/transform/ascend_pipe.h"
-#include "op/builtin.h"
 #include "op/utils.h"
 
 namespace tvm {
 namespace tl {
 using namespace tirx;
-
-namespace ascend {
-// A kernel-root configuration remains invariant only across registered native
-// operations with known hardware roles and pure IR metadata. A pure external
-// call still has no verified register contract. Opaque library GEMMs may issue
-// their own Basic LoadData setup and cannot share this root configuration.
-bool PreservesLoad3DConfig(const CallNode *call) {
-  if (call->op.same_as(builtin::call_extern()) ||
-      call->op.same_as(builtin::call_pure_extern()))
-    return false;
-  const auto callee = call->op.as<Op>();
-  if (!callee)
-    return false;
-  if (call->op.same_as(ascend_gemm_l1()) ||
-      call->op.same_as(ascend_blockscaled_gemm_l1()))
-    return false;
-  if (call->op.same_as(region()) || call->op.same_as(access_ptr()) ||
-      call->op.same_as(builtin::tvm_access_ptr()) ||
-      call->op.same_as(builtin::assume()))
-    return true;
-  if (GetAscendCallPipeMask(GetRef<Call>(call)) != 0)
-    return true;
-  static auto effects = Op::GetAttrMap<TCallEffectKind>("TCallEffectKind");
-  return effects.count(callee.value()) &&
-         effects[callee.value()]->value <=
-             static_cast<int>(CallEffectKind::kPure);
-}
-
-} // namespace ascend
 
 AscendCubeLoad3D::AscendCubeLoad3D(
     ffi::Array<PrimExpr> args,
@@ -93,6 +63,9 @@ Stmt AscendCubeLoad3DNode::Lower(const LowerArgs &args,
 
 TIR_REGISTER_TL_TILE_OP(AscendCubeLoad3D, ascend_cube_load3d)
     .set_num_inputs(4)
+    .set_attr<ascend::TRegisterStatePreservation>(
+        ascend::kRegisterStatePreservationAttr,
+        Integer(ascend::kPreserveCubeRegisterStates))
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 TVM_FFI_STATIC_INIT_BLOCK() { AscendCubeLoad3DNode::RegisterReflection(); }

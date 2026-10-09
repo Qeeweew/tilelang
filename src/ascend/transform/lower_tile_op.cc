@@ -20,6 +20,7 @@
 #include "ascend/layout/ascend_layouts.h"
 #include "ascend/op/copy.h"
 #include "ascend/op/utils.h"
+#include "ascend/op/vector_reduce.h"
 #include "ascend/target_utils.h"
 #include "cuda/op/builtin.h"
 #include "layout/layout.h"
@@ -1240,33 +1241,17 @@ private:
   // Keep that exact rectangle through dependency/version planning; only this
   // late mechanical conversion needs a pointer span covering the row gaps.
   Stmt LowerRowReduceRegions(const EvaluateNode *op, const CallNode *call) {
-    ICHECK_EQ(call->args.size(), 5U) << "FP32 row reduce expects five operands";
-    const auto *static_rows = call->args[2].as<IntImmNode>();
-    const auto *stride = call->args[3].as<IntImmNode>();
-    const auto *lanes = call->args[4].as<IntImmNode>();
-    ICHECK(call->args[2].dtype() == DataType::UInt(8) &&
-           (!static_rows || (static_rows->value > 0 && static_rows->value <= 255)))
-        << "FP32 row reduce requires uint8 rows in [1, 255]";
-    ICHECK(lanes && lanes->value >= 8 && lanes->value <= 64 &&
-           lanes->value % 8 == 0 && call->args[4].dtype() == DataType::UInt(8))
-        << "FP32 row reduce requires static uint8 valid lanes in [8, 64], "
-           "in multiples of eight";
-    ICHECK(stride && stride->value >= lanes->value / 8 &&
-           stride->value <= 65535 &&
-           call->args[3].dtype() == DataType::UInt(16))
-        << "FP32 row reduce requires a uint16 source row stride in "
-           "[valid_lanes / 8, 65535]";
-    ICHECK(lanes->value == 64 ? stride->value % 8 == 0
-                              : stride->value == lanes->value / 8)
-        << "FP32 row reduce requires a whole-VL stride for 64 lanes or "
-           "a compact source row stride for partial lanes";
+    const RepeatRowReduceF32 native = DecodeRepeatRowReduceF32(call);
+    const int64_t row_width = native.SourceRowStrideElements();
+    const int64_t lanes = native.valid_lanes;
     Array<PrimExpr> args = call->args;
     Optional<PrimExpr> rows;
     for (size_t i = 0; i < 2; ++i) {
-      const auto *region = call->args[i].as<CallNode>();
+      const PrimExpr &operand = i == 0 ? native.destination : native.source;
+      const auto *region = operand.as<CallNode>();
       ICHECK(region && region->op.same_as(tl::region()))
           << "FP32 row reduce requires exact typed tl.region operands";
-      BufferRegion access = NormalizeToBufferRegion(call->args[i]);
+      BufferRegion access = NormalizeToBufferRegion(operand);
       const int mask = i == 0 ? kAccessWrite : kAccessRead;
       ICHECK(is_const_int(region->args[1], mask))
           << "FP32 row reduce region access mask differs from its operand";
@@ -1290,7 +1275,7 @@ private:
         ICHECK(analyzer_->CanProve(active_rows > 0) &&
                analyzer_->CanProve(active_rows <= 255) &&
                analyzer_->CanProveEqual(
-                   call->args[2], cast(DataType::UInt(8), active_rows)))
+                   native.rows, cast(DataType::UInt(8), active_rows)))
             << "FP32 row reduce requires proved active rows in [1, 255] "
                "and an exact uint8 repeat count";
         rows = active_rows;
@@ -1313,7 +1298,7 @@ private:
           ICHECK(analyzer_->CanProveEqual(
               access->buffer->strides[row_axis],
               make_const(access->buffer->strides[row_axis].dtype(),
-                         i == 1 ? stride->value * 8 : 1)))
+                         i == 1 ? row_width : 1)))
               << "FP32 row reduce physical row pitch differs from its "
                  "compact output or source stride";
       }
@@ -1321,12 +1306,12 @@ private:
       if (i == 0) {
         span = access->region[row_axis]->extent;
       } else {
-        ICHECK(is_const_int(access->region.back()->extent, lanes->value) &&
-               is_const_int(access->buffer->shape.back(), stride->value * 8))
+        ICHECK(is_const_int(access->region.back()->extent, lanes) &&
+               is_const_int(access->buffer->shape.back(), row_width))
             << "FP32 row reduce source must be an exact [rows, valid_lanes] "
                "chunk "
                "of its physical row width";
-        if (lanes->value == 64) {
+        if (lanes == 64) {
           ICHECK(analyzer_->CanProveEqual(
               floormod(access->region.back()->min,
                        make_const(access->region.back()->min.dtype(), 64)),
@@ -1339,8 +1324,8 @@ private:
         }
         DataType dtype = access->region[row_axis]->extent.dtype();
         span = (access->region[row_axis]->extent - make_const(dtype, 1)) *
-                   make_const(dtype, stride->value * 8) +
-               make_const(dtype, lanes->value);
+                   make_const(dtype, row_width) +
+               make_const(dtype, lanes);
       }
       Array<PrimExpr> indices;
       for (const Range &range : access->region)
@@ -1497,10 +1482,7 @@ private:
                      native->name == "tl.ascend_membase.mul_rows_f32" ||
                      native->name == "tl.ascend_membase.div_rows_f32"))
         return LowerRowBinaryRegions(op, call);
-      if (const auto *native = call->op.as<OpNode>();
-          native &&
-          (native->name == "tl.ascend_membase.repeat_reduce_sum_rows_f32" ||
-           native->name == "tl.ascend_membase.repeat_reduce_max_rows_f32"))
+      if (IsRepeatRowReduceF32(call))
         return LowerRowReduceRegions(op, call);
     }
     // Do not analysis the call node to the global function.

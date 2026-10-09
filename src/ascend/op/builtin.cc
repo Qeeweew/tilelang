@@ -4,6 +4,7 @@
  */
 
 #include "builtin.h"
+#include "register_state.h"
 
 #include <tvm/ir/transform.h>
 
@@ -14,12 +15,20 @@ namespace tl {
 
 using namespace tirx;
 
+// These native implementations preserve both kernel-invariant Cube states.
+// Setters and opaque library GEMMs below declare their different contracts
+// explicitly. Issue-pipe classification never grants this property.
+#define TIR_DEFINE_ASCEND_PRESERVING_BUILTIN(Name)                             \
+  TIR_DEFINE_TL_BUILTIN(Name).set_attr<ascend::TRegisterStatePreservation>(    \
+      ascend::kRegisterStatePreservationAttr,                                  \
+      Integer(ascend::kPreserveCubeRegisterStates))
+
 TVM_REGISTER_PASS_CONFIG_OPTION(kEnableAutoSchedule, Bool);
 
 // Emitted by tilelang.ascend.language.assume_conflict/assume_no_conflict and
 // consumed by src/ascend/transform/normalize_conflict_hints.cc, so it lives
 // with the rest of the Ascend op registrations.
-TIR_DEFINE_TL_BUILTIN(conflict_hint)
+TIR_DEFINE_ASCEND_PRESERVING_BUILTIN(conflict_hint)
     .set_num_inputs(-1)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kPure));
@@ -34,9 +43,12 @@ TIR_DEFINE_TL_BUILTIN(conflict_hint)
     return op;                                                                 \
   }                                                                            \
   TVM_REGISTER_OP("tl.simd." #Name)                                            \
-      .set_attr<TScriptPrinterName>("TScriptPrinterName", "tl.simd." #Name)
+      .set_attr<TScriptPrinterName>("TScriptPrinterName", "tl.simd." #Name)    \
+      .set_attr<ascend::TRegisterStatePreservation>(                           \
+          ascend::kRegisterStatePreservationAttr,                              \
+          Integer(ascend::kPreserveCubeRegisterStates))
 
-TIR_DEFINE_TL_BUILTIN(ascend_pipe_barrier)
+TIR_DEFINE_ASCEND_PRESERVING_BUILTIN(ascend_pipe_barrier)
     .set_num_inputs(1)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
@@ -296,139 +308,142 @@ TIR_DEFINE_TL_SIMD_BUILTIN(vshrs).set_num_inputs(-1).set_attr<TCallEffectKind>(
 TIR_DEFINE_TL_SIMD_BUILTIN(mem_bar).set_num_inputs(1).set_attr<TCallEffectKind>(
     "TCallEffectKind", Integer(CallEffectKind::kOpaque));
 
-TIR_DEFINE_TL_BUILTIN(ascend_set_flag)
+TIR_DEFINE_ASCEND_PRESERVING_BUILTIN(ascend_set_flag)
     .set_num_inputs(2)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
-TIR_DEFINE_TL_BUILTIN(ascend_wait_flag)
+TIR_DEFINE_ASCEND_PRESERVING_BUILTIN(ascend_wait_flag)
     .set_num_inputs(2)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
-TIR_DEFINE_TL_BUILTIN(ascend_threadfence)
+TIR_DEFINE_ASCEND_PRESERVING_BUILTIN(ascend_threadfence)
     .set_num_inputs(0)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
-TIR_DEFINE_TL_BUILTIN(ascend_cross_core_set_flag)
+TIR_DEFINE_ASCEND_PRESERVING_BUILTIN(ascend_cross_core_set_flag)
     .set_num_inputs(3)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
-TIR_DEFINE_TL_BUILTIN(ascend_cross_core_wait_flag)
+TIR_DEFINE_ASCEND_PRESERVING_BUILTIN(ascend_cross_core_wait_flag)
     .set_num_inputs(3)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
-TIR_DEFINE_TL_BUILTIN(ascend_copy_gm_to_ubuf)
+TIR_DEFINE_ASCEND_PRESERVING_BUILTIN(ascend_copy_gm_to_ubuf)
     .set_num_inputs(11)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
-TIR_DEFINE_TL_BUILTIN(ascend_set_copy_pad_value)
+TIR_DEFINE_ASCEND_PRESERVING_BUILTIN(ascend_set_copy_pad_value)
     .set_num_inputs(1)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
-TIR_DEFINE_TL_BUILTIN(ascend_copy_ubuf_to_gm)
+TIR_DEFINE_ASCEND_PRESERVING_BUILTIN(ascend_copy_ubuf_to_gm)
     .set_num_inputs(8)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
-TIR_DEFINE_TL_BUILTIN(ascend_copy_gm_to_cbuf)
+TIR_DEFINE_ASCEND_PRESERVING_BUILTIN(ascend_copy_gm_to_cbuf)
     .set_num_inputs(11)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
-TIR_DEFINE_TL_BUILTIN(ascend_fill_l1)
+TIR_DEFINE_ASCEND_PRESERVING_BUILTIN(ascend_fill_l1)
     .set_num_inputs(7)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
-TIR_DEFINE_TL_BUILTIN(ascend_load_cbuf_to_ca)
+TIR_DEFINE_ASCEND_PRESERVING_BUILTIN(ascend_load_cbuf_to_ca)
     .set_num_inputs(9)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
-TIR_DEFINE_TL_BUILTIN(ascend_load_cbuf_to_cb)
+TIR_DEFINE_ASCEND_PRESERVING_BUILTIN(ascend_load_cbuf_to_cb)
     .set_num_inputs(9)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
-TIR_DEFINE_TL_BUILTIN(ascend_load_cbuf_to_ca_2d)
+TIR_DEFINE_ASCEND_PRESERVING_BUILTIN(ascend_load_cbuf_to_ca_2d)
     .set_num_inputs(7)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
 TIR_DEFINE_TL_BUILTIN(ascend_set_load3d_config)
+    .set_attr<ascend::TRegisterStatePreservation>(
+        ascend::kRegisterStatePreservationAttr,
+        Integer(ascend::kPreserveMmadDirection))
     .set_num_inputs(2)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
-TIR_DEFINE_TL_BUILTIN(ascend_set_fixpipe_config)
+TIR_DEFINE_ASCEND_PRESERVING_BUILTIN(ascend_set_fixpipe_config)
     .set_num_inputs(0)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
-TIR_DEFINE_TL_BUILTIN(ascend_load_cbuf_to_ca_3d)
+TIR_DEFINE_ASCEND_PRESERVING_BUILTIN(ascend_load_cbuf_to_ca_3d)
     .set_num_inputs(7)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
-TIR_DEFINE_TL_BUILTIN(ascend_load_cbuf_to_cb_3d)
+TIR_DEFINE_ASCEND_PRESERVING_BUILTIN(ascend_load_cbuf_to_cb_3d)
     .set_num_inputs(7)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
-TIR_DEFINE_TL_BUILTIN(ascend_load_cbuf_to_cb_2d)
+TIR_DEFINE_ASCEND_PRESERVING_BUILTIN(ascend_load_cbuf_to_cb_2d)
     .set_num_inputs(7)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
-TIR_DEFINE_TL_BUILTIN(ascend_load_ca_sf)
+TIR_DEFINE_ASCEND_PRESERVING_BUILTIN(ascend_load_ca_sf)
     .set_num_inputs(8)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
-TIR_DEFINE_TL_BUILTIN(ascend_load_cb_sf)
+TIR_DEFINE_ASCEND_PRESERVING_BUILTIN(ascend_load_cb_sf)
     .set_num_inputs(8)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
-TIR_DEFINE_TL_BUILTIN(ascend_copy_matrix_cc_to_ub)
+TIR_DEFINE_ASCEND_PRESERVING_BUILTIN(ascend_copy_matrix_cc_to_ub)
     .set_num_inputs(26)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
-TIR_DEFINE_TL_BUILTIN(ascend_copy_ubuf_to_cbuf)
+TIR_DEFINE_ASCEND_PRESERVING_BUILTIN(ascend_copy_ubuf_to_cbuf)
     .set_num_inputs(7)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
-TIR_DEFINE_TL_BUILTIN(ascend_nd2nz_scatter)
+TIR_DEFINE_ASCEND_PRESERVING_BUILTIN(ascend_nd2nz_scatter)
     .set_num_inputs(7)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
-TIR_DEFINE_TL_BUILTIN(ascend_nd2nz_post_copy)
+TIR_DEFINE_ASCEND_PRESERVING_BUILTIN(ascend_nd2nz_post_copy)
     .set_num_inputs(6)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
-TIR_DEFINE_TL_BUILTIN(ascend_copy_matrix_cc_to_gm)
+TIR_DEFINE_ASCEND_PRESERVING_BUILTIN(ascend_copy_matrix_cc_to_gm)
     .set_num_inputs(25)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
-TIR_DEFINE_TL_BUILTIN(ascend_mad)
+TIR_DEFINE_ASCEND_PRESERVING_BUILTIN(ascend_mad)
     .set_num_inputs(10)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
 // L0 block-scaled MAD (MXFP8). Same args as ascend_mad; reads the per-block
 // scale factors from the L0A/L0B MX registers loaded beforehand.
-TIR_DEFINE_TL_BUILTIN(ascend_mad_mx)
+TIR_DEFINE_ASCEND_PRESERVING_BUILTIN(ascend_mad_mx)
     .set_num_inputs(10)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
@@ -443,45 +458,50 @@ TIR_DEFINE_TL_BUILTIN(ascend_blockscaled_gemm_l1)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
-TIR_DEFINE_TL_BUILTIN(ascend_read_gm_bypass_dcache)
+TIR_DEFINE_ASCEND_PRESERVING_BUILTIN(ascend_read_gm_bypass_dcache)
     .set_num_inputs(1)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kPure));
 
-TIR_DEFINE_TL_BUILTIN(ascend_write_gm_bypass_dcache)
+TIR_DEFINE_ASCEND_PRESERVING_BUILTIN(ascend_write_gm_bypass_dcache)
     .set_num_inputs(2)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
-TIR_DEFINE_TL_BUILTIN(ascend_get_buf)
+TIR_DEFINE_ASCEND_PRESERVING_BUILTIN(ascend_get_buf)
     .set_num_inputs(3)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
-TIR_DEFINE_TL_BUILTIN(ascend_rls_buf)
+TIR_DEFINE_ASCEND_PRESERVING_BUILTIN(ascend_rls_buf)
     .set_num_inputs(3)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
-TIR_DEFINE_TL_BUILTIN(ascend_set_hf32_mode)
+TIR_DEFINE_ASCEND_PRESERVING_BUILTIN(ascend_set_hf32_mode)
     .set_num_inputs(1)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
 TIR_DEFINE_TL_BUILTIN(ascend_set_mmad_direction)
+    .set_attr<ascend::TRegisterStatePreservation>(
+        ascend::kRegisterStatePreservationAttr,
+        Integer(ascend::kPreserveLoad3DConfig))
     .set_num_inputs(1)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
-TIR_DEFINE_TL_BUILTIN(ascend_set_atomic)
+TIR_DEFINE_ASCEND_PRESERVING_BUILTIN(ascend_set_atomic)
     .set_num_inputs(2)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
-TIR_DEFINE_TL_BUILTIN(ascend_set_atomic_none)
+TIR_DEFINE_ASCEND_PRESERVING_BUILTIN(ascend_set_atomic_none)
     .set_num_inputs(0)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
 } // namespace tl
 } // namespace tvm
+
+#undef TIR_DEFINE_ASCEND_PRESERVING_BUILTIN

@@ -143,6 +143,14 @@ copies unchanged. Selection ranks the static upper bound on saved Load2D
 descriptors, using the ordinary lowering recipe and finite loop trip counts.
 This is an instruction-count objective, not measured latency or bandwidth;
 unknown bounds, overflow and ties retain the original conflicting-bank path.
+
+Load3D configuration and MMAD direction have separate register-state contracts.
+Known native Ops explicitly declare which state they preserve; an issue pipe
+or a name prefix grants no such permission. Each setter writes its own state
+and preserves the other. External calls, opaque library operations and unknown
+Ops remain unmodeled. Load3D synchronization separately validates and permits
+its unique root initializer; closed MAD/FIX streams consume the direction
+contract while retaining their complete-stream and explicit-state checks.
 Live reconfiguration is unsupported. External and unmodeled opaque calls
 prevent selection, and an
 already selected kernel diagnoses them at synchronization lowering because

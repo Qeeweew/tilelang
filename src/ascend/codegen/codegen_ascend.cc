@@ -20,6 +20,7 @@
 
 #include "ascend/op/builtin.h"
 #include "ascend/op/copy.h"
+#include "ascend/op/vector_reduce.h"
 #include "ascend/target_utils.h"
 #include "backend/common/target_utils.h"
 #include "transform/common/attr.h"
@@ -56,19 +57,15 @@ bool HasMaskSafeArguments(const PrimExpr &expr) {
 // These exact 2201 C API overloads leave normal/full mask state unchanged.
 // Restrict the run to direct statements with side-effect-free arguments.
 bool IsNormalFullMaskCall(const CallNode *call) {
-  const auto *callee = call->op.as<OpNode>();
-  if (!callee ||
-      (callee->name != "tl.ascend_membase.brcb_f32" &&
-       callee->name != "tl.ascend_membase.sub_rows_f32" &&
-       callee->name != "tl.ascend_membase.mul_rows_f32" &&
-       callee->name != "tl.ascend_membase.div_rows_f32" &&
-       callee->name != "tl.ascend_membase.repeat_reduce_sum_rows_f32" &&
-       callee->name != "tl.ascend_membase.repeat_reduce_max_rows_f32")) {
-    return false;
-  }
-  if (callee->name == "tl.ascend_membase.repeat_reduce_sum_rows_f32" ||
-      callee->name == "tl.ascend_membase.repeat_reduce_max_rows_f32") {
-    if (call->args.size() != 5 || !is_const_int(call->args[4], 64))
+  if (tl::ascend::IsRepeatRowReduceF32(call)) {
+    if (!tl::ascend::DecodeRepeatRowReduceF32(call).UsesFullNormalMask())
+      return false;
+  } else {
+    const auto *callee = call->op.as<OpNode>();
+    if (!callee || (callee->name != "tl.ascend_membase.brcb_f32" &&
+                    callee->name != "tl.ascend_membase.sub_rows_f32" &&
+                    callee->name != "tl.ascend_membase.mul_rows_f32" &&
+                    callee->name != "tl.ascend_membase.div_rows_f32"))
       return false;
   }
   return std::all_of(call->args.begin(), call->args.end(),
@@ -2136,48 +2133,32 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
   if (EmitAscendMemoryCall_(op)) {
     return;
   }
-  if (const auto *callee = op->op.as<OpNode>();
-      callee &&
-      (callee->name == "tl.ascend_membase.repeat_reduce_sum_rows_f32" ||
-       callee->name == "tl.ascend_membase.repeat_reduce_max_rows_f32")) {
+  if (tl::ascend::IsRepeatRowReduceF32(op)) {
     ICHECK(is_dav2201_) << "FP32 strided row reduce requires dav-2201";
-    ICHECK_EQ(op->args.size(), 5U);
-    const auto *rows = op->args[2].as<IntImmNode>();
-    const auto *stride = op->args[3].as<IntImmNode>();
-    const auto *lanes = op->args[4].as<IntImmNode>();
-    // LowerRowReduceRegions proves the original active extent in [1, 255]
-    // under its nonempty guard before producing these exact access pointers.
-    // Codegen only preserves that uint8 scalar repeat; it must not require
-    // a constant after the native boundary has validated dynamic rows.
-    ICHECK(op->args[2].dtype() == DataType::UInt(8) &&
-           (!rows || (rows->value > 0 && rows->value <= 255)) && stride && lanes &&
-           lanes->value >= 8 && lanes->value <= 64 && lanes->value % 8 == 0 &&
-           stride->value >= lanes->value / 8 && stride->value <= 65535 &&
-           (lanes->value == 64 ? stride->value % 8 == 0
-                               : stride->value == lanes->value / 8));
-    const char *name =
-        callee->name == "tl.ascend_membase.repeat_reduce_sum_rows_f32"
-            ? "asc_repeat_reduce_sum"
-            : "asc_repeat_reduce_max_only_value";
-    std::string dst = PrintMaskArgument_(op->args[0]);
-    std::string src = PrintMaskArgument_(op->args[1]);
-    std::string repeats = PrintMaskArgument_(op->args[2]);
-    std::string row_stride = PrintMaskArgument_(op->args[3]);
-    // The six-argument overload reduces the explicitly active lanes per row.
-    // Its destination repeat stride is in elements; source strides are 32B
-    // blocks. Count-mode predecessors do not restore a full normal mask.
-    if (lanes->value == 64) {
+    const auto native = tl::ascend::DecodeRepeatRowReduceF32(op);
+    // The region boundary proves the original active extent in [1, 255]
+    // under its nonempty guard. Preserve the decoded uint8 repeat expression;
+    // scalar ABI decoding does not require dynamic rows to become constant.
+    std::string dst = PrintMaskArgument_(native.destination);
+    std::string src = PrintMaskArgument_(native.source);
+    std::string repeats = PrintMaskArgument_(native.rows);
+    std::string row_stride = PrintMaskArgument_(native.source_stride);
+    // Count-mode predecessors do not restore a full normal mask.
+    if (native.UsesFullNormalMask()) {
       EmitNormalFullMask_();
     } else {
       PrintIndent();
       stream << "asc_set_mask_norm();\n";
       PrintIndent();
       stream << "asc_set_vector_mask(uint64_t(0), uint64_t("
-             << ((uint64_t(1) << lanes->value) - 1) << "));\n";
+             << native.NormalMaskLowBits() << "));\n";
     }
     PrintIndent();
-    stream << name << "(" << dst << ", " << src << ", " << repeats
-           << ", uint16_t(1), uint16_t(1), " << row_stride << ");\n";
+    stream << native.NativeSymbol() << "(" << dst << ", " << src << ", "
+           << repeats << ", uint16_t("
+           << native.kDestinationRepeatStrideElements << "), uint16_t("
+           << native.kSourceBlockStrideDatablocks << "), " << row_stride
+           << ");\n";
     return;
   }
   if (const auto *callee = op->op.as<OpNode>();

@@ -846,20 +846,67 @@ def test_conditional_native_readers_acquire_root_state_once_before_all_controls(
 
 
 @pytest.mark.parametrize("factory", [_fixture, _b_fixture], ids=["A", "B"])
-@pytest.mark.parametrize("kind", ["extern", "pure_extern", "opaque_gemm"])
+@pytest.mark.parametrize("kind", ["extern", "pure_extern", "opaque_gemm", "membase_opaque"])
 def test_unknown_native_state_keeps_ordinary_copy(factory, kind):
     original = factory()
     root = original["main"].body.block
-    call = (tirx.Call("void", tvm.ir.Op.get("tl.ascend_gemm_l1"), [0] * 11)
-            if kind == "opaque_gemm" else
-            tirx.call_pure_extern("int32", "set_fmatrix_b", 0) if kind == "pure_extern" else
-            tirx.call_extern("int32", "set_fmatrix", 0))
+    if kind == "membase_opaque":
+        name = "tl.ascend_membase.test_cube_load_opaque_state_" + factory.__name__
+        tvm.ir.register_op_attr(name, "TGlobalSymbol", "test_cube_load_opaque_state")
+        tvm.ir.register_op_attr(name, "TCallEffectKind", tirx.IntImm("int32", 3))
+        opaque_op = tvm.ir.Op.get(name)
+        opaque_op.set_num_inputs(0)
+        call = tirx.Call("void", opaque_op, [])
+    else:
+        call = (tirx.Call("void", tvm.ir.Op.get("tl.ascend_gemm_l1"), [0] * 11)
+                if kind == "opaque_gemm" else
+                tirx.call_pure_extern("int32", "set_fmatrix_b", 0) if kind == "pure_extern" else
+                tirx.call_extern("int32", "set_fmatrix", 0))
     before = kernel(seq(tirx.Evaluate(call), root.body), buffers=root.alloc_buffers,
                     annotations=root.annotations)
     after = _select(before)
     assert not calls(after, NATIVE)
     assert not calls(after, CFG)
     assert len(calls(after, "tl.tileop.ascend_copy")) == 1
+    if kind == "membase_opaque":
+        assert len(calls(after, name)) == 1
+
+
+def test_typed_l1_gemm_keeps_ordinary_copy_without_a_register_contract():
+    original = _fixture(m=32, cache_k=32, load_k=16, k_start=16)
+    root = original["main"].body.block
+    source = root.alloc_buffers[0]
+    output = tirx.decl_buffer((32, 32), "float32", name="c", scope="shared.l0c")
+    gemm = T.gemm(source, source, output, transpose_B=True, clear_accum=True)
+    before = kernel(seq(root.body, tirx.Evaluate(gemm)),
+                    buffers=[*root.alloc_buffers, output], annotations=root.annotations)
+    after = _select(before)
+    assert not calls(after, NATIVE)
+    assert not calls(after, CFG)
+    assert len(calls(after, "tl.tileop.ascend_copy")) == 1
+    assert len(calls(after, "tl.tileop.gemm")) == 1
+
+
+@pytest.mark.parametrize("shared", [False, True], ids=["fresh-call", "shared-call"])
+def test_configuration_in_control_header_is_not_a_root_initializer(shared):
+    original = _state_fixture(nested=False)
+    root = original["main"].body.block
+    setup, loop_unit = root.body.seq
+    (config,) = calls(setup, CFG)
+    # Effectful control headers are unsupported. Give the setter an integer
+    # result only to construct malformed TIR; this must never reach emission.
+    header = tirx.Call("int32", config.op, config.args)
+    if shared:
+        # The same expression object occurs at two execution sites. A DAG
+        # postorder visitor would count it once and miss this extra setter.
+        setup = unit(tirx.Evaluate(header), core=2, cost=(1, 1))
+    loop = loop_unit.body
+    rewritten = tirx.For(loop.loop_var, header, loop.extent, loop.kind, loop.body,
+                         annotations=loop.annotations)
+    before = kernel(seq(setup, unit(rewritten, core=None)), buffers=root.alloc_buffers)
+    before["main"] = before["main"].with_attr("target", original["main"].attrs["target"])
+    with pytest.raises(tvm.error.InternalError, match="exactly one unconditional kernel-root S task"):
+        transform.InsertSync()(before)
 
 
 @pytest.mark.parametrize("kind", ["extern", "pure_extern"])

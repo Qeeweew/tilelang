@@ -39,6 +39,7 @@
 #include "ascend/op/builtin.h"
 #include "ascend/op/copy.h"
 #include "ascend/op/cube_load.h"
+#include "ascend/op/register_state.h"
 #include "ascend/op/utils.h"
 #include "ascend/transform/attr.h"
 #include "op/copy.h"
@@ -368,19 +369,23 @@ public:
 
 private:
   void VisitExpr_(const CallNode *op) final {
+    if (ascend::GetRegisterStateEffect(op,
+                                       ascend::RegisterState::kLoad3DConfig) ==
+        ascend::RegisterStateEffect::kWrites)
+      Add(SpecialRegister::kLoad3DConfig);
+    if (ascend::GetRegisterStateEffect(op,
+                                       ascend::RegisterState::kMmadDirection) ==
+        ascend::RegisterStateEffect::kWrites)
+      Add(SpecialRegister::kMmadDirection);
     if (op->op.same_as(tl::loop_break())) {
       Add(SpecialRegister::kLoopControl);
     } else if (op->op.same_as(tl::ascend_set_hf32_mode())) {
       Add(SpecialRegister::kHf32Mode);
-    } else if (op->op.same_as(tl::ascend_set_mmad_direction())) {
-      Add(SpecialRegister::kMmadDirection);
     } else if (op->op.same_as(tl::ascend_set_copy_pad_value())) {
       Add(SpecialRegister::kPadValue);
     } else if (op->op.same_as(tl::ascend_set_atomic()) ||
                op->op.same_as(tl::ascend_set_atomic_none())) {
       Add(SpecialRegister::kAtomicMode);
-    } else if (op->op.same_as(tl::ascend_set_load3d_config())) {
-      Add(SpecialRegister::kLoad3DConfig);
     } else if (op->op.same_as(tl::ascend_set_fixpipe_config())) {
       Add(SpecialRegister::kFixpipeNz2Nd);
     } else if (IsAscendCopyCall(op)) {

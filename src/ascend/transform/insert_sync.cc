@@ -72,6 +72,7 @@
 #include "./auto_schedule/unit_flag_stream.h"
 #include "ascend/op/builtin.h"
 #include "ascend/op/cube_load.h"
+#include "ascend/op/register_state.h"
 #include "ascend/target_utils.h"
 #include "ascend/transform/attr.h"
 #include "buffer_alias.h"
@@ -5044,14 +5045,33 @@ void InsertRootLoad3DInitMarker(
   }
   // Inspect the complete input, including control expressions: a raw setter
   // hidden in an opaque call cannot be assumed to preserve the root SPR state.
-  PostOrderVisit(kernel_body, [&](const ffi::ObjectRef &node) {
-    if (const auto *call = node.as<CallNode>()) {
-      ICHECK(ascend::PreservesLoad3DConfig(call))
+  class Load3DStateValidator : public StmtExprVisitor {
+  public:
+    size_t initializer_count{0};
+
+  private:
+    void VisitExpr_(const CallNode *call) final {
+      StmtExprVisitor::VisitExpr_(call);
+      // The single root initializer proved above defines this state. It is
+      // not a preserver; every other operation needs its own permission.
+      if (call->op.same_as(ascend_set_load3d_config())) {
+        ++initializer_count;
+        return;
+      }
+      ICHECK(ascend::GetRegisterStateEffect(
+                 call, ascend::RegisterState::kLoad3DConfig) ==
+             ascend::RegisterStateEffect::kPreserves)
           << "Load3D configuration cannot cross an external or opaque "
              "operation without a modeled register-preservation contract: "
           << call->op;
     }
-  });
+  } state_validator;
+  // Count executed occurrences, not unique Call objects: a shared TIR node
+  // reused in a header still introduces a second configuration operation.
+  state_validator(kernel_body);
+  ICHECK_EQ(state_validator.initializer_count, 1U)
+      << "Load3D configuration requires exactly one unconditional "
+         "kernel-root S task; repeated configuration is unsupported";
 
   auto marker = MakeSyncTaskNode(Evaluate(0), kCoreCube, 0);
   marker->SetPipeMask(PipeMask(ResourcePipe::kMTE1));
@@ -5148,13 +5168,15 @@ bool HasClosedKernelUnitDirection(
     const std::vector<UnitFlagStreamPlan> &plans, const Stmt &kernel_body) {
   if (plans.empty())
     return false;
-  // Reuse the existing native/pure-operation admission. An unmodeled opaque
-  // scalar call may change CTRL51 even though it uses neither M nor FIX.
+  // An unmodeled opaque scalar call may change CTRL51 even though it uses
+  // neither M nor FIX. A Load3D contract cannot grant this state permission.
   // Explicit direction/atomic setters were rejected before stream selection.
   bool known_state = true;
   PostOrderVisit(kernel_body, [&](const ffi::ObjectRef &node) {
     if (const auto *call = node.as<CallNode>())
-      known_state &= ascend::PreservesLoad3DConfig(call);
+      known_state &= ascend::GetRegisterStateEffect(
+                         call, ascend::RegisterState::kMmadDirection) ==
+                     ascend::RegisterStateEffect::kPreserves;
   });
   if (!known_state)
     return false;

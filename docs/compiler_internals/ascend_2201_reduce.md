@@ -76,6 +76,15 @@ These are the installed CANN 9.1
 interfaces. Their dav-c220 implementations issue `vcadd(..., last_acc_mode=0)`
 and `vcmax(..., ONLY_VALUE)` respectively, without a hidden barrier.
 
+The internal five-operand row Call has one scalar ABI decoder in
+`ascend/op/vector_reduce`: it owns the Op identity, integer types, lane and
+stride limits, stride units and native overload. The producer, late region
+lowering and codegen consume that view. It is not a memory or guard proof:
+late lowering still proves the original active row extent before narrowing,
+matching typed regions, physical pitch, bounds and aligned backing. Codegen
+retains dynamic `uint8` repeats and rejects malformed scalar operands even
+when invoked directly on lowered IR.
+
 To bound IR expansion, the candidate is selected only when its native operation
 count, `2*chunks-1` including ordinary binary combines, does not exceed the
 existing per-row tree's `R*levels` native reductions. This is a conservative

@@ -20,6 +20,7 @@
 #include "ascend/op/copy.h"
 #include "ascend/op/cube_load.h"
 #include "ascend/op/oob_padding.h"
+#include "ascend/op/register_state.h"
 #include "ascend/op/utils.h"
 #include "ascend/target_utils.h"
 #include "ascend/transform/ascend_pipe.h"
@@ -50,7 +51,9 @@ public:
                           call->op.same_as(AscendCubeLoad3D::Get()) ||
                           call->op.same_as(ascend_load_cbuf_to_ca_3d()) ||
                           call->op.same_as(ascend_load_cbuf_to_cb_3d());
-        unknown_state |= !ascend::PreservesLoad3DConfig(call);
+        unknown_state |= ascend::GetRegisterStateEffect(
+                             call, ascend::RegisterState::kLoad3DConfig) !=
+                         ascend::RegisterStateEffect::kPreserves;
       }
     });
     if (existing_state || unknown_state)

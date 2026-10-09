@@ -170,6 +170,21 @@ def test_partial_reduce_mask_ends_full_run_and_full_call_restores_it(lanes):
     assert source.index("asc_repeat_reduce_sum(") < source.rindex(FULL_MASK) < source.rindex("asc_brcb("), source
 
 
+@pytest.mark.parametrize("kind", ["sum", "max"])
+@pytest.mark.parametrize("field", ["stride", "lanes"])
+def test_direct_codegen_rejects_row_reduce_scalar_dtype_mismatch(kind, field):
+    dst, src = _pointer("dst"), _pointer("src")
+    args = [dst, src, tirx.const(8, "uint8"), tirx.const(16, "uint16"),
+            tirx.const(64, "uint8")]
+    index = 3 if field == "stride" else 4
+    # The values remain legal. Only the ABI type is wrong, and this public
+    # codegen entry deliberately bypasses LowerRowReduceRegions validation.
+    args[index] = tirx.const(16 if field == "stride" else 64, "int32")
+    diagnostic = "uint16 source row stride" if field == "stride" else "uint8 valid lanes"
+    with pytest.raises(tvm.error.InternalError, match=diagnostic):
+        _source(_native("repeat_reduce_" + kind + "_rows_f32", *args), [dst, src])
+
+
 @pytest.mark.parametrize("boundary", ["attr", "sblock", "bind"])
 def test_scope_and_bind_boundaries_start_a_new_run(boundary):
     dst, src = _pointer("dst"), _pointer("src")
