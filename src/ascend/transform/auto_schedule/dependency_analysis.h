@@ -136,8 +136,8 @@ struct DepInfo {
   //   -1  : unresolved cross-iteration dependency. A versioned storage may
   //         resolve it to its ring width; otherwise it means one iteration
   //         of the loop whose child list is being analyzed.
-  //   >=1 : dependency on a manually multi-buffered buffer, at the physical
-  //         iteration distance solved per access pair.
+  //   >=1 : a proven forward distance (or conservative lower bound), from
+  //         manual ring regions or persistent-state regions and guards.
   // kOwnerExclusion leaves this as zero during shared analysis. InsertSync
   // resolves both directed distances from the final stage and physical order.
   int distance;

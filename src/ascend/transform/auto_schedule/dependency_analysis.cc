@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <tuple>
 #include <utility>
@@ -83,7 +84,7 @@ namespace {
 struct PreparedRegionContext {
   PreparedRegionContext(const ConstrSet &a_ctx, const ConstrSet &b_ctx,
                         ControlNode *loop, int offset,
-                        bool independent_owner_epochs) {
+                        bool independent_owner_epochs, int forward_limit) {
     ConstrSet a_local_ctx = a_ctx;
     ConstrSet b_local_ctx = b_ctx;
     ConstrSet loop_ctx;
@@ -121,7 +122,12 @@ struct PreparedRegionContext {
       if (offset > 0) {
         loop_ctx.AddConstr(c == p + IntImm(iteration.dtype(), offset));
       } else if (!independent_owner_epochs) {
-        loop_ctx.AddConstr(p != c);
+        // A carried dependency is directed from an earlier invocation to a
+        // later one. Distinct coordinates alone also admit a reader followed
+        // by a writer in the *past*, inventing a forward recurrence.
+        loop_ctx.AddConstr(c > p);
+        if (forward_limit > 0)
+          loop_ctx.AddConstr(c <= p + IntImm(iteration.dtype(), forward_limit));
       }
     }
     constraints = loop_ctx.Merge(a_local_ctx).Merge(b_local_ctx);
@@ -142,7 +148,8 @@ public:
 
   bool MayConflict(const TaskNode *a_task, const BufferRegion &a_region,
                    const TaskNode *b_task, const BufferRegion &b_region,
-                   int offset, size_t num_storage_owners) {
+                   int offset, size_t num_storage_owners,
+                   int forward_limit = 0) {
     const bool cross = offset != 0;
     if (cross && loop_ == nullptr)
       return false;
@@ -189,9 +196,10 @@ public:
     const PreparedRegionContext &context =
         contexts_
             .try_emplace(std::make_tuple(a_task, b_task, offset,
-                                         independent_owner_epochs),
+                                         independent_owner_epochs,
+                                         forward_limit),
                          a_task->outer_ctx, b_task->outer_ctx, loop_, offset,
-                         independent_owner_epochs)
+                         independent_owner_epochs, forward_limit)
             .first->second;
     arith::Analyzer ana;
     ana.z3_prover.SetRLimit(50000);
@@ -223,7 +231,7 @@ public:
 private:
   ControlNode *loop_;
   const ConflictHintList &root_conflicts_;
-  std::map<std::tuple<const TaskNode *, const TaskNode *, int, bool>,
+  std::map<std::tuple<const TaskNode *, const TaskNode *, int, bool, int>,
            PreparedRegionContext>
       contexts_;
 };
@@ -438,7 +446,42 @@ AnalyzeDependencies(std::vector<IRStructure *> nodes, ControlNode *loop,
               if (conflicts.MayConflict(lhs.task, lhs.region, rhs.task,
                                         rhs.region, distance,
                                         get_num_storage_owners(storage))) {
-                add_pair(storage, owner_exclusion ? 0 : distance, lhs, rhs,
+                int resolved_distance = owner_exclusion ? 0 : distance;
+                if (distance < 0 && !owner_exclusion && storage.has_value() &&
+                    !multi_buffer_owners.count(storage.value())) {
+                  // Persistent state can name a grouped logical epoch in its
+                  // ordinary region indices. It is not a task-generation ring.
+                  // Prove the short forward distances that could invalidate a
+                  // requested stage separation; beyond this prefix the weakest
+                  // remaining distance is sufficient and conservative. Owned
+                  // rings retain their scheduler-selected version distance.
+                  int64_t gap = std::max<int64_t>(
+                      0, int64_t(nodes[i]->GetStage()) - nodes[j]->GetStage());
+                  if (gap > 0) {
+                    int horizon = std::min<int64_t>(
+                                      gap, std::numeric_limits<int>::max() - 2) +
+                                  1;
+                    auto may_conflict_through = [&](int last) {
+                      return conflicts.MayConflict(
+                          lhs.task, lhs.region, rhs.task, rhs.region, -1,
+                          /*num_storage_owners=*/0, last);
+                    };
+                    if (!may_conflict_through(horizon)) {
+                      resolved_distance = horizon + 1;
+                    } else {
+                      int first = 1, last = horizon;
+                      while (first < last) {
+                        int middle = first + (last - first) / 2;
+                        if (may_conflict_through(middle))
+                          last = middle;
+                        else
+                          first = middle + 1;
+                      }
+                      resolved_distance = first;
+                    }
+                  }
+                }
+                add_pair(storage, resolved_distance, lhs, rhs,
                          owner_exclusion ? DependencyKind::kOwnerExclusion
                                          : DependencyKind::kData,
                          // Different storages conflict only through a positive

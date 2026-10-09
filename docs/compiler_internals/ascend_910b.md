@@ -130,13 +130,25 @@ reversing an owner dependency swaps both its roles and conflict records.
 
 Within one ordered node-pair analysis, region comparisons share only the
 prepared task contexts: iteration renames and merged constraints. The key
-includes both endpoints, distance and whether distinct physical owners allow
-equal coordinates. Ordinary carried edges keep ancestors fixed and require
-different loop coordinates; independent owner epochs rename the full nest.
+includes both endpoints, distance, a forward-distance bound and whether distinct
+physical owners allow equal coordinates. Ordinary carried edges keep ancestors
+fixed and require the consumer coordinate to follow the producer; independent
+owner epochs rename the full nest and may have equal coordinates.
 Each region comparison creates its own analyzer and per-side mutable-read
 snapshots. Conflict hints still decide before storage/alias checks. Prepared
 contexts do not survive another child list, IR rewrite or sync attempt; no
 region proof or solver state is cached.
+
+Unowned persistent state retains its ordinary region and guard semantics. For
+a backward stage edge, shared analysis proves the shortest potentially
+conflicting forward prefix needed by that stage separation, using bounded
+queries rather than enumerating all iterations. If that prefix is disjoint,
+the edge retains a conservative lower bound for later conflicts. This is a
+schedule constraint, not instruction completion or an inferred state ring.
+Task-generation rings retain their selected version distance. A grouped query
+state may therefore use `local_pair % slots` without equating its lifetime
+with every task write. Scheduling and synchronization consume the same
+dependency record; owner, guard or region rewrites invalidate the analysis.
 
 ScheduledTIR decoding and physical alias analysis share one task-effect scope:
 a leaf owns its statement and direct guards; a control header owns only its
