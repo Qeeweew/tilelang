@@ -60,6 +60,7 @@
 #include "./auto_schedule/kernel_rewriter.h"
 #include "./auto_schedule/l0ab_phase_reuse.h"
 #include "./auto_schedule/l0c_storage_reuse.h"
+#include "./auto_schedule/loop_schedule_validation.h"
 #include "./auto_schedule/manual_schedule_completion.h"
 #include "./auto_schedule/multi_buffer.h"
 #include "./auto_schedule/optimization_diagnostic.h"
@@ -290,17 +291,6 @@ private:
 // Scratch timing state used only while AutoSchedule is solving and ordering an
 // IRStructure tree. Task latency and II live directly on IRStructure because
 // they are ordinary T.Task metadata.
-// Half-open issue spans, in the existing cost model's units. These never
-// replace a task's completion latency. kind 0 names a core/pipe bit; kind 1
-// names an existing HBM contention-policy bit.
-struct IssueResourceSpan {
-  int64_t kind;
-  int64_t bit;
-  int64_t first;
-  int64_t last;
-};
-using IssueResourceProfile = std::vector<IssueResourceSpan>;
-
 class AutoScheduleExtraInfo final : public IRExtraInfo {
 public:
   std::unique_ptr<IRExtraInfo> Clone() const final {
@@ -1796,17 +1786,34 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
     tvm_memory_groups.push_back({std::numeric_limits<int64_t>::max(), id});
   }
 
+  // Both plan producers consume these same residual capacity facts. Fixed
+  // rings and root reservations have already been charged above.
+  std::vector<std::vector<int64_t>> plan_memory_groups;
+  for (const auto &group : tvm_memory_groups)
+    plan_memory_groups.emplace_back(group.begin(), group.end());
+  std::vector<int64_t> plan_hbm_masks(tvm_resource_hbm_masks.begin(),
+                                    tvm_resource_hbm_masks.end());
+  LoopScheduleConstraints constraints{
+      iis, resource_flags, data_deps, resource_deps, owner_exclusion_deps,
+      pipe_order_deps, stage_order_deps, storage_sizes, storage_min_versions,
+      plan_memory_groups, num_stages, enable_offset};
+  if (manual_schedule)
+    constraints.manual_stages = &manual_stages;
+  else if (stage_horizon > 0)
+    constraints.stage_horizon = stage_horizon;
+  if (!resource_profiles.empty()) {
+    constraints.resource_profiles = &resource_profiles;
+    constraints.resource_hbm_masks = &plan_hbm_masks;
+  }
+
   ffi::Array<int64_t> start_times;
   ffi::Array<int> storage_versions;
   int64_t ii = 0;
   if (preserve_issue_order) {
-    std::vector<std::vector<int64_t>> completion_memory_groups;
-    for (const auto &group : tvm_memory_groups)
-      completion_memory_groups.emplace_back(group.begin(), group.end());
     ManualCompletionResult completion = CompleteManualSourceOrder(
         manual_stages, latencies, iis, resource_flags, data_deps, resource_deps,
         owner_exclusion_deps, pipe_order_deps, stage_order_deps, enable_offset,
-        storage_sizes, storage_min_versions, completion_memory_groups,
+        storage_sizes, storage_min_versions, plan_memory_groups,
         num_stages);
     ICHECK(completion.plan.has_value())
         << "Explicit Ascend source issue order is not legal: "
@@ -1853,39 +1860,16 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
     storage_versions = return_val.get<1>();
     ii = return_val.get<2>();
   }
-  ICHECK_EQ(start_times.size(), n);
-  ICHECK_GT(ii, 0);
-  ICHECK_EQ(storage_versions.size(), storage_min_versions.size());
-  for (size_t i = 0; i < storage_versions.size(); ++i)
-    ICHECK_GE(storage_versions[i], storage_min_versions[i])
-        << "AutoSchedule returned fewer versions than the shared storage ring";
-
-  // Independently check the physical order about to be emitted. This check
-  // uses selected starts, not the solver's resource orientation Booleans.
-  // Prefix/suffix summaries permit no parent task inside a child source block.
-  if (!resource_profiles.empty()) {
-    using Wide = __int128;
-    for (const auto &profile : resource_profiles)
-      for (const auto &span : profile)
-        ICHECK(Wide(span.last) - span.first <= Wide(ii))
-            << "Hierarchical resource self collision";
-    for (const auto &[i, j] : resource_deps) {
-      int64_t ri = start_times[i] % ii, rj = start_times[j] % ii;
-      int64_t ki = start_times[i] / ii, kj = start_times[j] / ii;
-      bool before = ri < rj || (ri == rj && (ki > kj || (ki == kj && i < j)));
-      for (const auto &a : resource_profiles[i]) {
-        for (const auto &b : resource_profiles[j]) {
-          if (a.kind != b.kind || a.bit != b.bit)
-            continue;
-          Wide forward = before ? Wide(rj) + b.first - ri - a.last
-                                : Wide(ri) + a.first - rj - b.last;
-          Wide wrap = before ? Wide(ii) + ri + a.first - rj - b.last
-                             : Wide(ii) + rj + b.first - ri - a.last;
-          ICHECK(forward >= 0 && wrap >= 0)
-              << "Hierarchical resource plan violates atomic source order";
-        }
-      }
-    }
+  ConcreteLoopSchedule plan{
+      std::vector<int64_t>(start_times.begin(), start_times.end()),
+      std::vector<int>(storage_versions.begin(), storage_versions.end()), ii};
+  // Complete source order already validates its deterministic completion
+  // with this contract. Check every solver/partial-manual result here, before
+  // changing any task stages, timestamps, order, or physical version plan.
+  if (!preserve_issue_order) {
+    const char *failure = ValidateLoopSchedule(constraints, plan);
+    ICHECK(failure == nullptr)
+        << "Invalid Ascend loop schedule: " << failure;
   }
 
   // Automatic plans have no fixed absolute origin. Use a common origin
@@ -1895,43 +1879,20 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
   // constraint. Otherwise remove whole periods and retain the original cut.
   if (!manual_schedule) {
     int64_t first = *std::min_element(start_times.begin(), start_times.end());
-    ICHECK_GE(first, 0);
-    std::vector<int64_t> relative, residues, stages;
-    for (int64_t start : start_times) {
-      relative.push_back(start - first);
-      residues.push_back((start - first) % ii);
-      stages.push_back((start - first) / ii);
-    }
-    const char *rejection = nullptr;
-    // Resource spans share the child's origin. A residue cut may rotate an
-    // atomic block across another block or its own wrap; keep whole periods
-    // for this first slice, preserving the already checked physical order.
-    if (!resource_profiles.empty())
+    ConcreteLoopSchedule relative_plan = plan;
+    for (int64_t &start : relative_plan.starts)
+      start -= first;
+    const char *rejection = ValidateLoopSchedule(constraints, relative_plan);
+    // Resource spans share the child's origin. Keep the existing conservative
+    // policy for a residue cut of an atomic child block, even if the numeric
+    // candidate satisfies the common plan contract.
+    if (!rejection && !resource_profiles.empty())
       rejection = "hierarchical-resource-origin";
-    using Wide = __int128;
-    for (const auto &[u, v] : resource_deps) {
-      Wide difference = Wide(residues[v]) - residues[u];
-      if (!((difference >= iis[u] && Wide(ii) - difference >= iis[v]) ||
-            (-difference >= iis[v] && Wide(ii) + difference >= iis[u])))
-        rejection = "resource-wrap";
-    }
-    for (const auto &[u, v, forward, reverse] : owner_exclusion_deps) {
-      Wide difference = Wide(residues[v]) - residues[u];
-      if (!((difference >= forward && Wide(ii) - difference >= reverse) ||
-            (-difference >= reverse && Wide(ii) + difference >= forward)))
-        rejection = "owner-wrap";
-    }
-    for (const auto &[u, v] : pipe_order_deps)
-      if (residues[u] > residues[v])
-        rejection = "pipe-order";
-    for (const auto &[u, v] : stage_order_deps)
-      if (stages[u] > stages[v])
-        rejection = "let-stage-order";
     int64_t origin = rejection ? (first / ii) * ii : first;
     if (rejection)
       for (size_t i = 0; i < n; ++i)
-        relative[i] = start_times[i] - origin;
-    start_times = ffi::Array<int64_t>(relative);
+        relative_plan.starts[i] = start_times[i] - origin;
+    start_times = ffi::Array<int64_t>(relative_plan.starts);
     OptimizationDiagnostics diagnostics;
     diagnostics.Record("automatic-schedule-origin",
                        rejection ? OptimizationStatus::kRejected

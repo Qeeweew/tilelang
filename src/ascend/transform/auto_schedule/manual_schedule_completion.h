@@ -20,10 +20,13 @@
 // Deterministic completion for an explicitly fixed global issue order.
 #pragma once
 
+#include "loop_schedule_validation.h"
+
 #include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <string_view>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -32,11 +35,7 @@ namespace tvm::tl::ascend {
 
 constexpr const char *kPreserveIssueOrder = "tl.ascend_preserve_issue_order";
 
-struct ManualScheduleCompletion {
-  std::vector<int64_t> starts;
-  std::vector<int> versions;
-  int64_t ii;
-};
+using ManualScheduleCompletion = ConcreteLoopSchedule;
 
 struct ManualCompletionResult {
   std::optional<ManualScheduleCompletion> plan;
@@ -74,6 +73,23 @@ inline ManualCompletionResult CompleteManualSourceOrder(
       return {std::nullopt, "nonzero-stage-without-offset"};
     quantum = std::max(quantum, Wide(std::max(latencies[i], iis[i])) + 1);
   }
+  LoopScheduleConstraints constraints{iis,
+                                      resource_flags,
+                                      data_deps,
+                                      resource_deps,
+                                      owner_deps,
+                                      pipe_order_deps,
+                                      stage_order_deps,
+                                      storage_sizes,
+                                      storage_min_versions,
+                                      memory_groups,
+                                      num_stages,
+                                      enable_offset,
+                                      &stages};
+  // Check all indices before the least-version completion indexes starts or
+  // storage. The same input contract is used by automatic plan validation.
+  if (const char *reason = ValidateLoopScheduleInputs(constraints))
+    return {std::nullopt, reason};
   for (const auto &[u, v, distance, latency] : data_deps)
     quantum = std::max(quantum, Wide(latency) + 1);
   for (const auto &[u, v, forward, reverse] : owner_deps)
@@ -82,22 +98,15 @@ inline ManualCompletionResult CompleteManualSourceOrder(
   if (ii > std::numeric_limits<int64_t>::max())
     return {std::nullopt, "coordinate-overflow"};
   ManualScheduleCompletion plan{{}, {}, static_cast<int64_t>(ii)};
-  std::vector<Wide> residues;
   for (size_t i = 0; i < n; ++i) {
     Wide residue = Wide(i) * quantum;
     Wide start = Wide(stages[i]) * ii + residue;
     if (start > std::numeric_limits<int64_t>::max())
       return {std::nullopt, "coordinate-overflow"};
     plan.starts.push_back(static_cast<int64_t>(start));
-    residues.push_back(residue);
   }
-  if (storage_sizes.size() != storage_min_versions.size() || num_stages < 1)
-    return {std::nullopt, "invalid-storage-count"};
-  for (int64_t minimum : storage_min_versions) {
-    if (minimum < 1 || minimum > std::numeric_limits<int>::max())
-      return {std::nullopt, "invalid-storage-minimum"};
+  for (int64_t minimum : storage_min_versions)
     plan.versions.push_back(static_cast<int>(minimum));
-  }
   // With start and II fixed, each negative-distance edge is precisely
   // versions[id] >= ceil((latency - delta_start) / II). Taking the maximum
   // over its edges is the least legal integer completion. Existing shared
@@ -106,8 +115,6 @@ inline ManualCompletionResult CompleteManualSourceOrder(
     if (distance >= 0)
       continue;
     Wide id = -Wide(distance) - 1;
-    if (id >= Wide(plan.versions.size()))
-      return {std::nullopt, "invalid-storage-dependency"};
     Wide numerator = Wide(latency) - (Wide(plan.starts[v]) - plan.starts[u]);
     Wide required = numerator / ii + (numerator > 0 && numerator % ii != 0);
     if (required > std::numeric_limits<int>::max())
@@ -115,59 +122,23 @@ inline ManualCompletionResult CompleteManualSourceOrder(
     if (required > plan.versions[static_cast<size_t>(id)])
       plan.versions[static_cast<size_t>(id)] = static_cast<int>(required);
   }
-  for (size_t id = 0; id < plan.versions.size(); ++id)
-    if (plan.versions[id] >
-        std::max<int64_t>(num_stages, storage_min_versions[id]))
-      return {std::nullopt, "source-order-version-bound"};
-  for (const auto &group : memory_groups) {
-    if (group.empty())
-      return {std::nullopt, "invalid-memory-group"};
-    Wide bytes = 0;
-    for (size_t member = 1; member < group.size(); ++member) {
-      int64_t id = group[member];
-      if (id < 0 || static_cast<size_t>(id) >= plan.versions.size() ||
-          storage_sizes[id] < 0)
-        return {std::nullopt, "invalid-memory-group"};
-      bytes += Wide(storage_sizes[id]) * plan.versions[id];
-    }
-    if (bytes > group.front())
-      return {std::nullopt, "source-order-memory-capacity"};
+  // Both producers now cross the same hard-contract boundary. Preserve the
+  // existing explicit-order diagnostic vocabulary for its callers.
+  if (const char *reason = ValidateLoopSchedule(constraints, plan)) {
+    const std::pair<const char *, const char *> manual_reasons[] = {
+        {"version-bound", "source-order-version-bound"},
+        {"memory-capacity", "source-order-memory-capacity"},
+        {"data-dependency", "source-order-data-dependency"},
+        {"resource-wrap", "source-order-resource-wrap"},
+        {"owner-wrap", "source-order-owner-wrap"},
+        {"pipe-order", "source-order-pipe-order"},
+        {"let-stage-order", "source-order-let-stage"},
+        {"resource-offset", "source-order-resource-offset"}};
+    for (const auto &[common, manual] : manual_reasons)
+      if (std::string_view(reason) == common)
+        return {std::nullopt, manual};
+    return {std::nullopt, reason};
   }
-  // Recheck all hard edges using the completed counts, including fixed
-  // positive distances. Failure never changes the requested source order.
-  for (const auto &[u, v, distance, latency] : data_deps) {
-    Wide resolved_distance =
-        distance >= 0 ? Wide(distance)
-                      : plan.versions[static_cast<size_t>(-Wide(distance) - 1)];
-    if (Wide(plan.starts[v]) - plan.starts[u] <
-        Wide(latency) - ii * resolved_distance)
-      return {std::nullopt, "source-order-data-dependency"};
-  }
-  for (const auto &[u, v] : resource_deps) {
-    Wide difference = residues[v] - residues[u];
-    if (!((difference >= iis[u] && ii - difference >= iis[v]) ||
-          (-difference >= iis[v] && ii + difference >= iis[u])))
-      return {std::nullopt, "source-order-resource-wrap"};
-  }
-  for (const auto &[u, v, forward, reverse] : owner_deps) {
-    Wide difference = residues[v] - residues[u];
-    if (!((difference >= forward && ii - difference >= reverse) ||
-          (-difference >= reverse && ii + difference >= forward)))
-      return {std::nullopt, "source-order-owner-wrap"};
-  }
-  for (const auto &[u, v] : pipe_order_deps)
-    if (residues[u] > residues[v])
-      return {std::nullopt, "source-order-pipe-order"};
-  for (const auto &[u, v] : stage_order_deps)
-    if (stages[u] > stages[v])
-      return {std::nullopt, "source-order-let-stage"};
-  if (!enable_offset)
-    for (size_t u = 0; u < n; ++u)
-      for (size_t v = u + 1; v < n; ++v)
-        if ((resource_flags[u] & resource_flags[v]) != 0 &&
-            (Wide(plan.starts[u]) - plan.starts[v] >= ii ||
-             Wide(plan.starts[v]) - plan.starts[u] >= ii))
-          return {std::nullopt, "source-order-resource-offset"};
   return {std::move(plan), "fixed-source-order"};
 }
 

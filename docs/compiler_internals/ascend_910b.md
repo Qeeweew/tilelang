@@ -411,6 +411,16 @@ Plain serial loops and explicit `num_stages=0` without an offset request keep
 all tasks at stage zero. They do not search arbitrary cross-pipe epoch offsets.
 Explicit positive version bounds retain their existing scheduling policy.
 
+Automatic, Stage-only and complete source-order loop plans share a native
+numeric contract before stages, timestamps or buffer versions are written to
+IR. It checks the selected counts against data/completion edges, resource and
+owner wrap gaps, pipe/Let order and residual storage capacity. Complete manual
+order still uses deterministic completion without a solver search. Partial
+manual completion may translate all stages by one common whole-period origin;
+materialization keeps the requested stages. Automatic origin selection checks
+its proposed cut with the same contract. An unchecked or malformed fallback is
+rejected rather than repaired during materialization.
+
 Straight-line sibling lists minimize makespan using the same task effects and
 resource exclusions. Weighted data and pipe paths remove implied resource
 choices while retaining any stronger issue-interval gap. Tasks with identical
