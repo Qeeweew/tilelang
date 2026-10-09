@@ -58,7 +58,10 @@ public:
 
   ffi::Array<PrimExpr> OutputShape() const;
 
-  ffi::Array<PrimExpr> GetForwardIndex() const { return forward_index_; }
+  // Return expressions in the canonical placeholder coordinates used by
+  // layout consumers. The serialized bindings retain their identity across
+  // JSON graph restoration; variable names are never used to recover axes.
+  ffi::Array<PrimExpr> GetForwardIndex() const;
 
   /*!
    * \brief Convert the physical output coordinates to a row-major linear
@@ -149,7 +152,12 @@ public:
 
 protected:
   virtual ffi::Map<tirx::Var, Range> GetVarMap() const;
+  virtual ffi::Array<tirx::Var> CanonicalPlaceholderVars() const;
+  ffi::Map<tirx::Var, PrimExpr> PlaceholderSubstitution() const;
   void UpdateAnalyzer(arith::Analyzer *analyzer) const;
+  // Input-axis binders, followed by the replication binder for fragments.
+  // Stored before the maps in reflection so structural comparison binds them.
+  ffi::Array<tirx::Var> placeholder_vars_;
   ffi::Array<PrimExpr> forward_index_;
   ffi::Array<PrimExpr> input_size_;
 };
@@ -175,7 +183,7 @@ public:
                ffi::Array<PrimExpr> forward_index, PrimExpr forward_thread,
                PrimExpr replicate_size);
 
-  PrimExpr GetForwardThread() const { return forward_thread_; }
+  PrimExpr GetForwardThread() const;
 
   ffi::Array<PrimExpr> GetForwardVars() const final;
 
@@ -232,6 +240,7 @@ public:
 
 protected:
   ffi::Map<tirx::Var, Range> GetVarMap() const final;
+  ffi::Array<tirx::Var> CanonicalPlaceholderVars() const final;
   Range thread_range_;
   PrimExpr forward_thread_;
   PrimExpr replicate_size_;
