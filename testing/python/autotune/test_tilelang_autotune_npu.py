@@ -36,7 +36,7 @@ class _Tensor:
 
 @pytest.fixture
 def npu(monkeypatch):
-    state = SimpleNamespace(current=5, entered=[])
+    state = SimpleNamespace(current=5, entered=[], bound=[])
 
     @contextmanager
     def device_context(device):
@@ -51,12 +51,16 @@ def npu(monkeypatch):
     def cuda_is_available():
         pytest.fail("Ascend tuning consulted CUDA availability")
 
+    def set_device(device):
+        state.current = device.index
+        state.bound.append(device)
+
     monkeypatch.setattr(tuner_module, "torch", SimpleNamespace(
         Tensor=_Tensor,
         device=_Device,
         cuda=SimpleNamespace(is_available=cuda_is_available),
         npu=SimpleNamespace(is_available=lambda: True, current_device=lambda: state.current,
-                            device_count=lambda: 8, device=device_context),
+                            device_count=lambda: 8, device=device_context, set_device=set_device),
     ))
     return state
 
@@ -101,6 +105,140 @@ def test_captured_inputs_follow_worker_npu_and_preserve_scalars(npu):
     with tuner_module.torch.npu.device(_Device("npu", 3)):
         second = supply([])
     assert second[0].device == _Device("npu", 3) and second is not first
+
+
+@pytest.mark.parametrize("timeout", [0, 1])
+def test_compile_caller_and_selected_benchmark_keep_separate_npu_bindings(npu, monkeypatch, timeout):
+    tuner = _tuner()
+    original = _Tensor(_Device("npu", 1))
+    with set_autotune_inputs(original, 0.25):
+        tuner.set_profile_args()
+    assert tuner._resolve_benchmark_devices(False, [3], "ascend") == (False, [3])
+    monkeypatch.setattr(tuner, "_resolve_num_compile_workers", lambda: 1)
+    compiled = []
+
+    def compile_program(**config):
+        compiled.append((npu.current, config))
+        return object()
+
+    pool, futures, _, _ = tuner._prepare_compile_execution(
+        config_args=[{"tile": 16}, {"tile": 32}], grouped_compile_active=False,
+        group_compile_size=1, compile_func=compile_program, elaborate_func=lambda: None,
+    )
+    try:
+        units = [future.result(timeout=1) for future in futures]
+    finally:
+        pool.shutdown(wait=True)
+    assert compiled == [(5, {"tile": 16}), (5, {"tile": 32})]
+    assert npu.bound == [_Device("npu", 5), _Device("npu", 5)]
+    tasks, results = queue.Queue(), queue.Queue()
+    start = threading.Event()
+    for (idx, config, kernel, error), in units:
+        assert error is None
+        tasks.put((kernel, config, idx))
+    tasks.put(None)
+    observed = []
+
+    def benchmark_target(**kwargs):
+        supplied = tuner.profile_args.supply_prog([])
+        observed.append((kwargs["benchmark_device"], npu.current, supplied))
+        return 1.0, None
+
+    start.set()
+    tuner._benchmark_worker_loop(3, tasks, results, start, "ascend", benchmark_target,
+                                 timeout, _BenchmarkWorkerState())
+    assert [(device, current) for device, current, _ in observed] == [(_Device("npu", 3), 3)] * 2
+    assert observed[0][2] is observed[1][2], "Captured inputs remain cached within the selected device"
+    assert observed[0][2][0].device == _Device("npu", 3)
+    assert observed[0][2][1] == 0.25
+    assert npu.current == 5 and results.qsize() == 2
+    assert all(results.get_nowait()[-2] is None for _ in range(2))
+
+
+def test_npu_binding_failure_uses_the_same_fail_stop_result_path(npu, monkeypatch):
+    tuner = _tuner()
+    tasks, results = queue.Queue(), queue.Queue()
+    start, stop = threading.Event(), threading.Event()
+    tasks.put((object(), {}, 0))
+    tasks.put((object(), {}, 1))
+
+    @contextmanager
+    def unavailable_scope(device):
+        raise RuntimeError("NPU context rejected device")
+        yield
+
+    monkeypatch.setattr(tuner_module.torch.npu, "device", unavailable_scope)
+    start.set()
+    tuner._benchmark_worker_loop(3, tasks, results, start, "ascend",
+                                 lambda **kwargs: pytest.fail("Benchmark ran outside a valid device scope"),
+                                 0, _BenchmarkWorkerState(), stop)
+    failure = results.get_nowait()
+    assert failure[-2] == "error" and "NPU context rejected device" in failure[-1]
+    assert stop.is_set() and tasks.qsize() == 1 and results.empty()
+
+
+@pytest.mark.parametrize("timeout", [0, 1])
+def test_cuda_worker_binding_warning_and_candidate_recovery_are_preserved(monkeypatch, timeout):
+    state = SimpleNamespace(current=5, bound=[], entered=[])
+
+    def set_device(ordinal):
+        state.bound.append(ordinal)
+        raise RuntimeError("Initial CUDA binding failed")
+
+    @contextmanager
+    def device_context(device):
+        previous = state.current
+        state.current = device.index
+        state.entered.append(device)
+        try:
+            yield
+        finally:
+            state.current = previous
+
+    monkeypatch.setattr(tuner_module, "torch", SimpleNamespace(
+        device=_Device, cuda=SimpleNamespace(set_device=set_device, device=device_context),
+    ))
+    warnings = []
+    monkeypatch.setattr(tuner_module.logger, "warning", lambda *args: warnings.append(args))
+    tuner = AutoTuner(lambda: None, configs=[{}])
+    tasks, results = queue.Queue(), queue.Queue()
+    start, stop = threading.Event(), threading.Event()
+    tasks.put((object(), {}, 0))
+    tasks.put((object(), {}, 1))
+    tasks.put(None)
+    observed = []
+
+    def benchmark_target(**kwargs):
+        observed.append((kwargs["benchmark_device"], state.current))
+        if len(observed) == 1:
+            raise RuntimeError("CUDA candidate failed")
+        return 1.0, None
+
+    start.set()
+    tuner._benchmark_worker_loop(3, tasks, results, start, "cuda", benchmark_target,
+                                 timeout, _BenchmarkWorkerState(), stop)
+    assert state.bound == [3] and warnings == [("Failed to bind benchmark worker to cuda:%s", 3)]
+    assert observed == [(_Device("cuda", 3), 3)] * 2
+    assert results.get_nowait()[-2] == "error" and results.get_nowait()[-2] is None
+    assert not stop.is_set() and state.current == 5 and tasks.empty()
+
+
+def test_cpu_worker_keeps_no_implicit_accelerator_binding(monkeypatch):
+    monkeypatch.setattr(tuner_module, "torch", SimpleNamespace())
+    tuner = AutoTuner(lambda: None, configs=[{}])
+    tasks, results = queue.Queue(), queue.Queue()
+    start = threading.Event()
+    tasks.put((object(), {}, 0))
+    tasks.put(None)
+
+    def benchmark_target(**kwargs):
+        assert kwargs["benchmark_device"] is None
+        return 1.0, None
+
+    start.set()
+    tuner._benchmark_worker_loop(0, tasks, results, start, "c", benchmark_target,
+                                 0, _BenchmarkWorkerState())
+    assert results.get_nowait()[-2] is None
 
 
 @pytest.mark.parametrize("timeout", [0, 1])

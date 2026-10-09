@@ -103,6 +103,54 @@ class _BenchmarkWorkerState:
     shared_best_latency: list[float] | None = None
 
 
+@dataclass(frozen=True)
+class _TuningDeviceBinding:
+    """Device mapping and thread binding, separate from tuning policy.
+
+    Compilation captures the caller's current device. Benchmarking binds its
+    selected worker device at the actual call site, including timeout threads.
+    Neither binding changes the device selection or failure policy.
+    """
+
+    device: torch.device | None
+
+    @classmethod
+    def current(cls, target_kind: str) -> _TuningDeviceBinding:
+        if target_kind == "ascend":
+            if not hasattr(torch, "npu") or not torch.npu.is_available():
+                raise RuntimeError("Ascend auto-tuning requires an available Torch NPU device")
+            return cls.worker(target_kind, torch.npu.current_device())
+        if torch.cuda.is_available() and target_kind == "cuda":
+            return cls.worker(target_kind, torch.cuda.current_device())
+        return cls(torch.device("cpu"))
+
+    @classmethod
+    def worker(cls, target_kind: str, ordinal: int) -> _TuningDeviceBinding:
+        device_type = {"ascend": "npu", "cuda": "cuda"}.get(target_kind)
+        return cls(torch.device(device_type, ordinal) if device_type is not None else None)
+
+    def bind_compile_thread(self) -> None:
+        if self.device is not None and self.device.type in ("cuda", "npu"):
+            getattr(torch, self.device.type).set_device(self.device)
+
+    @classmethod
+    def benchmark_worker(cls, target_kind: str, ordinal: int) -> _TuningDeviceBinding:
+        # Preserve CUDA's best-effort worker initialization. NPU binding stays
+        # inside the benchmark scope so failures use the fail-stop result path.
+        if target_kind == "cuda":
+            try:
+                torch.cuda.set_device(ordinal)
+            except Exception:
+                logger.warning("Failed to bind benchmark worker to cuda:%s", ordinal)
+                logger.debug("Error: %s", traceback.format_exc())
+        return cls.worker(target_kind, ordinal)
+
+    def benchmark_scope(self):
+        if self.device is not None and self.device.type in ("cuda", "npu"):
+            return getattr(torch, self.device.type).device(self.device)
+        return nullcontext()
+
+
 class AutoTuner:
     """Auto-tuner for tilelang programs.
 
@@ -149,13 +197,7 @@ class AutoTuner:
 
     def _current_benchmark_device(self) -> torch.device:
         """Use the target backend's current logical device, including in workers."""
-        if self._target_kind() == "ascend":
-            if not hasattr(torch, "npu") or not torch.npu.is_available():
-                raise RuntimeError("Ascend auto-tuning requires an available Torch NPU device")
-            return torch.device("npu", torch.npu.current_device())
-        if torch.cuda.is_available() and self._target_kind() == "cuda":
-            return torch.device("cuda", torch.cuda.current_device())
-        return torch.device("cpu")
+        return _TuningDeviceBinding.current(self._target_kind()).device
 
     @classmethod
     def _get_cache_dir(cls) -> Path:
@@ -502,14 +544,11 @@ class AutoTuner:
         futures: list[concurrent.futures.Future] = []
         future_to_unit: dict[concurrent.futures.Future, list[UnitItem]] = {}
 
-        compile_device = self._current_benchmark_device()
+        compile_binding = _TuningDeviceBinding(self._current_benchmark_device())
 
         def device_wrapper(func: Callable[..., Any]):
             def inner(**config_arg):
-                if compile_device.type == "cuda":
-                    torch.cuda.set_device(compile_device)
-                elif compile_device.type == "npu":
-                    torch.npu.set_device(compile_device)
+                compile_binding.bind_compile_thread()
                 return func(**config_arg)
 
             return inner
@@ -577,19 +616,7 @@ class AutoTuner:
         worker_state: _BenchmarkWorkerState,
         stop_event: threading.Event | None = None,
     ) -> None:
-        if target_kind == "cuda":
-            try:
-                torch.cuda.set_device(worker_device)
-            except Exception:
-                logger.warning("Failed to bind benchmark worker to cuda:%s", worker_device)
-                logger.debug("Error: %s", traceback.format_exc())
-
-        if target_kind == "ascend":
-            benchmark_device = torch.device("npu", worker_device)
-        elif target_kind == "cuda":
-            benchmark_device = torch.device("cuda", worker_device)
-        else:
-            benchmark_device = None
+        benchmark_binding = _TuningDeviceBinding.benchmark_worker(target_kind, worker_device)
 
         def report_failure(idx, config, jit_kernel, status, error_text):
             if target_kind == "ascend" and stop_event is not None:
@@ -606,15 +633,10 @@ class AutoTuner:
                 return benchmark_target(
                     jit_kernel=jit_kernel,
                     benchmark_state=benchmark_state,
-                    benchmark_device=benchmark_device,
+                    benchmark_device=benchmark_binding.device,
                 )
 
-            context = nullcontext()
-            if target_kind == "ascend":
-                context = torch.npu.device(benchmark_device)
-            elif target_kind == "cuda":
-                context = torch.cuda.device(benchmark_device)
-            with context:
+            with benchmark_binding.benchmark_scope():
                 return invoke()
 
         start_event.wait()
