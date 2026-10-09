@@ -261,7 +261,9 @@ def test_cmpmask_orders_selection_only_and_survives_per_core_decode(per_core, or
     def schedule(*args, **kwargs):
         dependencies = kwargs.get("data_deps", args[4] if len(args) > 4 else None)
         captured.extend(tuple(int(value) for value in dependency) for dependency in dependencies)
-        return [0, 1, 2], [], 2
+        # Three V issues need three distinct phases. This also leaves the
+        # CMPMASK wrap edge from the final selection to the first one legal.
+        return [0, 1, 2], [], 3
 
     with patch.object(z3_scheduler, "z3_schedule_loop_python", side_effect=schedule):
         transform.AutoSchedule()(before)
