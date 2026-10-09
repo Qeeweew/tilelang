@@ -104,6 +104,11 @@ points. Reversing owner order reverses both endpoints and their access records.
 These regions remain conservative footprints, not exact coverage or completion
 proofs. SPR ordering records name the register and have no memory regions.
 The records belong to one analysis snapshot and are rebuilt after IR rewrites.
+The same snapshot records complete read/write roles on the dependency storage
+for both leaf endpoints and their enclosing nodes, including nonconflicting
+regions. Whole-node roles include control-header accesses. Handoff and prefetch
+selection consume these roles without confusing them with individual hazards;
+reversing an owner dependency swaps both its roles and conflict records.
 
 After this normalization, native Cube instruction selection may replace
 2201 FP16/BF16 copies with Load3Dv2. A requires canonical L1 NZ and L0A ZA,

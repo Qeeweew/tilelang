@@ -294,7 +294,7 @@ def _boundary_fixture(kind):
     from tilelang import tvm
     from tilelang.ascend import transform
     from tvm import tirx
-    from testing.ascend._ir import copy, kernel, seq
+    from testing.ascend._ir import calls, copy, kernel, nodes, seq
     from testing.ascend.auto_schedule._scheduled_ir import unit
 
     source = tirx.decl_buffer((4, 32), "float32", name="source")
@@ -326,6 +326,29 @@ def _boundary_fixture(kind):
         buffers.append(accumulator)
         params.append(workspace)
         eligible = [ub.data]
+    elif kind in ("constant-header", "storage-read-header"):
+        output = tirx.decl_buffer((4, 32), "float32", name="output")
+        minimum = (tirx.Cast("int32", ub[0])
+                   if kind == "storage-read-header" else tirx.IntImm("int32", 0))
+        leaf = unit(copy(source, ub, src_indices=[i, 0], src_shape=[1, 32]),
+                    core=1, stage=-1, cost=(1, 1))
+        producer = unit(tirx.For(inner, minimum, 2, tirx.ForKind.SERIAL, leaf),
+                        core=None, stage=-1)
+        consumer = unit(copy(ub, output, dst_indices=[i, 0], dst_shape=[1, 32]),
+                        core=1, stage=-1, cost=(3, 1))
+        params.append(output)
+        eligible = [ub.data]
+
+        # The paired inputs differ only in this real control-header read.
+        # Its typed-copy leaf remains GM->UB, with no read of UB itself.
+        movement, = calls(producer, "tl.tileop.ascend_copy")
+        assert movement.args[0].args[0].buffer.data.same_as(source.data)
+        assert movement.args[1].args[0].buffer.data.same_as(ub.data)
+        control, = nodes(producer, tirx.For)
+        header_reads = nodes(control.min, tirx.BufferLoad)
+        assert bool(header_reads) == (kind == "storage-read-header")
+        assert all(read.buffer.data.same_as(ub.data) for read in header_reads)
+        assert int(control.extent) == 2
     annotations = {"multi_buffer_eligible": eligible, "tl.ascend_auto_pipeline": True, "num_stages": 3}
     loop = unit(tirx.For(i, 0, 4, tirx.ForKind.SERIAL, seq(producer, consumer), annotations=annotations), core=None, stage=-1)
     mod = kernel(loop, buffers=buffers, params=params)
@@ -342,18 +365,39 @@ import tvm_ffi
 from testing.ascend.auto_schedule.test_prefetch_selection import _boundary_fixture
 original = tvm_ffi.get_global_func("tl.transform.z3_schedule_loop_python")
 seen = []
+problems = []
 def observe(*args):
     assert len(args) == 18, len(args)
     assert list(map(int, args[17])) == [1] * len(args[8])
     seen.append([tuple(map(int, pair)) for pair in args[16]])
+    problems.append({
+        "pipes": tuple(map(int, args[3])),
+        "data": tuple(tuple(map(int, edge))[:3] for edge in args[4]),
+        "owners": tuple(tuple(map(int, edge)) for edge in args[6]),
+        "buffer_sizes": tuple(map(int, args[8])),
+    })
     return original(*args)
 tvm_ffi.register_global_func("tl.transform.z3_schedule_loop_python", observe, override=True)
-for kind in ("eligible", "3510", "rmw", "mixed-child", "overlap-pipe", "cross-core"):
+header_problems = {}
+for kind in ("eligible", "3510", "rmw", "mixed-child", "overlap-pipe", "cross-core",
+             "constant-header", "storage-read-header"):
     seen.clear()
+    problems.clear()
     _boundary_fixture(kind)
     assert seen, kind
     # Nested child callbacks may occur first; the outer loop is always last.
-    assert seen[-1] == ([(0, 1)] if kind == "eligible" else []), (kind, seen)
+    assert seen[-1] == ([(0, 1)] if kind in ("eligible", "constant-header") else []), (kind, seen)
+    if kind in ("constant-header", "storage-read-header"):
+        outer = problems[-1]
+        # AIV:MTE2 and AIV:MTE3, one outer-owned UB slot candidate, and the
+        # same forward data edge: neither core/pipe nor owner rejection is
+        # allowed to substitute for the whole-node storage-role check.
+        assert outer["pipes"] == (2 << 7, 4 << 7), (kind, outer)
+        assert outer["buffer_sizes"] == (32 * 4,), (kind, outer)
+        assert outer["owners"] == (), (kind, outer)
+        assert (0, 1, 0) in outer["data"], (kind, outer)
+        header_problems[kind] = outer
+assert header_problems["constant-header"] == header_problems["storage-read-header"], header_problems
 '''
     result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=60)
     assert result.returncode == 0, result.stdout + result.stderr

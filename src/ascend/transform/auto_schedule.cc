@@ -598,12 +598,10 @@ CollectHandoffIssuePreferences(const std::vector<IRStructure *> &nodes,
       if (!IsConcreteCore(pcore) || !IsConcreteCore(ccore) || pcore == ccore ||
           cores[i] != pcore || cores[j] != ccore)
         continue;
-      const Var &storage = dep.storage.value();
       // Do not infer a unique forward role from an ambiguous read-modify-write
       // pair. All of its original dependencies still go to Z3 and InsertSync.
-      if (!producer->WritesStorage(storage) ||
-          !consumer->ReadsStorage(storage) ||
-          (producer->ReadsStorage(storage) && consumer->WritesStorage(storage)))
+      if (!pair.producer_access.writes || !pair.consumer_access.reads ||
+          (pair.producer_access.reads && pair.consumer_access.writes))
         continue;
       handoff[i] = true;
       blocking_consumer[j] = true;
@@ -702,16 +700,16 @@ std::vector<std::pair<int64_t, int64_t>> CollectPrefetchIssuePreferences(
     if (i == j || !IsConcreteCore(cores[i]) || cores[i] != cores[j] ||
         ((nodes[i]->GetPipeMask() & nodes[j]->GetPipeMask()) != 0 &&
          !profiled_children.count(nodes[j])) ||
-        nodes[i]->ReadsStorage(storage) || nodes[j]->WritesStorage(storage))
+        !dep.producer_access.IsWriteOnly() ||
+        !dep.consumer_access.IsReadOnly())
       continue;
     for (const auto &pair : dep.task_pairs) {
       TaskNode *producer = pair.producer;
       TaskNode *consumer = pair.consumer;
       if (TaskExecutionCore(producer) != cores[i] ||
           TaskExecutionCore(consumer) != cores[j] ||
-          !producer->WritesStorage(storage) ||
-          producer->ReadsStorage(storage) || !consumer->ReadsStorage(storage) ||
-          consumer->WritesStorage(storage) || !is_load(producer, storage))
+          !pair.producer_access.IsWriteOnly() ||
+          !pair.consumer_access.IsReadOnly() || !is_load(producer, storage))
         continue;
       pairs.emplace(i, j);
     }

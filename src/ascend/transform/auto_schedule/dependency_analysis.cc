@@ -212,21 +212,56 @@ AnalyzeDependencies(std::vector<IRStructure *> nodes, ControlNode *loop,
     BufferRegion region;
     DependencyAccessMode mode;
   };
+  using StorageAccesses =
+      std::unordered_map<Var, DependencyStorageAccess, ObjectPtrHash,
+                         ObjectPtrEqual>;
   struct NodeAccesses {
     std::vector<RegionAccess> reads;
     std::vector<RegionAccess> writes;
+    StorageAccesses storage_accesses;
+    std::unordered_map<TaskNode *, StorageAccesses> task_accesses;
+  };
+  auto record_access = [](StorageAccesses *accesses, const BufferRegion &region,
+                          DependencyAccessMode mode) {
+    DependencyStorageAccess &access = (*accesses)[region->buffer->data];
+    if (mode == DependencyAccessMode::kRead)
+      access.reads = true;
+    else
+      access.writes = true;
+  };
+  auto storage_access = [](const StorageAccesses &accesses,
+                           const ffi::Optional<Var> &storage) {
+    if (storage.has_value()) {
+      auto found = accesses.find(storage.value());
+      if (found != accesses.end())
+        return found->second;
+    }
+    return DependencyStorageAccess{};
   };
   std::vector<NodeAccesses> accesses(n);
   for (size_t i = 0; i < n; ++i) {
+    // Whole-node roles include a control's own header task. The leaf set below
+    // deliberately excludes that task, preserving the dependency edge set.
+    for (const BufferRegion &region : nodes[i]->GetReadRegions())
+      record_access(&accesses[i].storage_accesses, region,
+                    DependencyAccessMode::kRead);
+    for (const BufferRegion &region : nodes[i]->GetWriteRegions())
+      record_access(&accesses[i].storage_accesses, region,
+                    DependencyAccessMode::kWrite);
     std::vector<TaskNode *> tasks;
     CollectAllTaskNodes(nodes[i], tasks);
     for (TaskNode *task : tasks) {
-      for (const BufferRegion &region : task->GetReadRegions())
+      StorageAccesses &roles = accesses[i].task_accesses[task];
+      for (const BufferRegion &region : task->GetReadRegions()) {
+        record_access(&roles, region, DependencyAccessMode::kRead);
         accesses[i].reads.push_back(
             {task, region, DependencyAccessMode::kRead});
-      for (const BufferRegion &region : task->GetWriteRegions())
+      }
+      for (const BufferRegion &region : task->GetWriteRegions()) {
+        record_access(&roles, region, DependencyAccessMode::kWrite);
         accesses[i].writes.push_back(
             {task, region, DependencyAccessMode::kWrite});
+      }
     }
   }
 
@@ -311,7 +346,12 @@ AnalyzeDependencies(std::vector<IRStructure *> nodes, ControlNode *loop,
             existing->task_pairs
                 .try_emplace(
                     std::make_pair(producer.task, consumer.task),
-                    DependencyTaskPair{producer.task, consumer.task, {}, 0})
+                    DependencyTaskPair{
+                        producer.task, consumer.task, {}, 0,
+                        storage_access(
+                            accesses[i].task_accesses.at(producer.task), storage),
+                        storage_access(
+                            accesses[j].task_accesses.at(consumer.task), storage)})
                 .first;
         pair->second.memory_accesses.push_back(
             {producer.region, consumer.region, producer.mode, consumer.mode});
@@ -381,9 +421,14 @@ AnalyzeDependencies(std::vector<IRStructure *> nodes, ControlNode *loop,
         pairs.reserve(dep.task_pairs.size());
         for (auto &entry : dep.task_pairs)
           pairs.push_back(std::move(entry.second));
+        DependencyStorageAccess producer_access =
+            storage_access(accesses[i].storage_accesses, dep.storage);
+        DependencyStorageAccess consumer_access =
+            storage_access(accesses[j].storage_accesses, dep.storage);
         deps.push_back({nodes[i], nodes[j], std::move(dep.storage),
                         std::move(pairs), dep.distance, dep.kind,
-                        dep.cross_storage_conflict});
+                        dep.cross_storage_conflict, producer_access,
+                        consumer_access});
       }
     }
   }

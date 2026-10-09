@@ -22,9 +22,10 @@ from testing.ascend.auto_schedule._scheduled_ir import unit
 WORKSPACES = "tl.ascend.compiler_workspace_storages"
 
 
-def _mixed_handoffs(*, arch="dav-2201", manual=False):
-    outbound, inbound = [tirx.decl_buffer((16, 16), "float32", name=name)
-                         for name in ("outbound", "inbound")]
+def _mixed_handoffs(*, arch="dav-2201", manual=False, storage_roles=None):
+    outbound = tirx.decl_buffer((3, 16) if storage_roles else (16, 16),
+                               "float32", name="outbound")
+    inbound = tirx.decl_buffer((16, 16), "float32", name="inbound")
     accum = tirx.decl_buffer((16, 16), "float32", name="accum", scope="shared.l0c")
     received = tirx.decl_buffer((16, 16), "float32", name="received", scope="shared.dyn")
     source = tirx.decl_buffer((16, 16), "float32", name="source", scope="shared.dyn")
@@ -38,12 +39,39 @@ def _mixed_handoffs(*, arch="dav-2201", manual=False):
         [ptr(produced, 2), ptr(source, 1), tirx.IntImm("uint32", 256)],
     ))
     stage = 0 if manual else -1
+    buffers = [outbound, inbound, accum, received, source, produced, l1]
+    publisher = copy(accum, outbound)
+    incoming = copy(outbound, received)
+    if storage_roles is not None:
+        assert storage_roles in ("waw-with-disjoint-read", "rmw-with-only-raw")
+
+        def row_copy(src, dst, *, src_row=0, dst_row=0):
+            return copy(src, dst, src_indices=[src_row, 0],
+                        dst_indices=[dst_row, 0], src_shape=[1, 16],
+                        dst_shape=[1, 16])
+
+        publisher = row_copy(accum, outbound)
+        if storage_roles == "waw-with-disjoint-read":
+            # The only overlapping pair is WAW on row 0. The consumer also
+            # reads this allocation, but its row-2 read does not conflict.
+            incoming = seq(row_copy(outbound, received, src_row=2),
+                           row_copy(source, outbound))
+        else:
+            # Both endpoints are RMW on the allocation, although only P's
+            # row-0 write and C's row-0 read overlap. P's row-2 read cannot
+            # conflict with C's row-1 write, so there is no reverse WAR.
+            readback = tirx.decl_buffer((1, 16), "float32", name="readback",
+                                       scope="shared.l1")
+            buffers.append(readback)
+            publisher = seq(row_copy(outbound, readback, src_row=2), publisher)
+            incoming = seq(row_copy(outbound, received),
+                           row_copy(source, outbound, dst_row=1))
     # Task indices at the FFI boundary:
     # 0 AIC publisher; 1 AIV incoming reader; 2 independent Vector producer;
     # 3 AIV publisher; 4 AIC incoming reader.
     body = seq(
-        unit(copy(accum, outbound), core=2, stage=stage, cost=(1, 1)),
-        unit(copy(outbound, received), core=1, stage=stage, cost=(1, 1)),
+        unit(publisher, core=2, stage=stage, cost=(1, 1)),
+        unit(incoming, core=1, stage=stage, cost=(1, 1)),
         unit(vector, core=1, stage=stage, cost=(2, 1)),
         unit(copy(produced, inbound), core=1, stage=stage, cost=(1, 1)),
         unit(copy(inbound, l1), core=2, stage=stage, cost=(1, 1)),
@@ -55,7 +83,7 @@ def _mixed_handoffs(*, arch="dav-2201", manual=False):
     )
     before = kernel(
         unit(loop, core=None, stage=-1),
-        buffers=[outbound, inbound, accum, received, source, produced, l1],
+        buffers=buffers,
         annotations={
             "vector_count": 2,
             WORKSPACES: [outbound.data, inbound.data],
@@ -67,12 +95,16 @@ def _mixed_handoffs(*, arch="dav-2201", manual=False):
     return transform.AnnotateMultiBufferEligible()(before), outbound, inbound
 
 
-def _observe_schedule(before):
+def _observe_schedule(before, *, data_dependencies=None):
     solve = z3_scheduler.z3_schedule_loop_python
     seen = []
 
     def observe(*args, **kwargs):
         seen.append(set(tuple(pair) for pair in kwargs["issue_priority_pairs"]))
+        if data_dependencies is not None:
+            edges = kwargs["data_deps"] if "data_deps" in kwargs else args[4]
+            data_dependencies.extend(tuple(int(value) for value in edge)
+                                     for edge in edges)
         return solve(*args, **kwargs)
 
     # The existing FFI wrapper looks up this Python function dynamically, so
@@ -166,6 +198,43 @@ def test_mixed_handoffs_prioritize_independent_work_and_keep_completion(arch, ma
     # Inbound channel: data readiness and reverse read-completion release.
     _assert_collective_pair(synced, 1, "PIPE_MTE3", 2, "PIPE_MTE2")
     _assert_collective_pair(synced, 2, "PIPE_MTE2", 1, "PIPE_MTE3")
+
+
+@pytest.mark.parametrize(
+    "storage_roles, producer_reads, consumer_reads, consumer_writes, expected",
+    [
+        pytest.param("waw-with-disjoint-read", [], [2], [0],
+                     {(0, 4), (2, 1), (3, 1)}, id="WAW-with-storage-reader"),
+        pytest.param("rmw-with-only-raw", [2], [0], [1], set(),
+                     id="RAW-with-both-storage-RMW"),
+    ],
+)
+def test_handoff_eligibility_keeps_complete_storage_roles(
+    storage_roles, producer_reads, consumer_reads, consumer_writes, expected
+):
+    before, outbound, _ = _mixed_handoffs(storage_roles=storage_roles)
+    producer, consumer, *_ = _leaf_units(before)
+
+    def rows(task, destination):
+        result = []
+        for call in calls(task.body, "tl.tileop.ascend_copy"):
+            region = call.args[1 if destination else 0]
+            access = region.args[0]
+            if access.buffer.data.same_as(outbound.data):
+                assert int(region.args[2]) == 1 and int(region.args[3]) == 16
+                result.append(int(access.indices[0]))
+        return result
+
+    # Check the real typed regions so unrelated fixture rejection cannot stand
+    # in for the distinction between complete endpoint roles and conflicts.
+    assert rows(producer, False) == producer_reads
+    assert rows(producer, True) == [0]
+    assert rows(consumer, False) == consumer_reads
+    assert rows(consumer, True) == consumer_writes
+    dependencies = []
+    _, preferences = _observe_schedule(before, data_dependencies=dependencies)
+    assert any(edge[:3] == (0, 1, 0) for edge in dependencies)
+    assert preferences == expected
 
 
 def test_unannotated_native_ancestors_share_core_facts_and_exclude_descendants():

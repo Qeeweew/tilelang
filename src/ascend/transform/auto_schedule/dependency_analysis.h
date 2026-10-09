@@ -44,6 +44,17 @@ using namespace tirx;
 
 enum class DependencyAccessMode { kRead, kWrite };
 
+// All logical region accesses to the parent DepInfo's storage, including
+// regions that did not form a conflict. These are snapshot-local access roles,
+// not coverage or completion facts. Storage-free ordering has no roles.
+struct DependencyStorageAccess {
+  bool reads{false};
+  bool writes{false};
+
+  bool IsReadOnly() const { return reads && !writes; }
+  bool IsWriteOnly() const { return writes && !reads; }
+};
+
 // The logical may-regions used to form one conflict in shared analysis.
 // They may be conservative footprints or hulls. These are access provenance,
 // not exact accesses, must-access/coverage, or completion facts.
@@ -64,6 +75,10 @@ struct DependencyTaskPair {
   TaskNode *consumer;
   std::vector<DependencyMemoryAccess> memory_accesses;
   uint16_t special_register_mask{0};
+  // Complete leaf roles on DepInfo.storage, unlike memory_accesses which
+  // contains only the conflicts that formed this dependency.
+  DependencyStorageAccess producer_access;
+  DependencyStorageAccess consumer_access;
 
   bool MatchesEndpoints(const TaskNode *source,
                         const TaskNode *destination) const {
@@ -85,6 +100,7 @@ struct DependencyTaskPair {
   DependencyTaskPair Reversed() const {
     DependencyTaskPair result = *this;
     std::swap(result.producer, result.consumer);
+    std::swap(result.producer_access, result.consumer_access);
     for (auto &access : result.memory_accesses) {
       std::swap(access.producer_region, access.consumer_region);
       std::swap(access.producer_mode, access.consumer_mode);
@@ -131,6 +147,10 @@ struct DepInfo {
   // inferring either buffer's guarded epoch domain. False for invariant SPR
   // state dependencies.
   bool cross_storage_conflict{false};
+  // Complete node roles on storage, including control-header accesses and
+  // nonconflicting leaf regions. Empty when storage is undefined.
+  DependencyStorageAccess producer_access;
+  DependencyStorageAccess consumer_access;
 };
 
 // Per-phase dependency-analysis cache. A ControlNode key represents the

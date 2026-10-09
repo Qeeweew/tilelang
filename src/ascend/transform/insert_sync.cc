@@ -2681,6 +2681,10 @@ private:
         bool lhs_first = dep.prod_node->GetIndex() < dep.cons_node->GetIndex();
         IRStructure *first = lhs_first ? dep.prod_node : dep.cons_node;
         IRStructure *second = lhs_first ? dep.cons_node : dep.prod_node;
+        DependencyStorageAccess first_access =
+            lhs_first ? dep.producer_access : dep.consumer_access;
+        DependencyStorageAccess second_access =
+            lhs_first ? dep.consumer_access : dep.producer_access;
         std::vector<DependencyTaskPair> first_to_second =
             std::move(dep.task_pairs);
         if (!lhs_first) {
@@ -2697,10 +2701,12 @@ private:
           second_to_first.push_back(pair.Reversed());
         directed_deps.push_back({first, second, dep.storage,
                                  std::move(first_to_second), forward_distance,
-                                 DependencyKind::kOwnerExclusion});
+                                 DependencyKind::kOwnerExclusion, false,
+                                 first_access, second_access});
         directed_deps.push_back(
             {second, first, dep.storage, std::move(second_to_first),
-             1 - forward_distance, DependencyKind::kOwnerExclusion});
+             1 - forward_distance, DependencyKind::kOwnerExclusion, false,
+             second_access, first_access});
       }
       deps = std::move(directed_deps);
     }
