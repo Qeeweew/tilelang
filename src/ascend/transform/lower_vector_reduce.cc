@@ -365,32 +365,39 @@ private:
                                    input_count % 512 == 0 && native_dst_compact;
     // Datablock's late pointer boundary retains its static-count contract.
     // Dynamic wide rows use the established two-level count/row plan below.
-    const bool use_datablocks =
-        compact_wide_rows && row_extent.as<IntImmNode>() &&
-        HasMultiVLHeadroom(op->src, op->dst,
-                           count * (input_count / 8 + chunks) * 4);
-    if (compact_wide_rows &&
-        (use_datablocks ||
-         HasMultiVLHeadroom(op->src, op->dst, count * chunks * 4))) {
+    Buffer row_partials, row_blocks;
+    bool use_datablocks = false, use_compact_rows = false;
+    if (compact_wide_rows) {
+      row_partials = decl_buffer({make_const(DataType::Int(32), count),
+                                  make_const(DataType::Int(32), chunks)},
+                                 DataType::Float(32),
+                                 "membase_reduce_partials_" +
+                                     std::to_string(next_temporary_),
+                                 "shared.dyn");
+      if (row_extent.as<IntImmNode>()) {
+        row_blocks = decl_buffer(
+            {make_const(DataType::Int(32), count),
+             make_const(DataType::Int(32), input_count / 8)},
+            DataType::Float(32),
+            "membase_reduce_datablocks_" + std::to_string(next_temporary_ + 1),
+            "shared.dyn");
+        use_datablocks =
+            HasMultiVLHeadroom(op->src, op->dst, {row_blocks, row_partials});
+      }
+      use_compact_rows = use_datablocks ||
+                         HasMultiVLHeadroom(op->src, op->dst, {row_partials});
+    }
+    if (use_compact_rows) {
       Require(task_depth_ == 0,
               "this reduction expands to multiple dependency-bearing tasks; "
               "use T.Stage rather than an opaque T.Task/PerCoreTask wrapper");
-      Buffer partials = decl_buffer({make_const(DataType::Int(32), count),
-                                     make_const(DataType::Int(32), chunks)},
-                                    DataType::Float(32),
-                                    "membase_reduce_partials_" +
-                                        std::to_string(next_temporary_++),
-                                    "shared.dyn");
+      Buffer partials = row_partials;
+      next_temporary_ += use_datablocks ? 2 : 1;
       BufferLoad partial_base(partials, {0, 0});
       Array<Stmt> tasks;
       if (use_datablocks) {
         const int64_t block_columns = input_count / 8;
-        Buffer blocks = decl_buffer(
-            {make_const(DataType::Int(32), count),
-             make_const(DataType::Int(32), block_columns)},
-            DataType::Float(32),
-            "membase_reduce_datablocks_" + std::to_string(next_temporary_++),
-            "shared.dyn");
+        Buffer blocks = row_blocks;
         scratch_.push_back(blocks);
         BufferLoad block_base(blocks, {0, 0});
         const Op &count_intrinsic = Op::Get(
@@ -461,31 +468,19 @@ private:
     if (2 * chunks - 1 > count * levels)
       return std::nullopt;
 
-    PrimExpr aligned_row_bytes = analyzer_.Simplify(ascend::AlignPrimExpr(
-        ascend::PackedBytesFromElems(make_const(DataType::Int(64), count), 32),
-        ascend::AscendScopeAlignBytes("shared.dyn")));
-    const auto *row_bytes = aligned_row_bytes.as<IntImmNode>();
-    ICHECK(row_bytes && row_bytes->value > 0);
-    const int64_t partial_bytes = chunks * row_bytes->value;
-    // VectorTiles emits at most one aligned row temporary per binary node.
-    // Charge even the final node, although its output normally is dst. Reserve
-    // these future allocations across subsequent reductions in the same root.
-    const int64_t combine_bytes = (chunks - 1) * row_bytes->value;
-    if (!HasMultiVLHeadroom(op->src, op->dst, partial_bytes + combine_bytes))
-      return std::nullopt;
-    Require(task_depth_ == 0,
-            "this reduction expands to multiple dependency-bearing tasks; "
-            "use T.Stage rather than an opaque T.Task/PerCoreTask wrapper");
-
+    // Build the candidate's actual allocation owners before checking capacity.
+    // In particular, the final combine writes dst and needs no extra UB slot.
+    int next_candidate_temporary = next_temporary_;
+    int next_candidate_row = next_row_;
+    Array<Buffer> candidate_scratch;
     const int64_t row_capacity = (count + 7) / 8 * 8;
-    Buffer partials = decl_buffer({make_const(DataType::Int(32), chunks),
-                                   make_const(DataType::Int(32), row_capacity)},
-                                  DataType::Float(32),
-                                  "membase_reduce_partials_" +
-                                      std::to_string(next_temporary_++),
-                                  "shared.dyn");
-    scratch_.push_back(partials);
-    future_combine_bytes_ += combine_bytes;
+    Buffer partials = decl_buffer(
+        {make_const(DataType::Int(32), chunks),
+         make_const(DataType::Int(32), row_capacity)},
+        DataType::Float(32),
+        "membase_reduce_partials_" + std::to_string(next_candidate_temporary++),
+        "shared.dyn");
+    candidate_scratch.push_back(partials);
     Array<Stmt> tasks;
     for (int64_t chunk = 0; chunk < chunks; ++chunk) {
       Array<PrimExpr> source = src_indices;
@@ -504,15 +499,15 @@ private:
                 row_extent});
       tasks.push_back(
           Evaluate(Call(DataType::Void(), intrinsic,
-                        {destination_region, source_region,
-                         repeats,
+                        {destination_region, source_region, repeats,
                          make_const(DataType::UInt(16), input_count / 8),
                          make_const(DataType::UInt(8), 64)})));
     }
 
-    // Each chunk performs the native 64-lane tree. Combine compact row
-    // vectors with an ordinary balanced tree, preserving typed FP32 nodes
-    // and their separate scheduling/completion boundaries in VectorTiles.
+    // Each chunk performs the native 64-lane tree. Preserve that balanced
+    // FP32 combine tree, but make its algorithm intermediates explicit here.
+    // VectorTiles consumes single binary assignments, not an implicit scratch
+    // contract whose allocation count this pass would have to predict.
     std::vector<PrimExpr> values;
     for (int64_t chunk = 0; chunk < chunks; ++chunk)
       values.push_back(BufferLoad(
@@ -526,14 +521,55 @@ private:
                            : PrimExpr(Max(values[i], values[i + 1])));
       values = std::move(next);
     }
-    tasks.push_back(For(rows[0], make_zero(rows[0].dtype()),
-                        row_extent, ForKind::kParallel,
-                        BufferStore(op->dst, values[0], dst->indices)));
+    auto materialize = [&](auto &&self, const PrimExpr &value,
+                           bool final) -> PrimExpr {
+      if (value.as<BufferLoadNode>())
+        return value;
+      const auto *sum = value.as<AddNode>();
+      const auto *maximum = value.as<MaxNode>();
+      ICHECK(sum || maximum);
+      PrimExpr lhs = self(self, sum ? sum->a : maximum->a, false);
+      PrimExpr rhs = self(self, sum ? sum->b : maximum->b, false);
+      PrimExpr combined =
+          sum ? PrimExpr(Add(lhs, rhs)) : PrimExpr(Max(lhs, rhs));
+      Buffer output = op->dst;
+      Array<PrimExpr> indices = dst->indices;
+      if (!final) {
+        output = decl_buffer({make_const(DataType::Int(32), row_capacity)},
+                             DataType::Float(32),
+                             "membase_reduce_combine_" +
+                                 std::to_string(next_candidate_temporary++),
+                             "shared.dyn");
+        candidate_scratch.push_back(output);
+        indices = {rows[0]};
+      }
+      Var row("membase_reduce_combine_row_" +
+                  std::to_string(next_candidate_row++),
+              rows[0].dtype());
+      // Each assignment owns its lexical iterator. Keep rows[0] only as the
+      // logical row template returned to the next node, never as a repeated
+      // definition in emitted IR.
+      Stmt store =
+          Substitute(BufferStore(output, combined, indices), {{rows[0], row}});
+      tasks.push_back(For(row, make_zero(row.dtype()), row_extent,
+                          ForKind::kParallel, store));
+      return BufferLoad(output, indices);
+    };
+    materialize(materialize, values[0], true);
+    if (!HasMultiVLHeadroom(op->src, op->dst, candidate_scratch))
+      return std::nullopt;
+    Require(task_depth_ == 0,
+            "this reduction expands to multiple dependency-bearing tasks; "
+            "use T.Stage rather than an opaque T.Task/PerCoreTask wrapper");
+    for (const Buffer &buffer : candidate_scratch)
+      scratch_.push_back(buffer);
+    next_temporary_ = next_candidate_temporary;
+    next_row_ = next_candidate_row;
     return active_plan(MakeSeq(tasks));
   }
 
   bool HasMultiVLHeadroom(const Buffer &src, const Buffer &dst,
-                          int64_t candidate_bytes) {
+                          const Array<Buffer> &candidate_scratch) {
     if (!ub_owner_bytes_.has_value() || !ub_slots_.Get(src->data).has_value() ||
         !ub_slots_.Get(dst->data).has_value())
       return false;
@@ -552,16 +588,19 @@ private:
       remaining -= bytes;
       return true;
     };
-    if (!charge(future_combine_bytes_) || !charge(candidate_bytes))
-      return false;
-    for (const Buffer &buffer : scratch_) {
+    auto charge_buffer = [&](const Buffer &buffer) {
       PrimExpr footprint = analyzer_.Simplify(ascend::AlignPrimExpr(
           ascend::GetBufferSizeBytes(buffer, DataType::Int(64)),
           ascend::AscendScopeAlignBytes(GetPtrStorageScope(buffer->data))));
       const auto *bytes = footprint.as<IntImmNode>();
-      if (!bytes || !charge(bytes->value))
+      return bytes && charge(bytes->value);
+    };
+    for (const Buffer &buffer : scratch_)
+      if (!charge_buffer(buffer))
         return false;
-    }
+    for (const Buffer &buffer : candidate_scratch)
+      if (!charge_buffer(buffer))
+        return false;
     return true;
   }
 
@@ -843,7 +882,6 @@ private:
     auto saved_bytes = ub_owner_bytes_;
     auto saved_slots = ub_slots_;
     auto saved_manual_versions = manual_versions_;
-    int64_t saved_combine_bytes = future_combine_bytes_;
     auto saved_private = aiv_private_;
     if (root) {
       aiv_private_ = ascend::ValidatedAivPrivateData(op);
@@ -857,7 +895,6 @@ private:
       ub_slots_ = ascend::StorageFootprintCollector::SlotBytes(
           GetRef<SBlock>(op), manual_versions_);
       ub_owner_bytes_ = 0;
-      future_combine_bytes_ = 0;
       for (const auto &[storage, footprint] : ub_slots_) {
         if (ascend::AscendScopeAlignBytes(GetPtrStorageScope(storage)) != 32)
           continue;
@@ -895,7 +932,6 @@ private:
       ub_owner_bytes_ = saved_bytes;
       ub_slots_ = saved_slots;
       manual_versions_ = saved_manual_versions;
-      future_combine_bytes_ = saved_combine_bytes;
       aiv_private_ = saved_private;
     }
     return block;
@@ -909,7 +945,6 @@ private:
   BufferVersionMap manual_versions_;
   std::optional<int64_t> ub_owner_bytes_;
   int64_t ub_capacity_bytes_{0};
-  int64_t future_combine_bytes_{0};
   int next_temporary_{0};
   int next_row_{0};
   int task_depth_{0};

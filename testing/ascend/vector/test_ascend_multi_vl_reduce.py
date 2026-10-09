@@ -109,14 +109,27 @@ def test_each_chunk_has_exact_regions_aligned_partials_and_no_row_readback(kind,
         _equal(target.args[2:], [1, rows])
         assert int(origin.args[0].indices[-1]) + int(origin.args[-1]) <= columns
     assert not nodes(after, tirx.Bind)
-    (loop,) = nodes(after, tirx.For)
-    assert loop.kind == tirx.ForKind.PARALLEL and int(loop.extent) == rows
-    (store,) = nodes(after, tirx.BufferStore)
-    assert store.buffer.same_as(destination)
-    values = nodes(store.value, tirx.BufferLoad)
-    assert len(values) == columns // 64
-    assert sorted(int(load.indices[0]) for load in values) == list(range(columns // 64))
-    assert all(load.buffer.same_as(partials) and load.indices[1].same_as(loop.loop_var) for load in values)
+    loops = nodes(after, tirx.For)
+    assert len(loops) == columns // 64 - 1
+    assert len({loop.loop_var for loop in loops}) == len(loops)
+    producers = {}
+    for loop in loops:
+        assert loop.kind == tirx.ForKind.PARALLEL and int(loop.extent) == rows
+        (store,) = nodes(loop.body, tirx.BufferStore)
+        assert isinstance(store.value, tirx.Add if kind == "sum" else tirx.Max)
+        assert all(isinstance(value, tirx.BufferLoad) for value in (store.value.a, store.value.b))
+        assert all(load.indices[-1].same_as(loop.loop_var)
+                   for load in nodes(store.value, tirx.BufferLoad))
+        producers[store.buffer.data] = store.value
+
+    def chunks(value):
+        if isinstance(value, tirx.BufferLoad):
+            if value.buffer.same_as(partials):
+                return [int(value.indices[0])]
+            return chunks(producers[value.buffer.data])
+        return chunks(value.a) + chunks(value.b)
+
+    assert sorted(chunks(producers[destination.data])) == list(range(columns // 64))
 
 
 @pytest.mark.parametrize("kind", ["sum", "max"])
@@ -263,11 +276,11 @@ def test_near_ub_capacity_retains_the_small_existing_row_scratch(kind):
     assert scratch and all(int(buffer.shape[0]) * 4 == 32 for buffer in scratch)
 
 
-def test_headroom_includes_future_ordinary_combine_temporaries():
+def test_headroom_includes_actual_combine_allocations():
     before, _, _ = _program(rows=6, columns=384)
     assert len(_strided(_lower(before))) == 6
     # The original owners consume 9248B. Partials need 192B, which fits
-    # exactly with this filler; five additional row temporaries do not fit.
+    # exactly with this filler; four actual combine intermediates do not fit.
     filler_bytes = 196608 - 9248 - 192
     filler = tirx.decl_buffer((filler_bytes // 4,), "float32", "filler",
                               scope="shared.dyn")
@@ -276,7 +289,8 @@ def test_headroom_includes_future_ordinary_combine_temporaries():
     assert [int(call.args[-1]) for call in calls(after, PREFIX + "sum")] == [384, 6]
 
 
-def test_pending_scratch_and_reserved_combines_are_charged_across_reductions():
+@pytest.mark.parametrize("fits", [False, True])
+def test_pending_actual_scratch_is_charged_across_reductions(fits):
     before, source, destination = _program()
     second = tirx.decl_buffer((3,), "float32", "second", scope="shared.dyn")
     original = calls(before, "tl.tileop.reduce")[0]
@@ -284,23 +298,25 @@ def test_pending_scratch_and_reserved_combines_are_charged_across_reductions():
     args[1] = region(second, 2)
     body = seq(tirx.Evaluate(original),
                tirx.Evaluate(tirx.Call("handle", original.op, args)))
-    # 160B is enough for the first 64B partial allocation and its reserved
-    # 32B combine; adding the second candidate and reserve would require 192B.
+    # Each two-chunk candidate owns 64B of partials and writes its final
+    # binary node directly to dst. Two candidates need exactly 128B; with
+    # 96B available only the first fits, leaving 32B for the count fallback.
     original_bytes = 3 * 128 * 4 + 2 * 32
-    filler = tirx.decl_buffer(((196608 - original_bytes - 160) // 4,),
+    available = 128 if fits else 96
+    filler = tirx.decl_buffer(((196608 - original_bytes - available) // 4,),
                               "float32", "filler", scope="shared.dyn")
     after = _lower(_root_program(before, extra_buffers=[second, filler], body=body))
-    assert len(_strided(after)) == 2
-    assert [int(call.args[-1]) for call in calls(after, PREFIX + "sum")] == [128, 2]
+    assert len(_strided(after)) == (4 if fits else 2)
+    assert [int(call.args[-1]) for call in calls(after, PREFIX + "sum")] == ([] if fits else [128, 2])
 
 
 @pytest.mark.parametrize("padded_layout", [False, True])
 def test_owner_aliases_use_one_maximum_layout_footprint(padded_layout):
     before, _, _ = _program(rows=6, columns=384)
-    # Exactly enough headroom for partials and every conservative binary
-    # temporary when the storage is charged once. A padded alias expands the
+    # Exactly enough headroom for partials and actual binary intermediates
+    # when the storage is charged once. A padded alias expands the
     # same physical storage and must force fallback despite its compact owner.
-    elements = (196608 - 9248 - (6 + 5) * 32) // 4
+    elements = (196608 - 9248 - (6 + 4) * 32) // 4
     filler = tirx.decl_buffer((elements,), "float32", "filler", scope="shared.dyn")
     alias = tirx.decl_buffer((elements,), "float32", "alias", scope="shared.dyn",
                              data=filler.data)

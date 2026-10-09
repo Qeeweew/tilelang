@@ -32,14 +32,15 @@ def test_packer_respects_complete_allocation_conflicts(disable_reuse):
 
 def _merge_on_target(buffers, *, arch="dav-2201", contract=True, aliases=None, disable_reuse=False):
     body = tirx.SeqStmt(
-        [*[tirx.AllocBuffer(buffer) for buffer in buffers], *[tirx.BufferStore(buffer, tirx.const(0, buffer.dtype), [0]) for buffer in buffers]]
+        [*[tirx.AllocBuffer(buffer) for buffer in buffers], *[tirx.BufferStore(buffer, tirx.const(0, buffer.dtype), [0] * len(buffer.shape)) for buffer in buffers]]
     )
     thread = tirx.IterVar(tvm.ir.Range(0, 1), tirx.Var("block", "int32"), tirx.IterVar.ThreadIndex, "blockIdx.x")
     body = tirx.AttrStmt(thread, "thread_extent", 1, body)
     if contract:
         body = tirx.AttrStmt(aliases or {buffer.data: [] for buffer in buffers}, "tl.buffer_alias_map", 1, body)
     func = tirx.PrimFunc([], body).with_attr("target", tvm.target.Target({"kind": "ascend", "arch": arch}))
-    return transform.MergeUBAllocations(align_bytes=32, disable_reuse=disable_reuse)(tvm.IRModule({"main": func}))
+    module = tirx.transform.FlattenBuffer()(tvm.IRModule({"main": func}))
+    return transform.MergeUBAllocations(align_bytes=32, disable_reuse=disable_reuse)(module)
 
 
 @pytest.mark.parametrize("contract,disable_reuse", [(False, False), (True, False), (True, True)])

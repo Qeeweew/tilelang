@@ -86,13 +86,17 @@ existing tree. Width 64 retains its existing single count-mode call.
 Selection also requires conservative UB headroom. The common physical
 allocation collector charges each root-owned storage once at its maximum
 owner/alias/layout footprint, including physical padding and 32-byte alignment.
-The selection adds already generated reduction scratch, reserves the future
-combine scratch of previous selections, and charges this candidate's partials
-plus one aligned R-element FP32 temporary per binary combine node. This includes
-the final combine even when it can write directly to the output. Unknown
+The selection adds already generated reduction scratch and this candidate's
+actual allocation owners using the shared physical footprint helper. Each
+non-final binary node owns an aligned R-element FP32 buffer; the final node
+writes the existing output. There is no reserve for a later pass's inferred
+combine temporaries. Rejected candidates commit no allocations or ownership
+facts. Unknown
 allocation sizes, absent allocation owners and automatic future UB version
 requests keep the existing plan. These are conservative selection bounds;
-ordinary resource planning and final allocation checks still apply.
+scratch from other ordinary Parallel expressions may be created later by
+VectorTiles. Ordinary resource planning and final allocation checks still
+apply to all actual allocations.
 
 An unrelated manual buffer ring already reserves physical storage and does
 not make the root's headroom unknown. The same collector charges each leading
@@ -117,8 +121,11 @@ and aligned base independently of an inferred layout.
 For the chunk candidate, compiler-owned `shared.dyn` partials have shape
 `[C/64, round_up(R,8)]`; each chunk starts at a 32-byte aligned FP32 address.
 Only R valid results are written/read. The extra padded capacity is not treated
-as initialized data. Ordinary Parallel Add/Max nodes form a balanced combine
-tree over corresponding row partials and write the compact output. There is no
+as initialized data. The reduction pass materializes the balanced combine tree
+as single-binary Parallel assignments with explicit intermediate owners.
+VectorTiles lowers those assignments into native tasks without adding algorithm
+temporaries. The original FP32 tree and left/right evaluation order are retained;
+the final node writes the compact output. There is no
 per-row scalar readback or store in the selected path.
 
 Each `datablock_reduce_{sum,max}` call has three typed IR operands: exact
@@ -179,9 +186,10 @@ existing native contract.
 Focused CPU regressions cover exact disjoint chunk regions, compact output,
 ordinary combines and task boundaries, source/version offsets with wide index
 types, mask setup, completion in generated source, fallback domains and ordinary
-FA with Bkv128. Capacity regressions cover near-full UB, pending scratch and
-combine reservations, manual slot padding, alias/layout footprints and unknown
-future allocation sizes. Successful CPU lowering alone does not establish
+FA with Bkv128. Capacity regressions cover near-full UB, pending actual scratch,
+manual slot padding, alias/layout footprints and unknown future allocation sizes.
+Odd chunk trees have a cancellation-sensitive FP32 oracle; unrelated Parallel
+scratch retains its final capacity gate. Successful CPU lowering alone does not establish
 native stride legality or numerical/device performance: CANN offline compilation
 and locked finite numerical comparisons are subsequent gates.
 

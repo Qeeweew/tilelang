@@ -171,10 +171,29 @@ def test_late_scalar_schema_rejects_unproved_lane_or_stride_contract(bad, diagno
         _lower(_module(malformed, source, destination))
 
 
+@pytest.mark.parametrize("source_rows,destination_rows,diagnostic", [
+    (2, 3, "FP32 row reduce source/destination active rows must match"),
+    (3, 2, r"FP32 row reduce requires proved active rows in \[1, 255\] and an exact uint8 repeat count"),
+    (2, 2, r"FP32 row reduce requires proved active rows in \[1, 255\] and an exact uint8 repeat count"),
+], ids=["source-rows", "destination-rows", "equal-regions-wrong-repeat"])
+def test_native_repeat_and_both_region_row_counts_must_agree(
+        source_rows, destination_rows, diagnostic):
+    call, source, destination = _fixture(rows=3, retained=True)
+    args = list(call.args)
+    # All regions remain inside their backing with unchanged lanes, origins,
+    # strides and access modes. The last case isolates the repeat mismatch
+    # even when the two region row counts agree.
+    for operand, rows in ((0, destination_rows), (1, source_rows)):
+        data = list(args[operand].args)
+        data[-2] = tirx.IntImm("int32", rows)
+        args[operand] = tirx.Call("handle", tvm.ir.Op.get("tl.region"), data)
+    assert int(args[2]) == 3
+    with pytest.raises(tvm.error.InternalError, match=diagnostic):
+        _lower(_module(tirx.Call(call.dtype, call.op, args), source, destination))
+
+
 @pytest.mark.parametrize("bad,diagnostic", [
-    ("source-rows", "exact \\[rows, valid_lanes\\]"),
     ("source-lanes", "exact \\[rows, valid_lanes\\]"),
-    ("destination-rows", "exactly rows compact elements"),
     ("source-out-of-bounds", "inside its backing"),
     ("destination-out-of-bounds", "inside its backing"),
     ("source-width", "physical row width"),
@@ -196,12 +215,8 @@ def test_late_regions_reject_wrong_span_backing_or_effect_metadata(bad, diagnost
     operand = 0 if bad.startswith("destination") else 1
     data = list(args[operand].args)
     buffer = destination if operand == 0 else source
-    if bad == "source-rows":
-        data[-2] = tirx.IntImm("int32", 2)
-    elif bad == "source-lanes":
+    if bad == "source-lanes":
         data[-1] = tirx.IntImm("int32", 24)
-    elif bad == "destination-rows":
-        data[-2] = tirx.IntImm("int32", 2)
     elif bad in ("source-out-of-bounds", "destination-out-of-bounds"):
         data[0] = buffer[2, 0] if operand == 1 else buffer[6, 0]
     elif bad.endswith("-mask"):

@@ -74,10 +74,10 @@ def test_independent_manual_ring_keeps_static_dense_rows(kind, ring_shape):
 @pytest.mark.parametrize("fits", [False, True])
 def test_manual_slot_padding_is_charged_at_the_capacity_boundary(kind, fits):
     # Source=1536B, output=32B, two 4B manual slots occupy 2*32B.
-    # The candidate needs 64B partials plus a reserved 32B vector combine.
+    # The candidate owns 64B partials; its final binary node writes dst.
     # Charging the whole compact ring as 32B would incorrectly accept the
     # non-fitting case. Its old count plan still fits with <=64B scratch.
-    owner_bytes, ring_bytes, candidate_bytes = 1536 + 32, 64, 64 + 32
+    owner_bytes, ring_bytes, candidate_bytes = 1536 + 32, 64, 64
     filler_bytes = 196608 - owner_bytes - ring_bytes - candidate_bytes
     if not fits:
         filler_bytes += 32
@@ -92,7 +92,7 @@ def test_flat_manual_owner_aliases_are_charged_once_at_their_maximum_footprint(p
     # The exact-capacity candidate fits if identical views of one flat manual
     # owner are charged once. An alias reserving 32B more must force fallback;
     # the original <=64B count scratch still fits in that case.
-    filler_bytes = 196608 - (1536 + 32 + 64) - (64 + 32)
+    filler_bytes = 196608 - (1536 + 32 + 64) - 64
     before, owners = _program(ring_shape=(16,), filler_bytes=filler_bytes)
     ring = owners[2]
     alias = tirx.decl_buffer((16,), "float32", "ring_alias", scope="shared.dyn", data=ring.data)

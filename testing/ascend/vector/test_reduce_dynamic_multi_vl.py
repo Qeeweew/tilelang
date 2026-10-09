@@ -85,7 +85,7 @@ def _execute_rows(statement, environment, memory, issued):
 
 
 @pytest.mark.parametrize("kind", ["sum", "max"])
-@pytest.mark.parametrize("columns", [128, 256, 512, 1024])
+@pytest.mark.parametrize("columns", [128, 192, 256, 320, 512, 1024])
 @pytest.mark.parametrize("active", [0, 1, 4, 8])
 def test_dynamic_native_math_exact_accesses_and_static_scratch(kind, columns, active):
     rows = tirx.Var("owned_rows", "int32")
@@ -160,18 +160,20 @@ def test_dynamic_uint8_upper_endpoint_uses_static_maximum_capacity(index_dtype):
         transform.AscendLowerTileOp()(_lower(before, vector=True))
 
 
-def test_dynamic_candidate_reserves_maximum_scratch_and_rejects_opaque_task():
+@pytest.mark.parametrize("fits", [False, True])
+def test_dynamic_candidate_allocates_maximum_scratch_and_rejects_opaque_task(fits):
     rows = tirx.Var("owned_rows", "int32")
     before, _, _ = _program(rows=8, columns=256, row_extent=rows, task=True)
     with pytest.raises(ValueError, match="multiple dependency-bearing tasks"):
         _lower(before)
     before, _, _ = _program(rows=8, columns=256, row_extent=rows)
-    # One 32B-aligned row vector per chunk and combine is charged using Rmax,
+    # Four partial row vectors and two actual intermediates use Rmax,
     # even when the current dynamic invocation happens to own just one row.
     owner_bytes = 8 * 256 * 4 + 32
-    filler = tirx.decl_buffer(((196608 - owner_bytes - 192) // 4,),
+    available = 192 if fits else 160
+    filler = tirx.decl_buffer(((196608 - owner_bytes - available) // 4,),
                              "float32", "filler", scope="shared.dyn")
-    assert not _strided(_lower(_root_program(before, extra_buffers=[filler])))
+    assert bool(_strided(_lower(_root_program(before, extra_buffers=[filler])))) == fits
 
 
 @pytest.mark.parametrize("bad", ["unguarded-zero", "overflow", "mismatched-repeat"])
@@ -264,9 +266,13 @@ def test_packed_decode_dynamic_rows_have_finite_scalar_vector_flags_and_no_empty
     # The separate native owner/collective tests retain their full controls.
     assert {node.flag[0] for node in trace if node.flag} == {"V_S", "S_V"}
     _prove_binary_protocol(trace)
-    # Keep a balanced-set/wait negative control. Without the real S->V
-    # reverse bridge, repeated V->S notifications must fail even though
-    # every individual notification still has a matching wait.
+    # Keep a balanced-set/wait negative control without requiring a particular
+    # legal reverse bridge. Scalar can also consume V->S before dispatching
+    # its next notification, so removing S->V alone need not break lifetime.
+    # Remove that channel and defer the remaining acquires: notifications now
+    # reuse a live bit even though every set still has its matching wait.
     without_reverse = [node for node in trace if not node.flag or node.flag[0] != "S_V"]
+    acquires = [node for node in without_reverse if node.kind == "wait"]
+    broken = [node for node in without_reverse if node.kind != "wait"] + acquires
     with pytest.raises(AssertionError, match="may be set again before its prior wait completes"):
-        _prove_binary_protocol(without_reverse)
+        _prove_binary_protocol(broken)
