@@ -524,7 +524,7 @@ public:
   // thread_extent / virtual_thread iter ranges, tilelang_assume, and
   // IfThenElse / Select branch guards. Populated by the scheduled-TIR builder
   // or decoder when the TaskNode is constructed; consumed by
-  // RegionsMayConflict so the prover sees the symbol environment each region
+  // shared dependency analysis so the prover sees the environment each region
   // was written under.
   ConstrSet outer_ctx;
 

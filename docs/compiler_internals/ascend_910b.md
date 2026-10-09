@@ -128,6 +128,16 @@ regions. Whole-node roles include control-header accesses. Handoff and prefetch
 selection consume these roles without confusing them with individual hazards;
 reversing an owner dependency swaps both its roles and conflict records.
 
+Within one ordered node-pair analysis, region comparisons share only the
+prepared task contexts: iteration renames and merged constraints. The key
+includes both endpoints, distance and whether distinct physical owners allow
+equal coordinates. Ordinary carried edges keep ancestors fixed and require
+different loop coordinates; independent owner epochs rename the full nest.
+Each region comparison creates its own analyzer and per-side mutable-read
+snapshots. Conflict hints still decide before storage/alias checks. Prepared
+contexts do not survive another child list, IR rewrite or sync attempt; no
+region proof or solver state is cached.
+
 ScheduledTIR decoding and physical alias analysis share one task-effect scope:
 a leaf owns its statement and direct guards; a control header owns only its
 minimum, extent, optional step and direct guards. Child bodies and descendant

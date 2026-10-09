@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <iterator>
 #include <map>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -74,117 +75,160 @@ static bool IsConflictHint(const Array<Any> &hint) {
   return is_conflict->value;
 }
 
-bool RegionsMayConflict(const ConstrSet &a_ctx, const BufferRegion &a_region,
-                        const ConstrSet &b_ctx, const BufferRegion &b_region,
+namespace {
+
+// The symbolic environment of two task executions. Region bounds, mutable-read
+// snapshots and prover state are deliberately absent: each access comparison
+// instantiates those independently from these immutable iteration facts.
+struct PreparedRegionContext {
+  PreparedRegionContext(const ConstrSet &a_ctx, const ConstrSet &b_ctx,
                         ControlNode *loop, int offset,
-                        size_t num_storage_owners,
-                        const ConflictHintList &root_conflicts) {
-  const bool cross = offset != 0;
-  if (cross && loop == nullptr)
-    return false;
-
-  bool declared_no_conflict = false;
-  for (const Any &entry : ActiveConflictHints(loop, root_conflicts)) {
-    Array<Any> hint = Downcast<Array<Any>>(entry);
-    bool is_conflict = IsConflictHint(hint);
-    int64_t cross_code = Downcast<IntImm>(hint[2])->value;
-    if (cross_code != -1 && (cross_code == 1) != cross)
-      continue;
-    bool matches = (HintOperandMatches(hint[0], a_region) &&
-                    HintOperandMatches(hint[1], b_region)) ||
-                   (HintOperandMatches(hint[0], b_region) &&
-                    HintOperandMatches(hint[1], a_region));
-    if (!matches)
-      continue;
-    if (is_conflict)
-      return true;
-    declared_no_conflict = true;
+                        bool independent_owner_epochs) {
+    ConstrSet a_local_ctx = a_ctx;
+    ConstrSet b_local_ctx = b_ctx;
+    ConstrSet loop_ctx;
+    // Scheduled tasks can define condition snapshots outside the constraint
+    // visitor's Bind stack. Rename all variables written in the compared
+    // iteration scope, including these otherwise-free predicates. Ancestor
+    // definitions stay shared: opposite branches selected by one outer epoch
+    // are still exclusive when comparing iterations of an inner loop.
+    auto seed_iteration_vars = [&](const ControlNode *scope) {
+      for (const Var &var : scope->GetWriteVars()) {
+        if (!a_sub.count(var))
+          a_sub.Set(var, var.copy_with_suffix("_p"));
+        if (!b_sub.count(var))
+          b_sub.Set(var, var.copy_with_suffix("_c"));
+      }
+    };
+    if (offset != 0) {
+      // A carried edge belongs to the loop being analyzed, not to any differing
+      // coordinate in its enclosing nest. Keep ancestors fixed and instantiate
+      // this loop and its descendants independently. Parent analysis retains
+      // hazards that cross the outer boundary of this sequence.
+      const ControlNode *rename_scope = loop;
+      if (independent_owner_epochs) {
+        // Distinct storage owners have independent epochs even when their
+        // enclosing coordinates happen to coincide.
+        rename_scope = loop->GetAncestorControls().front();
+      }
+      seed_iteration_vars(rename_scope);
+      Var pivot = rename_scope->control->loop_var;
+      a_local_ctx = a_local_ctx.RenameFrom("_p", a_sub, pivot);
+      b_local_ctx = b_local_ctx.RenameFrom("_c", b_sub, pivot);
+      Var iteration = loop->control->loop_var;
+      PrimExpr p = Substitute(iteration, a_sub);
+      PrimExpr c = Substitute(iteration, b_sub);
+      if (offset > 0) {
+        loop_ctx.AddConstr(c == p + IntImm(iteration.dtype(), offset));
+      } else if (!independent_owner_epochs) {
+        loop_ctx.AddConstr(p != c);
+      }
+    }
+    constraints = loop_ctx.Merge(a_local_ctx).Merge(b_local_ctx);
   }
-  // A forced conflict wins if contradictory declarations match.
-  if (declared_no_conflict)
-    return false;
 
-  if (!a_region->buffer->data.same_as(b_region->buffer->data))
-    return false;
-
-  // Same storage but different logical buffer (T.view/T.reshape): regions may
-  // differ in rank/dtype/strides, so keep the dependency conservatively.
-  if (!a_region->buffer.same_as(b_region->buffer))
-    return true;
-
-  const Array<Range> &a_rng = a_region->region;
-  const Array<Range> &b_rng = b_region->region;
-  if (a_rng.size() != b_rng.size())
-    return true; // shape mismatch — be safe
-  const size_t ndim = a_rng.size();
-
-  arith::Analyzer ana;
-  ana.z3_prover.SetRLimit(50000);
   Map<Var, PrimExpr> a_sub, b_sub;
-  ConstrSet a_local_ctx = a_ctx;
-  ConstrSet b_local_ctx = b_ctx;
-  ConstrSet loop_ctx;
-  // Scheduled tasks can define condition snapshots outside the constraint
-  // visitor's Bind stack. Rename all variables written in the compared
-  // iteration scope, including these otherwise-free predicates. Ancestor
-  // definitions stay shared: opposite branches selected by one outer epoch
-  // are still exclusive when comparing iterations of an inner loop.
-  auto seed_iteration_vars = [&](const ControlNode *scope) {
-    for (const Var &var : scope->GetWriteVars()) {
-      if (!a_sub.count(var))
-        a_sub.Set(var, var.copy_with_suffix("_p"));
-      if (!b_sub.count(var))
-        b_sub.Set(var, var.copy_with_suffix("_c"));
-    }
-  };
-  if (cross) {
-    // A carried edge belongs to the loop being analyzed, not to any differing
-    // coordinate in its enclosing nest. Keep ancestors fixed and instantiate
-    // this loop and its descendants independently. Parent analysis retains
-    // hazards that cross the outer boundary of this sequence.
-    const ControlNode *rename_scope = loop;
-    if (offset < 0 && num_storage_owners > 1) {
-      // Distinct storage owners have independent epochs even when their
-      // enclosing coordinates happen to coincide.
-      rename_scope = loop->GetAncestorControls().front();
-    }
-    seed_iteration_vars(rename_scope);
-    Var pivot = rename_scope->control->loop_var;
-    a_local_ctx = a_local_ctx.RenameFrom("_p", a_sub, pivot);
-    b_local_ctx = b_local_ctx.RenameFrom("_c", b_sub, pivot);
-    Var iteration = loop->control->loop_var;
-    PrimExpr p = Substitute(iteration, a_sub);
-    PrimExpr c = Substitute(iteration, b_sub);
-    if (offset > 0) {
-      loop_ctx.AddConstr(c == p + IntImm(iteration.dtype(), offset));
-    } else if (num_storage_owners <= 1) {
-      loop_ctx.AddConstr(p != c);
-    }
-  }
-  loop_ctx.Merge(a_local_ctx).Merge(b_local_ctx).Populate(ana);
+  ConstrSet constraints;
+};
 
-  // Freshen mutable reads (BufferLoads etc.) inline in the region bounds, per
-  // side: a read written verbatim in both bounds is not provably equal across
-  // the two access points (a store may sit between them), so it must become an
-  // independent unknown on each side.
-  FreshenMutableReads freshen_a(FreshenMutableReads::Mode::kSnapshot);
-  FreshenMutableReads freshen_b(FreshenMutableReads::Mode::kSnapshot);
-  PrimExpr any_dim_disjoint = Bool(false);
-  for (size_t i = 0; i < ndim; ++i) {
-    PrimExpr a_min = freshen_a(Substitute(a_rng[i]->min, a_sub));
-    PrimExpr a_max =
-        freshen_a(Substitute(a_rng[i]->min + a_rng[i]->extent - 1, a_sub));
-    PrimExpr b_min = freshen_b(Substitute(b_rng[i]->min, b_sub));
-    PrimExpr b_max =
-        freshen_b(Substitute(b_rng[i]->min + b_rng[i]->extent - 1, b_sub));
-    any_dim_disjoint = any_dim_disjoint || (a_max < b_min) || (b_max < a_min);
+// One ordered node-pair analysis, shared by its RAW/WAW/WAR region queries.
+// The tasks and loop are unchanged for this lifetime. Nothing survives into
+// another child list, an IR rewrite, or a synchronization fallback attempt.
+class RegionConflictAnalysis {
+public:
+  RegionConflictAnalysis(ControlNode *loop,
+                         const ConflictHintList &root_conflicts)
+      : loop_(loop), root_conflicts_(root_conflicts) {}
+
+  bool MayConflict(const TaskNode *a_task, const BufferRegion &a_region,
+                   const TaskNode *b_task, const BufferRegion &b_region,
+                   int offset, size_t num_storage_owners) {
+    const bool cross = offset != 0;
+    if (cross && loop_ == nullptr)
+      return false;
+
+    bool declared_no_conflict = false;
+    for (const Any &entry : ActiveConflictHints(loop_, root_conflicts_)) {
+      Array<Any> hint = Downcast<Array<Any>>(entry);
+      bool is_conflict = IsConflictHint(hint);
+      int64_t cross_code = Downcast<IntImm>(hint[2])->value;
+      if (cross_code != -1 && (cross_code == 1) != cross)
+        continue;
+      bool matches = (HintOperandMatches(hint[0], a_region) &&
+                      HintOperandMatches(hint[1], b_region)) ||
+                     (HintOperandMatches(hint[0], b_region) &&
+                      HintOperandMatches(hint[1], a_region));
+      if (!matches)
+        continue;
+      if (is_conflict)
+        return true;
+      declared_no_conflict = true;
+    }
+    // A forced conflict wins if contradictory declarations match.
+    if (declared_no_conflict)
+      return false;
+
+    if (!a_region->buffer->data.same_as(b_region->buffer->data))
+      return false;
+
+    // Same storage but different logical buffer (T.view/T.reshape): regions may
+    // differ in rank/dtype/strides, so keep the dependency conservatively.
+    if (!a_region->buffer.same_as(b_region->buffer))
+      return true;
+
+    const Array<Range> &a_rng = a_region->region;
+    const Array<Range> &b_rng = b_region->region;
+    if (a_rng.size() != b_rng.size())
+      return true; // shape mismatch — be safe
+    const size_t ndim = a_rng.size();
+
+    // Independent owner epochs permit equal loop coordinates, even when the
+    // loop is already outermost. Keep that relation distinct from an ordinary
+    // carried edge (p != c); a rename scope alone does not identify a context.
+    bool independent_owner_epochs = offset < 0 && num_storage_owners > 1;
+    const PreparedRegionContext &context =
+        contexts_
+            .try_emplace(std::make_tuple(a_task, b_task, offset,
+                                         independent_owner_epochs),
+                         a_task->outer_ctx, b_task->outer_ctx, loop_, offset,
+                         independent_owner_epochs)
+            .first->second;
+    arith::Analyzer ana;
+    ana.z3_prover.SetRLimit(50000);
+    context.constraints.Populate(ana);
+
+    // Freshen mutable reads (BufferLoads etc.) inline in the region bounds, per
+    // side: a read written verbatim in both bounds is not provably equal across
+    // the two access points (a store may sit between them), so it must become
+    // an independent unknown on each side.
+    FreshenMutableReads freshen_a(FreshenMutableReads::Mode::kSnapshot);
+    FreshenMutableReads freshen_b(FreshenMutableReads::Mode::kSnapshot);
+    PrimExpr any_dim_disjoint = Bool(false);
+    for (size_t i = 0; i < ndim; ++i) {
+      PrimExpr a_min = freshen_a(Substitute(a_rng[i]->min, context.a_sub));
+      PrimExpr a_max = freshen_a(
+          Substitute(a_rng[i]->min + a_rng[i]->extent - 1, context.a_sub));
+      PrimExpr b_min = freshen_b(Substitute(b_rng[i]->min, context.b_sub));
+      PrimExpr b_max = freshen_b(
+          Substitute(b_rng[i]->min + b_rng[i]->extent - 1, context.b_sub));
+      any_dim_disjoint = any_dim_disjoint || (a_max < b_min) || (b_max < a_min);
+    }
+    any_dim_disjoint = ana.Simplify(any_dim_disjoint);
+    // Raw Z3 as a fallback catches the infeasible-context case that Analyzer's
+    // constant-fold short-circuit misses.
+    return !(ana.CanProve(any_dim_disjoint) ||
+             ana.z3_prover.CanProve(any_dim_disjoint));
   }
-  any_dim_disjoint = ana.Simplify(any_dim_disjoint);
-  // Raw Z3 as a fallback catches the infeasible-context case that Analyzer's
-  // constant-fold short-circuit misses.
-  return !(ana.CanProve(any_dim_disjoint) ||
-           ana.z3_prover.CanProve(any_dim_disjoint));
-}
+
+private:
+  ControlNode *loop_;
+  const ConflictHintList &root_conflicts_;
+  std::map<std::tuple<const TaskNode *, const TaskNode *, int, bool>,
+           PreparedRegionContext>
+      contexts_;
+};
+
+} // namespace
 
 std::vector<DepInfo>
 AnalyzeDependencies(std::vector<IRStructure *> nodes, ControlNode *loop,
@@ -325,6 +369,7 @@ AnalyzeDependencies(std::vector<IRStructure *> nodes, ControlNode *loop,
             task_pairs;
       };
       std::vector<PendingDependency> pending;
+      RegionConflictAnalysis conflicts(loop, root_conflicts);
 
       auto add_pair = [&](const ffi::Optional<Var> &storage, int distance,
                           const RegionAccess &producer,
@@ -376,10 +421,9 @@ AnalyzeDependencies(std::vector<IRStructure *> nodes, ControlNode *loop,
             int manual_versions = get_manual_versions(storage);
             if (manual_versions && !owner_exclusion) {
               for (int d = (i < j ? 0 : 1); d <= manual_versions; ++d) {
-                if (RegionsMayConflict(lhs.task->outer_ctx, lhs.region,
-                                       rhs.task->outer_ctx, rhs.region, loop, d,
-                                       /*num_storage_owners=*/0,
-                                       root_conflicts)) {
+                if (conflicts.MayConflict(lhs.task, lhs.region, rhs.task,
+                                          rhs.region, d,
+                                          /*num_storage_owners=*/0)) {
                   add_pair(storage, d, lhs, rhs);
                   break;
                 }
@@ -391,10 +435,9 @@ AnalyzeDependencies(std::vector<IRStructure *> nodes, ControlNode *loop,
                 continue;
               if (distance < 0 && loop == nullptr)
                 continue;
-              if (RegionsMayConflict(lhs.task->outer_ctx, lhs.region,
-                                     rhs.task->outer_ctx, rhs.region, loop,
-                                     distance, get_num_storage_owners(storage),
-                                     root_conflicts)) {
+              if (conflicts.MayConflict(lhs.task, lhs.region, rhs.task,
+                                        rhs.region, distance,
+                                        get_num_storage_owners(storage))) {
                 add_pair(storage, owner_exclusion ? 0 : distance, lhs, rhs,
                          owner_exclusion ? DependencyKind::kOwnerExclusion
                                          : DependencyKind::kData,
