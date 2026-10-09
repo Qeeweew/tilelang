@@ -98,17 +98,7 @@ inline CoreMask GetTaskMte2CoreMask(const TaskNode *task) {
 
 inline CoreMask GetTaskCandidateCoreMask(const TaskNode *task) {
   uint16_t pipe_mask = task->GetPipeMask();
-  CoreMask result = kCoreUnassigned;
-  if (pipe_mask & static_cast<uint16_t>(ResourcePipe::kCube))
-    result |= kCoreCube;
-  if (pipe_mask & static_cast<uint16_t>(ResourcePipe::kVector))
-    result |= kCoreVector;
-  if (pipe_mask & static_cast<uint16_t>(ResourcePipe::kMTE1) ||
-      pipe_mask & static_cast<uint16_t>(ResourcePipe::kFixpipe)) {
-    result |= kCoreCube;
-  }
-  if (pipe_mask & static_cast<uint16_t>(ResourcePipe::kMTE3))
-    result |= kCoreVector;
+  CoreMask result = GetAscendPipeCoreRequirements(pipe_mask);
   if (pipe_mask & static_cast<uint16_t>(ResourcePipe::kMTE2))
     result |= GetTaskMte2CoreMask(task);
 

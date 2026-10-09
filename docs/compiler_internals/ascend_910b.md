@@ -38,6 +38,15 @@ ordering. Native 2201 L0A uses ZZ order; it is distinct from L1's NZ layout.
 The input capability boundary diagnoses unsupported operations before layout
 inference or scheduling.
 
+Before layout, mixed partitioning collects explicit CUBE regions, real
+instruction/storage requirements, and unscoped cross-core endpoints whose pipe
+pins execution to AIC. It does not interpret a synchronization endpoint mask as
+an instruction requirement: `PIPE_ALL` fences the enclosing core and cannot
+create another core. Scoped synchronization keeps its declared execution
+region. This early intent is not final core placement; AssignCore retains input
+availability and explicit-region checks. Both use the same exclusive-pipe core
+facts, while S and MTE2 require context or storage to resolve their owner.
+
 The [ordinary GEMM example](../../examples/ascend/gemm_910b.py) chooses its
 output traversal in Python. Its default launches one logical block per output
 tile. Optional `num_cores` bounds the logical launch and distributes output

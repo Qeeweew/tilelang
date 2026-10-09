@@ -57,21 +57,11 @@ using ffi::GetRef;
 namespace {
 
 static CoreMask GetCrossCorePipeCoreMask(const PrimExpr &pipe_arg) {
-  switch (task_analysis_detail::SpecialRegisterForCrossCorePipe(pipe_arg)) {
-  case SpecialRegister::kPipeVector:
-  case SpecialRegister::kPipeMTE3:
-    return kCoreVector;
-  case SpecialRegister::kPipeCube:
-  case SpecialRegister::kPipeMTE1:
-  case SpecialRegister::kPipeFixpipe:
-    return kCoreCube;
-  case SpecialRegister::kPipeScalar:
-  case SpecialRegister::kPipeMTE2:
-    return kCoreUnassigned;
-  default:
-    LOG(FATAL) << "Unexpected special register for cross-core pipe";
-    return kCoreUnassigned;
-  }
+  // Preserve the synchronization ABI's validation and diagnostics before
+  // querying the shared single-pipe execution-core fact.
+  task_analysis_detail::SpecialRegisterForCrossCorePipe(pipe_arg);
+  return GetAscendExclusivePipeCoreMask(
+      ParseAscendPipe(pipe_arg.as<StringImmNode>()->value));
 }
 
 static Optional<Call> GetCrossCoreCall(const Call &call) {

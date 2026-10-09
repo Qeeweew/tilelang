@@ -371,6 +371,31 @@ def test_other_architecture_and_pure_vector_preserve_existing_ir(arch, cube):
     tvm.ir.assert_structural_equal(_lower(before), before)
 
 
+@pytest.mark.parametrize("pipe", ["PIPE_V", "PIPE_ALL"])
+@pytest.mark.parametrize("auto_schedule", [False, True], ids=["no-auto", "auto"])
+def test_pure_vector_barrier_does_not_require_mixed_row_ownership(pipe, auto_schedule):
+    @T.prim_func
+    def main(A: T.Tensor((5, 32), "float32"), C: T.Tensor((5, 32), "float32")):
+        with T.Kernel(1):
+            x = T.alloc_shared((5, 32), "float32")
+            with T.Vector(vector=1):
+                T.copy(A, x)
+                T.ascend_pipe_barrier(pipe)
+                T.copy(x, C)
+
+    with tvm.transform.PassContext(config={"tl.enable_auto_schedule": auto_schedule}):
+        artifact = tilelang.lower(
+            main, target={"kind": "ascend", "arch": "dav-2201"},
+            enable_host_codegen=False, enable_device_compile=False,
+        )
+    source = artifact.kernel_source
+    assert "__vector__" in source and "__mix__" not in source
+    if pipe == "PIPE_ALL":
+        assert source.count("asc_sync();") == 1
+    else:
+        assert "asc_sync_pipe(" + pipe + ");" in source
+
+
 def test_repeated_pass_is_idempotent():
     once = _lower(_program())
     tvm.ir.assert_structural_equal(_lower(once), once)
@@ -424,6 +449,84 @@ def test_handover_only_cube_intent_is_partitioned_without_a_gemm_call():
     assert not calls(after, "tl.tileop.gemm")
     assert int(_root(after).annotations["tl.ascend_row_partitioned"]) == 2
     assert int(next(buffer for buffer in _root(after).alloc_buffers if buffer.name == "x").shape[0]) == 3
+
+
+@pytest.mark.parametrize("intent", ["gemm", "handover"])
+def test_vector_barrier_does_not_hide_independent_cube_data_intent(intent):
+    before = _program()
+    root = _root(before)
+    body = list(root.body.seq)
+    buffers = list(root.alloc_buffers)
+    if intent == "handover":
+        x = next(buffer for buffer in buffers if buffer.name == "x")
+        l0c = tirx.decl_buffer((5, 32), "float32", name="handover_l0c", scope="shared.l0c")
+        workspace = tirx.decl_buffer((5, 32), "float32", name="handover")
+        body[0], body[1] = copy(l0c, workspace), copy(workspace, x)
+        buffers.extend([l0c, workspace])
+    # Scope state must end with this Vector region: the following real Cube
+    # data operation still establishes mixed ownership for the row algorithm.
+    body.insert(0, tirx.SBlock([], [], [], "VECTOR", tirx.Evaluate(T.ascend_pipe_barrier("PIPE_ALL"))))
+    root = tirx.SBlock([], [], [], "tilelang_root", seq(*body), alloc_buffers=buffers)
+    before = tvm.IRModule({"main": before["main"].with_body(tirx.SBlockRealize([], True, root))})
+    after = _lower(before)
+    assert int(_root(after).annotations["tl.ascend_row_partitioned"]) == 2
+    assert int(next(buffer for buffer in _root(after).alloc_buffers if buffer.name == "x").shape[0]) == 3
+    assert len(calls(after, "tl.tileop.gemm")) == int(intent == "gemm")
+    assert len(calls(after, "tl.ascend_pipe_barrier")) == 1
+
+
+def test_unscoped_cube_cross_endpoint_still_establishes_mixed_row_ownership():
+    before = _program()
+    root = _root(before)
+    body = list(root.body.seq)
+    # The explicit FIX endpoint belongs to Cube even without a GEMM/data
+    # call. Its MTE3 consumer then runs on the two partitioned AIV owners.
+    body[:1] = [
+        tirx.Evaluate(T.ascend_cross_core_set_flag(2, "PIPE_FIX", 0)),
+        tirx.Evaluate(T.ascend_cross_core_wait_flag(2, "PIPE_MTE3", 0)),
+    ]
+    root = tirx.SBlock([], [], [], "tilelang_root", seq(*body), alloc_buffers=root.alloc_buffers)
+    before = tvm.IRModule({"main": before["main"].with_body(tirx.SBlockRealize([], True, root))})
+    after = _lower(before)
+    assert int(_root(after).annotations["tl.ascend_row_partitioned"]) == 2
+    sid = _sid(after)
+    load = calls(after, "tl.tileop.ascend_copy")[0]
+    _, ub = _regions(load)
+    assert [_constant(ub[2][0], {sid: tirx.IntImm("int32", owner)}) for owner in (0, 1)] == [3, 2]
+    assert len(calls(after, "tl.ascend_cross_core_set_flag")) == 1
+    assert len(calls(after, "tl.ascend_cross_core_wait_flag")) == 1
+
+
+@pytest.mark.parametrize("operation", ["typed-fill", "native-fill", "native-gm-to-l1"])
+def test_l1_writes_establish_cube_intent_on_the_shared_mte2_pipe(operation):
+    before = _program()
+    root = _root(before)
+    body = list(root.body.seq)
+    params = list(before["main"].buffer_map.values())
+    l1 = next(buffer for buffer in root.alloc_buffers if buffer.name == "cube_a")
+    if operation == "typed-fill":
+        body[0] = tirx.Evaluate(T.fill(l1, 0))
+    elif operation == "native-fill":
+        # One NZ repeat writes sixteen 32-byte blocks: the real 16x16 FP16
+        # destination, with no byte offset or gap.
+        body[0] = tirx.Evaluate(tirx.Call("void", tvm.ir.Op.get("tl.ascend_fill_l1"), [
+            l1.access_ptr("w"), 0, tirx.IntImm("uint32", 0), 1, 16, 0, 16,
+        ]))
+    else:
+        gm = tirx.decl_buffer((16, 16), "float16", name="l1_input")
+        params.append(gm)
+        # The native ABI carries source row pitch in bytes and n/d in
+        # elements. This full ND2NZ copy writes the same 512-byte L1 tile.
+        body[0] = tirx.Evaluate(tirx.Call("void", tvm.ir.Op.get("tl.ascend_copy_gm_to_cbuf"), [
+            l1.access_ptr("w"), gm.access_ptr("r"), 0, 32, 0,
+            16, 16, 0, 0, 0, 16, tirx.StringImm("half"),
+        ]))
+    after = _lower(_target(kernel(seq(*body), buffers=root.alloc_buffers, params=params)))
+    assert not calls(after, "tl.tileop.gemm")
+    assert int(_root(after).annotations["tl.ascend_row_partitioned"]) == 2
+    sid = _sid(after)
+    _, ub = _regions(calls(after, "tl.tileop.ascend_copy")[0])
+    assert [_constant(ub[2][0], {sid: tirx.IntImm("int32", owner)}) for owner in (0, 1)] == [3, 2]
 
 
 def test_frontend_opaque_blocks_keep_affine_row_facts_and_private_allocations():

@@ -39,6 +39,7 @@
 #include "ascend/op/copy.h"
 #include "ascend/op/cube_load.h"
 #include "ascend/op/utils.h"
+#include "core_mask.h"
 #include "op/copy.h"
 #include "op/fill.h"
 #include "op/utils.h"
@@ -71,6 +72,32 @@ inline constexpr uint16_t kAllResourcePipes = PipeMask(ResourcePipe::kAll);
 
 inline bool IsSingleResourcePipe(uint16_t mask) {
   return mask != 0 && (mask & (mask - 1)) == 0;
+}
+
+// Only these individual pipes identify an execution core without storage or
+// lexical ownership. Shared DMA/scalar pipes and whole-core fences do not.
+inline CoreMask GetAscendExclusivePipeCoreMask(ResourcePipe pipe) {
+  switch (pipe) {
+  case ResourcePipe::kCube:
+  case ResourcePipe::kMTE1:
+  case ResourcePipe::kFixpipe:
+    return kCoreCube;
+  case ResourcePipe::kVector:
+  case ResourcePipe::kMTE3:
+    return kCoreVector;
+  default:
+    return kCoreUnassigned;
+  }
+}
+
+inline CoreMask GetAscendPipeCoreRequirements(uint16_t pipe_mask) {
+  CoreMask result = kCoreUnassigned;
+  for (ResourcePipe pipe :
+       {ResourcePipe::kCube, ResourcePipe::kVector, ResourcePipe::kMTE1,
+        ResourcePipe::kFixpipe, ResourcePipe::kMTE3})
+    if (pipe_mask & PipeMask(pipe))
+      result |= GetAscendExclusivePipeCoreMask(pipe);
+  return result;
 }
 
 inline std::string GetResourcePipeName(uint16_t mask) {
@@ -341,6 +368,32 @@ inline uint16_t GetAscendTaskPipeMask(const Call &call) {
     return 0;
   }
   return GetAscendCallPipeMask(call);
+}
+
+// Early kernel intent includes the actual local storage used by an operation,
+// before task regions have been decoded. Declarations/access metadata alone
+// supply no execution intent, and sync endpoints contribute no data resource.
+inline CoreMask GetAscendCallCoreRequirements(const Call &call) {
+  CoreMask result = GetAscendPipeCoreRequirements(GetAscendTaskPipeMask(call));
+  auto cube_storage = [](const Buffer &buffer) {
+    return IsL1Buffer(buffer) || IsL0ABuffer(buffer) || IsL0BBuffer(buffer) ||
+           IsL0CBuffer(buffer);
+  };
+  if (IsAscendCopyCall(call.get())) {
+    AscendCopy copy(call->args, call->annotations);
+    if (cube_storage(copy->src) || cube_storage(copy->dst))
+      result |= kCoreCube;
+  } else if (call->op.same_as(Fill::Get())) {
+    Fill fill(call->args, call->annotations);
+    if (cube_storage(fill->dst))
+      result |= kCoreCube;
+  } else if (call->op.same_as(ascend_copy_gm_to_cbuf()) ||
+             call->op.same_as(ascend_fill_l1())) {
+    // These native ABIs write L1. Their MTE2 pipe by itself is shared with
+    // AIV-side loads, so it cannot establish this storage requirement.
+    result |= kCoreCube;
+  }
+  return result;
 }
 
 inline ResourcePipe GetAscendCallArgumentPipe(const Call &call,
