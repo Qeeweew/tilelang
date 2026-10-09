@@ -100,7 +100,10 @@ def schedule_snapshots(program, pass_names, *, auto_schedule=True):
     if not requested <= available:
         raise ValueError(f"Unknown or disabled scheduling passes: {sorted(requested - available)}")
     snapshots = {}
-    target = tvm.target.Target("ascend")
+    # Keep the pass context consistent with an explicitly bound architecture.
+    # BindTarget preserves an existing function target; fixtures without one
+    # retain this helper's architecture-less Ascend default.
+    target = program.attrs["target"] if program.attrs is not None and "target" in program.attrs else tvm.target.Target("ascend")
     with target:
         mod = tvm.IRModule({"main": program.with_attr("global_symbol", "main")})
         mod = tirx.transform.BindTarget(target)(mod)

@@ -164,10 +164,7 @@ def test_atomic_pair_keeps_region_proofs_and_distance_hints_independent(forced_c
     from testing.ascend.auto_schedule.test_owner_result_completion import (
         _name, _region, _trace, _value,
     )
-    # The geometry case isolates one comparison without requiring a carried
-    # binary-flag retirement protocol. The hint case supplies that real reverse
-    # handshake and separately exercises distance-specific declarations.
-    trips = 2 if forced_carried else 1
+    trips = 2
 
     @T.prim_func
     def main(
@@ -195,7 +192,8 @@ def test_atomic_pair_keeps_region_proofs_and_distance_hints_independent(forced_c
                     T.copy(overlap[i, :, :], D[i, :, :])
 
     with tvm.transform.PassContext(config={"tl.disable_shared_memory_reuse": True}):
-        before = schedule(main, through="ResolveCore", auto_schedule=False)
+        target = tvm.target.Target({"kind": "ascend", "arch": "dav-2201"})
+        before = schedule(main.with_attr("target", target), through="ResolveCore", auto_schedule=False)
         # Both regions must belong to the same pair of atomic leaves. Separate
         # tasks would not exercise reuse of their comparison environment.
         atomic = [task for task in nodes(before, tirx.AttrStmt)
@@ -241,6 +239,22 @@ def test_atomic_pair_keeps_region_proofs_and_distance_hints_independent(forced_c
         # The conservative cross-epoch hint adds a real reverse handshake;
         # its same-epoch no-conflict declaration cannot erase this distance.
         require(3 * disjoint_reads[0] + 2, 3 * writers[1] + 1)
+
+
+@pytest.mark.parametrize("explicit_arch", [False, True], ids=["default-dav3510", "explicit-dav2201"])
+def test_scheduling_prefix_preserves_bound_target(explicit_arch):
+    program = _hint_program("root", True, False, False)
+    if explicit_arch:
+        program = program.with_attr("target", tvm.target.Target({"kind": "ascend", "arch": "dav-2201"}))
+    before = schedule(program, through="NormalizeControlFlowForSchedule", auto_schedule=False)
+    target = before["main"].attrs["target"]
+    assert target.kind.name == "ascend"
+    info = tvm.ffi.get_global_func("tl.GetAscendTargetInfo")(target)
+    assert info["arch"] == ("dav-2201" if explicit_arch else "dav-3510")
+    if explicit_arch:
+        assert target.attrs["arch"] == "dav-2201"
+    else:
+        assert "arch" not in target.attrs and "mcpu" not in target.attrs
 
 
 if __name__ == "__main__":
