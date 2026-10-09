@@ -128,16 +128,20 @@ regions. Whole-node roles include control-header accesses. Handoff and prefetch
 selection consume these roles without confusing them with individual hazards;
 reversing an owner dependency swaps both its roles and conflict records.
 
-Within one ordered node-pair analysis, region comparisons share only the
-prepared task contexts: iteration renames and merged constraints. The key
+Within one ordered node-pair analysis, region comparisons share the prepared
+task contexts: iteration renames and merged constraints. The key
 includes both endpoints, distance, a forward-distance bound and whether distinct
 physical owners allow equal coordinates. Ordinary carried edges keep ancestors
 fixed and require the consumer coordinate to follow the producer; independent
 owner epochs rename the full nest and may have equal coordinates.
-Each region comparison creates its own analyzer and per-side mutable-read
-snapshots. Conflict hints still decide before storage/alias checks. Prepared
-contexts do not survive another child list, IR rewrite or sync attempt; no
-region proof or solver state is cached.
+While the exact leaf task pair remains current, its context can also retain
+the populated analyzer for each distinct distance/owner relation. Region
+queries only simplify and prove; they add no assumptions. Each query still
+creates fresh per-side mutable-read snapshots. Changing either leaf releases
+all active analyzers, bounding solver retention even in a large control pair.
+Conflict hints still decide before storage/alias checks. Prepared contexts and
+active analyzers do not survive another node pair, child list, IR rewrite or
+sync attempt; no region result or cross-pass proof is cached.
 
 Unowned persistent state retains its ordinary region and guard semantics. For
 a backward stage edge, shared analysis proves the shortest potentially

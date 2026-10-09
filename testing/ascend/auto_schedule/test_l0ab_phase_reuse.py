@@ -474,18 +474,76 @@ def test_balanced_l1_gemms_keep_the_actual_epoch_storage_contract(dtype, automat
                  for allocation in nodes(function, tirx.AllocBuffer)
                  if allocation.buffer.scope() == scope + ".dyn"]
         (bank,) = banks
-        if automatic:
-            # The existing closed-phase certificate does not admit an offset
-            # automatic outer epoch. Keep its independent rings and sum all
-            # actual slots, rather than inferring a max-budget from syntax.
-            assert frozenset((first, second)) not in selected
-            assert second not in aliases[first] and first not in aliases[second]
-            assert _bytes(bank) == sum(map(_bytes, actual)) <= 65536
-        else:
-            assert frozenset((first, second)) in selected
+        # Automatic offset intent and explicit stages now use the same closed
+        # epoch contract. A selected pair must also have its actual completion
+        # proof and late max-budget allocation; an independent pair uses sum.
+        if frozenset((first, second)) in selected:
             assert second in aliases[first] and first in aliases[second]
             assert _bytes(bank) == max(map(_bytes, actual)) <= 65536
+        else:
+            assert automatic
+            assert second not in aliases[first] and first not in aliases[second]
+            assert _bytes(bank) == sum(map(_bytes, actual)) <= 65536
     assert _PAIRS not in synced.annotations
+    _assert_balanced_operand_completions(snapshots["tl.LowerScheduledTIR"], selected)
+
+
+def _assert_balanced_operand_completions(mod, selected):
+    """Check load readiness and all overlapping old readers on shared banks."""
+    records = list(_trace(mod, core=2, lane=0))
+    commands, writes, reads = [], [], []
+    shared = {storage for pair in selected for storage in pair}
+
+    def footprint(region, env):
+        buffer, minimum, extent = _region(region, env)
+        # These native copies cover one complete operand tile. A materialized
+        # ring adds its leading slot axis; the remaining fractal occupies one
+        # contiguous tile, irrespective of its NZ layout.
+        assert len(extent) in (2, 3)
+        assert extent[-2:] == tuple(map(int, buffer.shape[-2:]))
+        assert len(extent) == 2 or extent[0] == 1
+        slot_bytes = math.prod(extent[-2:]) * tvm.DataType(buffer.dtype).bits // 8
+        assert minimum[-2:] == (0, 0)
+        start = minimum[0] * slot_bytes if len(extent) == 3 else 0
+        return buffer, start, start + slot_bytes
+
+    for index, (call, env, _) in enumerate(records):
+        name = _name(call)
+        if name in ("tl.ascend_set_flag", "tl.ascend_wait_flag"):
+            event = call.args[0].value
+            source, destination = event.split("_")
+            setting = name == "tl.ascend_set_flag"
+            commands.append(_Command(source if setting else destination,
+                                     "set" if setting else "wait", (event, _value(call.args[1], env))))
+        elif name == "tl.ascend_pipe_barrier":
+            commands.append(_Command(call.args[0].value.removeprefix("PIPE_"), "barrier"))
+        elif name == _GEMM:
+            commands.append(_Command("M", "mad"))
+            reads.extend((index, *footprint(call.args[n], env)) for n in (0, 1))
+        elif name in (_COPY, _LOAD3D):
+            source = _region(call.args[0], env)[0]
+            destination = _region(call.args[1], env)[0]
+            pipe = "FIX" if source.scope() == "shared.l0c" else "MTE2" if source.scope() == "global" else "MTE1"
+            commands.append(_Command(pipe, "copy"))
+            if destination.scope() in ("shared.l0a", "shared.l0b"):
+                writes.append((index, *footprint(call.args[1], env)))
+        else:
+            assert name in ("tl.ascend_set_mmad_direction", "tl.ascend_set_fixpipe_config",
+                            "tl.ascend_set_cube_load_config", "tl.ascend_set_load3d_config"), name
+            commands.append(_Command("S", "scalar"))
+    require = _prove_completions(commands)
+    assert writes and reads
+    for reader, buffer, begin, end in reads:
+        prior = [(writer, target, low, high) for writer, target, low, high in writes
+                 if writer < reader and target.data.same_as(buffer.data)
+                 and low == begin and high == end]
+        assert prior, "Every actual MAD operand needs an initialized slot"
+        writer = prior[-1][0]
+        require(3 * writer + 2, 3 * reader + 1)
+        for overwrite, target, low, high in writes:
+            if (reader < overwrite and buffer.data in shared and target.data in shared
+                    and target.scope() == buffer.scope() and begin < high and low < end):
+                require(3 * reader + 2, 3 * overwrite + 1)
 
 
 def _matching_unit_boundary(records, event, start, end, *, notify_before=None,

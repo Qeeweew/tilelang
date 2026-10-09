@@ -126,3 +126,43 @@ def test_nested_spill_reload_keeps_binary_flags_and_parent_data_completion(pairs
     for (previous, left), (current, right) in zip(data, data[1:]):
         assert left.kind != right.kind
         assert precedes(previous, current), "UB reuse needs completion across both child and parent iterations"
+
+
+@pytest.mark.parametrize("mutable_index", [False, True], ids=["affine-rows", "separate-mutable-reads"])
+@pytest.mark.parametrize("reverse_buffers", [False, True])
+def test_atomic_multi_region_queries_keep_independent_access_snapshots(mutable_index, reverse_buffers):
+    """A proven disjoint region must not become a premise of the next query.
+
+    The first task writes two buffers and the second reads both. Their fixed
+    rows are disjoint. Index is incremented between the two tasks, so shifting
+    its second read by one makes the mutable accesses alias the first row.
+    Buffer order cannot change either result in the common dependency input.
+    """
+    source = tirx.decl_buffer((3, 1, 64), "float32", name="Input")
+    outputs = [tirx.decl_buffer((3, 1, 64), "float32", name=f"Output{n}") for n in range(2)]
+    index = tirx.decl_buffer((1,), "int32", name="Index")
+    buffers = [tirx.decl_buffer((2, 1, 64), "float32", name=f"Storage{n}", scope="shared.dyn")
+               for n in range(2)]
+    epoch = tirx.Var("epoch", "int32")
+    left = index[0] % 2 if mutable_index else epoch % 2
+    right = (index[0] + 1) % 2 if mutable_index else (epoch + 1) % 2
+    rows = [(0, 1), (left, right)]
+    order = [1, 0] if reverse_buffers else [0, 1]
+    loads = [copy(source, buffers[n], src_indices=[epoch, 0, 0], src_shape=[1, 1, 64],
+                  dst_indices=[rows[n][0], 0, 0], dst_shape=[1, 1, 64]) for n in order]
+    stores = [copy(buffers[n], outputs[n], src_indices=[rows[n][1], 0, 0], src_shape=[1, 1, 64],
+                   dst_indices=[epoch, 0, 0], dst_shape=[1, 1, 64]) for n in order]
+    body = seq(unit(seq(*loads), cost=(1, 1)),
+               unit(tirx.BufferStore(index, index[0] + 1, [0]), cost=(1, 1)),
+               unit(seq(*stores), cost=(1, 1)))
+    loop = tirx.For(epoch, 0, 3, tirx.ForKind.SERIAL, body)
+    before = kernel(unit(loop, core=None), buffers=buffers, params=[source, *outputs, index])
+    before["main"] = before["main"].with_attr("target", tvm.target.Target(
+        {"kind": "ascend", "arch": "dav-2201"}))
+    observed = _observe_dependencies(before)
+    (inner,) = [deps for count, deps in observed if count == 3]
+    raw_same_epoch = any(producer == 0 and consumer == 2 and distance == 0
+                         for producer, consumer, distance, _ in inner)
+    assert raw_same_epoch == mutable_index
+    assert any(producer == 2 and consumer == 0 and distance == 1
+               for producer, consumer, distance, _ in inner), "Cross-epoch row reuse must remain ordered"

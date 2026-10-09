@@ -29,6 +29,7 @@
 #include <iterator>
 #include <limits>
 #include <map>
+#include <memory>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -79,8 +80,8 @@ static bool IsConflictHint(const Array<Any> &hint) {
 
 namespace {
 
-// The symbolic environment of two task executions. Region bounds, mutable-read
-// snapshots and prover state are deliberately absent: each access comparison
+// The symbolic environment of two task executions. Region bounds and their
+// mutable-read snapshots are deliberately absent: each access comparison
 // instantiates those independently from these immutable iteration facts.
 struct PreparedRegionContext {
   PreparedRegionContext(const ConstrSet &a_ctx, const ConstrSet &b_ctx,
@@ -202,9 +203,27 @@ public:
                          a_task->outer_ctx, b_task->outer_ctx, loop_, offset,
                          independent_owner_epochs, forward_limit)
             .first->second;
-    arith::Analyzer ana;
-    ana.z3_prover.SetRLimit(50000);
-    context.constraints.Populate(ana);
+    // Binding the same captured task context can be substantially more costly
+    // than its region query (in particular for min/max loop domains). Reuse
+    // its analyzer while this exact task pair remains current. Queries only
+    // simplify/prove expressions; they never install extra assumptions. Keep
+    // the mutable region snapshots below fresh for each query.
+    //
+    // Do not retain every task pair's solver: a control/control comparison can
+    // contain many leaves. Changing either task releases all active provers;
+    // different offsets/owner relations still have distinct contexts.
+    auto tasks = std::make_pair(a_task, b_task);
+    if (active_tasks_ != tasks) {
+      active_provers_.clear();
+      active_tasks_ = tasks;
+    }
+    auto [prover, inserted] = active_provers_.try_emplace(&context);
+    if (inserted) {
+      prover->second = std::make_unique<arith::Analyzer>();
+      prover->second->z3_prover.SetRLimit(50000);
+      context.constraints.Populate(*prover->second);
+    }
+    arith::Analyzer &ana = *prover->second;
 
     // Freshen mutable reads (BufferLoads etc.) inline in the region bounds, per
     // side: a read written verbatim in both bounds is not provably equal across
@@ -235,6 +254,9 @@ private:
   std::map<std::tuple<const TaskNode *, const TaskNode *, int, bool, int>,
            PreparedRegionContext>
       contexts_;
+  std::pair<const TaskNode *, const TaskNode *> active_tasks_{nullptr, nullptr};
+  std::map<const PreparedRegionContext *, std::unique_ptr<arith::Analyzer>>
+      active_provers_;
 };
 
 } // namespace
