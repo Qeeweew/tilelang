@@ -295,6 +295,15 @@ The count may have a static tail or a bounded dynamic extent, including zero;
 each physical UB operand origin must satisfy 32-byte instruction alignment.
 Multi-row DMA uses target-specific byte gaps on GM and 32-byte gaps on UB.
 
+Each normalized vector assignment first builds a local instruction plan with
+selected typed destinations, actual scratch buffers, private ownership and
+frozen operand/count expressions. CSE and row-broadcast caches end at that
+assignment. Emission consumes the completed plan without traversing the source
+expression, choosing destinations or allocating scratch. Prefix selection keeps
+its mask writes and native operation together in the real chunk epoch; a
+single chunk remains inline. The records stay within this lowering and use
+existing TIR for scalar statements and regions; downstream passes consume TIR.
+
 For 2201, layout inference preserves the logical Parallel loop axes and
 validates their ordinary nest layout. Vector lowering chooses the contiguous
 instruction domain after consuming row broadcasts and column predicates.

@@ -19,8 +19,10 @@
 
 #include <iterator>
 #include <limits>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
+#include <variant>
 #include <vector>
 
 #include "aiv_private.h"
@@ -437,12 +439,6 @@ private:
     bool saved_;
   };
 
-  void RegisterScratch(const Buffer &buffer) {
-    scratch_.push_back(buffer);
-    if (private_operation_)
-      ascend::AppendAivPrivateData(&aiv_private_, buffer->data);
-  }
-
   struct Value {
     Optional<BufferLoad> tile;
     PrimExpr scalar;
@@ -481,6 +477,104 @@ private:
     }
   };
   using ValueMap = std::unordered_map<PrimExpr, Value, ValueHash, ValueEqual>;
+
+  // Local recipes freeze typed operands, counts and actual destinations before
+  // native instruction emission. Scalar statements retain the existing TIR;
+  // only a prefix-select needs a compound recipe for its real chunk epoch.
+  struct NativeInstruction {
+    const char *name;
+    Array<PrimExpr> args;
+  };
+  struct PrefixSelectInstruction {
+    Var chunk;
+    int64_t chunks;
+    Array<Stmt> mask_writes;
+    NativeInstruction select;
+  };
+  using PlannedInstruction =
+      std::variant<Stmt, NativeInstruction, PrefixSelectInstruction>;
+  struct AssignmentPlan {
+    std::vector<PlannedInstruction> instructions;
+    Array<Buffer> scratch;
+    bool private_storage{false};
+  };
+  struct AssignmentPlanningState {
+    AssignmentPlan plan;
+    ValueMap values;
+    std::unordered_map<PrimExpr, BufferLoad, ValueHash, ValueEqual> row_blocks;
+    VectorExpressionLastUse::StorageSet dead_inputs;
+    std::unordered_map<const VarNode *, size_t> expression_reads;
+    bool reuse_allowed{false};
+  };
+
+  void BeginAssignmentPlan() {
+    ICHECK(!assignment_.has_value());
+    assignment_.emplace();
+    assignment_->plan.private_storage = private_operation_;
+  }
+
+  void PlanScratch(const Buffer &buffer) {
+    ICHECK(assignment_.has_value());
+    assignment_->plan.scratch.push_back(buffer);
+  }
+
+  void PlanScalarStatement(Stmt stmt) {
+    ICHECK(assignment_.has_value());
+    assignment_->plan.instructions.emplace_back(std::move(stmt));
+  }
+
+  // This emitter is deliberately independent of the lowerer's Analyzer,
+  // liveness, domain and CSE state. Every operand and allocation is selected.
+  static Stmt EmitNativeInstruction(const NativeInstruction &instruction) {
+    return Evaluate(
+        Call(DataType::Void(),
+             Op::Get(std::string("tl.ascend_membase.") + instruction.name),
+             instruction.args));
+  }
+
+  static Stmt EmitAssignmentPlan(const AssignmentPlan &plan) {
+    Array<Stmt> stmts;
+    for (const PlannedInstruction &instruction : plan.instructions) {
+      if (const auto *scalar = std::get_if<Stmt>(&instruction)) {
+        stmts.push_back(*scalar);
+      } else if (const auto *native =
+                     std::get_if<NativeInstruction>(&instruction)) {
+        stmts.push_back(EmitNativeInstruction(*native));
+      } else {
+        const auto &select = std::get<PrefixSelectInstruction>(instruction);
+        Array<Stmt> body = select.mask_writes;
+        body.push_back(EmitNativeInstruction(select.select));
+        if (select.chunks == 1) {
+          // A single VL has no independent reuse epoch. Its scalar mask
+          // writes and vector read retain their actual enclosing owner.
+          stmts.push_back(
+              Substitute(MakeSeq(body),
+                         {{select.chunk, make_zero(select.chunk.dtype())}}));
+        } else {
+          stmts.push_back(For(select.chunk, Integer(0),
+                              make_const(select.chunk.dtype(), select.chunks),
+                              ForKind::kSerial, MakeSeq(body)));
+        }
+      }
+    }
+    return MakeSeq(stmts);
+  }
+
+  AssignmentPlan FinishAssignmentPlan() {
+    ICHECK(assignment_.has_value());
+    AssignmentPlan plan = std::move(assignment_->plan);
+    assignment_.reset();
+    return plan;
+  }
+
+  Stmt MaterializeAssignmentPlan(const AssignmentPlan &plan) {
+    for (const Buffer &buffer : plan.scratch) {
+      scratch_.push_back(buffer);
+      if (plan.private_storage)
+        ascend::AppendAivPrivateData(&aiv_private_, buffer->data);
+    }
+    return EmitAssignmentPlan(plan);
+  }
 
   static Stmt MakeSeq(const Array<Stmt> &stmts) {
     if (stmts.empty())
@@ -589,7 +683,7 @@ private:
     Buffer buffer = decl_buffer(
         {capacity}, dtype, "membase_tmp_" + std::to_string(next_temporary_++),
         "shared.dyn");
-    RegisterScratch(buffer);
+    PlanScratch(buffer);
     return BufferLoad(buffer, {make_const(DataType::Int(32), 0)});
   }
 
@@ -600,7 +694,9 @@ private:
                  make_const(DataType::Int(32), mask)});
   }
 
-  void Emit(const char *name, Array<PrimExpr> args, bool append_count = true) {
+  NativeInstruction MakeNativeInstruction(const char *name,
+                                          Array<PrimExpr> args,
+                                          bool append_count = true) {
     // Count-mode arithmetic permits exact in-place operands. A shifted
     // overlapping source is not an in-place operation and would introduce
     // instruction-order-dependent reads within the vector tile.
@@ -633,12 +729,17 @@ private:
     }
     if (append_count)
       args.push_back(cast(DataType::UInt(32), active_count_));
-    emitted_.push_back(Evaluate(
-        Call(DataType::Void(),
-             Op::Get(std::string("tl.ascend_membase.") + name), args)));
+    return {name, std::move(args)};
   }
 
-  void EmitBitCopy(const BufferLoad &dst, const BufferLoad &src) {
+  void PlanNativeInstruction(const char *name, Array<PrimExpr> args,
+                             bool append_count = true) {
+    ICHECK(assignment_.has_value());
+    assignment_->plan.instructions.emplace_back(
+        MakeNativeInstruction(name, std::move(args), append_count));
+  }
+
+  void PlanBitCopy(const BufferLoad &dst, const BufferLoad &src) {
     Require(dst->buffer->dtype == src->buffer->dtype,
             "UB bit copy requires matching element types; use T.cast for "
             "datatype conversion");
@@ -648,11 +749,12 @@ private:
       return;
     // Keep typed regions in TIR. Only the one-instruction native primitive
     // reinterprets FP16/BF16 as one UInt16 lane or FP32 as two UInt16 lanes.
-    // Emit also checks shifted overlap against the bounded active capacity.
-    Emit("copy_bits", {Ptr(dst, kAccessWrite), Ptr(src, kAccessRead)});
+    // Native planning checks shifted overlap against the bounded capacity.
+    PlanNativeInstruction("copy_bits",
+                          {Ptr(dst, kAccessWrite), Ptr(src, kAccessRead)});
   }
 
-  Value Scalar(const PrimExpr &expr) {
+  Value PlanScalar(const PrimExpr &expr) {
     PrimExpr value = Substitute(expr, base_map_);
     bool reads_memory = false;
     PostOrderVisit(value, [&](const ObjectRef &node) {
@@ -670,17 +772,18 @@ private:
       }
       Var scalar("membase_scalar_" + std::to_string(next_temporary_++),
                  value.dtype());
-      emitted_.push_back(Bind(scalar, value));
+      PlanScalarStatement(Bind(scalar, value));
       value = scalar;
     }
     return {std::nullopt, value};
   }
 
-  Value MaterializeScalar(Value value, DataType dtype) {
+  Value PlanScalarTile(Value value, DataType dtype) {
     if (value.tile.defined())
       return value;
     BufferLoad dst = NewScratch(dtype);
-    Emit("duplicate", {Ptr(dst, kAccessWrite), cast(dtype, value.scalar)});
+    PlanNativeInstruction("duplicate",
+                          {Ptr(dst, kAccessWrite), cast(dtype, value.scalar)});
     return {dst, PrimExpr()};
   }
 
@@ -730,7 +833,7 @@ private:
          make_const(DataType::Int(32), batch_columns_)},
         DataType::Float(32), "membase_tmp_" + std::to_string(next_temporary_++),
         "shared.dyn");
-    RegisterScratch(buffer);
+    PlanScratch(buffer);
     return BufferLoad(buffer, {make_const(DataType::Int(32), 0),
                                make_const(DataType::Int(32), 0)});
   }
@@ -786,25 +889,25 @@ private:
     return std::nullopt;
   }
 
-  Value LowerRowBinary(const RowBinary &binary, Optional<BufferLoad> output) {
+  Value PlanRowBinary(const RowBinary &binary, Optional<BufferLoad> output) {
     BufferLoad matrix = Base(binary.matrix);
     BufferLoad row = Base(binary.row);
-    auto found = row_blocks_.find(binary.row);
+    auto found = assignment_->row_blocks.find(binary.row);
     BufferLoad blocks;
     PrimExpr rows = make_const(DataType::Int(32), batch_rows_);
     PrimExpr block_elements = make_const(DataType::Int(32), batch_rows_ * 8);
-    if (found == row_blocks_.end()) {
+    if (found == assignment_->row_blocks.end()) {
       blocks = NewScratch(DataType::Float(32), batch_rows_ * 8);
       // One repeat reads eight compact FP32 values and writes eight 32B
       // blocks. R is a multiple of eight; neither the read nor write is rounded
       // beyond the declared regions. The ordinary V RAW dependency supplies
       // completion before a row-binary consumer.
-      Emit("brcb_f32",
-           {Ptr(blocks, kAccessWrite, block_elements),
-            Ptr(row, kAccessRead, rows),
-            make_const(DataType::UInt(8), batch_rows_ / 8)},
-           false);
-      row_blocks_.emplace(binary.row, blocks);
+      PlanNativeInstruction("brcb_f32",
+                            {Ptr(blocks, kAccessWrite, block_elements),
+                             Ptr(row, kAccessRead, rows),
+                             make_const(DataType::UInt(8), batch_rows_ / 8)},
+                            false);
+      assignment_->row_blocks.emplace(binary.row, blocks);
     } else {
       blocks = found->second;
     }
@@ -817,14 +920,14 @@ private:
     // describe a fictitious contiguous R*C span from a nonzero column origin.
     for (int64_t column = 0; column < batch_columns_; column += 64) {
       PrimExpr matrix_region = RowChunkRegion(matrix, kAccessRead, column);
-      Emit(binary.name,
-           {RowChunkRegion(dst, kAccessWrite, column),
-            binary.row_lhs ? row_region : matrix_region,
-            binary.row_lhs ? matrix_region : row_region,
-            make_const(DataType::UInt(8), batch_rows_),
-            make_const(DataType::Bool(), binary.row_lhs),
-            make_const(DataType::UInt(8), batch_columns_ / 8)},
-           false);
+      PlanNativeInstruction(binary.name,
+                            {RowChunkRegion(dst, kAccessWrite, column),
+                             binary.row_lhs ? row_region : matrix_region,
+                             binary.row_lhs ? matrix_region : row_region,
+                             make_const(DataType::UInt(8), batch_rows_),
+                             make_const(DataType::Bool(), binary.row_lhs),
+                             make_const(DataType::UInt(8), batch_columns_ / 8)},
+                            false);
     }
     return {dst, PrimExpr()};
   }
@@ -1081,7 +1184,8 @@ private:
     if (boundary_equality) {
       // The affine proof above and the proved ordering admit only the first
       // lane or an empty prefix. Evaluate the original equality at the origin;
-      // emitting b-a+1 could overflow even when both original operands are safe.
+      // emitting b-a+1 could overflow even when both original operands are
+      // safe.
       return Select(Substitute(normalized, base_map_),
                     make_const(active_count_.dtype(), 1),
                     make_zero(active_count_.dtype()));
@@ -1098,7 +1202,7 @@ private:
     Buffer buffer = decl_buffer(
         {Integer(4)}, DataType::UInt(64),
         "membase_predicate_" + std::to_string(next_temporary_++), "shared.dyn");
-    RegisterScratch(buffer); // 32 B capacity, 16 B actual CMPMASK input.
+    PlanScratch(buffer); // 32 B capacity, 16 B actual CMPMASK input.
     return buffer;
   }
 
@@ -1138,8 +1242,8 @@ private:
     return result;
   }
 
-  Value LowerSelect(const PrimExpr &condition, const PrimExpr &true_value,
-                    const PrimExpr &false_value, Optional<BufferLoad> output) {
+  Value PlanSelect(const PrimExpr &condition, const PrimExpr &true_value,
+                   const PrimExpr &false_value, Optional<BufferLoad> output) {
     DataType dtype = true_value.dtype();
     Require(dtype == false_value.dtype() &&
                 (dtype == DataType::Float(16) || dtype == DataType::Float(32)),
@@ -1153,19 +1257,20 @@ private:
         uniform || threshold.has_value(),
         "supported predicates are row-independent scalar conditions or "
         "affine column prefixes (including intersected tail/causal bounds)");
-    Value control = Scalar(uniform ? predicate : threshold.value());
-    Value a = MaterializeScalar(LowerExpr(true_value), dtype);
-    Value b = MaterializeScalar(LowerExpr(false_value), dtype);
+    Value control = PlanScalar(uniform ? predicate : threshold.value());
+    Value a = PlanScalarTile(PlanExpr(true_value), dtype);
+    Value b = PlanScalarTile(PlanExpr(false_value), dtype);
     BufferLoad dst = output.has_value() ? output.value() : NewScratch(dtype);
     Buffer mask = NewPredicateScratch();
     if (uniform) {
       PrimExpr word = Select(control.scalar, ~make_zero(DataType::UInt(64)),
                              make_zero(DataType::UInt(64)));
-      emitted_.push_back(BufferStore(mask, word, {Integer(0)}));
-      emitted_.push_back(BufferStore(mask, word, {Integer(1)}));
-      Emit("select_bits",
-           {Ptr(dst, kAccessWrite), Ptr(a.tile.value(), kAccessRead),
-            Ptr(b.tile.value(), kAccessRead), PredicatePtr(mask)});
+      PlanScalarStatement(BufferStore(mask, word, {Integer(0)}));
+      PlanScalarStatement(BufferStore(mask, word, {Integer(1)}));
+      PlanNativeInstruction("select_bits", {Ptr(dst, kAccessWrite),
+                                            Ptr(a.tile.value(), kAccessRead),
+                                            Ptr(b.tile.value(), kAccessRead),
+                                            PredicatePtr(mask)});
       return {dst, PrimExpr()};
     }
     int vl = 256 / (dtype.bits() / 8);
@@ -1185,27 +1290,16 @@ private:
     active_count_ = analyzer_.Simplify(
         max(make_zero(saved_count.dtype()),
             min(make_const(saved_count.dtype(), vl), saved_count - offset)));
-    // Reuse the normal overlap/effect emitter. Multiple VLs retain one compact
-    // Serial loop, so code size does not grow with the vector extent.
-    size_t before = emitted_.size();
-    Emit("select_bits", {Ptr(ChunkBase(dst, offset), kAccessWrite),
-                         Ptr(ChunkBase(a.tile.value(), offset), kAccessRead),
-                         Ptr(ChunkBase(b.tile.value(), offset), kAccessRead),
-                         PredicatePtr(mask)});
-    chunk_body.push_back(emitted_.back());
-    emitted_.resize(before);
+    // Freeze the chunk's count and typed regions now. Emission consumes one
+    // compound item, without inserting and then removing a global statement.
+    NativeInstruction select = MakeNativeInstruction(
+        "select_bits", {Ptr(ChunkBase(dst, offset), kAccessWrite),
+                        Ptr(ChunkBase(a.tile.value(), offset), kAccessRead),
+                        Ptr(ChunkBase(b.tile.value(), offset), kAccessRead),
+                        PredicatePtr(mask)});
     active_count_ = saved_count;
-    if (chunks == 1) {
-      // A single VL has no independent reuse epoch. Keep the scalar mask
-      // writes and vector read in their actual enclosing owner, whose reverse
-      // completion protects reuse across rows and outer loop iterations.
-      emitted_.push_back(
-          Substitute(MakeSeq(chunk_body), {{chunk, make_zero(chunk.dtype())}}));
-    } else {
-      emitted_.push_back(For(chunk, Integer(0),
-                             make_const(chunk.dtype(), chunks),
-                             ForKind::kSerial, MakeSeq(chunk_body)));
-    }
+    assignment_->plan.instructions.emplace_back(PrefixSelectInstruction{
+        chunk, chunks, std::move(chunk_body), std::move(select)});
     return {dst, PrimExpr()};
   }
 
@@ -1245,9 +1339,9 @@ private:
     return rounding;
   }
 
-  Value Convert(Value source, DataType dtype,
-                Optional<BufferLoad> output = std::nullopt,
-                const std::string &rounding = "") {
+  Value PlanConvert(Value source, DataType dtype,
+                    Optional<BufferLoad> output = std::nullopt,
+                    const std::string &rounding = "") {
     DataType from = ValueDType(source);
     if (from == dtype)
       return source;
@@ -1257,11 +1351,11 @@ private:
     Require(dtype == DataType::Float(16) || dtype.is_bfloat16() ||
                 dtype == DataType::Float(32),
             "cast destination must be float16/bfloat16/float32");
-    source = MaterializeScalar(source, from);
+    source = PlanScalarTile(source, from);
     if (from != DataType::Float(32) && dtype != DataType::Float(32)) {
       // There is no direct 2201 half<->bfloat instruction. Exact widening is
       // a distinct native task with its own visible FP32 UB lifetime.
-      source = Convert(source, DataType::Float(32));
+      source = PlanConvert(source, DataType::Float(32));
       from = DataType::Float(32);
     }
     BufferLoad dst = output.has_value() ? output.value() : NewScratch(dtype);
@@ -1280,16 +1374,17 @@ private:
       else
         name = bf16 ? "float2bfloat16_rz" : "float2half_rz";
     }
-    Emit(name, {Ptr(dst, kAccessWrite), Ptr(source.tile.value(), kAccessRead)});
+    PlanNativeInstruction(
+        name, {Ptr(dst, kAccessWrite), Ptr(source.tile.value(), kAccessRead)});
     return {dst, PrimExpr()};
   }
 
-  Optional<BufferLoad> DestructiveCastSource(const CastNode *cast) {
+  Optional<BufferLoad> PlanDestructiveCastSource(const CastNode *cast) {
     // Reuse only an FP32 arithmetic intermediate immediately consumed by a
     // narrowing cast. Conversion retains its distinct typed destination and
     // rounding point. A declared arithmetic destination (for example a DMA
     // input followed by a separate work tile) is never replaced here.
-    if (!dense_reuse_region_ || !expression_reuse_allowed_ ||
+    if (!dense_reuse_region_ || !assignment_->reuse_allowed ||
         cast->value.dtype() != DataType::Float(32) ||
         (cast->dtype != DataType::Float(16) && !cast->dtype.is_bfloat16()))
       return std::nullopt;
@@ -1316,7 +1411,8 @@ private:
       const VarNode *data = load->buffer->data.get();
       // A second occurrence can require the old value in a sibling expression,
       // even when the buffer is dead after the enclosing assignment.
-      if (!dead_inputs_.count(data) || expression_reads_[data] != 1)
+      if (!assignment_->dead_inputs.count(data) ||
+          assignment_->expression_reads[data] != 1)
         continue;
       BufferLoad region = GetRef<BufferLoad>(load);
       if (!DenseOrScalar(region, false))
@@ -1357,8 +1453,8 @@ private:
     }
   };
 
-  Value LowerExpr(const PrimExpr &expr,
-                  Optional<BufferLoad> output = std::nullopt) {
+  Value PlanExpr(const PrimExpr &expr,
+                 Optional<BufferLoad> output = std::nullopt) {
     // Fill adds a datatype conversion after frontend Simplify. A uniform
     // integer scalar (for example the ordinary fill value 0) belongs to S
     // expression codegen, followed by one typed native duplicate. This does
@@ -1377,7 +1473,7 @@ private:
         Require(!output.has_value() ||
                     output.value()->buffer->dtype == op->dtype,
                 "expression dtype must match its output buffer");
-        return Scalar(analyzer_.Simplify(expr));
+        return PlanScalar(analyzer_.Simplify(expr));
       }
     }
     // Cast annotations are never silently delegated to scalar codegen. Math
@@ -1390,15 +1486,15 @@ private:
     detector(expr);
     requires_vector |= detector.found;
     if (!requires_vector && Invariant(expr))
-      return Scalar(expr);
+      return PlanScalar(expr);
     if (!output.has_value()) {
-      auto found = values_.find(expr);
-      if (found != values_.end())
+      auto found = assignment_->values.find(expr);
+      if (found != assignment_->values.end())
         return found->second;
     }
     if (auto binary = MatchRowBinary(expr)) {
-      Value result = LowerRowBinary(binary.value(), output);
-      values_.emplace(expr, result);
+      Value result = PlanRowBinary(binary.value(), output);
+      assignment_->values.emplace(expr, result);
       return result;
     }
     if (const auto *load = expr.as<BufferLoadNode>()) {
@@ -1407,26 +1503,27 @@ private:
       return {base, PrimExpr()};
     }
     if (const auto *select = expr.as<SelectNode>()) {
-      Value result = LowerSelect(select->condition, select->true_value,
-                                 select->false_value, output);
-      values_.emplace(expr, result);
+      Value result = PlanSelect(select->condition, select->true_value,
+                                select->false_value, output);
+      assignment_->values.emplace(expr, result);
       return result;
     }
     if (const auto *call = expr.as<CallNode>();
         call && call->op.same_as(Op::Get("tirx.if_then_else")) &&
         call->args.size() == 3) {
       Value result =
-          LowerSelect(call->args[0], call->args[1], call->args[2], output);
-      values_.emplace(expr, result);
+          PlanSelect(call->args[0], call->args[1], call->args[2], output);
+      assignment_->values.emplace(expr, result);
       return result;
     }
     DataType dtype = expr.dtype();
     Require(!output.has_value() || output.value()->buffer->dtype == dtype,
             "expression dtype must match its output buffer");
     if (const auto *op = expr.as<CastNode>()) {
-      Value result = Convert(LowerExpr(op->value, DestructiveCastSource(op)),
-                             dtype, output, CastRounding(op));
-      values_.emplace(expr, result);
+      Value result =
+          PlanConvert(PlanExpr(op->value, PlanDestructiveCastSource(op)), dtype,
+                      output, CastRounding(op));
+      assignment_->values.emplace(expr, result);
       return result;
     }
     Require(dtype == DataType::Float(16) || dtype == DataType::Float(32) ||
@@ -1484,40 +1581,75 @@ private:
                          ? output.value()
                          : NewScratch(compute_dtype);
     auto operand = [&](const PrimExpr &value) {
-      Value lowered = LowerExpr(value);
+      Value lowered = PlanExpr(value);
       Require(ValueDType(lowered) == dtype, "arithmetic input dtype mismatch");
       // Use a normal typed Cast expression as the CSE key for compiler-added
       // promotions; all consumers of the same BF16 value share its widening.
-      return dtype.is_bfloat16() ? LowerExpr(Cast(compute_dtype, value))
+      return dtype.is_bfloat16() ? PlanExpr(Cast(compute_dtype, value))
                                  : lowered;
     };
     Value a = operand(lhs);
     if (unary_exp) {
-      a = MaterializeScalar(a, compute_dtype);
-      Emit(name, {Ptr(dst, kAccessWrite), Ptr(a.tile.value(), kAccessRead)});
+      a = PlanScalarTile(a, compute_dtype);
+      PlanNativeInstruction(
+          name, {Ptr(dst, kAccessWrite), Ptr(a.tile.value(), kAccessRead)});
     } else {
       Value b = operand(rhs);
       if (scalar_name && b.scalar.defined() && a.tile.has_value()) {
-        Emit(scalar_name,
-             {Ptr(dst, kAccessWrite), Ptr(a.tile.value(), kAccessRead),
-              cast(compute_dtype, b.scalar)});
+        PlanNativeInstruction(scalar_name, {Ptr(dst, kAccessWrite),
+                                            Ptr(a.tile.value(), kAccessRead),
+                                            cast(compute_dtype, b.scalar)});
       } else if (scalar_name && a.scalar.defined() && b.tile.has_value() &&
                  std::string(name) != "sub") {
-        Emit(scalar_name,
-             {Ptr(dst, kAccessWrite), Ptr(b.tile.value(), kAccessRead),
-              cast(compute_dtype, a.scalar)});
+        PlanNativeInstruction(scalar_name, {Ptr(dst, kAccessWrite),
+                                            Ptr(b.tile.value(), kAccessRead),
+                                            cast(compute_dtype, a.scalar)});
       } else {
-        a = MaterializeScalar(a, compute_dtype);
-        b = MaterializeScalar(b, compute_dtype);
-        Emit(name, {Ptr(dst, kAccessWrite), Ptr(a.tile.value(), kAccessRead),
-                    Ptr(b.tile.value(), kAccessRead)});
+        a = PlanScalarTile(a, compute_dtype);
+        b = PlanScalarTile(b, compute_dtype);
+        PlanNativeInstruction(name, {Ptr(dst, kAccessWrite),
+                                     Ptr(a.tile.value(), kAccessRead),
+                                     Ptr(b.tile.value(), kAccessRead)});
       }
     }
     Value result{dst, PrimExpr()};
     if (dtype.is_bfloat16())
-      result = Convert(result, dtype, output);
-    values_.emplace(expr, result);
+      result = PlanConvert(result, dtype, output);
+    assignment_->values.emplace(expr, result);
     return result;
+  }
+
+  AssignmentPlan PlanAssignment(const BufferStoreNode *store) {
+    BeginAssignmentPlan();
+    assignment_->dead_inputs = last_use_.DeadInputs(store);
+    ReadStorageCollector reads;
+    reads(store->value);
+    for (const PrimExpr &index : store->indices)
+      reads(index);
+    if (store->predicate.has_value())
+      reads(store->predicate.value());
+    for (const VarNode *data : reads.data)
+      ++assignment_->expression_reads[data];
+    assignment_->reuse_allowed =
+        !store->predicate.has_value() || is_one(store->predicate.value());
+    PostOrderVisit(store->value, [&](const ObjectRef &node) {
+      if (node.as<SelectNode>())
+        assignment_->reuse_allowed = false;
+      if (const auto *call = node.as<CallNode>();
+          call && call->op.same_as(Op::Get("tirx.if_then_else")))
+        assignment_->reuse_allowed = false;
+    });
+    BufferLoad dst = Base(BufferLoad(store->buffer, store->indices));
+    CheckAligned(dst);
+    Value result = PlanExpr(store->value, dst);
+    if (result.scalar.defined()) {
+      PlanNativeInstruction(
+          "duplicate",
+          {Ptr(dst, kAccessWrite), cast(store->buffer->dtype, result.scalar)});
+    } else if (!result.tile.value().same_as(dst)) {
+      PlanBitCopy(dst, result.tile.value());
+    }
+    return FinishAssignmentPlan();
   }
 
   Stmt LowerBody(const Stmt &body) {
@@ -1582,39 +1714,7 @@ private:
                       Select(store->predicate.value(), store->value,
                              BufferLoad(store->buffer, store->indices)),
                       store->indices));
-    output_dtype_ = store->buffer->dtype;
-    emitted_.clear();
-    values_.clear();
-    row_blocks_.clear();
-    dead_inputs_ = last_use_.DeadInputs(store);
-    expression_reads_.clear();
-    ReadStorageCollector reads;
-    reads(store->value);
-    for (const PrimExpr &index : store->indices)
-      reads(index);
-    if (store->predicate.has_value())
-      reads(store->predicate.value());
-    for (const VarNode *data : reads.data)
-      ++expression_reads_[data];
-    expression_reuse_allowed_ =
-        !store->predicate.has_value() || is_one(store->predicate.value());
-    PostOrderVisit(store->value, [&](const ObjectRef &node) {
-      if (node.as<SelectNode>())
-        expression_reuse_allowed_ = false;
-      if (const auto *call = node.as<CallNode>();
-          call && call->op.same_as(Op::Get("tirx.if_then_else")))
-        expression_reuse_allowed_ = false;
-    });
-    BufferLoad dst = Base(BufferLoad(store->buffer, store->indices));
-    CheckAligned(dst);
-    Value result = LowerExpr(store->value, dst);
-    if (result.scalar.defined()) {
-      Emit("duplicate",
-           {Ptr(dst, kAccessWrite), cast(output_dtype_, result.scalar)});
-    } else if (!result.tile.value().same_as(dst)) {
-      EmitBitCopy(dst, result.tile.value());
-    }
-    return MakeSeq(emitted_);
+    return MaterializeAssignmentPlan(PlanAssignment(store));
   }
 
   Stmt LowerUBCopy(const Copy &copy) {
@@ -1676,11 +1776,11 @@ private:
       ICHECK(load != nullptr);
       count_ = 1;
       active_count_ = make_const(DataType::Int(32), 1);
-      emitted_.clear();
+      BeginAssignmentPlan();
       BufferLoad dst(store->buffer, store->indices);
       CheckAligned(dst);
-      EmitBitCopy(dst, GetRef<BufferLoad>(load));
-      return MakeSeq(emitted_);
+      PlanBitCopy(dst, GetRef<BufferLoad>(load));
+      return MaterializeAssignmentPlan(FinishAssignmentPlan());
     }
     return VisitStmt(loop);
   }
@@ -1871,23 +1971,17 @@ private:
 
   arith::Analyzer analyzer_;
   VectorExpressionLastUse last_use_;
-  VectorExpressionLastUse::StorageSet dead_inputs_;
-  std::unordered_map<const VarNode *, size_t> expression_reads_;
   bool dense_reuse_region_{false};
-  bool expression_reuse_allowed_{false};
   LayoutMap layouts_;
   bool mixed_cube_{false};
   bool row_partitioned_{false};
   bool private_operation_{false};
   Array<Var> aiv_private_;
   Array<Buffer> scratch_;
-  Array<Stmt> emitted_;
+  std::optional<AssignmentPlanningState> assignment_;
   Map<Var, PrimExpr> base_map_;
   PrimExpr linear_index_;
   PrimExpr active_count_;
-  DataType output_dtype_;
-  ValueMap values_;
-  std::unordered_map<PrimExpr, BufferLoad, ValueHash, ValueEqual> row_blocks_;
   int64_t batch_rows_{0};
   int64_t batch_columns_{0};
   Optional<Var> batch_row_var_;
