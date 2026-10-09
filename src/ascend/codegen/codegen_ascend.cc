@@ -1521,6 +1521,9 @@ void CodeGenTileLangAscend::EmitCrossCoreSync_(const CallNode *op,
       << intrinsic
       << " expects exactly 3 arguments (mode_id int, pipe string, flag_id)";
   const int64_t mode_id = GetIntImmArg(op, 0, intrinsic, "mode_id");
+  ICHECK(!is_dav2201_ || (mode_id >= 0 && mode_id <= 2))
+      << "dav-2201 cross-core synchronization supports modes 0, 1, 2; "
+         "mode 4 requires dav-3510";
   const char *scope = GetCrossCoreSyncScope(mode_id);
   const std::string pipe = GetStringImmArg(op, 1, intrinsic, "pipe");
   const std::string flag_id = PrintExpr(op->args[2]);

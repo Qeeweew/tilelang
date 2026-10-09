@@ -225,6 +225,20 @@ plan. The pass responsibilities are:
 Codegen does not partition logical work or choose buffer versions. Resource
 validation and synchronization consume the same selected plan.
 
+When automatic scheduling is disabled, `InferBufferAliases` proves pairwise
+storage reuse from the explicit native instruction stream. This is separate
+from `T.Stage`, which uses the common scheduled plan and synchronization path.
+The analysis binds variables by their actual For/immutable Bind/cthread
+identity and instantiates finite execution contexts; names do not identify
+threads or events. Program order belongs to one physical core, AIV participant
+and pipe. Only a real flag handshake or barrier supplies completion across
+pipes or cores. Private UB lifetimes are checked per AIV; shared L1 needs all
+participants. A 2201 mode-2 acquire requires both AIV contributions for the same
+flag generation. Unknown event identities and unbounded or over-budget loops
+retain may-access lifetimes and cannot manufacture a completion edge. Explicit
+unpolluted synchronization outside a summarized loop can still prove whole-loop
+retirement.
+
 Within `PrepareMultiBuffer`, owner analysis retains the active epoch guard and
 its definition position until guard canonicalization finishes. Equivalent
 guards use one dominating snapshot, and both counter emission and serialized

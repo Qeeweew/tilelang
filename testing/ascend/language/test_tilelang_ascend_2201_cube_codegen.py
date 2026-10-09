@@ -5,6 +5,7 @@ import pytest
 import tilelang
 from tilelang import tvm
 from tilelang.ascend import language as T
+from tvm import tirx
 
 
 def _kernel(dtype, transpose_b):
@@ -82,3 +83,24 @@ def test_automatic_pipeline_emits_native_cube_dma_signatures(dtype, transpose_b)
     assert "asc_copy_gm2l1_dn2nz(" not in source
     assert "asc_copy_l12l0b_transpose(" not in source
     assert "tl::ascend_gemm_l1" not in source
+
+
+@pytest.mark.parametrize("arrive", [False, True], ids=["wait", "arrive"])
+@pytest.mark.parametrize("arch", ["dav-2201", "dav-3510"])
+def test_mode4_cross_core_sync_requires_3510_at_direct_codegen(arrive, arch):
+    # The no-auto path bypasses InsertSync. Codegen must still reject the
+    # unsupported native mode instead of relying on that pass's validation.
+    name = "tl.ascend_cross_core_" + ("set_flag" if arrive else "wait_flag")
+    call = tirx.Evaluate(tirx.Call("void", tvm.ir.Op.get(name), [4, "PIPE_MTE3", 0]))
+    target = tvm.target.Target({"kind": "ascend", "arch": arch})
+    function = tirx.PrimFunc([], call).with_attr({
+        "global_symbol": "mode4_probe", "calling_conv": 2, "target": target,
+    })
+    build = tvm.ffi.get_global_func("target.build.tilelang_ascend_without_compile")
+    module = tvm.IRModule({"main": function})
+    if arch == "dav-2201":
+        with pytest.raises(tvm.error.InternalError, match="mode 4 requires dav-3510"):
+            build(module, target)
+    else:
+        source = build(module, target).inspect_source()
+        assert "asc_sync_intra_" + ("arrive" if arrive else "wait") + "(" in source
