@@ -217,3 +217,39 @@ def test_gm_ring_uses_collective_readiness_reuse_and_balanced_fill_drain():
     assert initial == drained and len(initial) == 2
     after = transform.MaterializeMultiBuffer()(before)
     assert int(_physical_owner(after, scratch.data).shape[0]) == 2
+
+
+def test_public_workspace_allocation_registers_every_private_owner():
+    from tilelang.ascend import language as T
+    from testing.ascend._ir import schedule
+
+    @T.prim_func
+    def main(A: T.Tensor((5, 64), "float32"), O: T.Tensor((5, 64), "float32")):
+        with T.Kernel(1):
+            first = T.alloc_workspace((64,), "float32")
+            second = T.alloc_workspace((64,), "float32")
+            a = T.alloc_shared((64,), "float32")
+            b = T.alloc_shared((64,), "float32")
+            c = T.alloc_shared((64,), "float32")
+            T.annotate_buffer_versions({a: 1, b: 1, c: 1})
+            for t in T.serial(5, annotations={"enable_offset": True,
+                                              "tl.ascend_preserve_issue_order": True}):
+                with T.Stage(0):
+                    T.copy(A[t, :], a)
+                    T.copy(a, first)
+                with T.Stage(1):
+                    T.copy(first, b)
+                    T.copy(b, second)
+                with T.Stage(2):
+                    T.copy(second, c)
+                    T.copy(c, O[t, :])
+
+    main = main.with_attr("target", tvm.target.Target({"kind": "ascend", "arch": "dav-2201"}))
+    after = schedule(main, through="MaterializeMultiBuffer")
+    root = next(block for block in nodes(after, tirx.SBlock) if block.name_hint == "tilelang_root")
+    registered = set(root.annotations[WORKSPACES])
+    owners = [buffer for buffer in root.alloc_buffers if buffer.data in registered]
+    assert len(owners) == 2
+    assert all(buffer.scope() == "global" and tuple(int(d) for d in buffer.shape) == (2, 64)
+               for buffer in owners)
+    assert len(after["main"].params) == 2  # Private generations never extend the caller ABI.

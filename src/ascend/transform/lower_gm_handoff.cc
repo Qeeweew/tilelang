@@ -22,6 +22,7 @@
 #include "ascend/op/utils.h"
 #include "ascend/target_utils.h"
 #include "ascend/transform/attr.h"
+#include "ascend/transform/storage_footprint.h"
 #include "op/builtin.h"
 #include "op/utils.h"
 
@@ -178,19 +179,18 @@ private:
     SBlock result = Downcast<SBlock>(Parent::VisitStmt_(op));
     Root root = std::move(roots_.back());
     roots_.pop_back();
-    if (!root.buffers.empty()) {
+    if (!root.buffers.empty() ||
+        result->annotations.count(attr::kCompilerWorkspaceStorages)) {
       auto *writer = result.CopyOnWrite();
-      Array<Var> compiler_storages;
-      if (auto existing =
-              writer->annotations.Get(attr::kCompilerWorkspaceStorages))
-        compiler_storages = existing.value().cast<Array<Var>>();
+      Array<Var> compiler_storages = ascend::CompilerWorkspaceStorageList(result);
       for (const Buffer &buffer : root.buffers) {
         writer->alloc_buffers.push_back(buffer);
         compiler_storages.push_back(buffer->data);
       }
       writer->annotations.Set(attr::kCompilerWorkspaceStorages,
                               compiler_storages);
-      writer->body = CoreRegionDistributor().Rewrite(writer->body);
+      if (!root.buffers.empty())
+        writer->body = CoreRegionDistributor().Rewrite(writer->body);
     }
     return result;
   }

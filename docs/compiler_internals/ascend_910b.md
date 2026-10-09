@@ -818,8 +818,12 @@ validator for manual kernels or kernels without an automatic loop. UB, L1 and
 3510 retain their existing policies. Final physical allocations and native
 completion still need their own validation.
 
-Compiler-created GM handoff storage also uses this buffer-version and epoch
-protocol. Its root provenance annotation,
+Compiler-created GM handoff storage and explicit `T.alloc_workspace(shape,
+dtype)` allocations use this buffer-version and epoch protocol. The public
+allocator describes one logical generation, including grid and owner axes;
+it does not register an external parameter or change a caller-owned ABI.
+Multiple allocator calls merge storage identities in the frontend, and
+LowerGmHandoff canonicalizes that declaration before owner analysis. Its root provenance annotation,
 `tl.ascend.compiler_workspace_storages`, registers allocation data Vars;
 external tensors and unregistered user global allocations are not automatic
 candidates. A version slot includes the complete grid capacity, so a workspace

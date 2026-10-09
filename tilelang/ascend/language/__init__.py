@@ -9,6 +9,7 @@ from tilelang.language.common import __all__ as _COMMON_ALL
 # bool buffers in the requested scope, without CUDA's static-scope hack.
 from .allocate import (  # noqa: F401
     alloc_shared,
+    alloc_workspace,
     alloc_l1,
     alloc_l0a,
     alloc_l0a_sf,

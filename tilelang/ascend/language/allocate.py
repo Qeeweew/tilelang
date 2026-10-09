@@ -23,6 +23,23 @@ def alloc_shared(shape: ShapeType, dtype: DType, scope="shared.dyn") -> Buffer:
     return _with_span(T.sblock_alloc_buffer(shape, dtype, scope=scope))
 
 
+def alloc_workspace(shape: ShapeType, dtype: DType) -> Buffer:
+    """Allocate private runtime-managed GM storage eligible for versioning.
+
+    The shape describes one logical generation, including any grid/owner axes.
+    The ordinary buffer owner and dependency analysis determine its lifetime;
+    stages and version hints determine bounded physical storage. Host lowering
+    allocates aligned storage on the caller's stream and owns its lifetime.
+    This declaration cannot register an external tensor or enlarge its ABI.
+    Allocate it in the kernel's root block, as with on-chip tiles.
+    """
+    buffer = _with_span(T.sblock_alloc_buffer(shape, dtype, scope="global"))
+    # Maps merge across allocator calls in the script builder; distinct array
+    # annotations would conflict rather than append their storage identities.
+    sblock_attr({"tl.ascend.compiler_workspace_storages": {buffer.data: T.int32(1)}})
+    return buffer
+
+
 def alloc_l1(shape: ShapeType, dtype: DType, scope="shared.l1") -> Buffer:
     """Allocate an L1 buffer (__cbuf__) on Ascend NPU.
 
@@ -130,6 +147,7 @@ def alloc_l0b_sf(buf: Buffer, sf_dtype: DType = "uint16", sf_shape: ShapeType | 
 
 __all__ = [
     "alloc_shared",
+    "alloc_workspace",
     "alloc_l1",
     "alloc_l0a",
     "alloc_l0a_sf",

@@ -46,16 +46,30 @@ namespace ascend {
 using CompilerWorkspaceStorageSet =
     std::unordered_set<tirx::Var, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>;
 
+inline ffi::Array<tirx::Var>
+CompilerWorkspaceStorageList(const tirx::SBlock &root) {
+  auto annotation = root->annotations.Get(attr::kCompilerWorkspaceStorages);
+  if (!annotation.has_value())
+    return {};
+  if (auto storages = annotation.value().try_cast<ffi::Array<tirx::Var>>())
+    return storages.value();
+  // Public allocator calls use a mergeable map in the script builder. The
+  // handoff boundary publishes the same canonical list as generated storage.
+  ffi::Array<tirx::Var> storages;
+  for (const auto &[storage, enabled] :
+       annotation.value().cast<ffi::Map<tirx::Var, PrimExpr>>()) {
+    ICHECK(tirx::is_one(enabled)) << "Invalid compiler workspace declaration";
+    storages.push_back(storage);
+  }
+  return storages;
+}
+
 // Provenance is checked against the allocation owner once at each scheduling
 // contract boundary. Names and the first accessed Buffer view are not owners.
 inline CompilerWorkspaceStorageSet
 GetCompilerWorkspaceStorages(const tirx::SBlock &root) {
   CompilerWorkspaceStorageSet result;
-  auto annotation = root->annotations.Get(attr::kCompilerWorkspaceStorages);
-  if (!annotation.has_value())
-    return result;
-  for (const tirx::Var &storage :
-       annotation.value().cast<ffi::Array<tirx::Var>>()) {
+  for (const tirx::Var &storage : CompilerWorkspaceStorageList(root)) {
     bool has_owner = false;
     for (const tirx::Buffer &buffer : root->alloc_buffers) {
       has_owner |= buffer->data.same_as(storage) && buffer.scope() == "global";
