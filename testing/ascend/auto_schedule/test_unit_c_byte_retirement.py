@@ -135,6 +135,31 @@ def test_full_dsl_keeps_independent_c_pitches_and_ab_completion_without_owner_m_
     assert 'asc_sync_pipe(PIPE_M);' not in source
 
 
+def test_shifted_independent_c_results_keep_full_fix_retirement_without_m_barrier():
+    before, (cq, cp) = _fixture()
+
+    def post(node):
+        if isinstance(node, tirx.For) and node.loop_var.name == "epoch":
+            return tirx.For(node.loop_var, node.min, node.extent, node.kind, node.body,
+                            annotations={"enable_offset": True,
+                                         "tl.ascend_preserve_issue_order": True})
+        if (isinstance(node, tirx.AttrStmt) and node.attr_key == "tl.schedule_unit"
+                and isinstance(node.body, tirx.For) and node.body.loop_var.name == "pv_owner"):
+            return tirx.AttrStmt({"stage": 1}, node.attr_key, node.value, node.body)
+
+    before["main"] = before["main"].with_body(
+        tirx.stmt_functor.ir_transform(before["main"].body, None, post))
+    scheduled, _, lowered = _through_sync(before)
+    # Capacity admission keeps C independent. Full-result completion still
+    # retires each C lifetime without claiming whole-MAD retirement.
+    assert frozenset((cq.data, cp.data)) not in _pairs(scheduled)
+    records = list(_trace(lowered, core=2, lane=0))
+    _, require = _ordinary_graph(records)
+    activations = _assert_closed_byte_protocol(records, require,
+                                               {"qk_result", "pv_result"}, barrier=False)
+    assert len(activations) == 12
+
+
 def _fixture(*, native_k=3, epochs=3, active_first=0, active_count=3, kind="full",
              epoch_name="epoch"):
     """Two genuine scheduled result streams; AutoSchedule chooses the pair."""

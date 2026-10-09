@@ -720,6 +720,11 @@ order alongside its nonnegative composed graph. Issue-only MTE/FIX order
 does not provide this completion fact. In the selected C-byte protocol the
 matching full FIX first completes into the real M drain, which then precedes
 the next phase's MAD; unit readiness alone cannot shorten the lifetime.
+The same full-result contract also applies when the two unaliased C
+allocations fit independently and have no additional user conflict/alias
+declarations. Keeping separate C bases does not require an extra whole-M
+entry barrier. Optional late aliasing still needs its ordinary completion
+proof; A/B credits still require each whole MAD to complete.
 Every query consumes this selected physical reservation, including a manual
 ancestor of an automatically pipelined child; established ring counts remain
 hard lower bounds.

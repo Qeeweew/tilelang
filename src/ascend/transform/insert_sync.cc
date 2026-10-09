@@ -5214,12 +5214,14 @@ bool HasClosedKernelUnitDirection(
 }
 
 // The installed dav-2201 inner-product Matmul reuses one canonical C bank
-// through matching complete unit results. Admit only the automatically
-// selected two-allocation phase pair here. The broader unit selector also
-// accepts column prefixes; those do not establish this C-byte contract.
+// through matching complete unit results. The same complete byte-retirement
+// contract applies to two independent C allocations that fit without aliasing.
+// The broader unit selector also accepts column prefixes; those do not
+// establish this C-byte contract.
 bool HasClosedCByteRetirement(const ScheduledTIRMetadata &metadata,
                               const SelectedL0PhaseReuse &selected,
-                              const std::vector<UnitFlagStreamPlan> &plans) {
+                              const std::vector<UnitFlagStreamPlan> &plans,
+                              int64_t capacity) {
   if (plans.size() != 2 || plans[0].c->data.same_as(plans[1].c->data))
     return false;
   size_t allocations = 0;
@@ -5229,8 +5231,12 @@ bool HasClosedCByteRetirement(const ScheduledTIRMetadata &metadata,
       if (!buffer.same_as(plans[0].c) && !buffer.same_as(plans[1].c))
         return false;
     }
-  if (!selected.ContainsPair(plans[0].c->data, plans[1].c->data) ||
-      allocations != 2)
+  bool selected_alias =
+      selected.ContainsPair(plans[0].c->data, plans[1].c->data);
+  if (allocations != 2 ||
+      (!selected_alias &&
+       (metadata.has_buffer_aliases ||
+        metadata.root_conflict_hints.size() != selected.Pairs().size())))
     return false;
   auto full = [](const Buffer &buffer, const Array<Range> &region) {
     if (!unit_flag_stream_detail::AdmissibleCDomain(buffer, region))
@@ -5241,6 +5247,7 @@ bool HasClosedCByteRetirement(const ScheduledTIRMetadata &metadata,
         return false;
     return true;
   };
+  int64_t independent_bytes = 0;
   for (const auto &plan : plans) {
     auto version = metadata.buffer_versions.Get(plan.c->data);
     // Phase-pair selection consumes an explicit fixed-one version entry.
@@ -5265,8 +5272,11 @@ bool HasClosedCByteRetirement(const ScheduledTIRMetadata &metadata,
     auto columns = unit_flag_stream_detail::Constant(plan.c->shape[1]);
     if (!rows || !columns || (*rows / 16) * (*columns / 16) < 10)
       return false;
+    if (*rows > capacity / 4 / *columns)
+      return false;
+    independent_bytes += *rows * *columns * 4;
   }
-  return true;
+  return selected_alias || independent_bytes <= capacity;
 }
 
 // Empty M tasks are insertion sites only: they do not claim a C access or
@@ -6351,7 +6361,7 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
       closed_c_byte_retirement =
           enable_c_byte_retirement && kernel_direction &&
           HasClosedCByteRetirement(scheduled_tir.metadata, selected_reuse,
-                                   unit_streams);
+                                   unit_streams, target_info.l0c_bytes);
       if (runtime::detail::VerboseLoggingEnabled(__FILE__, 1)) {
         LOG(INFO) << "Unit streams=" << unit_streams.size()
                   << " kernel direction=" << kernel_direction
