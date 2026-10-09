@@ -421,6 +421,73 @@ def test_guarded_fixed_q_cache_shares_with_the_automatic_pv_ring():
     _assert_late_bases(artifact, cached_qk=True)
 
 
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+@pytest.mark.parametrize("automatic", [False, True], ids=["closed-serial-epoch", "automatic-epoch"])
+def test_balanced_l1_gemms_keep_the_actual_epoch_storage_contract(dtype, automatic):
+    @T.prim_func
+    def main(Q: T.Tensor((16, 64), dtype), K: T.Tensor((320, 64), dtype),
+             P: T.Tensor((16, 320), dtype), V: T.Tensor((320, 64), dtype),
+             Score: T.Tensor((2, 16, 320), "float32"),
+             Result: T.Tensor((2, 16, 64), "float32")):
+        with T.Kernel(1):
+            q = T.alloc_l1((16, 64), dtype)
+            k = T.alloc_l1((320, 64), dtype)
+            p = T.alloc_l1((16, 320), dtype)
+            v = T.alloc_l1((320, 64), dtype)
+            score = T.alloc_l0c((16, 320), "float32")
+            result = T.alloc_l0c((16, 64), "float32")
+            if automatic:
+                for epoch in T.Pipelined(2, max_stages=3):
+                    T.copy(Q, q)
+                    T.copy(K, k)
+                    T.gemm(q, k, score, transpose_B=True, clear_accum=True)
+                    T.copy(score, Score[epoch, :, :])
+                    T.copy(P, p)
+                    T.copy(V, v)
+                    T.gemm(p, v, result, clear_accum=True)
+                    T.copy(result, Result[epoch, :, :])
+            else:
+                for epoch in T.serial(2):
+                    T.copy(Q, q)
+                    T.copy(K, k)
+                    T.gemm(q, k, score, transpose_B=True, clear_accum=True)
+                    T.copy(score, Score[epoch, :, :])
+                    T.copy(P, p)
+                    T.copy(V, v)
+                    T.gemm(p, v, result, clear_accum=True)
+                    T.copy(result, Result[epoch, :, :])
+
+    artifact, snapshots = _lower(main)
+    before = _root(snapshots["tl.AnnotateMultiBufferEligible"])
+    synced = _root(snapshots["tl.InsertSync"])
+    physical = _root(snapshots["tl.MaterializeMultiBuffer"])
+    selected = _pairs(snapshots["tl.AutoSchedule"])
+    aliases = synced.annotations["tl.buffer_alias_map"]
+    for scope in ("shared.l0a", "shared.l0b"):
+        operands = [buffer for buffer in before.alloc_buffers if buffer.scope() == scope]
+        assert len(operands) == 2, "Equal native chunks need no separate tail owner"
+        first, second = (buffer.data for buffer in operands)
+        actual = [buffer for buffer in physical.alloc_buffers
+                  if buffer.data.same_as(first) or buffer.data.same_as(second)]
+        assert len(actual) == 2, "Logical layouts and independent version owners remain intact"
+        banks = [allocation.buffer for function in artifact.device_mod.functions.values()
+                 for allocation in nodes(function, tirx.AllocBuffer)
+                 if allocation.buffer.scope() == scope + ".dyn"]
+        (bank,) = banks
+        if automatic:
+            # The existing closed-phase certificate does not admit an offset
+            # automatic outer epoch. Keep its independent rings and sum all
+            # actual slots, rather than inferring a max-budget from syntax.
+            assert frozenset((first, second)) not in selected
+            assert second not in aliases[first] and first not in aliases[second]
+            assert _bytes(bank) == sum(map(_bytes, actual)) <= 65536
+        else:
+            assert frozenset((first, second)) in selected
+            assert second in aliases[first] and first in aliases[second]
+            assert _bytes(bank) == max(map(_bytes, actual)) <= 65536
+    assert _PAIRS not in synced.annotations
+
+
 def _matching_unit_boundary(records, event, start, end, *, notify_before=None,
                             root=False, prefix=()):
     sent, received = defaultdict(list), defaultdict(list)

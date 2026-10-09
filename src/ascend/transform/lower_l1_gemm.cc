@@ -186,7 +186,18 @@ private:
           << ", L0A bytes=" << target_.l0a_bytes
           << ", L0B bytes=" << target_.l0b_bytes << ")";
     }
-    return std::min(tile_k, Align16(gemm->k_));
+    tile_k = std::min(tile_k, Align16(gemm->k_));
+    if (gemm->k_ % tile_k != 0) {
+      const int64_t chunks = gemm->k_ / tile_k + (gemm->k_ % tile_k != 0);
+      // Equal aligned chunks within the existing capacity bound need no
+      // separate tail allocation. Keep the original native chunk count.
+      if (chunks > 1 && gemm->k_ % chunks == 0) {
+        const int64_t balanced_k = gemm->k_ / chunks;
+        if (balanced_k % 16 == 0)
+          return balanced_k;
+      }
+    }
+    return tile_k;
   }
 
   PrimExpr NonterminalUnitFlag(const PrimExpr &terminal) {

@@ -62,7 +62,13 @@ keep their control boundary; larger loops are not expanded.
 
 L1 GEMM is expanded before layout inference into explicit L0 allocations,
 L1-to-L0 copies and ordinary L0 GEMM tasks. A bounded sub-K loop keeps IR size
-independent of K; a final partial chunk has its own compact allocation. The
+independent of K. After the capacity bound, lowering prefers equal 16-aligned
+chunks when they cover K exactly with the same number of native MADs. This
+avoids a separate tail allocation without increasing the native call count;
+it does not establish a measured latency advantage. Other splits retain their
+final partial chunk and its compact allocation. This selection does not grant
+cross-phase aliasing: scheduling and synchronization retain their existing
+epoch, version and completion contracts. The
 allocator and scheduler see these buffers and operations, including their
 read/write regions. No private template mutex or hidden allocation participates
 in this path. The L1 precision path uses matching FP16/BF16 NN or NT operands

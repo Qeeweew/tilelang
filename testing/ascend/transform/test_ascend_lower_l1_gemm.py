@@ -9,13 +9,13 @@ from tvm import tirx
 from tvm.tirx.stmt_functor import post_order_visit
 
 
-def _program(m, n, k, *, clear=True, unit_flag=None, transpose_a=False, transpose_b=True, arch="dav-2201"):
+def _program(m, n, k, *, clear=True, unit_flag=None, transpose_a=False, transpose_b=True, arch="dav-2201", dtype="bfloat16"):
     # Offsets verify that the transform slices the operation region instead of
     # reloading the allocation's origin. Both offsets satisfy native alignment.
     a_shape = (k + 32, m + 16) if transpose_a else (m + 16, k + 32)
     b_shape = (n + 16, k + 32) if transpose_b else (k + 32, n + 16)
-    a = tirx.decl_buffer(a_shape, "bfloat16", name="a", scope="shared.l1")
-    b = tirx.decl_buffer(b_shape, "bfloat16", name="b", scope="shared.l1")
+    a = tirx.decl_buffer(a_shape, dtype, name="a", scope="shared.l1")
+    b = tirx.decl_buffer(b_shape, dtype, name="b", scope="shared.l1")
     c = tirx.decl_buffer((m, n), "float32", name="c", scope="shared.l0c")
 
     def region(buffer, origin, shape):
@@ -99,7 +99,7 @@ def _executed_unit_flags(module, bindings=None):
     return result
 
 
-@pytest.mark.parametrize("k", [64, 134, 256, 262, 1024, 1030], ids=["single", "one-and-tail", "loop", "loop-and-tail", "long-loop", "long-loop-and-tail"])
+@pytest.mark.parametrize("k", [64, 134, 192, 256, 262, 1024, 1030], ids=["single", "one-and-tail", "balanced", "loop", "loop-and-tail", "long-loop", "long-loop-and-tail"])
 @pytest.mark.parametrize("control", [None, 0, 1, 2, 3], ids=["absent", "disabled", "raw-1", "check-only", "check-and-set"])
 def test_native_k_chunks_keep_check_until_the_terminal_control(k, control):
     after = transform.AscendLowerL1Gemm()(_program(128, 128, k, unit_flag=control))
@@ -114,7 +114,7 @@ def test_native_k_chunks_keep_check_until_the_terminal_control(k, control):
         assert all("unit_flag_ctrl" not in mad.annotations for mad in _calls(after, "tl.tileop.gemm"))
 
 
-@pytest.mark.parametrize("k", [64, 134, 256, 262])
+@pytest.mark.parametrize("k", [64, 134, 192, 256, 262])
 def test_conditional_unit_protocol_retains_check_only_when_enabled(k):
     enabled = tirx.Var("unit_enabled", "bool")
     control = tirx.Select(enabled, tirx.IntImm("int32", 3), tirx.IntImm("int32", 0))
@@ -180,18 +180,65 @@ def test_static_tail_has_its_own_compact_allocation_and_terminal_completion():
     assert int(source_extents[1]) == 6
 
 
+@pytest.mark.parametrize("m,n,k,chunk,trips", [
+    (16, 320, 64, 32, 2),
+    (16, 64, 320, 160, 2),
+    (128, 128, 192, 96, 2),
+    (128, 128, 384, 128, 3),
+])
+@pytest.mark.parametrize("transpose_b", [False, True], ids=["nn", "nt"])
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+def test_equal_native_chunks_cover_k_without_extra_tail_owners(m, n, k, chunk, trips, transpose_b, dtype):
+    after = transform.AscendLowerL1Gemm()(_program(
+        m, n, k, transpose_b=transpose_b, dtype=dtype, unit_flag=3))
+    (loop,) = _nodes(after, tirx.For)
+    (mad,) = _calls(after, "tl.tileop.gemm")
+    assert int(loop.extent) == trips and int(mad.args[7]) == chunk
+    assert len(_l0_buffers(after)) == 2
+    assert _executed_unit_flags(after) == [2] * (trips - 1) + [3]
+    a_copy, b_copy = _calls(after, "tl.tileop.ascend_copy")
+    for copy, axis, fixed in ((a_copy, 1, 16),
+                              (b_copy, 1 if transpose_b else 0, 16)):
+        _, origin, extents = _region(copy.args[0])
+        intervals = []
+        for iteration in range(trips):
+            binding = {loop.loop_var: tirx.IntImm("int32", iteration)}
+            start = _constant(tirx.stmt_functor.substitute(origin[axis], binding))
+            intervals.append((start, start + int(extents[axis])))
+            clear = _constant(tirx.stmt_functor.substitute(mad.args[9], binding))
+            assert clear == int(iteration == 0)
+        assert intervals == [(32 + i * chunk, 32 + (i + 1) * chunk) for i in range(trips)]
+        assert intervals[-1][1] == 32 + k
+        assert int(origin[1 - axis]) == fixed
+    for buffer in _l0_buffers(after):
+        assert math.prod(map(int, buffer.shape)) * 2 <= 32768
+
+
+@pytest.mark.parametrize("k", [80, 208])
+def test_nonuniform_aligned_split_retains_compact_tail_instead_of_extra_mads(k):
+    m, n, capacity_chunk = (16, 320, 48) if k == 80 else (128, 128, 128)
+    after = transform.AscendLowerL1Gemm()(_program(m, n, k, unit_flag=3))
+    assert not _nodes(after, tirx.For)
+    full, tail = _calls(after, "tl.tileop.gemm")
+    assert [int(mad.args[7]) for mad in (full, tail)] == [capacity_chunk, k - capacity_chunk]
+    assert len(_l0_buffers(after)) == 4
+    assert _executed_unit_flags(after) == [2, 3]
+
+
+@pytest.mark.parametrize("k", [192, 1024], ids=["balanced", "capacity-chunks"])
 @pytest.mark.parametrize("clear", [False, True])
-def test_accumulator_clear_and_completion_apply_at_whole_gemm_boundaries(clear):
-    after = transform.AscendLowerL1Gemm()(_program(128, 128, 1024, clear=clear, unit_flag=3))
+def test_accumulator_clear_and_completion_apply_at_whole_gemm_boundaries(clear, k):
+    after = transform.AscendLowerL1Gemm()(_program(128, 128, k, clear=clear, unit_flag=3))
     (loop,) = _nodes(after, tirx.For)
     (mad,) = _calls(after, "tl.tileop.gemm")
     assert int(mad.args[2].args[1]) == 3
-    for iteration in (0, 1, 7):
+    last = int(loop.extent) - 1
+    for iteration in {0, 1, last}:
         substitute = {loop.loop_var: tirx.IntImm("int32", iteration)}
         actual_clear = _constant(tirx.stmt_functor.substitute(mad.args[9], substitute))
         completion = _constant(tirx.stmt_functor.substitute(mad.annotations["unit_flag_ctrl"], substitute))
         assert actual_clear == int(clear and iteration == 0)
-        assert completion == (3 if iteration == 7 else 2)
+        assert completion == (3 if iteration == last else 2)
 
 
 def test_logical_matrix_tails_preserve_geometry_with_padded_storage():
