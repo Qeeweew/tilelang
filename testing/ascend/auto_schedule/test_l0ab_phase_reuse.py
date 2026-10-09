@@ -541,8 +541,9 @@ def _assert_balanced_operand_completions(mod, selected):
         writer = prior[-1][0]
         require(3 * writer + 2, 3 * reader + 1)
         for overwrite, target, low, high in writes:
-            if (reader < overwrite and buffer.data in shared and target.data in shared
-                    and target.scope() == buffer.scope() and begin < high and low < end):
+            if (reader < overwrite and (target.data.same_as(buffer.data) or
+                    (buffer.data in shared and target.data in shared and target.scope() == buffer.scope()))
+                    and begin < high and low < end):
                 require(3 * reader + 2, 3 * overwrite + 1)
 
 

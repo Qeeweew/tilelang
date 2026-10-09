@@ -954,8 +954,8 @@ def z3_schedule_loop_python(
         stages and emitted version counts fixed. They never replace dependencies.
     prefetch_priority_pairs : list[tuple[int, int]] | None
         Soft load-to-consumer preferences from eligible typed GM-to-on-chip
-        forward RAW accesses on one concrete core and distinct pipes. Applied
-        at the selected II before fixing stages or recalculating versions; a
+        or L1-to-native-operand forward RAW accesses on one concrete core and
+        distinct pipes. Applied at the selected II before fixing stages or recalculating versions; a
         preference requires both epoch lead and producer-first physical issue.
     stage_horizon : int | None
         Optional maximum number of task stages for automatic Ascend pipelines.

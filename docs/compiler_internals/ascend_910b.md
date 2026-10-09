@@ -598,9 +598,11 @@ schedules do not use it.
 
 Ordinary automatic 2201 loops with offsets also consider prefetch at the
 already selected II, before fixing stages or recalculating versions.
-A typed GM-to-L1/UB copy and its forward RAW reader qualify only on the same
-concrete core and distinct pipes, with one automatic storage owner and a
-version variable. Read-modify-write roles, ambiguous or mixed-core units,
+A typed GM-to-L1/UB copy, or L1-to-L0A/B native load and its MAD leaf reader,
+qualifies only on the same concrete core and distinct pipes, with one automatic storage owner and a
+version variable. Native loads include the selected load3D operation and
+stop at an asynchronous Cube leaf, without promoting an opaque compound.
+Read-modify-write roles, ambiguous or mixed-core units,
 manual schedules and 3510 are excluded. The bounded joint refinement retains
 every dependency, capacity and completion constraint while leaving stages and
 versions free. It first prefers at least one epoch of consumer lag together

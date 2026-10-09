@@ -204,7 +204,7 @@ public:
   // this source-issue preference. No target timing calibration is implied.
   void SetPreferHandoffIssue(bool value) { prefer_handoff_issue_ = value; }
 
-  // Structural GM prefetch preference for ordinary dav-2201 auto pipelines.
+  // Structural load prefetch preference for ordinary dav-2201 auto pipelines.
   void SetPreferPrefetchIssue(bool value) { prefer_prefetch_issue_ = value; }
 
   // First/last issue summaries are admitted only for the 2201 AIC contract.
@@ -672,7 +672,7 @@ CollectHandoffIssuePreferences(const std::vector<IRStructure *> &nodes,
   return result;
 }
 
-// A preference is a typed asynchronous GM load's forward RAW consumer, not
+// A preference is a typed asynchronous load's forward RAW consumer, not
 // its reverse slot-release edge. Shared dependency facts still establish all
 // readiness, last-reader, owner, tail and SPR constraints independently.
 std::vector<std::pair<int64_t, int64_t>> CollectPrefetchIssuePreferences(
@@ -691,21 +691,49 @@ std::vector<std::pair<int64_t, int64_t>> CollectPrefetchIssuePreferences(
                      std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual>>
       load_storages;
   auto is_load = [&](const TaskNode *task, const Var &storage) {
-    if (!task->UsesOnlyPipe(ResourcePipe::kMTE2))
+    const bool gm = task->UsesOnlyPipe(ResourcePipe::kMTE2);
+    const bool operand = task->UsesOnlyPipe(ResourcePipe::kMTE1);
+    if (!gm && !operand)
       return false;
     auto [entry, inserted] = load_storages.try_emplace(task);
     if (inserted) {
       PostOrderVisit(task->stmt, [&](const ObjectRef &node) {
         const auto *call = node.as<CallNode>();
-        if (!call || !IsAscendCopyCall(call))
+        if (!call)
           return;
-        AscendCopy copy(call->args, call->annotations);
-        if (IsGlobalBuffer(copy->src) &&
-            (IsSharedBuffer(copy->dst) || IsL1Buffer(copy->dst)))
-          entry->second.insert(copy->dst->data);
+        if (IsAscendCopyCall(call)) {
+          AscendCopy copy(call->args, call->annotations);
+          if ((gm && IsGlobalBuffer(copy->src) &&
+               (IsSharedBuffer(copy->dst) || IsL1Buffer(copy->dst))) ||
+              (operand && IsL1Buffer(copy->src) &&
+               (IsL0ABuffer(copy->dst) || IsL0BBuffer(copy->dst))))
+            entry->second.insert(copy->dst->data);
+        } else if (operand && call->op.same_as(AscendCubeLoad3D::Get())) {
+          AscendCubeLoad3D load(call->args, call->annotations);
+          if (IsL1Buffer(load->src->buffer) &&
+              (IsL0ABuffer(load->dst->buffer) ||
+               IsL0BBuffer(load->dst->buffer)))
+            entry->second.insert(load->dst->buffer->data);
+        }
       });
     }
     return entry->second.count(storage) != 0;
+  };
+  auto is_operand_reader = [](const TaskNode *task, const Var &storage) {
+    if (!task->UsesOnlyPipe(ResourcePipe::kCube))
+      return false;
+    bool reads = false;
+    PostOrderVisit(task->stmt, [&](const ObjectRef &node) {
+      const auto *call = node.as<CallNode>();
+      if (call && call->op.same_as(Gemm::Get())) {
+        Gemm gemm(call->args, call->annotations);
+        reads |= (IsL0ABuffer(gemm->a_) &&
+                  gemm->a_->data.same_as(storage)) ||
+                 (IsL0BBuffer(gemm->b_) &&
+                  gemm->b_->data.same_as(storage));
+      }
+    });
+    return reads;
   };
   std::set<std::pair<int64_t, int64_t>> pairs;
   for (const DepInfo &dep : deps) {
@@ -732,6 +760,11 @@ std::vector<std::pair<int64_t, int64_t>> CollectPrefetchIssuePreferences(
           TaskExecutionCore(consumer) != cores[j] ||
           !pair.producer_access.IsWriteOnly() ||
           !pair.consumer_access.IsReadOnly() || !is_load(producer, storage))
+        continue;
+      // A native operand preference stops at its asynchronous MAD leaf. Do
+      // not infer producer-first overlap through an opaque/compound consumer.
+      if (producer->UsesOnlyPipe(ResourcePipe::kMTE1) &&
+          (!nodes[j]->IsTask() || !is_operand_reader(consumer, storage)))
         continue;
       pairs.emplace(i, j);
     }

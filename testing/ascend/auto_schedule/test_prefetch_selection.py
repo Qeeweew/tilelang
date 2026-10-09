@@ -180,6 +180,76 @@ def test_no_prefetch_pairs_preserves_original_model():
     assert _refine(plan, pairs=[]) is plan[2]
 
 
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+@pytest.mark.parametrize("trip", [1, 2, 7])
+def test_native_load_prefetch_keeps_payload_and_all_reader_completions(dtype, trip):
+    from tilelang.ascend import language as T
+    from tvm import tirx
+    from testing.ascend._ir import allocated_buffer, nodes
+    from testing.ascend.auto_schedule.test_l0ab_phase_reuse import (
+        _lower, _root, _assert_balanced_operand_completions,
+    )
+    from testing.ascend.auto_schedule.test_owner_result_completion import _name, _region, _trace
+
+    @T.prim_func
+    def main(A: T.Tensor((16, trip * 64), dtype),
+             B: T.Tensor((128, trip * 64), dtype),
+             O: T.Tensor((16, 128), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_l1((16, trip * 64), dtype)
+            b = T.alloc_l1((128, trip * 64), dtype)
+            aa = T.alloc_l0a((16, 64), dtype)
+            bb = T.alloc_l0b((128, 64), dtype)
+            c = T.alloc_l0c((16, 128), "float32")
+            T.annotate_buffer_versions({a: 1, b: 1, c: 1})
+            T.set_mmad_direction("m")
+            T.copy(A, a)
+            T.copy(B, b)
+            for chunk in T.Pipelined(trip, max_stages=2):
+                with T.Task(latency=1, ii=1):
+                    T.copy(a[:, chunk * 64:(chunk + 1) * 64], aa)
+                with T.Task(latency=1, ii=1):
+                    T.copy(b[:, chunk * 64:(chunk + 1) * 64], bb)
+                with T.Task(latency=1, ii=1):
+                    T.gemm(aa, bb, c, transpose_B=True, clear_accum=chunk == 0)
+            T.copy(c, O)
+
+    _, snapshots = _lower(main)
+    scheduled = snapshots["tl.AutoSchedule"]
+    root = _root(scheduled)
+    versions = root.annotations.get("tl.buffer_versions_map", {})
+    assert [int(versions.get(allocated_buffer(scheduled, name).data, 1)) for name in ("aa", "bb")] == [1 if trip == 1 else 2] * 2
+    loops = [loop for loop in nodes(scheduled, tirx.For) if loop.loop_var.name == "chunk"]
+    if trip == 1:
+        assert not loops  # The normal control normalization removes this loop.
+    else:
+        loop, = loops
+        units = [node for node in nodes(loop.body, tirx.AttrStmt) if node.attr_key == "tl.schedule_unit"]
+        stages = [int(node.node["stage"]) for node in units]
+        assert max(stages) - min(stages) == 1
+
+    lowered = snapshots["tl.LowerScheduledTIR"]
+    _assert_balanced_operand_completions(lowered, set())
+    # Check actual generations, including multiple slot wraps. A later MAD
+    # must consume the chunk loaded into its two physical slots, not merely
+    # an initialized value or a matching annotation.
+    writers, next_chunk = {}, 0
+    for call, env, _ in _trace(lowered, core=2, lane=0):
+        name = _name(call)
+        if name in ("tl.tileop.ascend_copy", "tl.tileop.ascend_cube_load3d"):
+            destination, indices, _ = _region(call.args[1], env)
+            if destination.scope() in ("shared.l0a", "shared.l0b"):
+                source, origin, _ = _region(call.args[0], env)
+                assert source.scope() == "shared.l1"
+                writers[destination.data, indices] = origin[-1] // 64
+        elif name == "tl.tileop.gemm":
+            for argument in call.args[:2]:
+                operand, indices, _ = _region(argument, env)
+                assert writers[operand.data, indices] == next_chunk
+            next_chunk += 1
+    assert next_chunk == trip
+
+
 def test_later_handoff_issue_refinement_preserves_selected_prefetch():
     plan = _plan()
     before = _refine(plan)
