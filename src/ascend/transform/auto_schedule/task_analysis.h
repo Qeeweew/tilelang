@@ -249,9 +249,8 @@ struct TaskResourceUsage {
   bool reads_atomic{false};
 };
 
-// Direct buffer and scalar-variable accesses made by one statement. Accesses
-// remain separate from hardware resource classification because AutoSchedule
-// also adds accesses from surrounding guards and loop expressions to a task.
+// Logical buffer and scalar-variable accesses. These may be persisted on a
+// TaskNode; physical footprints and definite writes belong to fresh analysis.
 struct TaskAccessInfo {
   std::vector<BufferRegion> read_regions;
   std::vector<BufferRegion> write_regions;
@@ -260,6 +259,42 @@ struct TaskAccessInfo {
 };
 
 namespace task_analysis_detail {
+
+// A leaf owns its statement and direct guards. A control header owns only its
+// bounds/step and the control's direct guards, never its child statements.
+// The header statement is the current effect snapshot; its parent determines
+// guard ownership only. Rewriters changing bounds must update that statement
+// together with the control and refresh the stored logical accesses.
+// Keep fragments separate: each projection uses a fresh detector so assumptions
+// and definite-write proofs do not leak between a body and its guards.
+template <typename Consume>
+void ForEachOwnedTaskEffectFragment(const TaskNode *task, Consume consume) {
+  ICHECK(task != nullptr);
+  const IRStructure *guard_owner = task;
+  if (const IRStructure *parent = task->GetParent();
+      parent && parent->IsControl() &&
+      static_cast<const ControlNode *>(parent)->task.get() == task) {
+    guard_owner = parent;
+    const auto *loop = task->stmt.as<ForNode>();
+    ICHECK(loop);
+    consume(Evaluate(loop->min));
+    consume(Evaluate(loop->extent));
+    if (loop->step.defined())
+      consume(Evaluate(loop->step.value()));
+  } else {
+    consume(task->stmt);
+  }
+  for (const auto &guard : guard_owner->GetGuards()) {
+    if (guard->IsCondition()) {
+      consume(Evaluate(
+          static_cast<const ConditionGuard *>(guard.get())->condition));
+    } else {
+      const auto *attribute = static_cast<const AttributeGuard *>(guard.get());
+      if (auto expr = attribute->node.as<PrimExpr>())
+        consume(Evaluate(expr.value()));
+    }
+  }
+}
 
 inline bool IsCrossCoreSyncCall(const CallNode *op) {
   return op->op.same_as(tl::ascend_cross_core_set_flag()) ||
@@ -534,6 +569,22 @@ inline TaskAccessInfo AnalyzeTaskAccesses(const Stmt &stmt) {
   return result;
 }
 
+inline TaskAccessInfo AnalyzeTaskAccesses(const TaskNode *task) {
+  TaskAccessInfo result;
+  auto append = [](auto &dst, const auto &src) {
+    dst.insert(dst.end(), src.begin(), src.end());
+  };
+  task_analysis_detail::ForEachOwnedTaskEffectFragment(
+      task, [&](const Stmt &fragment) {
+        TaskAccessInfo accesses = AnalyzeTaskAccesses(fragment);
+        append(result.read_regions, accesses.read_regions);
+        append(result.write_regions, accesses.write_regions);
+        append(result.read_vars, accesses.read_vars);
+        append(result.write_vars, accesses.write_vars);
+      });
+  return result;
+}
+
 inline bool TaskAccessesStorage(const TaskAccessInfo &accesses,
                                 const Var &storage) {
   auto regions_access = [&](const std::vector<BufferRegion> &regions) {
@@ -759,6 +810,17 @@ inline void ApplyTaskAccesses(const TaskAccessInfo &accesses, TaskNode *task) {
     task->AddReadVar(var);
   for (const Var &var : accesses.write_vars)
     task->AddWriteVar(var);
+}
+
+// Rebuild only logical accesses after changing an active task snapshot.
+// Resource classification, costs and physical lifetime proofs are independent.
+inline void RefreshTaskAccesses(TaskNode *task) {
+  TaskAccessInfo accesses = AnalyzeTaskAccesses(task);
+  task->SetReadRegions({});
+  task->SetWriteRegions({});
+  task->SetReadVars({});
+  task->SetWriteVars({});
+  ApplyTaskAccesses(accesses, task);
 }
 
 } // namespace ascend

@@ -300,15 +300,7 @@ private:
             loop_node->kind, Evaluate(0), loop_node->thread_binding,
             loop_node->annotations, loop_node->step, loop_node->span);
     control->task->outer_ctx = GetConstrSet();
-    ApplyTaskAccesses(AnalyzeTaskAccesses(Evaluate(loop_node->min)),
-                      control->task.get());
-    ApplyTaskAccesses(AnalyzeTaskAccesses(Evaluate(loop_node->extent)),
-                      control->task.get());
-    if (loop_node->step.defined()) {
-      ApplyTaskAccesses(AnalyzeTaskAccesses(Evaluate(loop_node->step.value())),
-                        control->task.get());
-    }
-    ApplyGuardAccesses(control.get(), control->task.get());
+    RefreshTaskAccesses(control->task.get());
 
     {
       auto loop_scope =
@@ -334,7 +326,7 @@ private:
     task->SetGuards(std::move(guards));
     task->outer_ctx = GetConstrSet();
     ApplyTaskResourceUsage(AnalyzeTaskResourceUsage(body), task.get());
-    ApplyTaskAccesses(AnalyzeTaskAccesses(body), task.get());
+    RefreshTaskAccesses(task.get());
     task->SetSpecialReadMask(AnalyzeSpecialRegisterReads(body));
     uint16_t pipe_mask = task->GetPipeMask();
     if (semantic_task->attr_key == attr::kAscendPerCoreTask) {
@@ -362,7 +354,6 @@ private:
       task->SetLatency(metadata.latency.value());
     if (metadata.ii.has_value())
       task->SetII(metadata.ii.value());
-    ApplyGuardAccesses(task.get(), task.get());
     return task;
   }
 
@@ -380,23 +371,6 @@ private:
       control->task = MakeTaskNode();
     control->task->SetParent(control.get());
     return control;
-  }
-
-  void ApplyGuardAccesses(const IRStructure *node, TaskNode *task) {
-    for (const auto &guard : node->GetGuards()) {
-      if (guard->IsCondition()) {
-        const auto *condition =
-            static_cast<const ConditionGuard *>(guard.get());
-        ApplyTaskAccesses(AnalyzeTaskAccesses(Evaluate(condition->condition)),
-                          task);
-        continue;
-      }
-      const auto *attribute = static_cast<const AttributeGuard *>(guard.get());
-      if (const auto *expr = attribute->node.as<PrimExprNode>()) {
-        ApplyTaskAccesses(AnalyzeTaskAccesses(Evaluate(GetRef<PrimExpr>(expr))),
-                          task);
-      }
-    }
   }
 
   std::vector<std::shared_ptr<IRStructure>> result_;

@@ -44,6 +44,7 @@
 #include "./buffer_lifetime_analysis.h"
 #include "./ir_structure.h"
 #include "./memory_detector.h"
+#include "./task_analysis.h"
 #include "ascend/op/utils.h"
 #include "ascend/transform/buffer_version.h"
 #include "support/check.h"
@@ -126,30 +127,7 @@ inline PhysicalTaskAccesses AnalyzePhysicalTaskAccesses(const TaskNode *task) {
     append(result.read_vars, detector.GetReadVars());
     append(result.write_vars, detector.GetWriteVars());
   };
-  const IRStructure *guard_owner = task;
-  if (const IRStructure *parent = task->GetParent();
-      parent && parent->IsControl() &&
-      static_cast<const ControlNode *>(parent)->task.get() == task) {
-    guard_owner = parent;
-    const auto *loop = task->stmt.as<ForNode>();
-    ICHECK(loop);
-    analyze(Evaluate(loop->min));
-    analyze(Evaluate(loop->extent));
-    if (loop->step.defined())
-      analyze(Evaluate(loop->step.value()));
-  } else {
-    analyze(task->stmt);
-  }
-  for (const auto &guard : guard_owner->GetGuards()) {
-    if (guard->IsCondition()) {
-      analyze(Evaluate(
-          static_cast<const ConditionGuard *>(guard.get())->condition));
-    } else {
-      const auto *attribute = static_cast<const AttributeGuard *>(guard.get());
-      if (auto expr = attribute->node.as<PrimExpr>())
-        analyze(Evaluate(expr.value()));
-    }
-  }
+  task_analysis_detail::ForEachOwnedTaskEffectFragment(task, analyze);
   return result;
 }
 

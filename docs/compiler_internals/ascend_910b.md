@@ -110,6 +110,18 @@ regions. Whole-node roles include control-header accesses. Handoff and prefetch
 selection consume these roles without confusing them with individual hazards;
 reversing an owner dependency swaps both its roles and conflict records.
 
+ScheduledTIR decoding and physical alias analysis share one task-effect scope:
+a leaf owns its statement and direct guards; a control header owns only its
+minimum, extent, optional step and direct guards. Child bodies and descendant
+guards retain their own owners. Guard conditions and expression-valued attribute
+nodes contribute memory effects; attribute values have a separate core-input
+availability contract. Each fragment is analyzed independently. Logical regions
+and scalar accesses are stored on the task, while physical footprints, definite
+writes and opaque accesses are freshly derived for lifetime analysis. Moving a
+guard between active owners refreshes both logical access snapshots. A terminal
+rewrite followed immediately by encoding relies on the next decoder instead of
+maintaining a second cache or reanalyzing the whole tree.
+
 After this normalization, native Cube instruction selection may replace
 2201 FP16/BF16 copies with Load3Dv2. A requires canonical L1 NZ and L0A ZA,
 full padded M and a compact aligned K interval. NN B requires canonical L1 NZ,

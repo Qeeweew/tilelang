@@ -5279,32 +5279,14 @@ void InsertUnitFlagBoundaries(std::vector<std::shared_ptr<IRStructure>> &nodes,
       for (const auto &guard : plan->result_loop->GetGuards()) {
         ICHECK(guard->IsCondition());
         guards.push_back(guard->Clone());
-        const auto *condition =
-            static_cast<const ConditionGuard *>(guard.get());
-        ApplyTaskAccesses(AnalyzeTaskAccesses(Evaluate(condition->condition)),
-                          activation->task.get());
       }
       activation->SetGuards(std::move(guards));
       plan->result_loop->SetGuards({});
       // Guard reads now belong to the shell control, while the original
       // result control retains only its original bounds/step reads. Existing
       // task contexts still describe the same condition, now an ancestor.
-      TaskNode *loop_task = plan->result_loop->task.get();
-      loop_task->SetReadRegions({});
-      loop_task->SetWriteRegions({});
-      loop_task->SetReadVars({});
-      loop_task->SetWriteVars({});
-      ApplyTaskAccesses(
-          AnalyzeTaskAccesses(Evaluate(plan->result_loop->control->min)),
-          loop_task);
-      ApplyTaskAccesses(
-          AnalyzeTaskAccesses(Evaluate(plan->result_loop->control->extent)),
-          loop_task);
-      if (plan->result_loop->control->step.defined())
-        ApplyTaskAccesses(
-            AnalyzeTaskAccesses(
-                Evaluate(plan->result_loop->control->step.value())),
-            loop_task);
+      RefreshTaskAccesses(activation->task.get());
+      RefreshTaskAccesses(plan->result_loop->task.get());
       scope = activation.get();
     }
     auto make_site = [&](ResourcePipe pipe, const Stmt &body) {
