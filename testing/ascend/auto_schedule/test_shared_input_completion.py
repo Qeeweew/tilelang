@@ -85,3 +85,54 @@ def test_shared_input_waits_for_every_active_reader(trips, versions, last_stage,
                 "A shared input slot was reused before its last active reader completed"
             )
         last_slot[slot] = epoch
+
+
+@pytest.mark.parametrize("chunks", [2, 3])
+@pytest.mark.parametrize("tasks", [1, 3])
+def test_nested_chunk_versions_wait_for_both_readers_before_reuse(chunks, tasks):
+    """The chunk owns input generations even inside a delayed outer task.
+
+    Each input is loaded once, then consumed by two iterations of an owner
+    loop. The last owner must complete before that chunk slot is overwritten;
+    the first owner's readiness wait alone cannot establish this fact. This
+    pass-level fixture retains explicit child schedule units. Frontend
+    singleton chunks are inlined before such units and owners are built.
+    """
+    source = tirx.decl_buffer((tasks, chunks, 16, 16), "float16", name="Input")
+    storage = tirx.decl_buffer((16, 16), "float16", name="Chunk", scope="shared.l1")
+    consumed = tirx.decl_buffer((tasks, chunks, 2, 16, 16), "float16",
+                               name="Readers", scope="shared.l0a")
+    task, chunk, owner = [tirx.Var(name, "int32") for name in ("task", "chunk", "owner")]
+    producer = copy(source, storage, src_indices=[task, chunk, 0, 0], src_shape=[1, 1, 16, 16])
+    reader = copy(storage, consumed, dst_indices=[task, chunk, owner, 0, 0],
+                  dst_shape=[1, 1, 1, 16, 16])
+    owners = tirx.For(owner, 0, 2, tirx.ForKind.SERIAL, unit(reader, core=2))
+    inner = tirx.For(chunk, 0, chunks, tirx.ForKind.SERIAL,
+                    seq(unit(producer, core=2), unit(owners, core=None)),
+                    annotations={"multi_buffer_eligible": [storage.data]})
+    outer = tirx.For(task, 0, tasks, tirx.ForKind.SERIAL, unit(inner, core=None, stage=1),
+                    annotations={"enable_offset": True})
+    before = kernel(unit(outer, core=None), buffers=[storage, consumed], params=[source],
+                    annotations={"tl.buffer_versions_map": {storage.data: 2},
+                                 "tl.buffer_version_mode": {storage.data: "iteration"}})
+    before["main"] = before["main"].with_attr("target", tvm.target.Target(
+        {"kind": "ascend", "arch": "dav-2201"}))
+    trace = _completion_trace(_lower_protocol(before))
+    precedes = _prove_binary_protocol(trace)
+    producers, readers = {}, defaultdict(list)
+    for index, node in enumerate(trace):
+        if node.kind == "produce":
+            assert node.epoch not in producers
+            producers[node.epoch] = index
+        elif node.kind == "consume":
+            readers[node.epoch[:2]].append(index)
+    assert set(producers) == {(t, c) for t in range(tasks) for c in range(chunks)}
+    previous = {}
+    for epoch, producer in producers.items():
+        assert {trace[index].epoch[2] for index in readers[epoch]} == {0, 1}
+        slot = trace[producer].slot
+        for reader in readers[epoch]:
+            assert trace[reader].slot == slot and precedes(producer, reader)
+        if slot in previous:
+            assert all(precedes(reader, producer) for reader in readers[previous[slot]])
+        previous[slot] = epoch
