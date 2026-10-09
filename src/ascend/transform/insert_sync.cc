@@ -5919,6 +5919,188 @@ private:
 // ============================================================================
 // Kernel-level validation and scheduled-TIR rewrite
 // ============================================================================
+enum class KernelSyncFailureKind {
+  kAnalysis,
+  kCByteAlias,
+  kPrivateGmProof,
+  kPreserveOwnerResult,
+  kOwnerResultRelease,
+  kOwnerInputRelease,
+  kFlagCapacity,
+  kOwnerEventCapacity,
+};
+
+struct KernelSyncFailure {
+  KernelSyncFailureKind kind;
+  const char *reason;
+  // Indices refer only to the current selection, never to an analysis site.
+  std::vector<size_t> rejected_owner_plans;
+};
+
+enum class KernelSyncFallback {
+  kCByteRetirement,
+  kGmWriteAcquire,
+  kGmReadRelease,
+  kOperandPools,
+  kOwnerInputs,
+  kOwnerResults,
+  kFilterOwnerInputs,
+  kFilterOwnerResults,
+  kUnitStreams,
+};
+
+struct KernelSyncRootRetry {
+  bool enable_unit_streams;
+  bool enable_c_byte_retirement;
+};
+
+// Optional selections survive an analysis retry; proofs and allocations do not.
+// Keep fallback policy here, separate from the attempt that reports a failure.
+struct KernelSyncSelection {
+  std::vector<L0OperandSlotPool> operand_pools;
+  std::vector<ValidatedOwnerTransfer> owner_results;
+  std::vector<ValidatedOwnerTransfer> owner_inputs;
+  std::optional<ScheduledTIR> unit_fallback;
+  bool closed_c_byte_retirement{false};
+  bool enable_gm_read_release{true};
+  bool enable_gm_write_acquire{true};
+
+  std::optional<KernelSyncFallback>
+  GmFallback(const SyncAnalyzer &analyzer) const {
+    // Restore the delayed acquire before discarding an independent early
+    // release. Use cuts selected by this attempt, not the enable switches.
+    if (analyzer.HasGmWriteAcquires())
+      return KernelSyncFallback::kGmWriteAcquire;
+    if (analyzer.HasGmReadReleases())
+      return KernelSyncFallback::kGmReadRelease;
+    return std::nullopt;
+  }
+
+  KernelSyncFallback SelectFallback(const KernelSyncFailure &failure,
+                                    const SyncAnalyzer &analyzer) const {
+    switch (failure.kind) {
+    case KernelSyncFailureKind::kAnalysis:
+      if (closed_c_byte_retirement)
+        return KernelSyncFallback::kCByteRetirement;
+      if (auto gm = GmFallback(analyzer))
+        return *gm;
+      if (analyzer.NeedsOperandPoolFallback()) {
+        ICHECK(!operand_pools.empty());
+        return KernelSyncFallback::kOperandPools;
+      }
+      if (!owner_inputs.empty())
+        return KernelSyncFallback::kOwnerInputs;
+      // Analysis failure can require undoing the stream before discarding an
+      // owner result. Capacity failure below has the opposite priority.
+      if (analyzer.NeedsUnitFallback())
+        return KernelSyncFallback::kUnitStreams;
+      ICHECK(!owner_results.empty());
+      return KernelSyncFallback::kOwnerResults;
+    case KernelSyncFailureKind::kCByteAlias:
+      return KernelSyncFallback::kCByteRetirement;
+    case KernelSyncFailureKind::kPrivateGmProof: {
+      auto gm = GmFallback(analyzer);
+      ICHECK(gm.has_value());
+      return *gm;
+    }
+    case KernelSyncFailureKind::kPreserveOwnerResult:
+      return KernelSyncFallback::kOwnerInputs;
+    case KernelSyncFailureKind::kOwnerResultRelease:
+      return KernelSyncFallback::kFilterOwnerResults;
+    case KernelSyncFailureKind::kOwnerInputRelease:
+      return KernelSyncFallback::kFilterOwnerInputs;
+    case KernelSyncFailureKind::kFlagCapacity:
+      if (closed_c_byte_retirement)
+        return KernelSyncFallback::kCByteRetirement;
+      if (auto gm = GmFallback(analyzer))
+        return *gm;
+      if (!operand_pools.empty())
+        return KernelSyncFallback::kOperandPools;
+      if (!owner_inputs.empty())
+        return KernelSyncFallback::kOwnerInputs;
+      if (!owner_results.empty())
+        return KernelSyncFallback::kOwnerResults;
+      // A closed stream's terminal flag is exclusive. Optional selection must
+      // not exhaust 2201's eight local IDs; they cannot spill to 3510 mutexes.
+      return KernelSyncFallback::kUnitStreams;
+    case KernelSyncFailureKind::kOwnerEventCapacity:
+      if (auto gm = GmFallback(analyzer))
+        return *gm;
+      if (!owner_inputs.empty())
+        return KernelSyncFallback::kOwnerInputs;
+      ICHECK(!owner_results.empty());
+      return KernelSyncFallback::kOwnerResults;
+    }
+    LOG(FATAL) << "Unknown kernel synchronization failure";
+    return KernelSyncFallback::kUnitStreams;
+  }
+
+  std::optional<KernelSyncRootRetry>
+  ApplyFallback(KernelSyncFallback action, const KernelSyncFailure &failure,
+                OptimizationDiagnostics *diagnostics) {
+    auto retry = [&](const char *feature) {
+      diagnostics->Record(feature, OptimizationStatus::kRetry, failure.reason);
+    };
+    auto filter = [&](std::vector<ValidatedOwnerTransfer> *plans) {
+      // Failure indices are collected in ascending order before any mutation.
+      std::vector<ValidatedOwnerTransfer> retained;
+      retained.reserve(plans->size());
+      size_t rejected = 0;
+      for (size_t i = 0; i < plans->size(); ++i) {
+        if (rejected < failure.rejected_owner_plans.size() &&
+            failure.rejected_owner_plans[rejected] == i) {
+          ++rejected;
+          continue;
+        }
+        retained.push_back(std::move((*plans)[i]));
+      }
+      ICHECK_EQ(rejected, failure.rejected_owner_plans.size());
+      *plans = std::move(retained);
+    };
+    switch (action) {
+    case KernelSyncFallback::kCByteRetirement:
+      retry("c-byte-retirement");
+      ICHECK(unit_fallback.has_value());
+      return KernelSyncRootRetry{true, false};
+    case KernelSyncFallback::kGmWriteAcquire:
+      retry("gm-write-acquire");
+      enable_gm_write_acquire = false;
+      break;
+    case KernelSyncFallback::kGmReadRelease:
+      retry("gm-read-release");
+      enable_gm_read_release = false;
+      break;
+    case KernelSyncFallback::kOperandPools:
+      retry("l0-operand-slot-pool");
+      operand_pools.clear();
+      break;
+    case KernelSyncFallback::kOwnerInputs:
+      retry("owner-input");
+      owner_inputs.clear();
+      break;
+    case KernelSyncFallback::kOwnerResults:
+      retry("owner-result");
+      owner_results.clear();
+      break;
+    case KernelSyncFallback::kFilterOwnerInputs:
+      filter(&owner_inputs);
+      retry("owner-input");
+      break;
+    case KernelSyncFallback::kFilterOwnerResults:
+      filter(&owner_results);
+      retry("owner-result");
+      break;
+    case KernelSyncFallback::kUnitStreams:
+      ICHECK(unit_fallback.has_value());
+      retry("unit-flag-stream");
+      if (failure.kind == KernelSyncFailureKind::kFlagCapacity)
+        LOG(WARNING) << "Unit stream fallback due to flag allocation capacity";
+      return KernelSyncRootRetry{false, true};
+    }
+    return std::nullopt;
+  }
+};
+
 SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
                         Target target, const std::vector<Var> &lane_variables,
                         bool enable_unit_streams = true,
@@ -5927,9 +6109,12 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
   OptimizationDiagnostics local_diagnostics;
   if (!diagnostics)
     diagnostics = &local_diagnostics;
-  auto retry = [&](const char *feature, const char *reason) {
-    diagnostics->Record(feature, OptimizationStatus::kRetry, reason);
-  };
+  KernelSyncSelection selection;
+  auto &operand_pools = selection.operand_pools;
+  auto &owner_results = selection.owner_results;
+  auto &owner_inputs = selection.owner_inputs;
+  auto &unit_fallback = selection.unit_fallback;
+  auto &closed_c_byte_retirement = selection.closed_c_byte_retirement;
   std::vector<std::shared_ptr<IRStructure>> &root = scheduled_tir.tree;
   const AscendTargetInfo &target_info = GetAscendTargetInfo(target);
   CrossCoreSyncContract cross_core_contract{
@@ -5942,8 +6127,6 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
       ReadMultiBufferPlan(root, scheduled_tir.metadata.buffer_versions, groups);
   std::vector<UnitFlagStreamPlan> unit_streams;
   std::vector<UnitFlagBoundary> unit_boundaries;
-  std::optional<ScheduledTIR> unit_fallback;
-  bool closed_c_byte_retirement = false;
   if (enable_unit_streams &&
       target_info.architecture == AscendArchitecture::kDav2201) {
     // An existing direction setter has an explicit state contract. Do not
@@ -5990,7 +6173,7 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
   // reuse this tree without inserting another initialization consumer.
   if (target_info.architecture == AscendArchitecture::kDav2201)
     InsertRootLoad3DInitMarker(root, kernel_body);
-  std::vector<L0OperandSlotPool> operand_pools = AnalyzeL0OperandSlotPools(
+  operand_pools = AnalyzeL0OperandSlotPools(
       scheduled_tir, multi_buffer_plan, target_info, diagnostics);
   if (runtime::detail::VerboseLoggingEnabled(__FILE__, 1))
     for (const auto &pool : operand_pools)
@@ -6006,8 +6189,6 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
   EpochDomainRegistry domains(root, multi_buffer_plan);
   CrossCoreFlagReservation cross_core_flag_reservation =
       CollectExplicitCrossCoreFlags(kernel_body, cross_core_contract);
-  std::vector<ValidatedOwnerTransfer> owner_results;
-  std::vector<ValidatedOwnerTransfer> owner_inputs;
   if (cross_core_contract.collective &&
       cross_core_contract.num_aiv_subcores == 2) {
     owner_results = AnalyzeOwnerResults(
@@ -6020,65 +6201,20 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
   std::unique_ptr<SyncAnalyzer> analyzer;
   std::unique_ptr<FlagAllocator> flag_allocator;
   std::optional<std::vector<OwnerCompletionEvent>> owner_events;
-  bool enable_gm_read_release = true;
-  bool enable_gm_write_acquire = true;
-  auto disable_gm_handoff = [&](const char *reason) {
-    // Restore the delayed acquire before discarding an independent early
-    // input release. Each retry rebuilds the complete original proof graph.
-    if (analyzer->HasGmWriteAcquires()) {
-      retry("gm-write-acquire", reason);
-      enable_gm_write_acquire = false;
-      return true;
-    }
-    if (analyzer->HasGmReadReleases()) {
-      retry("gm-read-release", reason);
-      enable_gm_read_release = false;
-      return true;
-    }
-    return false;
-  };
-  for (;;) {
+  auto analyze_attempt = [&]() -> std::optional<KernelSyncFailure> {
+    // Allocation borrows this analyzer's sites. Destroy it first, then build
+    // all proofs again after any selection or root-tree change.
     flag_allocator.reset();
     analyzer = std::make_unique<SyncAnalyzer>(
         multi_buffer_plan, domains, target_info.architecture,
         scheduled_tir.metadata.manual_buffer_versions,
         scheduled_tir.metadata.root_conflict_hints, groups, &owner_results,
         &owner_inputs, &unit_streams, &unit_boundaries, &operand_pools,
-        enable_gm_read_release, enable_gm_write_acquire,
+        selection.enable_gm_read_release, selection.enable_gm_write_acquire,
         closed_c_byte_retirement);
     if (!analyzer->Analyze(root)) {
-      if (closed_c_byte_retirement) {
-        retry("c-byte-retirement", "completion-proof");
-        ICHECK(unit_fallback.has_value());
-        return InsertKernelSync(kernel_body, std::move(unit_fallback.value()),
-                                target, lane_variables, true, false,
-                                diagnostics);
-      }
-      if (disable_gm_handoff("completion-proof")) {
-        continue;
-      }
-      if (analyzer->NeedsOperandPoolFallback()) {
-        retry("l0-operand-slot-pool", "completion-proof");
-        ICHECK(!operand_pools.empty());
-        operand_pools.clear();
-        continue;
-      }
-      if (!owner_inputs.empty()) {
-        retry("owner-input", "completion-proof");
-        owner_inputs.clear();
-        continue;
-      }
-      if (analyzer->NeedsUnitFallback()) {
-        retry("unit-flag-stream", "completion-proof");
-        ICHECK(unit_fallback.has_value());
-        return InsertKernelSync(kernel_body, std::move(unit_fallback.value()),
-                                target, lane_variables, false, true,
-                                diagnostics);
-      }
-      ICHECK(!owner_results.empty());
-      retry("owner-result", "completion-proof");
-      owner_results.clear();
-      continue;
+      return KernelSyncFailure{KernelSyncFailureKind::kAnalysis,
+                               "completion-proof", {}};
     }
     if (closed_c_byte_retirement) {
       bool aliases_proven = true;
@@ -6090,11 +6226,8 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
             HasBufferAlias(analyzer->BufferAliases(), pair[0], pair[1]) &&
             HasBufferAlias(analyzer->BufferAliases(), pair[1], pair[0]);
       if (!aliases_proven) {
-        retry("c-byte-retirement", "mandatory-storage-alias");
-        ICHECK(unit_fallback.has_value());
-        return InsertKernelSync(kernel_body, std::move(unit_fallback.value()),
-                                target, lane_variables, true, false,
-                                diagnostics);
+        return KernelSyncFailure{KernelSyncFailureKind::kCByteAlias,
+                                 "mandatory-storage-alias", {}};
       }
     }
     if (analyzer->HasPrivateGmHandoffs()) {
@@ -6122,9 +6255,10 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
                         return analyzer->HasOwnerInputRelease(plan);
                       });
       if (!aliases_proven || !releases_proven) {
-        ICHECK(disable_gm_handoff(!aliases_proven ? "mandatory-storage-alias"
-                                                  : "owner-release-proof"));
-        continue;
+        return KernelSyncFailure{KernelSyncFailureKind::kPrivateGmProof,
+                                 !aliases_proven ? "mandatory-storage-alias"
+                                                 : "owner-release-proof",
+                                 {}};
       }
     }
     if (!owner_inputs.empty() &&
@@ -6134,31 +6268,25 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
                     })) {
       // A new optional input cut must not discard an already admissible
       // result protocol by removing one of its ordinary release witnesses.
-      retry("owner-input", "preserve-owner-result-release");
-      owner_inputs.clear();
-      continue;
+      return KernelSyncFailure{KernelSyncFailureKind::kPreserveOwnerResult,
+                               "preserve-owner-result-release", {}};
     }
-    size_t candidate_count = owner_results.size();
-    owner_results.erase(
-        std::remove_if(owner_results.begin(), owner_results.end(),
-                       [&](const ValidatedOwnerTransfer &plan) {
-                         return !analyzer->HasOwnerResultRelease(plan);
-                       }),
-        owner_results.end());
-    if (owner_results.size() != candidate_count) {
-      retry("owner-result", "missing-release-witness");
-      continue;
+    std::vector<size_t> rejected_owner_plans;
+    for (size_t i = 0; i < owner_results.size(); ++i)
+      if (!analyzer->HasOwnerResultRelease(owner_results[i]))
+        rejected_owner_plans.push_back(i);
+    if (!rejected_owner_plans.empty()) {
+      return KernelSyncFailure{KernelSyncFailureKind::kOwnerResultRelease,
+                               "missing-release-witness",
+                               std::move(rejected_owner_plans)};
     }
-    candidate_count = owner_inputs.size();
-    owner_inputs.erase(std::remove_if(owner_inputs.begin(), owner_inputs.end(),
-                                      [&](const ValidatedOwnerTransfer &plan) {
-                                        return !analyzer->HasOwnerInputRelease(
-                                            plan);
-                                      }),
-                       owner_inputs.end());
-    if (owner_inputs.size() != candidate_count) {
-      retry("owner-input", "missing-release-witness");
-      continue;
+    for (size_t i = 0; i < owner_inputs.size(); ++i)
+      if (!analyzer->HasOwnerInputRelease(owner_inputs[i]))
+        rejected_owner_plans.push_back(i);
+    if (!rejected_owner_plans.empty()) {
+      return KernelSyncFailure{KernelSyncFailureKind::kOwnerInputRelease,
+                               "missing-release-witness",
+                               std::move(rejected_owner_plans)};
     }
     flag_allocator = std::make_unique<FlagAllocator>(
         analyzer->SiteRegistry(), analyzer->SyncPoints(),
@@ -6169,59 +6297,27 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
                                   !operand_pools.empty(),
                               !unit_streams.empty() || !operand_pools.empty() ||
                                   analyzer->HasPrivateGmHandoffs())) {
-      if (closed_c_byte_retirement) {
-        retry("c-byte-retirement", "flag-capacity");
-        ICHECK(unit_fallback.has_value());
-        return InsertKernelSync(kernel_body, std::move(unit_fallback.value()),
-                                target, lane_variables, true, false,
-                                diagnostics);
-      }
-      if (disable_gm_handoff("flag-capacity")) {
-        continue;
-      }
-      if (!operand_pools.empty()) {
-        retry("l0-operand-slot-pool", "flag-capacity");
-        operand_pools.clear();
-        continue;
-      }
-      if (!owner_inputs.empty()) {
-        retry("owner-input", "flag-capacity");
-        owner_inputs.clear();
-        continue;
-      }
-      if (!owner_results.empty()) {
-        retry("owner-result", "flag-capacity");
-        owner_results.clear();
-        continue;
-      }
-      // A closed stream's terminal flag is exclusive. Optional selection
-      // must not force a previously legal 2201 kernel past its eight local
-      // IDs: this target cannot spill hard events to the 3510 mutex API.
-      ICHECK(unit_fallback.has_value());
-      retry("unit-flag-stream", "flag-capacity");
-      LOG(WARNING) << "Unit stream fallback due to flag allocation capacity";
-      return InsertKernelSync(kernel_body, std::move(unit_fallback.value()),
-                              target, lane_variables, false, true, diagnostics);
+      return KernelSyncFailure{KernelSyncFailureKind::kFlagCapacity,
+                               "flag-capacity", {}};
     }
     owner_events = AllocateOwnerCompletionEvents(
         owner_results, owner_inputs, analyzer->SiteRegistry(),
         analyzer->SyncPoints(), flag_allocator->Allocations(),
         cross_core_flag_reservation, domains);
     if (owner_events.has_value())
-      break;
-    if (disable_gm_handoff("owner-event-capacity")) {
-      continue;
-    }
-    if (!owner_inputs.empty()) {
-      retry("owner-input", "owner-event-capacity");
-      owner_inputs.clear();
-      continue;
-    }
-    // Owner specialization is optional. A kernel requiring the remaining
-    // result IDs keeps the normal collective implementation instead.
-    ICHECK(!owner_results.empty());
-    retry("owner-result", "owner-event-capacity");
-    owner_results.clear();
+      return std::nullopt;
+    return KernelSyncFailure{KernelSyncFailureKind::kOwnerEventCapacity,
+                             "owner-event-capacity", {}};
+  };
+  while (auto failure = analyze_attempt()) {
+    KernelSyncFallback action = selection.SelectFallback(*failure, *analyzer);
+    // A root retry starts again from the pre-unit snapshot, including fresh
+    // candidates, domains and enabled GM proofs, rather than this selection.
+    if (auto root_retry = selection.ApplyFallback(action, *failure, diagnostics))
+      return InsertKernelSync(
+          kernel_body, std::move(unit_fallback.value()), target, lane_variables,
+          root_retry->enable_unit_streams, root_retry->enable_c_byte_retirement,
+          diagnostics);
   }
   if (auto selected = scheduled_tir.metadata.kernel_root->annotations.Get(
           kL0PhaseReusePairs)) {

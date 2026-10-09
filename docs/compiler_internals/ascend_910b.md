@@ -208,6 +208,15 @@ again or recovering a just-computed guard from annotations. These facts are
 local to the preparation pass; later passes reconstruct the existing plan
 from annotations after counter insertion or an IR round-trip.
 
+`InsertSync` keeps optional protocol selection separate from each analysis
+attempt. An attempt builds fresh completion proofs and flag allocations and
+reports its failure; one selection policy applies the corresponding fallback.
+Proof failure, local-flag pressure and owner-event pressure keep their distinct
+priorities. A retry can retain proven owner transfers while removing only those
+without a release witness. Undoing a unit stream restarts from the tree captured
+before unit rewrites and root markers, rebuilding candidates and epoch domains.
+Only the successful attempt's proofs and analysis sites reach materialization.
+
 Ordinary CUBE/VECTOR blocks describe core ownership. Task materialization
 retains that ownership in the existing core-mask metadata and derives each
 task's hardware pipe from its native instruction effects. A VECTOR DMA task
