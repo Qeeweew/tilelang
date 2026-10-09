@@ -128,17 +128,19 @@ def _storage(name, size_bytes, scope):
     return tirx.decl_buffer((size_bytes // 2,), "float16", name=name, scope=scope)
 
 
-def _owner(storage, name, out, *, child=None):
+def _owner(storage, name, out, *, child=None, auto_pipeline=True):
     epoch = tirx.Var(name, "int32")
     tasks = [unit(tirx.BufferStore(storage, tirx.const(1, storage.dtype), [0]),
                   core=2, stage=-1, cost=(1, 1)),
              unit(tirx.BufferStore(out, storage[0], [0]), core=2, stage=-1, cost=(1, 1))]
     if child is not None:
         tasks.append(child)
+    annotations = {"multi_buffer_eligible": [storage.data], "num_stages": 3}
+    if auto_pipeline:
+        annotations["tl.ascend_auto_pipeline"] = True
     return unit(tirx.For(
         epoch, 0, 3, tirx.ForKind.SERIAL, seq(*tasks),
-        annotations={"multi_buffer_eligible": [storage.data],
-                     "tl.ascend_auto_pipeline": True, "num_stages": 3},
+        annotations=annotations,
     ), core=None, stage=-1)
 
 
@@ -160,10 +162,14 @@ def _capture_reservations(module, *, first_versions=None):
         if not queries and first_versions is not None:
             assert len(counts) == 1
             counts[0] = first_versions
+        stage_bound = int(args[0])
+        assert all(minimum <= count <= max(stage_bound, minimum)
+                   for minimum, count in zip(kwargs["buffer_min_versions"], counts))
         groups = [list(map(int, group)) for group in args[9]]
         assert all(sum(sizes[index] * counts[index] for index in group[1:]) <= group[0]
                    for group in groups)
-        queries.append({"sizes": sizes, "minimum": list(map(int, kwargs["buffer_min_versions"])),
+        queries.append({"sizes": sizes, "stage_bound": stage_bound,
+                        "minimum": list(map(int, kwargs["buffer_min_versions"])),
                         "groups": groups, "selected": counts})
         starts, end = [], 0
         for latency, ii in zip(map(int, args[1]), map(int, args[2])):
@@ -247,10 +253,16 @@ def test_previous_owner_count_is_a_lower_bound_and_other_owner_reservation(scope
     shared_ring = _storage("shared_ring", 16 * 1024, scope)
     other = _storage("other", 32 * 1024, scope)
     out = tirx.decl_buffer((1,), "float16", name="out")
-    body = seq(_owner(shared_ring, "first", out), _owner(shared_ring, "second", out),
+    # A scalar-only auto owner has a one-stage bound. The first witness
+    # deliberately selects two slots, so give it an explicit bound instead.
+    # The later auto owner must keep that established two-slot minimum even
+    # though its own stage bound remains one.
+    body = seq(_owner(shared_ring, "first", out, auto_pipeline=False),
+               _owner(shared_ring, "second", out),
                _owner(other, "other_epoch", out))
     after, queries = _capture_reservations(_module(body, [shared_ring, other], out), first_versions=2)
     assert len(queries) == 3
+    assert [query["stage_bound"] for query in queries] == [3, 1, 1]
     assert queries[0]["minimum"] == [1]
     assert queries[1]["minimum"] == [2]
     assert queries[1]["selected"] == [2]
@@ -302,9 +314,11 @@ def test_l0c_previous_owner_width_is_a_minimum_and_a_foreign_reservation():
     shared_ring = _l0c_storage("shared_ring", 32 * 1024)
     other = _l0c_storage("other", 64 * 1024)
     out = tirx.decl_buffer((1,), "float32", name="out")
-    body = seq(_owner(shared_ring, "first", out), _owner(shared_ring, "second", out),
+    body = seq(_owner(shared_ring, "first", out, auto_pipeline=False),
+               _owner(shared_ring, "second", out),
                _owner(other, "other_epoch", out))
     after, queries = _capture_reservations(_module(body, [shared_ring, other], out), first_versions=2)
+    assert [query["stage_bound"] for query in queries] == [3, 1, 1]
     assert [query["minimum"] for query in queries] == [[1], [2], [1]]
     assert _variable_capacity(queries[2]) == 64 * 1024
     assert int(_root(after).annotations["tl.buffer_versions_map"][shared_ring.data]) == 2
