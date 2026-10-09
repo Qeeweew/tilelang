@@ -2185,8 +2185,8 @@ static void ScheduleSingleKernel(const Stmt &kernel_body, Target target,
     Array<Array<Var>> pairs;
     for (const L0PhaseReusePair &pair : phase_reuse)
       pairs.push_back({pair.first, pair.second});
-    metadata.kernel_root.CopyOnWrite()->annotations.Set(kL0PhaseReusePairs,
-                                                        std::move(pairs));
+    metadata.kernel_root.CopyOnWrite()->annotations.Set(
+        kL0PhaseReusePairs, SelectedL0PhaseReuse(pairs).Encode());
   }
   unit_builder.SetL0PhaseReuse(std::move(phase_reuse));
   unit_builder.SetPreferHandoffIssue(target_info.architecture ==

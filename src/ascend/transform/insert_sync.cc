@@ -5177,21 +5177,10 @@ bool HasClosedKernelUnitDirection(
 // selected two-allocation phase pair here. The broader unit selector also
 // accepts column prefixes; those do not establish this C-byte contract.
 bool HasClosedCByteRetirement(const ScheduledTIRMetadata &metadata,
+                              const SelectedL0PhaseReuse &selected,
                               const std::vector<UnitFlagStreamPlan> &plans) {
   if (plans.size() != 2 || plans[0].c->data.same_as(plans[1].c->data))
     return false;
-  auto selected = metadata.kernel_root->annotations.Get(kL0PhaseReusePairs);
-  if (!selected)
-    return false;
-  bool selected_pair = false;
-  for (const auto &pair : selected.value().cast<Array<Array<Var>>>()) {
-    if (pair.size() == 2)
-      selected_pair |=
-          (pair[0].same_as(plans[0].c->data) &&
-           pair[1].same_as(plans[1].c->data)) ||
-          (pair[1].same_as(plans[0].c->data) &&
-           pair[0].same_as(plans[1].c->data));
-  }
   size_t allocations = 0;
   for (const auto &buffer : metadata.kernel_root->alloc_buffers)
     if (IsL0CBuffer(buffer)) {
@@ -5199,7 +5188,8 @@ bool HasClosedCByteRetirement(const ScheduledTIRMetadata &metadata,
       if (!buffer.same_as(plans[0].c) && !buffer.same_as(plans[1].c))
         return false;
     }
-  if (!selected_pair || allocations != 2)
+  if (!selected.ContainsPair(plans[0].c->data, plans[1].c->data) ||
+      allocations != 2)
     return false;
   auto full = [](const Buffer &buffer, const Array<Range> &region) {
     if (!unit_flag_stream_detail::AdmissibleCDomain(buffer, region))
@@ -6122,6 +6112,8 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
   auto &unit_fallback = selection.unit_fallback;
   auto &closed_c_byte_retirement = selection.closed_c_byte_retirement;
   std::vector<std::shared_ptr<IRStructure>> &root = scheduled_tir.tree;
+  const SelectedL0PhaseReuse selected_reuse =
+      SelectedL0PhaseReuse::Read(scheduled_tir.metadata.kernel_root);
   const AscendTargetInfo &target_info = GetAscendTargetInfo(target);
   CrossCoreSyncContract cross_core_contract{
       target_info.architecture == AscendArchitecture::kDav2201,
@@ -6163,7 +6155,8 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
           HasClosedKernelUnitDirection(root, unit_streams, kernel_body);
       closed_c_byte_retirement =
           enable_c_byte_retirement && kernel_direction &&
-          HasClosedCByteRetirement(scheduled_tir.metadata, unit_streams);
+          HasClosedCByteRetirement(scheduled_tir.metadata, selected_reuse,
+                                   unit_streams);
       ApplyUnitFlagStreams(unit_streams);
       InsertUnitFlagBoundaries(root, nullptr, unit_streams, &unit_boundaries,
                                kernel_direction, closed_c_byte_retirement);
@@ -6179,8 +6172,9 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
   // reuse this tree without inserting another initialization consumer.
   if (target_info.architecture == AscendArchitecture::kDav2201)
     InsertRootLoad3DInitMarker(root, kernel_body);
-  operand_pools = AnalyzeL0OperandSlotPools(
-      scheduled_tir, multi_buffer_plan, target_info, diagnostics);
+  operand_pools =
+      AnalyzeL0OperandSlotPools(scheduled_tir, multi_buffer_plan,
+                                selected_reuse, target_info, diagnostics);
   if (runtime::detail::VerboseLoggingEnabled(__FILE__, 1))
     for (const auto &pool : operand_pools)
       LOG(INFO) << "L0 operand slot pool " << pool.first.buffer->data << " / "
@@ -6207,10 +6201,12 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
   std::unique_ptr<SyncAnalyzer> analyzer;
   std::unique_ptr<FlagAllocator> flag_allocator;
   std::optional<std::vector<OwnerCompletionEvent>> owner_events;
+  std::optional<std::vector<size_t>> unproven_phase_aliases;
   auto analyze_attempt = [&]() -> std::optional<KernelSyncFailure> {
     // Allocation borrows this analyzer's sites. Destroy it first, then build
     // all proofs again after any selection or root-tree change.
     flag_allocator.reset();
+    unproven_phase_aliases.reset();
     analyzer = std::make_unique<SyncAnalyzer>(
         multi_buffer_plan, domains, target_info.architecture,
         scheduled_tir.metadata.manual_buffer_versions,
@@ -6222,35 +6218,19 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
       return KernelSyncFailure{KernelSyncFailureKind::kAnalysis,
                                "completion-proof", {}};
     }
-    if (closed_c_byte_retirement) {
-      bool aliases_proven = true;
-      for (const auto &pair : scheduled_tir.metadata.kernel_root->annotations
-                                  .Get(kL0PhaseReusePairs)
-                                  .value()
-                                  .cast<Array<Array<Var>>>())
-        aliases_proven &=
-            HasBufferAlias(analyzer->BufferAliases(), pair[0], pair[1]) &&
-            HasBufferAlias(analyzer->BufferAliases(), pair[1], pair[0]);
-      if (!aliases_proven) {
-        return KernelSyncFailure{KernelSyncFailureKind::kCByteAlias,
-                                 "mandatory-storage-alias", {}};
-      }
+    // Alias facts belong to this analysis attempt. Every optional protocol
+    // and final publication consumes this one result; retries rebuild it.
+    unproven_phase_aliases =
+        selected_reuse.UnprovenPairs(analyzer->BufferAliases());
+    if (closed_c_byte_retirement && !unproven_phase_aliases->empty()) {
+      return KernelSyncFailure{
+          KernelSyncFailureKind::kCByteAlias, "mandatory-storage-alias", {}};
     }
     if (analyzer->HasPrivateGmHandoffs()) {
       // A private GM cut cannot replace whole-phase alias retirement.
       // Retry before allocation/materialization if the removed wide edge
       // was needed by a mandatory physical-storage proof.
-      bool aliases_proven = true;
-      if (auto selected = scheduled_tir.metadata.kernel_root->annotations.Get(
-              kL0PhaseReusePairs)) {
-        for (const Array<Var> &pair :
-             selected.value().cast<Array<Array<Var>>>()) {
-          ICHECK_EQ(pair.size(), 2u);
-          aliases_proven &=
-              HasBufferAlias(analyzer->BufferAliases(), pair[0], pair[1]) &&
-              HasBufferAlias(analyzer->BufferAliases(), pair[1], pair[0]);
-        }
-      }
+      bool aliases_proven = unproven_phase_aliases->empty();
       bool releases_proven =
           std::all_of(owner_results.begin(), owner_results.end(),
                       [&](const ValidatedOwnerTransfer &plan) {
@@ -6325,14 +6305,11 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
           root_retry->enable_unit_streams, root_retry->enable_c_byte_retirement,
           diagnostics);
   }
-  if (auto selected = scheduled_tir.metadata.kernel_root->annotations.Get(
-          kL0PhaseReusePairs)) {
-    for (const Array<Var> &pair : selected.value().cast<Array<Array<Var>>>()) {
-      ICHECK_EQ(pair.size(), 2u);
-      bool proven =
-          HasBufferAlias(analyzer->BufferAliases(), pair[0], pair[1]) &&
-          HasBufferAlias(analyzer->BufferAliases(), pair[1], pair[0]);
-      if (!proven && !unit_streams.empty()) {
+  if (selected_reuse.Present()) {
+    ICHECK(unproven_phase_aliases.has_value());
+    for (size_t index : unproven_phase_aliases.value()) {
+      const auto &pair = selected_reuse.Pairs()[index];
+      if (!unit_streams.empty()) {
         std::ostringstream loops;
         for (const auto &plan : unit_streams)
           loops << " " << plan.result_loop->control->loop_var->name_hint;
@@ -6340,7 +6317,7 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
                      << unit_streams.size()
                      << " active unit streams:" << loops.str();
       }
-      ICHECK(proven)
+      LOG(FATAL)
           << "Selected L0 phase reuse lacks a completion-proven physical "
              "alias between "
           << pair[0]->name_hint << " and " << pair[1]->name_hint

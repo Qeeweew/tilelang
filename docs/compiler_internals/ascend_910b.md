@@ -222,6 +222,17 @@ without a release witness. Undoing a unit stream restarts from the tree captured
 before unit rewrites and root markers, rebuilding candidates and epoch domains.
 Only the successful attempt's proofs and analysis sites reach materialization.
 
+The early L0 max-budget choice is a required physical-alias contract, not
+evidence that storage can already overlap. A typed storage-pair snapshot owns
+its annotation decoding and exact conflict-list identity. It keeps pair order
+and marker presence, including an explicitly empty selection, without retaining
+early phase-node pointers across rewrites. Each synchronization attempt checks
+all selected pairs against that attempt's bidirectional alias facts once.
+C-byte retirement, private GM handoff fallback and final publication consume
+that same result. Retries rebuild it; only successful publication consumes the
+marker. Operand credits still require the complete, unchanged scope conflict
+list, and no selected pair supplies its own completion or alias proof.
+
 Ordinary CUBE/VECTOR blocks describe core ownership. Task materialization
 retains that ownership in the existing core-mask metadata and derives each
 task's hardware pipe from its native instruction effects. A VECTOR DMA task

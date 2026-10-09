@@ -173,25 +173,15 @@ inline bool ClosedCounter(const std::vector<std::shared_ptr<IRStructure>> &root,
 }
 
 inline bool SelectedPhaseConflicts(const ScheduledTIR &scheduled,
+                                   const SelectedL0PhaseReuse &selected,
                                    const ControlNode *epoch) {
-  auto pairs =
-      scheduled.metadata.kernel_root->annotations.Get(kL0PhaseReusePairs);
   auto local = epoch->control->annotations.Get("conflict_hint");
-  if (!pairs || !local)
+  if (!local)
     return false;
-  ConflictHintList expected;
-  for (const Array<Var> &pair : pairs.value().cast<Array<Array<Var>>>()) {
-    if (pair.size() != 2)
-      return false;
-    expected.push_back(
-        Array<ffi::Any>{pair[0], pair[1], Integer(-1), Bool(true)});
-  }
   // Only the exact early choice's scope ordering may be replaced by credits.
   // Do not interpret an arbitrary user conflict as operand-byte ownership.
-  return ffi::StructuralEqual()(expected,
-                                local.value().cast<ConflictHintList>()) &&
-         ffi::StructuralEqual()(expected,
-                                scheduled.metadata.root_conflict_hints);
+  return selected.MatchesConflicts(scheduled.metadata.root_conflict_hints,
+                                   local.value().cast<ConflictHintList>());
 }
 
 inline std::optional<L0OperandSlotMember> RejectMember(const Buffer &buffer,
@@ -204,7 +194,8 @@ inline std::optional<L0OperandSlotMember> RejectMember(const Buffer &buffer,
 
 inline std::optional<L0OperandSlotMember>
 Member(const ScheduledTIR &scheduled, const MultiBufferPlan &plan,
-       const Buffer &buffer, const LayoutMap &layouts, int64_t capacity,
+       const SelectedL0PhaseReuse &selected, const Buffer &buffer,
+       const LayoutMap &layouts, int64_t capacity,
        const ResourceEpochAnalysis &resource_epochs,
        ResourceEpochDecision *epoch_decision, const char **rejection_reason) {
   auto reject = [&](const char *reason) {
@@ -286,7 +277,7 @@ Member(const ScheduledTIR &scheduled, const MultiBufferPlan &plan,
                          &resource_epochs, {buffer->data}, epoch_decision) ||
       !LocateClosedPhase(result.reader, &result.epoch, &result.phase, true,
                          &resource_epochs, {buffer->data}, epoch_decision) ||
-      !SelectedPhaseConflicts(scheduled, result.epoch))
+      !SelectedPhaseConflicts(scheduled, selected, result.epoch))
     return reject("closed-prepared-phase");
   std::function<bool(IRStructure *)> controls = [&](IRStructure *node) {
     if (node->GuardsTouchStorage(buffer->data))
@@ -311,25 +302,23 @@ Member(const ScheduledTIR &scheduled, const MultiBufferPlan &plan,
 }
 } // namespace l0_operand_slot_detail
 
-inline std::vector<L0OperandSlotPool>
-AnalyzeL0OperandSlotPools(const ScheduledTIR &scheduled,
-                          const MultiBufferPlan &versions,
-                          const AscendTargetInfo &target,
-                          OptimizationDiagnostics *diagnostics = nullptr) {
+inline std::vector<L0OperandSlotPool> AnalyzeL0OperandSlotPools(
+    const ScheduledTIR &scheduled, const MultiBufferPlan &versions,
+    const SelectedL0PhaseReuse &selected, const AscendTargetInfo &target,
+    OptimizationDiagnostics *diagnostics = nullptr) {
   using namespace l0_operand_slot_detail;
   std::vector<L0OperandSlotPool> pools;
-  auto pairs =
-      scheduled.metadata.kernel_root->annotations.Get(kL0PhaseReusePairs);
   auto raw_layouts =
       scheduled.metadata.kernel_root->annotations.Get(attr::kLayoutMap);
-  if (target.architecture != AscendArchitecture::kDav2201 || !pairs ||
-      !raw_layouts || scheduled.metadata.has_buffer_aliases)
+  if (target.architecture != AscendArchitecture::kDav2201 ||
+      !selected.Present() || !raw_layouts ||
+      scheduled.metadata.has_buffer_aliases)
     return pools;
   LayoutMap layouts = raw_layouts.value().cast<LayoutMap>();
   std::vector<TaskNode *> tasks;
   CollectAllTaskNodes(scheduled.tree, tasks);
   ResourceEpochAnalysis resource_epochs(scheduled, &versions);
-  for (const Array<Var> &pair : pairs.value().cast<Array<Array<Var>>>()) {
+  for (const auto &pair : selected.Pairs()) {
     auto record = [&](OptimizationStatus status, const char *reason,
                       const ControlNode *epoch = nullptr,
                       const Var &cause = Var()) {
@@ -344,8 +333,7 @@ AnalyzeL0OperandSlotPools(const ScheduledTIR &scheduled,
       diagnostics->Record("l0-operand-slot-pool", status, reason,
                           std::move(resources), epoch);
     };
-    if (pair.size() != 2 || Scope(pair[0]).empty() ||
-        Scope(pair[0]) != Scope(pair[1])) {
+    if (Scope(pair[0]).empty() || Scope(pair[0]) != Scope(pair[1])) {
       record(OptimizationStatus::kRejected, "incompatible-storage-pair");
       continue;
     }
@@ -397,10 +385,10 @@ AnalyzeL0OperandSlotPools(const ScheduledTIR &scheduled,
     ResourceEpochDecision epoch_decisions[2];
     const char *member_rejections[2] = {nullptr, nullptr};
     auto a =
-        Member(scheduled, versions, buffers[0], layouts, capacity,
+        Member(scheduled, versions, selected, buffers[0], layouts, capacity,
                resource_epochs, &epoch_decisions[0], &member_rejections[0]);
     auto b =
-        Member(scheduled, versions, buffers[1], layouts, capacity,
+        Member(scheduled, versions, selected, buffers[1], layouts, capacity,
                resource_epochs, &epoch_decisions[1], &member_rejections[1]);
     if (!a || !b) {
       size_t rejected = a ? 1 : 0;

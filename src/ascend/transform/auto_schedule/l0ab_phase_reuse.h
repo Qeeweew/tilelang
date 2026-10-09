@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "./dependency_analysis.h"
+#include "./l0_phase_reuse_contract.h"
 #include "./resource_epoch.h"
 #include "./scheduled_tir.h"
 #include "ascend/layout/ascend_layouts.h"
@@ -39,11 +40,6 @@
 #include "op/gemm.h"
 
 namespace tvm::tl::ascend {
-
-// Root Array<Array<Var>>, with two storage Vars per selected reuse pair.
-// Operand and accumulator phases share one max-budget/final-alias contract,
-// without sharing logical layouts or version clocks.
-constexpr const char *kL0PhaseReusePairs = "tl.ascend_l0_phase_reuse_pairs";
 
 // An early address-reuse choice, not an alias proof or a shared version clock.
 // Keep both logical allocations/layouts through native lowering. InsertSync
