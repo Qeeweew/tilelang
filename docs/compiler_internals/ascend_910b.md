@@ -460,6 +460,15 @@ materialization keeps the requested stages. Automatic origin selection checks
 its proposed cut with the same contract. An unchecked or malformed fallback is
 rejected rather than repaired during materialization.
 
+Each loop query first builds one immutable storage budget from actual allocation
+footprints, eligible owners, fixed and previously selected rings, root
+reservations and admitted L0 pairs. It owns the version-variable IDs, slot
+bytes, minimum counts and residual capacity groups used by dependency distances,
+manual completion, solver serialization and native validation. Compiler
+workspaces have independent byte-representation bounds rather than a shared GM
+capacity. The budget is rebuilt for each query; only a validated plan publishes
+selected versions for later parent queries.
+
 Straight-line sibling lists minimize makespan using the same task effects and
 resource exclusions. Weighted data and pipe paths remove implied resource
 choices while retaining any stronger issue-interval gap. Tasks with identical

@@ -146,6 +146,37 @@ private:
   static LetDependencyClosure
   CollectLetDependencyClosure_(const std::vector<IRStructure *> &nodes);
 
+  // One query's storage facts, built before any candidate is produced. The
+  // schedule producers, distance encoder and final version publication all
+  // consume this same snapshot; no result is cached across IR rewrites.
+  struct LoopStorageBudget {
+    struct StorageResource {
+      Var storage;
+      Buffer representative;
+    };
+
+    std::vector<StorageResource> resources;
+    std::unordered_map<Var, size_t, ObjectPtrHash, ObjectPtrEqual> variable_ids;
+    std::unordered_map<Var, int, ObjectPtrHash, ObjectPtrEqual> fixed_versions;
+    std::vector<int64_t> slot_bytes;
+    std::vector<int64_t> min_versions;
+    // Residual on-chip groups followed by one independent byte-representation
+    // bound per variable compiler workspace. The latter are not a GM pool.
+    std::vector<std::vector<int64_t>> memory_groups;
+
+    int64_t VersionDistance(const Var &storage) const {
+      auto variable = variable_ids.find(storage);
+      if (variable != variable_ids.end())
+        return -static_cast<int64_t>(variable->second) - 1;
+      auto fixed = fixed_versions.find(storage);
+      return fixed != fixed_versions.end() ? fixed->second : 1;
+    }
+  };
+
+  LoopStorageBudget BuildLoopStorageBudget(
+      const ControlNode *ctrl, bool manual_schedule, bool preserve_issue_order,
+      bool has_resource_profiles) const;
+
 public:
   // Recursive scheduling function
   // Directly schedules the entire IRStructure tree recursively in place
@@ -1037,6 +1068,369 @@ std::vector<std::shared_ptr<IRStructure>> ScheduleBuilder::Z3SchedulePython(
   }
 }
 
+ScheduleBuilder::LoopStorageBudget ScheduleBuilder::BuildLoopStorageBudget(
+    const ControlNode *ctrl, bool manual_schedule, bool preserve_issue_order,
+    bool has_resource_profiles) const {
+  // Keep one representative Buffer per storage for shape/scope accounting.
+  // Version variables and dependency distances are keyed directly by storage.
+  LoopStorageBudget budget;
+  auto &storage_resources = budget.resources;
+  auto &storage_version_id = budget.variable_ids;
+  auto &storage_sizes = budget.slot_bytes;
+  auto &annotated_storage_versions = budget.fixed_versions;
+  std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> seen_storages;
+  // Build memory groups from memory_limits_ map.
+  // std::map iteration is ordered by key: "shared" then "shared.l1".
+  std::map<std::string, int> scope_to_group;
+  std::vector<int64_t> group_capacities;
+  std::vector<std::string> group_scopes;
+  std::vector<std::vector<int64_t>> group_indices;
+  // Independent int64 byte-representation bounds, never an aggregate GM
+  // hardware capacity or a charge against an on-chip memory pool.
+  std::vector<int64_t> workspace_version_ids;
+  for (const auto &entry : memory_limits_) {
+    if (entry.second > 0) {
+      scope_to_group[entry.first] = (int)group_capacities.size();
+      group_capacities.push_back(entry.second);
+      group_scopes.push_back(entry.first);
+      group_indices.push_back({});
+    }
+  }
+  auto get_storage_size = [&](const Var &storage) -> int64_t {
+    auto slot = storage_slot_bytes_.Get(storage);
+    ICHECK(slot.has_value())
+        << "AutoSchedule cannot find the allocation owner for storage "
+        << storage->name_hint;
+    arith::Analyzer analyzer;
+    PrimExpr size = analyzer.Simplify(slot.value());
+    const auto *constant = size.as<IntImmNode>();
+    ICHECK(constant)
+        << "AutoSchedule requires a static physical storage footprint for "
+        << storage->name_hint << ", got " << size;
+    ICHECK_GE(constant->value, 0)
+        << "AutoSchedule found a negative physical storage footprint for "
+        << storage->name_hint;
+    return constant->value;
+  };
+  auto get_buffer_size = [&](const Buffer &buffer) {
+    return get_storage_size(buffer->data);
+  };
+  auto consume_fixed_capacity = [&](int group, int64_t slot_bytes,
+                                    int versions) {
+    if (preserve_issue_order) {
+      __int128 bytes = __int128(slot_bytes) * versions;
+      ICHECK(bytes <= group_capacities[group])
+          << "Explicit Ascend source issue order is not legal: "
+             "source-order-memory-capacity for fixed storage";
+      group_capacities[group] -= static_cast<int64_t>(bytes);
+    } else if (reserve_ub_storage_ && group_scopes[group] == "shared") {
+      __int128 remaining =
+          __int128(group_capacities[group]) - __int128(slot_bytes) * versions;
+      ICHECK(remaining >= std::numeric_limits<int64_t>::min())
+          << "Ascend UB reservation exceeds int64 byte representation";
+      group_capacities[group] = static_cast<int64_t>(remaining);
+    } else {
+      group_capacities[group] -= slot_bytes * versions;
+    }
+  };
+  // A selected phase pair commits the kernel to one completion-proven shared
+  // bank. Every enclosing query must consume that same max-footprint contract,
+  // including manual ancestors of an automatically versioned child. Otherwise
+  // the ancestor either sums mutually exclusive allocations or loses the
+  // child's established physical ring count. Unselected manual kernels retain
+  // their existing per-query resource policy.
+  const bool reserve_l0 =
+      reserve_l0_storage_ && (!manual_schedule || !l0_phase_reuse_.empty());
+  auto is_ub_storage = [](const Var &storage) {
+    const std::string scope = GetPtrStorageScope(storage);
+    return scope == "shared" || scope == "shared.dyn";
+  };
+  auto l0_scope = [](const Var &storage) -> std::string {
+    const std::string scope = GetPtrStorageScope(storage);
+    if (scope == "shared.l0a" || scope == "shared.l0a.dyn")
+      return "shared.l0a";
+    if (scope == "shared.l0b" || scope == "shared.l0b.dyn")
+      return "shared.l0b";
+    if (scope == "shared.l0c" || scope == "shared.l0c.dyn")
+      return "shared.l0c";
+    return "";
+  };
+  auto reserved_versions = [&](const Var &storage) -> int {
+    // The manual allocation already contains its physical version axis.
+    if (manual_buffer_versions_.count(storage))
+      return 1;
+    int versions = selected_buffer_versions_.Get(storage).value_or(1);
+    // A fixed count with an established owner will be applied when that owner
+    // is scheduled; reserve it even if the owner has not been visited yet.
+    if (multi_buffer_owners_.count(storage))
+      versions = std::max(versions,
+                          buffer_version_overrides_.Get(storage).value_or(1));
+    return versions;
+  };
+  auto enumerate_buffers = [&](auto &&visit) {
+    for (const auto &r : ctrl->GetReadRegions())
+      visit(r->buffer);
+    for (const auto &r : ctrl->GetWriteRegions())
+      visit(r->buffer);
+  };
+  enumerate_buffers([&](const Buffer &buffer) {
+    if (!IsSharedBuffer(buffer) && !IsL1Buffer(buffer) &&
+        !IsL0CBuffer(buffer) && !IsL0ABuffer(buffer) && !IsL0BBuffer(buffer) &&
+        !compiler_workspaces_.count(buffer->data)) {
+      return;
+    }
+    if (seen_storages.insert(buffer->data).second)
+      storage_resources.push_back({buffer->data, buffer});
+  });
+
+  for (const LoopStorageBudget::StorageResource &resource : storage_resources) {
+    const Var &storage = resource.storage;
+    const Buffer &buffer = resource.representative;
+    if (preserve_issue_order && !manual_buffer_versions_.count(storage)) {
+      auto requested = buffer_version_overrides_.Get(storage);
+      // Stage order defines logical access order in the existing API. A
+      // read-first recurrence therefore cannot acquire an automatic version
+      // owner just because source-order completion was requested. The partial
+      // scheduler warns about an unapplied override; the complete contract
+      // must reject it rather than silently publish fewer physical versions.
+      ICHECK(!requested.has_value() || requested.value() <= 1 ||
+             multi_buffer_owners_.count(storage))
+          << "Explicit Ascend source issue order is not legal: "
+             "source-order-unowned-fixed-version for storage "
+          << storage->name_hint
+          << "; the requested ring has no eligible loop owner";
+    }
+    if (compiler_workspaces_.count(storage)) {
+      if (!ctrl->IsMultiBufferEligible(storage))
+        continue;
+      int64_t slot_bytes = get_buffer_size(buffer);
+      auto override_it = buffer_version_overrides_.find(storage);
+      if (override_it != buffer_version_overrides_.end()) {
+        int versions = (*override_it).second;
+        CheckCompilerWorkspaceVersionBytes(storage, slot_bytes, versions);
+        annotated_storage_versions[storage] = versions;
+      } else {
+        size_t id = storage_sizes.size();
+        storage_version_id.emplace(storage, id);
+        workspace_version_ids.push_back(static_cast<int64_t>(id));
+        storage_sizes.push_back(slot_bytes);
+      }
+      continue;
+    }
+    std::string scope;
+    if (IsL1Buffer(buffer)) {
+      scope = "shared.l1";
+    } else if (IsL0CBuffer(buffer)) {
+      scope = "shared.l0c";
+    } else if (IsL0ABuffer(buffer)) {
+      scope = "shared.l0a";
+    } else if (IsL0BBuffer(buffer)) {
+      scope = "shared.l0b";
+    } else {
+      scope = "shared";
+    }
+    int group_id = scope_to_group[scope];
+    bool root_l0 = reserve_l0 && !l0_scope(storage).empty();
+    bool root_ub = reserve_ub_storage_ && is_ub_storage(storage);
+    if (root_l0 && manual_buffer_versions_.count(storage))
+      continue;
+    if (root_ub && manual_buffer_versions_.count(storage)) {
+      // Its allocation already includes the physical version axis.
+      consume_fixed_capacity(group_id, get_buffer_size(buffer), 1);
+      continue;
+    }
+    if (!ctrl->IsMultiBufferEligible(storage)) {
+      // These buffers cannot be multi-buffered, and cannot share memory with
+      // other buffers either, so we directly reduce the capacity of the
+      // memory group by their size
+      if (!root_l0) {
+        int versions =
+            preserve_issue_order || root_ub ||
+                    (has_resource_profiles && IsL1Buffer(buffer))
+                ? reserved_versions(storage)
+                : 1;
+        consume_fixed_capacity(group_id, get_buffer_size(buffer), versions);
+      }
+    } else {
+      auto override_it = buffer_version_overrides_.find(storage);
+      if (override_it != buffer_version_overrides_.end()) {
+        int override_val = (*override_it).second;
+        if ((root_l0 || root_ub) && preserve_issue_order)
+          ICHECK_GE(override_val, reserved_versions(storage))
+              << "Explicit Ascend source issue order has a fixed version count "
+                 "smaller than an already selected shared ring for storage "
+              << storage->name_hint;
+        if (root_l0 || root_ub)
+          override_val = std::max(override_val, reserved_versions(storage));
+        annotated_storage_versions[storage] = override_val;
+        if (!root_l0)
+          consume_fixed_capacity(group_id, get_buffer_size(buffer),
+                                 override_val);
+      } else {
+        size_t id = storage_sizes.size();
+        storage_version_id.emplace(storage, id);
+        group_indices[group_id].push_back((int64_t)id);
+        storage_sizes.push_back(get_buffer_size(buffer));
+      }
+    }
+  }
+
+  auto &storage_min_versions = budget.min_versions;
+  storage_min_versions.assign(storage_sizes.size(), 1);
+  if (reserve_ub_storage_) {
+    // Every root UB allocation occupies this AIV's arena, including epilogue
+    // casts, normalization results and scratch absent from ctrl's accesses.
+    // Accessed fixed storage was charged above; variable storage remains in
+    // its memory group, with any previously selected physical ring as a lower
+    // bound. Reserve only the remaining allocation owners here, once each.
+    for (const auto &[storage, _] : storage_slot_bytes_) {
+      if (!is_ub_storage(storage))
+        continue;
+      int versions = reserved_versions(storage);
+      ICHECK_GT(versions, 0);
+      auto variable = storage_version_id.find(storage);
+      if (variable != storage_version_id.end()) {
+        storage_min_versions[variable->second] = versions;
+        continue;
+      }
+      if (seen_storages.count(storage))
+        continue;
+      int64_t bytes = get_storage_size(storage);
+      int64_t &remaining = group_capacities[scope_to_group.at("shared")];
+      ICHECK_LE(bytes, remaining / versions)
+          << "Z3 loop scheduling failed: scope \"shared\" capacity "
+          << remaining << " is insufficient for reserved root storage "
+          << storage->name_hint << " (" << bytes << " bytes, " << versions
+          << " physical versions)";
+      remaining -= bytes * versions;
+    }
+  }
+  if (reserve_l0) {
+    std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> phase_storages;
+    auto reserved_bytes = [&](const Var &storage) {
+      int versions = reserved_versions(storage);
+      ICHECK_GT(versions, 0);
+      int64_t bytes = get_storage_size(storage);
+      ICHECK_LE(bytes, std::numeric_limits<int64_t>::max() / versions);
+      return bytes * versions;
+    };
+    for (const L0PhaseReusePair &pair : l0_phase_reuse_) {
+      auto first = storage_version_id.find(pair.first);
+      auto second = storage_version_id.find(pair.second);
+      const bool first_variable = first != storage_version_id.end();
+      const bool second_variable = second != storage_version_id.end();
+      ICHECK(!(first_variable && second_variable))
+          << "L0 phase reuse cannot budget two independently variable "
+             "allocations in one scheduling query";
+      ICHECK(phase_storages.insert(pair.first).second &&
+             phase_storages.insert(pair.second).second);
+      int64_t &remaining = group_capacities[scope_to_group.at(pair.scope)];
+      int64_t first_bytes = reserved_bytes(pair.first);
+      int64_t second_bytes = reserved_bytes(pair.second);
+      if (!first_variable && !second_variable) {
+        int64_t bytes = std::max(first_bytes, second_bytes);
+        ICHECK_LE(bytes, remaining)
+            << "L0 phase reuse exceeds scope " << pair.scope << " capacity";
+        remaining -= bytes;
+      } else {
+        // Exactly two allocations occupy this bank. max(variable, fixed)
+        // fits iff both fit independently; keep the variable's full byte
+        // charge in its existing group and check its mate separately.
+        ICHECK_LE(first_variable ? second_bytes : first_bytes, remaining)
+            << "L0 phase reuse mate exceeds scope " << pair.scope
+            << " capacity";
+        const Var &variable = first_variable ? pair.first : pair.second;
+        size_t id = first_variable ? first->second : second->second;
+        storage_min_versions[id] = reserved_versions(variable);
+      }
+    }
+    // Unselected root allocations retain the conservative sum reservation.
+    // Chosen phase pairs retain distinct logical storage/version clocks;
+    // InsertSync must certify their alias before the late packer consumes it.
+    for (const auto &[storage, _] : storage_slot_bytes_) {
+      std::string scope = l0_scope(storage);
+      if (scope.empty() || phase_storages.count(storage))
+        continue;
+      int versions = reserved_versions(storage);
+      ICHECK_GT(versions, 0);
+      auto variable = storage_version_id.find(storage);
+      if (variable != storage_version_id.end()) {
+        storage_min_versions[variable->second] = versions;
+        continue;
+      }
+      int64_t bytes = get_storage_size(storage);
+      int group_id = scope_to_group.at(scope);
+      int64_t &remaining = group_capacities[group_id];
+      ICHECK_LE(bytes, remaining / versions)
+          << "Z3 loop scheduling failed: scope \"" << scope << "\" capacity "
+          << remaining << " is insufficient for reserved root storage "
+          << storage->name_hint << " (" << bytes << " bytes, " << versions
+          << " physical versions)";
+      remaining -= bytes * versions;
+    }
+  }
+
+  if (preserve_issue_order) {
+    // Completion must budget the actual shared ring, including decisions
+    // already made by independent nested owners. It cannot shrink that ring
+    // merely because this owner's fixed order needs fewer versions.
+    for (const auto &[storage, id] : storage_version_id)
+      storage_min_versions[id] =
+          std::max<int64_t>(storage_min_versions[id],
+                            selected_buffer_versions_.Get(storage).value_or(1));
+    for (const auto &[storage, fixed] : annotated_storage_versions)
+      ICHECK_LE(selected_buffer_versions_.Get(storage).value_or(1), fixed)
+          << "Explicit fixed buffer version count conflicts with an existing "
+             "owner for "
+          << storage->name_hint;
+  }
+
+  // Validate buffer capacities upfront: every eligible buffer needs at least
+  // one version, or the existing shared ring count for automatic 2201 L0.
+  // If that minimum exceeds the remaining capacity, Z3 cannot be feasible.
+  for (size_t g = 0; g < group_capacities.size(); ++g) {
+    int64_t capacity = group_capacities[g];
+    const auto &idxs = group_indices[g];
+    if (capacity < 0) {
+      LOG(FATAL) << "Z3 loop scheduling failed: scope \"" << group_scopes[g]
+                 << "\" capacity is negative (" << capacity
+                 << "). Non-eligible and fixed-version buffers already exceed"
+                 << " the memory limit. Try using T.annotate_unlimit_memory(\""
+                 << group_scopes[g] << "\") or reduce buffer sizes.";
+    }
+    if (!idxs.empty()) {
+      int64_t min_usage = 0;
+      for (int64_t idx : idxs) {
+        ICHECK_LE(storage_sizes[idx],
+                  (std::numeric_limits<int64_t>::max() - min_usage) /
+                      storage_min_versions[idx]);
+        min_usage += storage_sizes[idx] * storage_min_versions[idx];
+      }
+      if (min_usage > capacity) {
+        LOG(FATAL) << "Z3 loop scheduling failed: scope \"" << group_scopes[g]
+                   << "\" capacity " << capacity
+                   << " is insufficient for minimum buffer usage " << min_usage
+                   << ". Try using T.annotate_unlimit_memory(\""
+                   << group_scopes[g] << "\") or reduce buffer sizes.";
+      }
+    }
+  }
+
+  // Keep native capacity facts authoritative. FFI is a one-way projection
+  // of this result, never the source of a second native budget.
+  for (size_t g = 0; g < group_capacities.size(); ++g) {
+    std::vector<int64_t> group{group_capacities[g]};
+    group.insert(group.end(), group_indices[g].begin(), group_indices[g].end());
+    budget.memory_groups.push_back(std::move(group));
+  }
+  for (int64_t id : workspace_version_ids) {
+    // Z3 integers cannot overflow. Limit each allocation's represented byte
+    // extent without summing independent workspaces or charging on-chip pools.
+    budget.memory_groups.push_back({std::numeric_limits<int64_t>::max(), id});
+  }
+  return budget;
+}
+
 // Z3-based scheduler for loops that calls Python implementation via FFI
 // with distance-aware dependencies
 void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
@@ -1188,354 +1582,8 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
       resource_profiles.clear();
   }
 
-  // Keep one representative Buffer per storage for shape/scope accounting.
-  // Version variables and dependency distances are keyed directly by storage.
-  struct StorageResource {
-    Var storage;
-    Buffer representative;
-  };
-  std::vector<int64_t> storage_sizes;
-  std::vector<StorageResource> storage_resources;
-  std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> seen_storages;
-  std::unordered_map<Var, size_t, ObjectPtrHash, ObjectPtrEqual>
-      storage_version_id;
-  // Build memory groups from memory_limits_ map.
-  // std::map iteration is ordered by key: "shared" then "shared.l1".
-  std::map<std::string, int> scope_to_group;
-  std::vector<int64_t> group_capacities;
-  std::vector<std::string> group_scopes;
-  std::vector<std::vector<int64_t>> group_indices;
-  // Independent int64 byte-representation bounds, never an aggregate GM
-  // hardware capacity or a charge against an on-chip memory pool.
-  std::vector<int64_t> workspace_version_ids;
-  for (const auto &entry : memory_limits_) {
-    if (entry.second > 0) {
-      scope_to_group[entry.first] = (int)group_capacities.size();
-      group_capacities.push_back(entry.second);
-      group_scopes.push_back(entry.first);
-      group_indices.push_back({});
-    }
-  }
-  std::unordered_map<Var, int, ObjectPtrHash, ObjectPtrEqual>
-      annotated_storage_versions;
-  auto get_storage_size = [&](const Var &storage) -> int64_t {
-    auto slot = storage_slot_bytes_.Get(storage);
-    ICHECK(slot.has_value())
-        << "AutoSchedule cannot find the allocation owner for storage "
-        << storage->name_hint;
-    arith::Analyzer analyzer;
-    PrimExpr size = analyzer.Simplify(slot.value());
-    const auto *constant = size.as<IntImmNode>();
-    ICHECK(constant)
-        << "AutoSchedule requires a static physical storage footprint for "
-        << storage->name_hint << ", got " << size;
-    ICHECK_GE(constant->value, 0)
-        << "AutoSchedule found a negative physical storage footprint for "
-        << storage->name_hint;
-    return constant->value;
-  };
-  auto get_buffer_size = [&](const Buffer &buffer) {
-    return get_storage_size(buffer->data);
-  };
-  auto consume_fixed_capacity = [&](int group, int64_t slot_bytes,
-                                    int versions) {
-    if (preserve_issue_order) {
-      __int128 bytes = __int128(slot_bytes) * versions;
-      ICHECK(bytes <= group_capacities[group])
-          << "Explicit Ascend source issue order is not legal: "
-             "source-order-memory-capacity for fixed storage";
-      group_capacities[group] -= static_cast<int64_t>(bytes);
-    } else if (reserve_ub_storage_ && group_scopes[group] == "shared") {
-      __int128 remaining =
-          __int128(group_capacities[group]) - __int128(slot_bytes) * versions;
-      ICHECK(remaining >= std::numeric_limits<int64_t>::min())
-          << "Ascend UB reservation exceeds int64 byte representation";
-      group_capacities[group] = static_cast<int64_t>(remaining);
-    } else {
-      group_capacities[group] -= slot_bytes * versions;
-    }
-  };
-  // A selected phase pair commits the kernel to one completion-proven shared
-  // bank. Every enclosing query must consume that same max-footprint contract,
-  // including manual ancestors of an automatically versioned child. Otherwise
-  // the ancestor either sums mutually exclusive allocations or loses the
-  // child's established physical ring count. Unselected manual kernels retain
-  // their existing per-query resource policy.
-  const bool reserve_l0 =
-      reserve_l0_storage_ && (!manual_schedule || !l0_phase_reuse_.empty());
-  auto is_ub_storage = [](const Var &storage) {
-    const std::string scope = GetPtrStorageScope(storage);
-    return scope == "shared" || scope == "shared.dyn";
-  };
-  auto l0_scope = [](const Var &storage) -> std::string {
-    const std::string scope = GetPtrStorageScope(storage);
-    if (scope == "shared.l0a" || scope == "shared.l0a.dyn")
-      return "shared.l0a";
-    if (scope == "shared.l0b" || scope == "shared.l0b.dyn")
-      return "shared.l0b";
-    if (scope == "shared.l0c" || scope == "shared.l0c.dyn")
-      return "shared.l0c";
-    return "";
-  };
-  auto reserved_versions = [&](const Var &storage) -> int {
-    // The manual allocation already contains its physical version axis.
-    if (manual_buffer_versions_.count(storage))
-      return 1;
-    int versions = selected_buffer_versions_.Get(storage).value_or(1);
-    // A fixed count with an established owner will be applied when that owner
-    // is scheduled; reserve it even if the owner has not been visited yet.
-    if (multi_buffer_owners_.count(storage))
-      versions = std::max(versions,
-                          buffer_version_overrides_.Get(storage).value_or(1));
-    return versions;
-  };
-  auto enumerate_buffers = [&](auto &&visit) {
-    for (const auto &r : ctrl->GetReadRegions())
-      visit(r->buffer);
-    for (const auto &r : ctrl->GetWriteRegions())
-      visit(r->buffer);
-  };
-  enumerate_buffers([&](const Buffer &buffer) {
-    if (!IsSharedBuffer(buffer) && !IsL1Buffer(buffer) &&
-        !IsL0CBuffer(buffer) && !IsL0ABuffer(buffer) && !IsL0BBuffer(buffer) &&
-        !compiler_workspaces_.count(buffer->data)) {
-      return;
-    }
-    if (seen_storages.insert(buffer->data).second)
-      storage_resources.push_back({buffer->data, buffer});
-  });
-
-  for (const StorageResource &resource : storage_resources) {
-    const Var &storage = resource.storage;
-    const Buffer &buffer = resource.representative;
-    if (preserve_issue_order && !manual_buffer_versions_.count(storage)) {
-      auto requested = buffer_version_overrides_.Get(storage);
-      // Stage order defines logical access order in the existing API. A
-      // read-first recurrence therefore cannot acquire an automatic version
-      // owner just because source-order completion was requested. The partial
-      // scheduler warns about an unapplied override; the complete contract
-      // must reject it rather than silently publish fewer physical versions.
-      ICHECK(!requested.has_value() || requested.value() <= 1 ||
-             multi_buffer_owners_.count(storage))
-          << "Explicit Ascend source issue order is not legal: "
-             "source-order-unowned-fixed-version for storage "
-          << storage->name_hint
-          << "; the requested ring has no eligible loop owner";
-    }
-    if (compiler_workspaces_.count(storage)) {
-      if (!ctrl->IsMultiBufferEligible(storage))
-        continue;
-      int64_t slot_bytes = get_buffer_size(buffer);
-      auto override_it = buffer_version_overrides_.find(storage);
-      if (override_it != buffer_version_overrides_.end()) {
-        int versions = (*override_it).second;
-        CheckCompilerWorkspaceVersionBytes(storage, slot_bytes, versions);
-        annotated_storage_versions[storage] = versions;
-      } else {
-        size_t id = storage_sizes.size();
-        storage_version_id.emplace(storage, id);
-        workspace_version_ids.push_back(static_cast<int64_t>(id));
-        storage_sizes.push_back(slot_bytes);
-      }
-      continue;
-    }
-    std::string scope;
-    if (IsL1Buffer(buffer)) {
-      scope = "shared.l1";
-    } else if (IsL0CBuffer(buffer)) {
-      scope = "shared.l0c";
-    } else if (IsL0ABuffer(buffer)) {
-      scope = "shared.l0a";
-    } else if (IsL0BBuffer(buffer)) {
-      scope = "shared.l0b";
-    } else {
-      scope = "shared";
-    }
-    int group_id = scope_to_group[scope];
-    bool root_l0 = reserve_l0 && !l0_scope(storage).empty();
-    bool root_ub = reserve_ub_storage_ && is_ub_storage(storage);
-    if (root_l0 && manual_buffer_versions_.count(storage))
-      continue;
-    if (root_ub && manual_buffer_versions_.count(storage)) {
-      // Its allocation already includes the physical version axis.
-      consume_fixed_capacity(group_id, get_buffer_size(buffer), 1);
-      continue;
-    }
-    if (!ctrl->IsMultiBufferEligible(storage)) {
-      // These buffers cannot be multi-buffered, and cannot share memory with
-      // other buffers either, so we directly reduce the capacity of the
-      // memory group by their size
-      if (!root_l0) {
-        int versions =
-            preserve_issue_order || root_ub ||
-                    (!resource_profiles.empty() && IsL1Buffer(buffer))
-                ? reserved_versions(storage)
-                : 1;
-        consume_fixed_capacity(group_id, get_buffer_size(buffer), versions);
-      }
-    } else {
-      auto override_it = buffer_version_overrides_.find(storage);
-      if (override_it != buffer_version_overrides_.end()) {
-        int override_val = (*override_it).second;
-        if ((root_l0 || root_ub) && preserve_issue_order)
-          ICHECK_GE(override_val, reserved_versions(storage))
-              << "Explicit Ascend source issue order has a fixed version count "
-                 "smaller than an already selected shared ring for storage "
-              << storage->name_hint;
-        if (root_l0 || root_ub)
-          override_val = std::max(override_val, reserved_versions(storage));
-        annotated_storage_versions[storage] = override_val;
-        if (!root_l0)
-          consume_fixed_capacity(group_id, get_buffer_size(buffer),
-                                 override_val);
-      } else {
-        size_t id = storage_sizes.size();
-        storage_version_id.emplace(storage, id);
-        group_indices[group_id].push_back((int64_t)id);
-        storage_sizes.push_back(get_buffer_size(buffer));
-      }
-    }
-  }
-
-  std::vector<int64_t> storage_min_versions(storage_sizes.size(), 1);
-  if (reserve_ub_storage_) {
-    // Every root UB allocation occupies this AIV's arena, including epilogue
-    // casts, normalization results and scratch absent from ctrl's accesses.
-    // Accessed fixed storage was charged above; variable storage remains in
-    // its memory group, with any previously selected physical ring as a lower
-    // bound. Reserve only the remaining allocation owners here, once each.
-    for (const auto &[storage, _] : storage_slot_bytes_) {
-      if (!is_ub_storage(storage))
-        continue;
-      int versions = reserved_versions(storage);
-      ICHECK_GT(versions, 0);
-      auto variable = storage_version_id.find(storage);
-      if (variable != storage_version_id.end()) {
-        storage_min_versions[variable->second] = versions;
-        continue;
-      }
-      if (seen_storages.count(storage))
-        continue;
-      int64_t bytes = get_storage_size(storage);
-      int64_t &remaining = group_capacities[scope_to_group.at("shared")];
-      ICHECK_LE(bytes, remaining / versions)
-          << "Z3 loop scheduling failed: scope \"shared\" capacity "
-          << remaining << " is insufficient for reserved root storage "
-          << storage->name_hint << " (" << bytes << " bytes, " << versions
-          << " physical versions)";
-      remaining -= bytes * versions;
-    }
-  }
-  if (reserve_l0) {
-    std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> phase_storages;
-    auto reserved_bytes = [&](const Var &storage) {
-      int versions = reserved_versions(storage);
-      ICHECK_GT(versions, 0);
-      int64_t bytes = get_storage_size(storage);
-      ICHECK_LE(bytes, std::numeric_limits<int64_t>::max() / versions);
-      return bytes * versions;
-    };
-    for (const L0PhaseReusePair &pair : l0_phase_reuse_) {
-      auto first = storage_version_id.find(pair.first);
-      auto second = storage_version_id.find(pair.second);
-      const bool first_variable = first != storage_version_id.end();
-      const bool second_variable = second != storage_version_id.end();
-      ICHECK(!(first_variable && second_variable))
-          << "L0 phase reuse cannot budget two independently variable "
-             "allocations in one scheduling query";
-      ICHECK(phase_storages.insert(pair.first).second &&
-             phase_storages.insert(pair.second).second);
-      int64_t &remaining = group_capacities[scope_to_group.at(pair.scope)];
-      int64_t first_bytes = reserved_bytes(pair.first);
-      int64_t second_bytes = reserved_bytes(pair.second);
-      if (!first_variable && !second_variable) {
-        int64_t bytes = std::max(first_bytes, second_bytes);
-        ICHECK_LE(bytes, remaining)
-            << "L0 phase reuse exceeds scope " << pair.scope << " capacity";
-        remaining -= bytes;
-      } else {
-        // Exactly two allocations occupy this bank. max(variable, fixed)
-        // fits iff both fit independently; keep the variable's full byte
-        // charge in its existing group and check its mate separately.
-        ICHECK_LE(first_variable ? second_bytes : first_bytes, remaining)
-            << "L0 phase reuse mate exceeds scope " << pair.scope
-            << " capacity";
-        const Var &variable = first_variable ? pair.first : pair.second;
-        size_t id = first_variable ? first->second : second->second;
-        storage_min_versions[id] = reserved_versions(variable);
-      }
-    }
-    // Unselected root allocations retain the conservative sum reservation.
-    // Chosen phase pairs retain distinct logical storage/version clocks;
-    // InsertSync must certify their alias before the late packer consumes it.
-    for (const auto &[storage, _] : storage_slot_bytes_) {
-      std::string scope = l0_scope(storage);
-      if (scope.empty() || phase_storages.count(storage))
-        continue;
-      int versions = reserved_versions(storage);
-      ICHECK_GT(versions, 0);
-      auto variable = storage_version_id.find(storage);
-      if (variable != storage_version_id.end()) {
-        storage_min_versions[variable->second] = versions;
-        continue;
-      }
-      int64_t bytes = get_storage_size(storage);
-      int group_id = scope_to_group.at(scope);
-      int64_t &remaining = group_capacities[group_id];
-      ICHECK_LE(bytes, remaining / versions)
-          << "Z3 loop scheduling failed: scope \"" << scope << "\" capacity "
-          << remaining << " is insufficient for reserved root storage "
-          << storage->name_hint << " (" << bytes << " bytes, " << versions
-          << " physical versions)";
-      remaining -= bytes * versions;
-    }
-  }
-
-  if (preserve_issue_order) {
-    // Completion must budget the actual shared ring, including decisions
-    // already made by independent nested owners. It cannot shrink that ring
-    // merely because this owner's fixed order needs fewer versions.
-    for (const auto &[storage, id] : storage_version_id)
-      storage_min_versions[id] =
-          std::max<int64_t>(storage_min_versions[id],
-                            selected_buffer_versions_.Get(storage).value_or(1));
-    for (const auto &[storage, fixed] : annotated_storage_versions)
-      ICHECK_LE(selected_buffer_versions_.Get(storage).value_or(1), fixed)
-          << "Explicit fixed buffer version count conflicts with an existing "
-             "owner for "
-          << storage->name_hint;
-  }
-
-  // Validate buffer capacities upfront: every eligible buffer needs at least
-  // one version, or the existing shared ring count for automatic 2201 L0.
-  // If that minimum exceeds the remaining capacity, Z3 cannot be feasible.
-  for (size_t g = 0; g < group_capacities.size(); ++g) {
-    int64_t capacity = group_capacities[g];
-    const auto &idxs = group_indices[g];
-    if (capacity < 0) {
-      LOG(FATAL) << "Z3 loop scheduling failed: scope \"" << group_scopes[g]
-                 << "\" capacity is negative (" << capacity
-                 << "). Non-eligible and fixed-version buffers already exceed"
-                 << " the memory limit. Try using T.annotate_unlimit_memory(\""
-                 << group_scopes[g] << "\") or reduce buffer sizes.";
-    }
-    if (!idxs.empty()) {
-      int64_t min_usage = 0;
-      for (int64_t idx : idxs) {
-        ICHECK_LE(storage_sizes[idx],
-                  (std::numeric_limits<int64_t>::max() - min_usage) /
-                      storage_min_versions[idx]);
-        min_usage += storage_sizes[idx] * storage_min_versions[idx];
-      }
-      if (min_usage > capacity) {
-        LOG(FATAL) << "Z3 loop scheduling failed: scope \"" << group_scopes[g]
-                   << "\" capacity " << capacity
-                   << " is insufficient for minimum buffer usage " << min_usage
-                   << ". Try using T.annotate_unlimit_memory(\""
-                   << group_scopes[g] << "\") or reduce buffer sizes.";
-      }
-    }
-  }
+  const LoopStorageBudget storage_budget = BuildLoopStorageBudget(
+      ctrl, manual_schedule, preserve_issue_order, !resource_profiles.empty());
 
   // Variable (Let-var write -> read) data dependencies
   for (size_t i = 0; i < n; ++i) {
@@ -1604,17 +1652,9 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
       int64_t distance = 1;
       if (dep.storage.has_value()) {
         Var storage = storage_groups_.Representative(dep.storage.value());
-        auto it = storage_version_id.find(storage);
-        if (it != storage_version_id.end()) {
-          // Encode the storage-version id in the negative distance for the Z3
-          // scheduler to recognize.
-          distance = -(int64_t)it->second - 1;
-        } else {
-          auto ann_it = annotated_storage_versions.find(storage);
-          if (ann_it != annotated_storage_versions.end()) {
-            distance = ann_it->second;
-          }
-        }
+        // Negative distances name the budget's version variable; fixed
+        // rings retain their actual count and unversioned storage uses one.
+        distance = storage_budget.VersionDistance(storage);
       }
       data_deps.emplace_back(i, j, distance, latency);
     }
@@ -1650,7 +1690,7 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
   if (prefer_prefetch_issue_ && auto_pipeline && enable_offset &&
       !manual_schedule && num_stages > 1)
     prefetch_priority_pairs = CollectPrefetchIssuePreferences(
-        nodes, deps, storage_version_id, multi_buffer_owners_, ctrl,
+        nodes, deps, storage_budget.variable_ids, multi_buffer_owners_, ctrl,
         profiled_children);
 
   // Stage-order constraints for copied Let variables.
@@ -1755,9 +1795,12 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
     for (const auto &span : resource_profiles[i])
       tvm_resource_reservations.push_back({int64_t(i), span.kind, span.bit,
                                            span.first, span.last - span.first});
+  // Keep issue-summary masks native; FFI only serializes their values.
+  std::vector<int64_t> plan_hbm_masks;
   if (!resource_profiles.empty())
     for (IRStructure *node : nodes)
-      tvm_resource_hbm_masks.push_back(node->GetHbmMask());
+      plan_hbm_masks.push_back(node->GetHbmMask());
+  tvm_resource_hbm_masks = ffi::Array<int64_t>(plan_hbm_masks);
   ffi::Array<ffi::Array<int64_t>> tvm_stage_order_deps;
   for (const auto &dep : stage_order_deps) {
     ffi::Array<int64_t> pair;
@@ -1765,44 +1808,26 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
     pair.push_back(dep.second);
     tvm_stage_order_deps.push_back(pair);
   }
-  for (int64_t size : storage_sizes) {
+  for (int64_t size : storage_budget.slot_bytes) {
     tvm_storage_sizes.push_back(size);
   }
-  for (int64_t versions : storage_min_versions)
+  for (int64_t versions : storage_budget.min_versions)
     tvm_storage_min_versions.push_back(versions);
   for (int64_t stage : manual_stages) {
     tvm_manual_stages.push_back(stage);
   }
 
-  // Build memory groups for FFI: each inner array is [capacity, idx0, idx1,
-  // ...]
+  // Serialize the same native budget used by manual completion and
+  // validation. Each group is [capacity, variable_id0, variable_id1, ...].
   ffi::Array<ffi::Array<int64_t>> tvm_memory_groups;
-  for (size_t g = 0; g < group_capacities.size(); ++g) {
-    ffi::Array<int64_t> group;
-    group.push_back(group_capacities[g]);
-    for (auto idx : group_indices[g]) {
-      group.push_back(idx);
-    }
-    tvm_memory_groups.push_back(group);
-  }
-  for (int64_t id : workspace_version_ids) {
-    // Z3 integers cannot overflow. Constrain the final per-allocation byte
-    // extent before selecting versions, while leaving GM out of device
-    // resource-capacity accounting. Different workspaces are not summed.
-    tvm_memory_groups.push_back({std::numeric_limits<int64_t>::max(), id});
-  }
+  for (const auto &group : storage_budget.memory_groups)
+    tvm_memory_groups.push_back(ffi::Array<int64_t>(group));
 
-  // Both plan producers consume these same residual capacity facts. Fixed
-  // rings and root reservations have already been charged above.
-  std::vector<std::vector<int64_t>> plan_memory_groups;
-  for (const auto &group : tvm_memory_groups)
-    plan_memory_groups.emplace_back(group.begin(), group.end());
-  std::vector<int64_t> plan_hbm_masks(tvm_resource_hbm_masks.begin(),
-                                    tvm_resource_hbm_masks.end());
   LoopScheduleConstraints constraints{
       iis, resource_flags, data_deps, resource_deps, owner_exclusion_deps,
-      pipe_order_deps, stage_order_deps, storage_sizes, storage_min_versions,
-      plan_memory_groups, num_stages, enable_offset};
+      pipe_order_deps, stage_order_deps, storage_budget.slot_bytes,
+      storage_budget.min_versions, storage_budget.memory_groups, num_stages,
+      enable_offset};
   if (manual_schedule)
     constraints.manual_stages = &manual_stages;
   else if (stage_horizon > 0)
@@ -1819,8 +1844,8 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
     ManualCompletionResult completion = CompleteManualSourceOrder(
         manual_stages, latencies, iis, resource_flags, data_deps, resource_deps,
         owner_exclusion_deps, pipe_order_deps, stage_order_deps, enable_offset,
-        storage_sizes, storage_min_versions, plan_memory_groups,
-        num_stages);
+        storage_budget.slot_bytes, storage_budget.min_versions,
+        storage_budget.memory_groups, num_stages);
     ICHECK(completion.plan.has_value())
         << "Explicit Ascend source issue order is not legal: "
         << completion.reason;
@@ -2110,15 +2135,15 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
   if (use_hierarchical_resources_ && auto_pipeline && !manual_schedule)
     if (auto profile = SummarizeAutomaticChildResources(ctrl))
       GetAutoScheduleExtraInfo(ctrl)->SetResourceProfile(std::move(*profile));
-  for (const StorageResource &resource : storage_resources) {
+  for (const auto &resource : storage_budget.resources) {
     const Var &storage = resource.storage;
-    auto annotated = annotated_storage_versions.find(storage);
-    if (annotated != annotated_storage_versions.end()) {
+    auto annotated = storage_budget.fixed_versions.find(storage);
+    if (annotated != storage_budget.fixed_versions.end()) {
       MergeSelectedBufferVersion(storage, annotated->second);
       continue;
     }
-    auto selected = storage_version_id.find(storage);
-    if (selected != storage_version_id.end()) {
+    auto selected = storage_budget.variable_ids.find(storage);
+    if (selected != storage_budget.variable_ids.end()) {
       MergeSelectedBufferVersion(storage, storage_versions[selected->second]);
     }
   }
