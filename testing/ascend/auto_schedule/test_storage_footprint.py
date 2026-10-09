@@ -110,7 +110,7 @@ def _ub_storage(name, size, scope="shared.dyn"):
     return tirx.decl_buffer((size // 4,), "float32", name=name, scope=scope)
 
 
-def _ub_owner(storage, name, out, *, child=None):
+def _ub_owner(storage, name, out, *, child=None, auto_pipeline=True):
     epoch = tirx.Var(name, "int32")
     tasks = [
         unit(tirx.BufferStore(storage, tirx.const(1, "float32"), [0]), stage=-1, cost=(1, 1)),
@@ -118,10 +118,12 @@ def _ub_owner(storage, name, out, *, child=None):
     ]
     if child is not None:
         tasks.append(child)
+    annotations = {"multi_buffer_eligible": [storage.data], "num_stages": 3}
+    if auto_pipeline:
+        annotations["tl.ascend_auto_pipeline"] = True
     return unit(tirx.For(
         epoch, 0, 3, tirx.ForKind.SERIAL, seq(*tasks),
-        annotations={"multi_buffer_eligible": [storage.data],
-                     "tl.ascend_auto_pipeline": True, "num_stages": 3},
+        annotations=annotations,
     ), core=None, stage=-1)
 
 
@@ -135,8 +137,9 @@ def _capture_ub_budget(module, *, first_versions=None):
     """Observe the real FFI contract, with a deterministic legal serial witness.
 
     Unit costs isolate byte accounting from latency estimates. Choosing two
-    versions for the first owner is legal even though this serial witness only
-    needs one, and exposes the physical ring shared by subsequent owners.
+    versions for an explicitly bounded first owner is legal even though this
+    serial witness only needs one, and exposes the physical ring shared by
+    subsequent owners.
     """
     queries = []
 
@@ -147,10 +150,14 @@ def _capture_ub_budget(module, *, first_versions=None):
         if not queries and first_versions is not None:
             assert len(counts) == 1
             counts[0] = first_versions
+        stage_bound = int(args[0])
+        assert all(lower <= count <= max(stage_bound, lower)
+                   for lower, count in zip(minimum, counts))
         groups = [list(map(int, group)) for group in args[9]]
         assert all(sum(sizes[index] * counts[index] for index in group[1:]) <= group[0]
                    for group in groups)
-        queries.append(dict(sizes=sizes, minimum=minimum, groups=groups, selected=counts))
+        queries.append(dict(sizes=sizes, stage_bound=stage_bound, minimum=minimum,
+                            groups=groups, selected=counts))
         starts, end = [], 0
         for latency, ii in zip(map(int, args[1]), map(int, args[2])):
             starts.append(end)
@@ -211,9 +218,14 @@ def test_previously_selected_ub_width_is_a_lower_bound_and_foreign_reservation()
     ring = _ub_storage("ring", 32 * 1024)
     other = _ub_storage("other", 96 * 1024)
     out = tirx.decl_buffer((1,), "float32", name="out")
-    module = _ub_module(seq(_ub_owner(ring, "first", out), _ub_owner(ring, "second", out),
+    # Only the first owner needs an explicit bound for the injected V2.
+    # Later scalar-only auto owners keep bound1 and inherit the selected V2
+    # as a shared minimum instead of silently allocating a smaller ring.
+    module = _ub_module(seq(_ub_owner(ring, "first", out, auto_pipeline=False),
+                            _ub_owner(ring, "second", out),
                             _ub_owner(other, "other_epoch", out)), [ring, other], out)
     after, queries = _capture_ub_budget(module, first_versions=2)
+    assert [query["stage_bound"] for query in queries] == [3, 1, 1]
     assert [query["minimum"] for query in queries] == [[1], [2], [1]]
     assert [_ub_variable_capacity(query) for query in queries] == [96 * 1024, 96 * 1024, 128 * 1024]
     assert int(after["main"].body.block.annotations["tl.buffer_versions_map"][ring.data]) == 2
@@ -224,10 +236,18 @@ def test_parent_ub_budget_counts_the_selected_child_ring_without_double_charging
     child = _ub_storage("child", 32 * 1024)
     epilogue = _ub_storage("epilogue", 16 * 1024)
     out = tirx.decl_buffer((1,), "float32", name="out")
-    body = _ub_owner(parent, "parent_epoch", out, child=_ub_owner(child, "child_epoch", out))
-    _, queries = _capture_ub_budget(_ub_module(body, [parent, child, epilogue], out), first_versions=2)
+    # Child scheduling occurs first. Give only that scalar-only child an
+    # explicit bound for V2; the parent remains an automatic one-slot owner.
+    body = _ub_owner(parent, "parent_epoch", out,
+                     child=_ub_owner(child, "child_epoch", out, auto_pipeline=False))
+    after, queries = _capture_ub_budget(_ub_module(body, [parent, child, epilogue], out), first_versions=2)
+    assert [query["stage_bound"] for query in queries] == [3, 1]
+    assert [query["minimum"] for query in queries] == [[1], [1]]
+    assert [query["selected"] for query in queries] == [[2], [1]]
     assert [query["sizes"] for query in queries] == [[32 * 1024], [32 * 1024]]
     assert [_ub_variable_capacity(query) for query in queries] == [144 * 1024, 112 * 1024]
+    versions = after["main"].body.block.annotations["tl.buffer_versions_map"]
+    assert int(versions[child.data]) == 2 and int(versions[parent.data]) == 1
 
 
 def test_future_fixed_ub_owner_reserves_its_requested_physical_width():
