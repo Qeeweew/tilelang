@@ -4,7 +4,7 @@ import pytest
 from tilelang import tvm
 from tilelang.ascend import transform
 from tvm import tirx
-from testing.ascend._ir import copy, kernel, nodes, seq, statements
+from testing.ascend._ir import allocated_buffer, copy, kernel, nodes, seq, statements
 from testing.ascend.auto_schedule._scheduled_ir import unit
 
 
@@ -55,6 +55,71 @@ def test_guard_equivalence_preserves_storage_epochs(relation, share_clock):
             isinstance(parent, tirx.IfThenElse) and tvm.arith.Analyzer().can_prove_equal(parent.condition, expected)
             for parent in updates[0][1]
         )
+
+
+@pytest.mark.parametrize("owners", [1, 2], ids=["one-owner", "disjoint-owners"])
+def test_counter_emission_uses_the_earliest_canonical_epoch_snapshot(owners):
+    """A lexical guard may dominate later equivalent counter-owner guards."""
+    a = tirx.decl_buffer((64,), "float32", name="A")
+    c = tirx.decl_buffer((64,), "float32", name="C")
+    lexical = tirx.decl_buffer((64,), "float32", name="lexical", scope="shared.dyn")
+    x = tirx.decl_buffer((64,), "float32", name="x", scope="shared.dyn")
+    y = tirx.decl_buffer((64,), "float32", name="y", scope="shared.dyn")
+    p = tirx.Var("p", "int32")
+    loops, snapshots = [], []
+    for index in range(owners):
+        i = tirx.Var(f"i{index}", "int32")
+        early = tirx.Var(f"early{index}", "bool")
+        late = tirx.Var(f"late{index}", "bool")
+        snapshots.append((i, early, late))
+        body = seq(
+            unit(tirx.Bind(early, p > 0), core=3),
+            unit(copy(a, lexical), guard=early),
+            unit(copy(lexical, c), guard=early),
+            unit(tirx.Bind(late, p >= 1), core=3),
+            unit(copy(a, x), guard=late),
+            unit(copy(x, c), guard=late),
+            unit(copy(a, y), guard=late),
+            unit(copy(y, c), guard=late),
+        )
+        loops.append(unit(tirx.For(
+            i, 0, 4, tirx.ForKind.SERIAL, body,
+            annotations={"multi_buffer_eligible": [x.data, y.data]}), core=None))
+    before = kernel(
+        seq(*loops), buffers=[lexical, x, y], params=[a, c, p],
+        annotations={"tl.buffer_versions_map": {x.data: 2, y.data: 3},
+                     "tl.buffer_version_mode": {x.data: "counter", y.data: "counter"}},
+    )
+    prepared = transform.PrepareMultiBuffer()(before)
+    counters = []
+    for i, early, late in snapshots:
+        owner, = [loop for loop in nodes(prepared, tirx.For) if loop.loop_var.same_as(i)]
+        guards = owner.annotations["tl.storage_epoch_guard_map"]
+        assert all(guards[storage.data].same_as(early) for storage in (lexical, x, y))
+        assert not guards[x.data].same_as(late)
+        clocks = owner.annotations["tl.multi_buffer_counter_map"]
+        assert clocks[x.data].same_as(clocks[y.data])
+        counters.append(clocks[x.data])
+        advance, = [
+            (stmt, parents) for stmt, parents in statements(owner.body)
+            if isinstance(stmt, tirx.BufferStore) and stmt.buffer.same_as(clocks[x.data])
+        ]
+        assert any(isinstance(parent, tirx.IfThenElse) and parent.condition.same_as(early)
+                   for parent in advance[1])
+        assert tvm.arith.Analyzer().can_prove_equal(advance[0].value, clocks[x.data][0] + 1)
+    assert all(counter.same_as(counters[0]) for counter in counters)
+    stores = [stmt for stmt in nodes(prepared, tirx.BufferStore) if stmt.buffer.same_as(counters[0])]
+    assert len(stores) == owners + 1  # One root initialization and one tick per owner.
+
+    # Across a real IR round-trip, the existing annotation codec reconstructs
+    # the same clock and physical versions; no pass-local fact is required.
+    direct = transform.MaterializeMultiBuffer()(prepared)
+    roundtripped = tvm.ir.load_json(tvm.ir.save_json(prepared))
+    restored = transform.MaterializeMultiBuffer()(roundtripped)
+    tvm.ir.assert_structural_equal(direct, restored, map_free_vars=True)
+    for name, versions in (("x", 2), ("y", 3)):
+        physical = allocated_buffer(restored, name)
+        assert tuple(int(dim) for dim in physical.shape) == (versions, 64)
 
 
 @pytest.mark.parametrize("case", ["inner-guard", "mutated-bound"])

@@ -200,6 +200,14 @@ plan. The pass responsibilities are:
 Codegen does not partition logical work or choose buffer versions. Resource
 validation and synchronization consume the same selected plan.
 
+Within `PrepareMultiBuffer`, owner analysis retains the active epoch guard and
+its definition position until guard canonicalization finishes. Equivalent
+guards use one dominating snapshot, and both counter emission and serialized
+epoch metadata consume the finalized plan. This avoids analyzing an owner
+again or recovering a just-computed guard from annotations. These facts are
+local to the preparation pass; later passes reconstruct the existing plan
+from annotations after counter insertion or an IR round-trip.
+
 Ordinary CUBE/VECTOR blocks describe core ownership. Task materialization
 retains that ownership in the existing core-mask metadata and derives each
 task's hardware pipe from its native instruction effects. A VECTOR DMA task

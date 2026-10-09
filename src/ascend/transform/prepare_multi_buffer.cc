@@ -427,6 +427,30 @@ struct PreparedStorage {
   CoreMask protocol_core_mask{kCoreUnassigned};
 };
 
+// Owner analysis is retained until guard canonicalization. The planner and
+// epoch serializer must use the same guard and definition position. These
+// facts are local to this preparation: task accesses, guards and owner
+// structure remain unchanged until counter insertion.
+using OwnerEpochFacts = std::unordered_map<
+    Var, std::unordered_map<ControlNode *, StorageEpochAnalysis>, ObjectPtrHash,
+    ObjectPtrEqual>;
+
+struct PreparedMultiBuffer {
+  MultiBufferPlan plan;
+  OwnerEpochFacts owner_epochs;
+
+  const StorageEpochAnalysis &OwnerEpoch(const Var &representative,
+                                        ControlNode *owner) const {
+    auto storage = owner_epochs.find(representative);
+    ICHECK(storage != owner_epochs.end())
+        << "Missing prepared storage epoch for " << representative->name_hint;
+    auto epoch = storage->second.find(owner);
+    ICHECK(epoch != storage->second.end())
+        << "Missing prepared owner epoch for " << representative->name_hint;
+    return epoch->second;
+  }
+};
+
 class MultiBufferPlanBuilder {
 public:
   MultiBufferPlanBuilder(const std::vector<std::shared_ptr<IRStructure>> &root,
@@ -440,7 +464,7 @@ public:
       availability_.SetExternalVarCoreMask(outer_sid.value(), kCoreVector);
   }
 
-  MultiBufferPlan Build() {
+  PreparedMultiBuffer Build() {
     InitializeStorages();
     std::vector<TaskNode *> all_tasks;
     CollectAllTaskNodes(root_, all_tasks);
@@ -549,7 +573,7 @@ public:
         plan_.AddInfo(std::move(info));
       }
     }
-    return std::move(plan_);
+    return {std::move(plan_), std::move(owner_epochs_)};
   }
 
 private:
@@ -649,8 +673,11 @@ private:
   }
 
   PreparedOwner AnalyzeOwner(const Var &storage, ControlNode *owner) {
-    StorageEpochAnalysis analysis =
-        AnalyzeStorageEpoch(storage, owner, groups_);
+    auto [epoch, inserted] = owner_epochs_[storage].emplace(
+        owner, AnalyzeStorageEpoch(storage, owner, groups_));
+    ICHECK(inserted) << "Duplicate prepared owner epoch for "
+                    << storage->name_hint;
+    const StorageEpochAnalysis &analysis = epoch->second;
     bool has_non_affine_loop_path = HasNonAffineLoopPath(owner);
     bool needs_counter =
         !is_one(analysis.active_guard) || has_non_affine_loop_path;
@@ -854,9 +881,10 @@ private:
       bind_definitions_;
   CoreMaskAvailability availability_;
   MultiBufferPlan plan_;
+  OwnerEpochFacts owner_epochs_;
 };
 
-MultiBufferPlan
+PreparedMultiBuffer
 BuildMultiBufferPlan(const std::vector<std::shared_ptr<IRStructure>> &root,
                      const BufferVersionMap &selected_versions,
                      const BufferVersionModeTable &requested_modes,
@@ -902,10 +930,12 @@ std::shared_ptr<TaskNode> MakeCounterTask(const Stmt &body, int stage) {
   return task;
 }
 
-void AnnotateStorageEpochs(
+MultiBufferPlan AnnotateStorageEpochs(
     const std::vector<std::shared_ptr<IRStructure>> &root,
-    const MultiBufferPlan &plan, const BufferVersionMap &manual_buffer_versions,
+    const PreparedMultiBuffer &prepared,
+    const BufferVersionMap &manual_buffer_versions,
     const ffi::Optional<Var> &outer_sid, const L0StorageGroups &groups) {
+  const MultiBufferPlan &plan = prepared.plan;
   std::vector<TaskNode *> tasks;
   CollectAllTaskNodes(root, tasks);
   CoreMaskAvailability availability(tasks);
@@ -945,6 +975,7 @@ void AnnotateStorageEpochs(
     CoreMask required_core_mask{kCoreUnassigned};
   };
 
+  std::unordered_map<ControlNode *, StorageEpochGuardMap> canonical_guards;
   for (ControlNode *loop : loops) {
     MultiBufferCounterMap counter_map;
     std::vector<StorageEpoch> counter_epochs;
@@ -961,14 +992,17 @@ void AnnotateStorageEpochs(
     }
     for (const Var &storage : storages) {
       const MultiBufferInfo *info = plan.Find(storage);
+      const MultiBufferOwnerInfo *owner = info ? info->FindOwner(loop) : nullptr;
       StorageEpochAnalysis analysis =
-          info ? AnalyzeStorageEpoch(storage, loop, groups)
-               : AnalyzeStorageEpoch(storage, loop);
+          owner && owner->loop == loop
+              ? prepared.OwnerEpoch(groups.Representative(storage), loop)
+              : (info ? AnalyzeStorageEpoch(storage, loop, groups)
+                      : AnalyzeStorageEpoch(storage, loop));
       if (info) {
         // Iteration-mode rings retain the unconditional lexical clock.
         if (!info->UsesCounter())
           continue;
-        if (const MultiBufferOwnerInfo *owner = info->FindOwner(loop)) {
+        if (owner) {
           // Counter domains cover the owner and all of its descendants. Only
           // the concrete owner serializes the physical counter binding.
           if (owner->loop == loop) {
@@ -1063,6 +1097,7 @@ void AnnotateStorageEpochs(
                     guard_representatives[representative_index].expression);
     }
 
+    canonical_guards.emplace(loop, guard_map);
     For rewritten = loop->control;
     ForNode *node = rewritten.CopyOnWrite();
     if (!counter_map.empty())
@@ -1071,24 +1106,28 @@ void AnnotateStorageEpochs(
     loop->control = std::move(rewritten);
   }
 
-  // Every counter owner must have been encountered through its storage access
-  // order above. This also guarantees that its representative guard was
-  // serialized together with the physical counter binding.
+  // Publish canonical owner facts to both the plan and its serialized form.
+  // Counter emission consumes this final plan, rather than recovering facts
+  // from annotations that were just written in this same pass.
+  MultiBufferPlan finalized;
   for (const MultiBufferInfo &info : plan.Infos()) {
-    if (!info.UsesCounter())
-      continue;
-    for (const MultiBufferOwnerInfo &owner : info.owners) {
-      For loop = owner.loop->control;
-      auto counters = loop->annotations.Get(kMultiBufferCounterMap);
-      auto guards = loop->annotations.Get(kStorageEpochGuardMap);
-      ICHECK(counters.has_value() && guards.has_value())
-          << "Counter owner is missing prepared epoch metadata for storage "
-          << info.storage->name_hint;
-      ICHECK(
-          counters.value().cast<MultiBufferCounterMap>().count(info.storage));
-      ICHECK(guards.value().cast<StorageEpochGuardMap>().count(info.storage));
+    MultiBufferInfo canonical = info;
+    if (info.UsesCounter()) {
+      for (MultiBufferOwnerInfo &owner : canonical.owners) {
+        auto guards = canonical_guards.find(owner.loop);
+        ICHECK(guards != canonical_guards.end())
+            << "Counter owner is missing prepared epoch metadata for storage "
+            << info.storage->name_hint;
+        auto guard = guards->second.Get(info.storage);
+        ICHECK(guard.has_value())
+            << "Counter owner is missing its canonical epoch guard for storage "
+            << info.storage->name_hint;
+        owner.active_guard = guard.value();
+      }
     }
+    finalized.AddInfo(std::move(canonical));
   }
+  return finalized;
 }
 
 void MaterializeCounterProtocol(ScheduledTIR *scheduled_tir,
@@ -1110,8 +1149,12 @@ void MaterializeCounterProtocol(ScheduledTIR *scheduled_tir,
     } else {
       ICHECK(protocol.counter.same_as(info.counter));
       ICHECK_EQ(protocol.owners.size(), info.owners.size());
-      for (size_t i = 0; i < protocol.owners.size(); ++i)
+      for (size_t i = 0; i < protocol.owners.size(); ++i) {
         ICHECK_EQ(protocol.owners[i].loop, info.owners[i].loop);
+        ICHECK(protocol.owners[i].active_guard.same_as(
+            info.owners[i].active_guard))
+            << "Shared counter storages must use one canonical epoch guard";
+      }
     }
     protocol.storages.push_back(info.storage);
   }
@@ -1123,28 +1166,7 @@ void MaterializeCounterProtocol(ScheduledTIR *scheduled_tir,
       advances;
   for (const auto &[_, protocol] : protocols) {
     for (const MultiBufferOwnerInfo &owner : protocol.owners) {
-      auto guards = owner.loop->control->annotations.Get(kStorageEpochGuardMap);
-      ICHECK(guards.has_value())
-          << "Counter owner is missing its canonical epoch guard";
-      StorageEpochGuardMap guard_map =
-          guards.value().cast<StorageEpochGuardMap>();
-      PrimExpr active_guard;
-      for (const Var &storage : protocol.storages) {
-        auto guard = guard_map.Get(storage);
-        ICHECK(guard.has_value())
-            << "Counter owner is missing the epoch guard for storage "
-            << storage->name_hint;
-        if (!active_guard.defined()) {
-          active_guard = guard.value();
-        } else {
-          // This annotation is produced and consumed within this pass, so its
-          // canonical guards retain ObjectRef identity without an IR
-          // round-trip.
-          ICHECK(active_guard.same_as(guard.value()))
-              << "Shared counter storages must use one canonical epoch guard";
-        }
-      }
-      ICHECK(active_guard.defined());
+      PrimExpr active_guard = owner.active_guard;
 
       IRStructure *anchor = nullptr;
       for (const auto &child : owner.loop->children) {
@@ -1230,13 +1252,14 @@ tvm::transform::Pass PrepareMultiBuffer() {
               metadata.buffer_version_modes, groups, "version modes");
           BufferVersionModeTable modes =
               ParseBufferVersionModes(metadata.buffer_version_modes);
-          MultiBufferPlan plan = BuildMultiBufferPlan(
+          PreparedMultiBuffer prepared = BuildMultiBufferPlan(
               scheduled_tir.tree, scheduled_tir.metadata.buffer_versions, modes,
               context.outer_sid, groups);
           scheduled_tir.metadata.buffer_version_modes = {};
-          AnnotateStorageEpochs(scheduled_tir.tree, plan,
-                                scheduled_tir.metadata.manual_buffer_versions,
-                                context.outer_sid, groups);
+          MultiBufferPlan plan = AnnotateStorageEpochs(
+              scheduled_tir.tree, prepared,
+              scheduled_tir.metadata.manual_buffer_versions, context.outer_sid,
+              groups);
           MaterializeCounterProtocol(&scheduled_tir, plan);
           return EncodeScheduledTIR(std::move(scheduled_tir));
         });
