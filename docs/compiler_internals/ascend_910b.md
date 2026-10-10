@@ -707,10 +707,15 @@ L0A/B can share physical addresses across two closed AIC phases while keeping
 their different canonical Buffers, layouts and version clocks. Early admission
 requires exactly two root allocations in the same physical scope, FP16/BF16
 canonical operands, typed L1 writers and native MAD readers, and separate
-direct phase children of one unconditional positive static outer loop. An
+direct phase children of one unconditional bounded outer loop. Its zero-origin,
+unit-step extent must be nonnegative, finite and immutable on loop entry;
+it may depend on launch coordinates and pure lexical bindings. Empty groups
+execute no data epochs. Calls, mutable reads and unresolved parameters do not
+establish this contract. Collective control still requires the same extent
+on the AIC and both AIVs in each group. An
 explicit offset loop may place those phases at different logical stages.
 Before scheduling, ordinary automatic pipeline intent may name that same
-static epoch. Prepared resource proofs require the intent to have been
+bounded epoch. Prepared resource proofs require the intent to have been
 consumed into the validated plan; an unconsumed search request is not a proof.
 The shared offset policy reads automatic intent and an optional explicit
 override. AutoSchedule retains the selected `enable_offset` value after

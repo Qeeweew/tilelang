@@ -107,8 +107,8 @@ def _gm_transfers(program, groups):
     launch = {loop.thread_binding.thread_tag: loop for loop in nodes(program, tirx.For) if loop.thread_binding is not None}
     group, sid = launch["blockIdx.x"].loop_var, launch["cthread"].loop_var
     assert int(launch["blockIdx.x"].extent) == groups and int(launch["cthread"].extent) == 2
-    trips = 12 // groups * 3
-    (epoch,) = [loop for loop in nodes(program, tirx.For) if loop.kind == tirx.ForKind.SERIAL and int(loop.extent) == trips]
+    (epoch,) = [loop for loop in nodes(program, tirx.For)
+               if loop.annotations.get("enable_offset")]
     actual = collections.Counter()
     for call, loops, guards, cube in _tile_sites(program.body):
         for values in _loop_values(loops, definitions):
@@ -199,7 +199,7 @@ def _expected_transfers(groups, block_kv=16, pv_chunk=None, *, row_block=16,
 
 
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
-@pytest.mark.parametrize("groups", [2, 4])
+@pytest.mark.parametrize("groups", [2, 4, 5, 8, 20])
 def test_real_frontend_keeps_query_ownership_and_group_private_rings(example, dtype, groups):
     program = example.persistent_attention_fwd(batch=2, heads=2, query_pairs=3, kv_tiles=3,
                                              groups=groups, block_q=32, block_kv=16,
@@ -282,7 +282,7 @@ def test_chunked_frontend_shares_v_and_keeps_owner_accumulators_until_final_expo
     definitions = {binding.var: binding.value for binding in nodes(program, tirx.Bind)}
     launch = {loop.thread_binding.thread_tag: loop for loop in loops if loop.thread_binding is not None}
     group, sid = launch["blockIdx.x"].loop_var, launch["cthread"].loop_var
-    (epoch,) = [loop for loop in loops if loop.kind == tirx.ForKind.SERIAL and int(loop.extent) == 12 // groups * 3]
+    (epoch,) = [loop for loop in loops if loop.annotations.get("enable_offset")]
     accumulation = collections.defaultdict(list)
     for values in _loop_values(loops, definitions):
         if values[sid] or not all(bool(_integer(guard, values, definitions)) == expected for guard, expected in guards):
@@ -370,7 +370,7 @@ def test_cache_strategy_and_independent_grains_preserve_complete_gm_handoffs(
 
 @pytest.mark.parametrize("changes,message", [
     ({"batch": True}, "positive integers"),
-    ({"groups": 5}, "divide evenly"),
+    ({"groups": 0}, "positive integers"),
     ({"block_q": 24}, "Aligned dense tiles"),
     ({"row_block": 48}, "complete UB row subtiles"),
     ({"dtype": "float32"}, "FP16/BF16"),
@@ -399,9 +399,10 @@ def test_invalid_contract_is_rejected_before_frontend_construction(example, chan
 
 
 @pytest.mark.parametrize("head_dim", [64, 128])
-def test_cached_policy_configs_use_existing_tuner_and_distinct_cache_identity(example, head_dim):
+@pytest.mark.parametrize("groups", [16, 20])
+def test_cached_policy_configs_use_existing_tuner_and_distinct_cache_identity(example, head_dim, groups):
     from tilelang.autotuner import AutoTuner
-    configs = example.get_tuning_configs(1, 32, 4096, 4096, head_dim)
+    configs = example.get_tuning_configs(1, 32, 4096, 4096, head_dim, groups=groups)
     assert json.loads(json.dumps(configs)) == configs
     assert [(c["block_kv"], c["kv_tiles"]) for c in configs] == [(256, 16), (512, 8)]
     assert [c["row_block"] for c in configs] == [32, 16]

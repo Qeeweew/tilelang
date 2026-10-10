@@ -168,7 +168,7 @@ def _value(expr, env):
     return int(value)
 
 
-def _trace(stmt, *, core, lane, env=None, loops=()):
+def _trace(stmt, *, core, lane, group=0, env=None, loops=()):
     """Expand this finite fixture's control, retaining lexical loop facts."""
     env = {_SCALAR_VALUES: {}, _PURE_DEFINITIONS: {}} if env is None else env
     if isinstance(stmt, (tvm.IRModule, tirx.PrimFunc)):
@@ -180,34 +180,35 @@ def _trace(stmt, *, core, lane, env=None, loops=()):
                 previous = env[_PURE_DEFINITIONS].get(binding.var)
                 assert previous is None or tvm.ir.structural_equal(previous, binding.value)
                 env[_PURE_DEFINITIONS][binding.var] = binding.value
-        yield from _trace(body, core=core, lane=lane, env=env, loops=loops)
+        yield from _trace(body, core=core, lane=lane, group=group, env=env, loops=loops)
     elif isinstance(stmt, tirx.SeqStmt):
         for child in stmt.seq:
-            yield from _trace(child, core=core, lane=lane, env=env, loops=loops)
+            yield from _trace(child, core=core, lane=lane, group=group, env=env, loops=loops)
     elif isinstance(stmt, tirx.SBlockRealize):
         assert _value(stmt.predicate, env)
-        yield from _trace(stmt.block, core=core, lane=lane, env=env, loops=loops)
+        yield from _trace(stmt.block, core=core, lane=lane, group=group, env=env, loops=loops)
     elif isinstance(stmt, tirx.SBlock):
-        yield from _trace(stmt.body, core=core, lane=lane, env=env, loops=loops)
+        yield from _trace(stmt.body, core=core, lane=lane, group=group, env=env, loops=loops)
     elif isinstance(stmt, tirx.AttrStmt):
         if stmt.attr_key == "tl.ascend_task" and int(stmt.node["core_mask"]) not in (core, 3):
             return
         local = env
         if stmt.attr_key == "thread_extent" and isinstance(stmt.node, tirx.IterVar):
-            coordinate = lane if stmt.node.thread_tag == "cthread" else 0
+            coordinate = (lane if stmt.node.thread_tag == "cthread" else
+                          group if stmt.node.thread_tag == "blockIdx.x" else 0)
             local = {**env, stmt.node.var: tirx.const(coordinate, stmt.node.var.dtype)}
-        yield from _trace(stmt.body, core=core, lane=lane, env=local, loops=loops)
+        yield from _trace(stmt.body, core=core, lane=lane, group=group, env=local, loops=loops)
     elif isinstance(stmt, tirx.For):
         start, extent = _value(stmt.min, env), _value(stmt.extent, env)
         assert stmt.kind == tirx.ForKind.SERIAL and 0 <= extent <= 1536
         for index in range(start, start + extent):
             local = {**env, stmt.loop_var: tirx.const(index, stmt.loop_var.dtype)}
-            yield from _trace(stmt.body, core=core, lane=lane, env=local,
+            yield from _trace(stmt.body, core=core, lane=lane, group=group, env=local,
                               loops=(*loops, (stmt.loop_var, index, extent)))
     elif isinstance(stmt, tirx.IfThenElse):
         branch = stmt.then_case if _value(stmt.condition, env) else stmt.else_case
         if branch is not None:
-            yield from _trace(branch, core=core, lane=lane, env=env, loops=loops)
+            yield from _trace(branch, core=core, lane=lane, group=group, env=env, loops=loops)
     elif isinstance(stmt, tirx.Bind):
         env[stmt.var] = tirx.const(_value(stmt.value, env), stmt.var.dtype)
     elif isinstance(stmt, tirx.AllocBuffer):

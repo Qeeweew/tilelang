@@ -32,6 +32,7 @@
 #include "./dependency_analysis.h"
 #include "./ir_structure.h"
 #include "./multi_buffer.h"
+#include "./resource_epoch.h"
 #include "ascend/layout/ascend_layouts.h"
 #include "ascend/op/copy.h"
 #include "ascend/op/cube_load.h"
@@ -262,13 +263,7 @@ inline bool StaticResultLoop(const ControlNode *loop, int64_t *count) {
     // boundary is a sibling at this same incoming stage, so parent lowering
     // moves the complete transaction through fill/drain as one domain.
     const ControlNode *parent = loop->GetParentControl();
-    if (!parent || parent->control->kind != ForKind::kSerial ||
-        Constant(parent->control->min) != 0 ||
-        !Constant(parent->control->extent) ||
-        *Constant(parent->control->extent) <= 0 ||
-        (parent->control->step.has_value() &&
-         Constant(parent->control->step.value()) != 1) ||
-        parent->BodyHasLoopBreak())
+    if (!parent || !resource_epoch_detail::BoundedInvariantLoop(parent))
       return false;
     auto bound = parent->control->annotations.Get("num_stages");
     auto stages = bound ? StageCount(bound.value()) : std::nullopt;

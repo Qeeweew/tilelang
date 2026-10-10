@@ -27,6 +27,15 @@ a cycle. Single-control native rings keep their ordinary owner-order choices.
 The selected pair remains a mandatory downstream alias
 obligation; its marker is never evidence that completion has been established.
 
+The outer resource epoch can have a different finite length per launch group.
+Its serial, zero-origin, unit-step extent must be immutable throughout the
+loop and provably nonnegative and finite on entry. Pure launch-coordinate
+arithmetic and lexical bindings can establish this bound; mutable loads,
+calls and unbound parameters cannot. Inner matrix-plane and native-K loops
+retain their positive static extents. Cross-core collectives separately prove
+that an AIC and its two AIVs use the same extent. Each group fills and drains
+its own stream, including a group with no data epochs.
+
 ## Whole-MAD credits for a resident plane set
 
 The fixed-plane operand protocol currently admits one leading axis. One
@@ -61,7 +70,7 @@ completion-proven alias.
 ## A complete result at an incoming parent stage
 
 A serial result loop can enter at a nonzero, already scheduled parent stage
-without changing its own native-K chain. Selection requires a static finite
+without changing its own native-K chain. Selection requires a bounded invariant
 unit-step parent, known nonnegative child stages and enabled stage offsets.
 An automatic parent's consumed integer stage bound must contain every child.
 A complete manual parent instead supplies explicit offsets and its children's
@@ -81,7 +90,8 @@ particular, separate N-chunk result streams still have their own terminal
 drains; this contract does not merge them into one longer result stream.
 
 The ordinary CPU regressions check physical overlap and actual binary flags
-across three epochs, both operand dtypes, automatic rings, guarded incoming
+across multiple epochs, unequal and empty group streams, both operand dtypes,
+automatic rings, guarded incoming
 stages, exact output transactions and invalid capacity/lifetime cases.
 Device correctness and a same-card profiler comparison are separate gates for
 using this compiler capability as a performance policy.

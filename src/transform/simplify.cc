@@ -563,14 +563,36 @@ private:
   }
 
   Stmt VisitStmt_(const ForNode *op) final {
-    if (analyzer_->CanProve(op->extent <= 0)) {
+    // Loop bounds are evaluated on entry. The induction range and nonempty
+    // body fact must not simplify those same bounds: an extent in [0, 1]
+    // would otherwise become one under the body's extent > 0 assumption.
+    PrimExpr min = VisitExpr(op->min);
+    PrimExpr extent = VisitExpr(op->extent);
+    Optional<PrimExpr> step = op->step;
+    if (step.has_value())
+      step = VisitExpr(step.value());
+    if (analyzer_->CanProve(extent <= 0)) {
       // Remove loops with non-positive extent
       return Evaluate(0);
     }
-    With<ConstraintContext> ctx1(analyzer_, op->loop_var >= op->min);
-    With<ConstraintContext> ctx2(analyzer_,
-                                 op->loop_var < op->min + op->extent);
-    return Parent::VisitStmt_(op);
+    Stmt body = constraint_scope_.WithNewScope([&]() -> Stmt {
+      Range dom = Range::FromMinExtent(min, extent);
+      analyzer_->Bind(op->loop_var, dom);
+      iter_vars_.Set(op->loop_var, dom);
+      constraint_scope_.Current().Emplace(analyzer_, extent > 0);
+      With<ConstraintContext> ctx1(analyzer_, op->loop_var >= min);
+      With<ConstraintContext> ctx2(analyzer_, op->loop_var < min + extent);
+      return VisitStmt(op->body);
+    });
+    if (min.same_as(op->min) && extent.same_as(op->extent) &&
+        step.same_as(op->step) && body.same_as(op->body))
+      return GetRef<Stmt>(op);
+    auto rewritten = CopyOnWrite(op);
+    rewritten->min = std::move(min);
+    rewritten->extent = std::move(extent);
+    rewritten->step = std::move(step);
+    rewritten->body = std::move(body);
+    return Stmt(rewritten);
   }
 
   bool CanInlineBind(const BindNode *op) {

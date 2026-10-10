@@ -23,9 +23,11 @@
 
 #include <tvm/arith/analyzer.h>
 
+#include <functional>
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "./scheduled_tir.h"
@@ -63,6 +65,78 @@ inline bool PositiveStaticLoop(const ControlNode *control) {
          *extent > 0 &&
          (!loop->step.has_value() || Constant(loop->step.value()) == 1) &&
          !control->BodyHasLoopBreak();
+}
+
+// A resource epoch may have a different finite length in each launch group.
+// The extent must be immutable for the complete loop, with a proven finite,
+// nonnegative range on entry. Do not use the loop's own nonempty body fact to
+// establish that bound. Mutable snapshots, calls, and unbound parameters do
+// not establish this contract. Cross-core lane uniformity remains a separate
+// collective-control proof in InsertSync.
+inline bool BoundedInvariantLoop(const ControlNode *control) {
+  if (PositiveStaticLoop(control))
+    return true;
+  const For &loop = control->control;
+  if (loop->kind != ForKind::kSerial || Constant(loop->min) != 0 ||
+      (loop->step.has_value() && Constant(loop->step.value()) != 1) ||
+      control->BodyHasLoopBreak())
+    return false;
+  const ConstrSet &context = control->task->outer_ctx;
+  std::unordered_set<const VarNode *> resolving, stable;
+  std::function<bool(const VarNode *)> stable_var;
+  class PureExtent : public ExprVisitor {
+  public:
+    explicit PureExtent(const std::function<bool(const VarNode *)> &check)
+        : check_(check) {}
+    bool valid{true};
+
+  private:
+    void VisitExpr_(const VarNode *op) final { valid &= check_(op); }
+    void VisitExpr_(const CallNode *) final { valid = false; }
+    void VisitExpr_(const BufferLoadNode *) final { valid = false; }
+    void VisitExpr_(const ProducerLoadNode *) final { valid = false; }
+    void VisitExpr_(const ReduceNode *) final { valid = false; }
+    const std::function<bool(const VarNode *)> &check_;
+  };
+  stable_var = [&](const VarNode *var) {
+    if (!var->dtype.is_scalar() ||
+        (!var->dtype.is_int() && !var->dtype.is_uint() &&
+         !var->dtype.is_bool()))
+      return false;
+    if (stable.count(var))
+      return true;
+    if (!resolving.insert(var).second)
+      return false;
+    const Constr *binding = nullptr;
+    for (const Constr &constraint : context.constrs_)
+      if (constraint.kind != Constr::kConstr && constraint.var.get() == var) {
+        if (binding)
+          return false;
+        binding = &constraint;
+      }
+    if (!binding)
+      return false;
+    PureExtent expression(stable_var);
+    if (binding->kind == Constr::kBindValue) {
+      expression(binding->value);
+    } else {
+      expression(binding->range->min);
+      expression(binding->range->extent);
+    }
+    resolving.erase(var);
+    if (expression.valid)
+      stable.insert(var);
+    return expression.valid;
+  };
+  PureExtent expression(stable_var);
+  expression(loop->extent);
+  if (!expression.valid)
+    return false;
+  arith::Analyzer analyzer;
+  context.Populate(analyzer);
+  auto bound = analyzer.const_int_bound(loop->extent);
+  return bound->min_value >= 0 &&
+         bound->max_value != arith::ConstIntBound::kPosInf;
 }
 
 inline bool Touches(const ObjectRef &value, const Var &storage) {
@@ -154,7 +228,7 @@ public:
                                 bool prepared = false) const {
     using namespace resource_epoch_detail;
     if (epoch->GetParentControl() || epoch->HasGuards() || !StageZero(epoch) ||
-        !PositiveStaticLoop(epoch))
+        !BoundedInvariantLoop(epoch))
       return {ResourceEpochRejection::kOpenControl, Var()};
     for (const auto &[key, value] : epoch->control->annotations) {
       if (key == kMultiBufferEligible ||
@@ -174,7 +248,7 @@ public:
       if (key == "num_stages" &&
           Constant(value.cast<PrimExpr>()).value_or(0) > 0)
         continue;
-      // Before scheduling, automatic intent may select this same static
+      // Before scheduling, automatic intent may select this same bounded
       // epoch. Prepared proofs require the request to have been consumed.
       if (key == "enable_offset" || (key == "tl.ascend_auto_pipeline" &&
                                      (!prepared || !value.cast<bool>())))

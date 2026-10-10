@@ -488,9 +488,9 @@ def test_balanced_l1_gemms_keep_the_actual_epoch_storage_contract(dtype, automat
     _assert_balanced_operand_completions(snapshots["tl.LowerScheduledTIR"], selected)
 
 
-def _assert_balanced_operand_completions(mod, selected):
+def _assert_balanced_operand_completions(mod, selected, *, group=0, allow_empty=False):
     """Check load readiness and all overlapping old readers on shared banks."""
-    records = list(_trace(mod, core=2, lane=0))
+    records = list(_trace(mod, core=2, lane=0, group=group))
     commands, writes, reads = [], [], []
     shared = {storage for pair in selected for storage in pair}
 
@@ -532,6 +532,9 @@ def _assert_balanced_operand_completions(mod, selected):
                             "tl.ascend_set_cube_load_config", "tl.ascend_set_load3d_config"), name
             commands.append(_Command("S", "scalar"))
     require = _prove_completions(commands)
+    if allow_empty:
+        assert not writes and not reads
+        return
     assert writes and reads
     for reader, buffer, begin, end in reads:
         prior = [(writer, target, low, high) for writer, target, low, high in writes

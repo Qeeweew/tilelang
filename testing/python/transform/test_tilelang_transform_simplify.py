@@ -84,6 +84,24 @@ def test_dynamic_reduction_tail_guard():
     simplify_and_compare(mod, mod)
 
 
+@pytest.mark.parametrize("count,groups", [(2, 3), (7, 3), (1024, 20)])
+def test_group_loop_extent_is_not_simplified_under_its_own_body_facts(count, groups):
+    """Entry bounds preserve empty groups and both lengths of balanced work."""
+    group = te.thread_axis("blockIdx.x")
+    epoch = tirx.Var("epoch", "int32")
+    output = tirx.decl_buffer((groups, count), "int32", name="O")
+    extent = (count + groups - 1 - group.var) // groups
+    store = tirx.BufferStore(output, epoch + 1, [group.var, epoch])
+    loop = tirx.For(epoch, 0, extent, tirx.ForKind.SERIAL, store)
+    body = tirx.AttrStmt(group, "thread_extent", groups, loop)
+    before = tvm.IRModule.from_expr(tirx.PrimFunc([output], body))
+    after = tl.transform.Simplify()(before)["main"].body.body
+    assert isinstance(after, tirx.For)
+    for index in range(groups):
+        concrete = tirx.stmt_functor.substitute(after.extent, {group.var: tirx.const(index, "int32")})
+        assert int(tvm.arith.Analyzer().simplify(concrete)) == len(range(index, count, groups))
+
+
 def test_context_singleton_floordiv_index():
     A, C = buffer_pair((128,))
     tx = te.thread_axis("threadIdx.x")

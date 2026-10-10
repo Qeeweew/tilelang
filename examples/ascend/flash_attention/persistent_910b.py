@@ -1,6 +1,6 @@
 """Persistent paired-query FlashAttention forward for dav-2201.
 
-Each mixed-core group traverses a divisible share of the query-pair grid.
+Each mixed-core group traverses a balanced round-robin share of the query-pair grid.
 Its AIVs own separate complete query tiles, with group-private GM handoffs
 and FP32 output state. Explicit phase and ring hints still use the ordinary
 Ascend lowering, AutoSchedule, capacity checks, and synchronization passes.
@@ -26,8 +26,6 @@ def get_tuning_configs(batch, heads, query_len, kv_len, head_dim, *,
         raise ValueError("Persistent tuning dimensions must be positive integers")
     if query_len % 128 or kv_len % 256 or head_dim % 16:
         raise ValueError("Cached tuning requires complete Q128/KV256 grids and aligned D")
-    if (batch * heads * (query_len // 128)) % groups:
-        raise ValueError("groups must divide the complete query-pair grid")
     if dtype not in ("float16", "bfloat16") or not isinstance(preserve_issue_order, bool):
         raise ValueError("Persistent tuning requires FP16/BF16 and a bool issue-order policy")
     return [dict(batch=batch, heads=heads, query_pairs=query_len // 128,
@@ -74,8 +72,9 @@ def persistent_attention_fwd(
     Each AIV processes its own complete query tile.
 
     Dimensions are positive integers, tile dimensions are multiples of 16,
-    row_block and row_block_vec2 divide block_q, and groups divides
-    B*H*query_pairs. This
+    row_block and row_block_vec2 divide block_q. Query pairs are distributed
+    round robin, with at most one pair of load difference between groups;
+    groups beyond the query-pair count have no tasks. This
     factory has no causal mask, GQA, dropout, or sequence tails. Resource
     feasibility is checked by the target compiler, not by these shape rules.
 
@@ -148,16 +147,9 @@ def persistent_attention_fwd(
     if not cache_pv and pv_rows != block_q:
         raise ValueError("pv_rows requires cache_pv=True")
     total_pairs = batch * heads * query_pairs
-    if total_pairs % groups:
-        raise ValueError(
-            f"total_pairs={total_pairs} (batch={batch}, heads={heads}, "
-            f"query_pairs={query_pairs}) must divide evenly across groups={groups}"
-        )
 
     from tilelang.ascend import language as T
 
-    pairs_per_group = total_pairs // groups
-    tasks = pairs_per_group * kv_tiles
     sequence_k = kv_tiles * block_kv
     chunked_pv = pv_chunk is not None
     pv_extent = pv_chunk if chunked_pv else block_kv
@@ -234,6 +226,9 @@ def persistent_attention_fwd(
 
             # One logical stream spans every local query pair. Query state
             # belongs to local_pair; task-generation slots belong to lowering.
+            # Count only this group's round-robin pairs. All three cores in
+            # the group share the same extent, including fill and drain.
+            tasks = ((total_pairs + groups - 1 - group) // groups) * kv_tiles
             for t in T.serial(tasks, annotations={
                     "enable_offset": True,
                     "tl.ascend_preserve_issue_order": preserve_issue_order}):

@@ -9,23 +9,24 @@ from tilelang import tvm
 from tilelang.ascend import language as T, transform
 from tvm import tirx
 
-from testing.ascend._ir import allocated_buffer
+from testing.ascend._ir import allocated_buffer, nodes
+from testing.ascend.auto_schedule.test_owner_result_completion import _trace
 from testing.ascend.auto_schedule.test_l0ab_phase_reuse import (
     _assert_balanced_operand_completions, _bytes, _lower, _pairs, _root,
 )
 
 
 def _program(dtype, planes=2, interleaved=False, reader_planes=None,
-             automatic=False):
+             automatic=False, groups=1, epochs=3, balanced=False):
     readers = planes if reader_planes is None else reader_planes
     @T.prim_func
-    def main(Q: T.Tensor((3, planes, 128, 128), dtype),
-             K: T.Tensor((3, 384, 128), dtype),
-             P: T.Tensor((3, planes, 128, 384), dtype),
-             V: T.Tensor((3, 384, 128), dtype),
-             Score: T.Tensor((3, planes, 128, 384), "float32"),
-             Result: T.Tensor((3, planes, 128, 128), "float32")):
-        with T.Kernel(1):
+    def main(Q: T.Tensor((groups, epochs, planes, 128, 128), dtype),
+             K: T.Tensor((groups, epochs, 384, 128), dtype),
+             P: T.Tensor((groups, epochs, planes, 128, 384), dtype),
+             V: T.Tensor((groups, epochs, 384, 128), dtype),
+             Score: T.Tensor((groups, epochs, planes, 128, 384), "float32"),
+             Result: T.Tensor((groups, epochs, planes, 128, 128), "float32")):
+        with T.Kernel(groups) as group:
             q = T.alloc_l1((planes, 128, 128), dtype)
             k = T.alloc_l1((128, 128), dtype)
             p = T.alloc_l1((128, 128), dtype)
@@ -36,34 +37,35 @@ def _program(dtype, planes=2, interleaved=False, reader_planes=None,
             cp = T.alloc_l0c((128, 128), "float32")
             T.annotate_buffer_versions({q: 1, k: 1, p: 1, v: 1,
                                         aq: 1, bq: 2, cq: 1, cp: 1})
-            for epoch in T.serial(3, annotations={"enable_offset": True,
+            for epoch in T.serial((epochs + groups - 1 - group) // groups if balanced else epochs,
+                                 annotations={"enable_offset": True,
                                                   "tl.ascend_preserve_issue_order": True}):
                 with T.Stage(0):
                     for owner in T.serial(planes):
-                        T.copy(Q[epoch, owner, :, :], q[owner, :, :])
+                        T.copy(Q[group, epoch, owner, :, :], q[owner, :, :])
                     for owner in T.serial(planes):
                         T.copy(q[owner, :, :], aq[owner, :, :])
                     for n in T.serial(3):
-                        T.copy(K[epoch, n * 128:(n + 1) * 128, :], k)
+                        T.copy(K[group, epoch, n * 128:(n + 1) * 128, :], k)
                         T.copy(k, bq)
                         for owner in T.serial(readers):
                             T.gemm(aq[owner, :, :], bq, cq,
                                    transpose_B=True, clear_accum=True)
-                            T.copy(cq, Score[epoch, owner, :, n * 128:(n + 1) * 128])
+                            T.copy(cq, Score[group, epoch, owner, :, n * 128:(n + 1) * 128])
                 with T.Stage(1):
-                    T.copy(V[epoch, :, :], v)
+                    T.copy(V[group, epoch, :, :], v)
                     for owner in T.serial(planes):
                         for chunk in T.Pipelined(3):
-                            T.copy(P[epoch, owner, :, chunk * 128:(chunk + 1) * 128], p)
+                            T.copy(P[group, epoch, owner, :, chunk * 128:(chunk + 1) * 128], p)
                             T.gemm(p, v[chunk * 128:(chunk + 1) * 128, :], cp,
                                    clear_accum=chunk == 0)
-                        T.copy(cp, Result[epoch, owner, :, :])
+                        T.copy(cp, Result[group, epoch, owner, :, :])
                 if interleaved:
                     with T.Stage(2):
                         for owner in T.serial(planes):
                             T.gemm(aq[owner, :, :], bq, cq,
                                    transpose_B=True, clear_accum=True)
-                            T.copy(cq, Score[epoch, owner, :, :128])
+                            T.copy(cq, Score[group, epoch, owner, :, :128])
     if not automatic:
         return main
 
@@ -107,6 +109,47 @@ def test_automatic_schedule_keeps_the_resident_plane_interval_closed(dtype):
     # overwrite against the old whole-MAD readers, across fill/drain epochs.
     _assert_balanced_operand_completions(snapshots["tl.LowerScheduledTIR"], selected)
     assert artifact.kernel_source
+
+
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+@pytest.mark.parametrize("automatic", [False, True])
+@pytest.mark.parametrize("epochs,expected", [(7, (3, 2, 2)), (2, (1, 1, 0))])
+def test_group_dependent_epochs_keep_completion_for_every_group(dtype, automatic, epochs, expected):
+    artifact, snapshots = _lower(_program(dtype, automatic=automatic, groups=3,
+                                         epochs=epochs, balanced=True))
+    selected = _pairs(snapshots["tl.AutoSchedule"])
+    aq = allocated_buffer(snapshots["tl.AutoSchedule"], "aq")
+    ap = allocated_buffer(snapshots["tl.AutoSchedule"], "gemm_l0a_0")
+    assert frozenset((aq.data, ap.data)) in selected
+    lowered = snapshots["tl.LowerScheduledTIR"]
+    for group, count in enumerate(expected):
+        # The actual binary flags must complete on both lengths and on an
+        # empty group. This also checks all old MAD readers before overwrite.
+        _assert_balanced_operand_completions(lowered, selected, group=group,
+                                            allow_empty=count == 0)
+        exports = [call for call, _, _ in _trace(lowered, core=2, lane=0, group=group)
+                   if call.op.name == "tl.tileop.ascend_copy"
+                   and call.args[1].args[0].buffer.name == "Result"]
+        assert len(exports) == count * 2
+    if all(expected):
+        assert artifact.kernel_source.count("asc_set_mmad_direction_n();") == 1
+        assert artifact.kernel_source.count("asc_set_mmad_direction_m();") == 1
+    # A one-epoch stream may retain ordinary whole-MAD/FIX handshakes when
+    # the independent reverse-completion certificate cannot select units.
+    # Its exact data transactions and physical completions are checked above.
+
+
+def test_storage_dependent_epoch_extent_cannot_claim_a_closed_phase():
+    program = _program("float16", groups=3, epochs=7, balanced=True)
+    query = next(buffer for buffer in program.buffer_map.values() if buffer.name == "Q")
+    def mutable_extent(node):
+        if isinstance(node, tirx.For) and node.loop_var.name == "epoch":
+            extent = tirx.Cast("int32", query[0, 0, 0, 0, 0]) % 3
+            return tirx.For(node.loop_var, node.min, extent, node.kind,
+                            node.body, annotations=node.annotations)
+    broken = program.with_body(tirx.stmt_functor.ir_transform(program.body, None, mutable_extent))
+    with pytest.raises(tvm.error.InternalError, match="scope.*shared.l0a.*capacity"):
+        _lower(broken)
 
 
 @pytest.mark.parametrize("fault", ["interposed-mate", "split-cache-stage"])
