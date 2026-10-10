@@ -983,6 +983,450 @@ bool HasImplicitSamePipeOrder(const std::string &pipe,
 // ============================================================================
 // Recursive dependency analysis and reuse planning
 // ============================================================================
+bool StableLocalBinaryBoundary(const PrimExpr &expression,
+                               const ControlNode *loop,
+                               bool allow_epoch = false) {
+  // Root fill/drain may use parameters and enclosing thread coordinates,
+  // but not values defined or changed inside the active loop. Follow outer
+  // Bind definitions only to validate their purity; this is not a second
+  // binding/rewriting mechanism.
+  std::unordered_set<const VarNode *> changing;
+  for (const Var &var : loop->GetWriteVars())
+    changing.insert(var.get());
+  std::function<void(const ControlNode *)> collect_loops =
+      [&](const ControlNode *control) {
+        changing.insert(control->control->loop_var.get());
+        for (const auto &child : control->children)
+          if (child->IsControl())
+            collect_loops(static_cast<const ControlNode *>(child.get()));
+      };
+  collect_loops(loop);
+  std::unordered_set<const VarNode *> checked, resolving;
+  std::function<bool(const PrimExpr &)> stable;
+  stable = [&](const PrimExpr &value) {
+    bool valid = true;
+    PostOrderVisit(value, [&](const ObjectRef &node) {
+      if (node.as<BufferLoadNode>() || node.as<ProducerLoadNode>() ||
+          node.as<CallNode>() || node.as<ReduceNode>())
+        valid = false;
+      const auto *var = node.as<VarNode>();
+      if (!var || !valid)
+        return;
+      if (allow_epoch && var == loop->control->loop_var.get())
+        return;
+      if (changing.count(var) || !var->dtype.is_scalar() ||
+          (!var->dtype.is_int() && !var->dtype.is_uint() &&
+           !var->dtype.is_bool())) {
+        valid = false;
+        return;
+      }
+      if (checked.count(var))
+        return;
+      if (!resolving.insert(var).second) {
+        valid = false;
+        return;
+      }
+      for (const Constr &constraint : loop->task->outer_ctx.constrs_)
+        if (constraint.kind == Constr::kBindValue &&
+            constraint.var.get() == var)
+          valid &= stable(constraint.value);
+      resolving.erase(var);
+      if (valid)
+        checked.insert(var);
+    });
+    return valid;
+  };
+  return stable(expression);
+}
+
+// Flag lifetime admission is deliberately separate from data completion.
+// These certificates neither add DepClosure edges nor authorize storage reuse.
+class ScalarAdmissionProof {
+public:
+  ScalarAdmissionProof(AscendArchitecture architecture,
+                       const SyncSiteRegistry &sites)
+      : architecture_(architecture), site_registry_(sites) {}
+
+  struct ClosedScalarWaitPhase {
+    ControlNode *scope;
+    IRStructure *first;
+    IRStructure *last;
+  };
+
+  bool HasScalarAdmissionLexicalClock(const SyncPoint &point,
+                                      ControlNode *loop) const {
+    if (architecture_ != AscendArchitecture::kDav2201 || !loop ||
+        point.flag_loop != loop || loop->GetParentControl() != nullptr ||
+        loop->HasConditions() || loop->BodyHasLoopBreak() ||
+        loop->control->kind != ForKind::kSerial ||
+        point.counter_group_id != 0 || !point.proof.HasOriginalEndpoints() ||
+        point.local_binary_plan || point.single_iteration_binary_plan ||
+        point.unit_boundary != UnitFlagBoundaryRole::kNone)
+      return false;
+    const SyncInsertionSite &src = site_registry_.Src(point);
+    const SyncInsertionSite &dst = site_registry_.Dst(point);
+    if (src.core != kCoreVector || dst.core != src.core || src.pipe != "V" ||
+        dst.pipe != "S" || src.at_beginning || !dst.at_beginning ||
+        src.EpochDomainId() != dst.EpochDomainId())
+      return false;
+    const EpochDomain &domain = site_registry_.Domain(src);
+    if (domain.IsCounter() || domain.owner != loop)
+      return false;
+    const ForNode *node = loop->control.get();
+    PrimExpr step = node->step.has_value() ? node->step.value()
+                                           : IntImm(node->extent.dtype(), 1);
+    if (!point.flag_iteration.dtype().is_int() ||
+        SideEffect(node->min) != CallEffectKind::kPure ||
+        SideEffect(node->extent) != CallEffectKind::kPure ||
+        SideEffect(step) != CallEffectKind::kPure ||
+        !loop->task->outer_ctx.CanProve(step > make_zero(step.dtype())))
+      return false;
+    return loop->GetLoopBodyContext().CanProve(
+        point.flag_iteration == indexdiv(node->loop_var - node->min, step));
+  }
+
+  bool HasShiftedScalarWaitWidth(const SyncPoint &point,
+                                 ControlNode *loop) const {
+    if (point.edge.distance != 1 ||
+        !HasScalarAdmissionLexicalClock(point, loop))
+      return false;
+    const SyncInsertionSite &src = site_registry_.Src(point);
+    const SyncInsertionSite &dst = site_registry_.Dst(point);
+    if (src.path_begin != src.path_end || src.path_end != dst.path_begin ||
+        dst.path_begin != dst.path_end || !src.path_end->IsControl() ||
+        src.path_begin->GetParent() != loop || src.path_begin->GetStage() < 0)
+      return false;
+    // These are real sibling insertions around one Control, including when
+    // its body has zero trips. The old epoch's Scalar wait consumes the bit
+    // before dispatch can reach this epoch's V notification. Retain the exact
+    // shifted clock/activation validation and one seed/drain in the caller.
+    // This bounds flag lifetime; it supplies no new data-completion edge.
+    for (const SyncInsertionSite *site : {&src, &dst}) {
+      PrimExpr guard = owner_result_detail::Expand(
+          site->GetGuard(),
+          owner_result_detail::TaskBindings(
+              static_cast<ControlNode *>(site->path_end)->task.get()));
+      if (!StableLocalBinaryBoundary(guard, loop, true) ||
+          !loop->GetLoopBodyContext().CanProve(guard))
+        return false;
+    }
+    return true;
+  }
+
+  std::optional<ClosedScalarWaitPhase>
+  ComputeClosedScalarWaitPhase(const SyncPoint &point,
+                               bool for_width = false) const {
+    if (architecture_ != AscendArchitecture::kDav2201 || !point.flag_loop ||
+        point.edge.distance != 0 || (!for_width && point.num_versions != 1) ||
+        !point.proof.HasOriginalEndpoints() || point.local_binary_plan ||
+        point.single_iteration_binary_plan ||
+        point.unit_boundary != UnitFlagBoundaryRole::kNone)
+      return std::nullopt;
+    const SyncInsertionSite &src = site_registry_.Src(point);
+    const SyncInsertionSite &dst = site_registry_.Dst(point);
+    ControlNode *scope = point.flag_loop;
+    if (src.core != kCoreVector || dst.core != src.core || src.pipe != "V" ||
+        dst.pipe != "S" || src.at_beginning || !dst.at_beginning ||
+        src.path_begin != src.path_end || !src.path_end->IsTask() ||
+        src.path_begin->GetParent() != scope ||
+        dst.path_begin->GetParent() != scope ||
+        src.path_begin->GetIndex() >= dst.path_begin->GetIndex())
+      return std::nullopt;
+    // PerCoreTask materialization can migrate a site into several guarded
+    // internal tasks. The ordinary-task sibling insertion contract used by
+    // this certificate does not establish those occurrences' activation.
+    if (static_cast<TaskNode *>(src.path_end)->IsPerCoreTask() ||
+        (dst.path_end->IsTask() &&
+         static_cast<TaskNode *>(dst.path_end)->IsPerCoreTask()))
+      return std::nullopt;
+    // Width reduction may use a common pipeline stage: the matching Scalar
+    // wait still executes before the next physical iteration can dispatch a
+    // new notification. Cross-channel phase sharing remains stage-zero only.
+    int stage = for_width ? src.path_begin->GetStage() : 0;
+    if (stage < 0 || dst.path_begin->GetStage() != stage)
+      return std::nullopt;
+
+    auto stable = [&](const PrimExpr &guard, const TaskNode *task) {
+      PrimExpr expanded = owner_result_detail::Expand(
+          guard, owner_result_detail::TaskBindings(task));
+      return StableLocalBinaryBoundary(expanded, scope, true)
+                 ? std::optional<PrimExpr>(std::move(expanded))
+                 : std::nullopt;
+    };
+    auto activation =
+        [&](const SyncInsertionSite &site) -> std::optional<PrimExpr> {
+      PrimExpr guard = site.GetGuard();
+      ffi::Map<Var, PrimExpr> entries;
+      // The existing insertion-site constructor descends a control only
+      // after proving it nonempty and attaches its first-iteration selector.
+      // Recover the activation by substituting those entry coordinates. A
+      // site that stopped at a Control is already outside its loop/guard;
+      // retain that real boundary, including execution for an empty loop.
+      for (IRStructure *node : site.path_end->PathFrom(site.path_begin)) {
+        if (node->GetStage() != (node == site.path_begin ? stage : 0))
+          return std::nullopt;
+        if (node == site.path_end)
+          break;
+        if (!node->IsControl())
+          return std::nullopt;
+        auto *control = static_cast<ControlNode *>(node);
+        if (control->BodyHasLoopBreak() ||
+            control->control->kind != ForKind::kSerial ||
+            SideEffect(control->control->min) != CallEffectKind::kPure ||
+            SideEffect(control->control->extent) != CallEffectKind::kPure)
+          return std::nullopt;
+        guard = guard && control->GetConditionGuard();
+        entries.Set(control->control->loop_var,
+                    Substitute(control->control->min, entries));
+        guard = Substitute(guard, entries);
+      }
+      const TaskNode *endpoint =
+          site.path_end->IsTask()
+              ? static_cast<TaskNode *>(site.path_end)
+              : static_cast<ControlNode *>(site.path_end)->task.get();
+      return stable(guard, endpoint);
+    };
+    auto source_activation = activation(src);
+    auto wait_activation = activation(dst);
+    if (!source_activation || !wait_activation ||
+        !GuardsEquivalent(*source_activation, *wait_activation,
+                          scope->GetLoopBodyContext()))
+      return std::nullopt;
+    return ClosedScalarWaitPhase{scope, src.path_begin, dst.path_begin};
+  }
+
+private:
+  AscendArchitecture architecture_;
+  const SyncSiteRegistry &site_registry_;
+};
+
+// Reads the incrementally finalized sync points and per-scope closure. Owns
+// only event-sharing certificates/results, never dependencies or retry state.
+class FlagReuseAnalysis {
+public:
+  FlagReuseAnalysis(const SyncSiteRegistry &sites,
+                    const std::vector<SyncPoint> &points,
+                    const ScalarAdmissionProof &scalar_admission)
+      : site_registry_(sites), sync_points_(points),
+        scalar_admission_(scalar_admission) {}
+
+  const std::set<std::pair<size_t, size_t>> &ReusablePairs() const {
+    return reusable_pairs_;
+  }
+
+private:
+  using ClosedScalarWaitPhase = ScalarAdmissionProof::ClosedScalarWaitPhase;
+
+  const std::optional<ClosedScalarWaitPhase> &
+  GetClosedScalarWaitPhase(size_t index) const {
+    auto it = closed_scalar_wait_phases_.find(index);
+    if (it == closed_scalar_wait_phases_.end())
+      it = closed_scalar_wait_phases_
+               .emplace(index, scalar_admission_.ComputeClosedScalarWaitPhase(
+                                   sync_points_[index]))
+               .first;
+    return it->second;
+  }
+
+  bool CanReuseClosedScalarWaitPhases(size_t lhs, size_t rhs) const {
+    const auto &left = GetClosedScalarWaitPhase(lhs);
+    const auto &right = GetClosedScalarWaitPhase(rhs);
+    if (!left || !right)
+      return false;
+    IRStructure *ancestor =
+        left->scope->GetLowestCommonAncestor(right->scope);
+    if (!ancestor || !ancestor->IsControl())
+      return false;
+    auto *common = static_cast<ControlNode *>(ancestor);
+    auto unshifted_path = [&](ControlNode *scope) {
+      for (;;) {
+        if (scope->GetStage() != 0 || scope->BodyHasLoopBreak() ||
+            scope->control->kind != ForKind::kSerial)
+          return false;
+        PrimExpr guard = owner_result_detail::Expand(
+            scope->GetConditionGuard(),
+            owner_result_detail::TaskBindings(scope->task.get()));
+        if (!StableLocalBinaryBoundary(guard, common, true) ||
+            SideEffect(scope->control->min) != CallEffectKind::kPure ||
+            SideEffect(scope->control->extent) != CallEffectKind::kPure ||
+            (scope->control->step.has_value() &&
+             SideEffect(scope->control->step.value()) != CallEffectKind::kPure))
+          return false;
+        if (scope == common)
+          return true;
+        scope = scope->GetParentControl();
+        ICHECK(scope != nullptr);
+      }
+    };
+    if (!unshifted_path(left->scope) || !unshifted_path(right->scope))
+      return false;
+    auto span = [&](const ClosedScalarWaitPhase &phase) {
+      IRStructure *first = phase.first->GetChildOnPathFrom(common);
+      IRStructure *last = phase.last->GetChildOnPathFrom(common);
+      return std::pair<int, int>{first->GetIndex(), last->GetIndex()};
+    };
+    auto [left_first, left_last] = span(*left);
+    auto [right_first, right_last] = span(*right);
+    // Each phase clears its single notification before leaving its own
+    // activation. A real WaitFlag(V,S) stalls Scalar, which dispatches later
+    // asynchronous commands: its consumption precedes a disjoint phase's
+    // later V notification, including the next enclosing-loop activation.
+    // This is a flag-lifetime admission inference, not Vector data completion.
+    // Storage epoch domains and DepClosure are deliberately unchanged.
+    return left_last < right_first || right_last < left_first;
+  }
+
+  bool CanReuse(const VisibleSyncPoint &lhs, const VisibleSyncPoint &rhs,
+                const DepClosure &closure, bool allow_cross_iter,
+                bool allow_mixed_iter) const {
+    const SyncPoint &lhs_sync = sync_points_[lhs.sync_point_id];
+    const SyncPoint &rhs_sync = sync_points_[rhs.sync_point_id];
+    if (!lhs_sync.proof.HasOriginalEndpoints() ||
+        !rhs_sync.proof.HasOriginalEndpoints())
+      return false;
+    if (lhs_sync.unit_boundary == UnitFlagBoundaryRole::kDrain ||
+        rhs_sync.unit_boundary == UnitFlagBoundaryRole::kDrain)
+      return false;
+    // Existing reuse proofs compare equal event phases. Keep a shifted local
+    // binary channel exclusive rather than sharing its partial seed/drain.
+    if (lhs_sync.local_binary_plan || rhs_sync.local_binary_plan ||
+        lhs_sync.single_iteration_binary_plan ||
+        rhs_sync.single_iteration_binary_plan)
+      return false;
+    if (!site_registry_.UsesFlag(lhs_sync) ||
+        !site_registry_.UsesFlag(rhs_sync) ||
+        !site_registry_.HasCompatibleFlagKind(lhs_sync, rhs_sync)) {
+      return false;
+    }
+    if (CanReuseClosedScalarWaitPhases(lhs.sync_point_id, rhs.sync_point_id))
+      return true;
+
+    auto by_domain = [&](const VisibleSyncPoint &visible) {
+      std::map<int, DepEdge> result;
+      for (const DepEdge &edge : visible.projected_edges) {
+        int src_domain = site_registry_.Src(edge).EpochDomainId();
+        int dst_domain = site_registry_.Dst(edge).EpochDomainId();
+        ICHECK_EQ(src_domain, dst_domain);
+        auto [_, inserted] = result.emplace(src_domain, edge);
+        ICHECK(inserted)
+            << "A visible synchronization point has duplicate projections in "
+               "one epoch domain";
+      }
+      return result;
+    };
+    std::map<int, DepEdge> lhs_edges = by_domain(lhs);
+    std::map<int, DepEdge> rhs_edges = by_domain(rhs);
+    if (lhs_edges.empty() || lhs_edges.size() != rhs_edges.size())
+      return false;
+
+    bool lhs_cross_iter = lhs_sync.edge.distance > 0;
+    bool rhs_cross_iter = rhs_sync.edge.distance > 0;
+    if (lhs_cross_iter != rhs_cross_iter) {
+      // A mixed same/cross-iteration handshake alternates on one flag ring.
+      if (!allow_mixed_iter || !site_registry_.IsCrossCore(lhs_sync) ||
+          !site_registry_.IsCrossCore(rhs_sync) ||
+          lhs_sync.num_versions != rhs_sync.num_versions ||
+          lhs_sync.flag_loop != rhs_sync.flag_loop) {
+        return false;
+      }
+      for (const auto &[domain_id, lhs_edge] : lhs_edges) {
+        auto rhs_it = rhs_edges.find(domain_id);
+        if (rhs_it == rhs_edges.end())
+          return false;
+        const DepEdge &rhs_edge = rhs_it->second;
+        const DepEdge &cross_edge = lhs_cross_iter ? lhs_edge : rhs_edge;
+        const DepEdge &same_edge = lhs_cross_iter ? rhs_edge : lhs_edge;
+        if (!closure.HasEdge(cross_edge.dst, same_edge.src, 0) ||
+            !closure.HasEdge(same_edge.dst, cross_edge.src, 0)) {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    std::optional<bool> lhs_before;
+    for (const auto &[domain_id, lhs_edge] : lhs_edges) {
+      auto rhs_it = rhs_edges.find(domain_id);
+      if (rhs_it == rhs_edges.end())
+        return false;
+      const DepEdge &rhs_edge = rhs_it->second;
+      bool current_lhs_before;
+      bool current_rhs_before;
+      if (!lhs_cross_iter) {
+        current_lhs_before = closure.HasEdge(lhs_edge.dst, rhs_edge.src, 0) &&
+                             closure.HasEdge(rhs_edge.dst, lhs_edge.src, 1);
+        current_rhs_before = closure.HasEdge(rhs_edge.dst, lhs_edge.src, 0) &&
+                             closure.HasEdge(lhs_edge.dst, rhs_edge.src, 1);
+      } else {
+        if (!allow_cross_iter)
+          return false;
+        current_lhs_before = closure.HasEdge(lhs_edge.src, rhs_edge.dst, 0) &&
+                             closure.HasEdge(rhs_edge.src, lhs_edge.dst, 1);
+        current_rhs_before = closure.HasEdge(rhs_edge.src, lhs_edge.dst, 0) &&
+                             closure.HasEdge(lhs_edge.src, rhs_edge.dst, 1);
+      }
+      if (current_lhs_before == current_rhs_before)
+        return false;
+      if (lhs_before.has_value() && lhs_before.value() != current_lhs_before) {
+        return false;
+      }
+      lhs_before = current_lhs_before;
+    }
+    return lhs_before.has_value();
+  }
+
+public:
+  bool PromoteReuseSites(VisibleSyncPoint &visible) const {
+    const SyncPoint &sync_point = sync_points_[visible.sync_point_id];
+    bool cross_iter = sync_point.edge.distance > 0;
+    std::set<DepEdge> promoted;
+    for (const DepEdge &edge : visible.projected_edges) {
+      site_registry_.ForEachParentSitePair(edge, [&](const DepEdge &parent) {
+        size_t src = parent.src;
+        size_t dst = parent.dst;
+        if (site_registry_.Src(parent).path_end !=
+            site_registry_.Src(edge).path_end) {
+          src = site_registry_.FindBoundarySite(src, !cross_iter);
+        }
+        if (site_registry_.Dst(parent).path_end !=
+            site_registry_.Dst(edge).path_end) {
+          dst = site_registry_.FindBoundarySite(dst, cross_iter);
+        }
+        promoted.emplace(src, dst, edge.distance, edge.strict);
+      });
+    }
+    if (promoted.empty())
+      return false;
+    visible.projected_edges.assign(promoted.begin(), promoted.end());
+    return true;
+  }
+
+  void RecordReusablePairs(const std::vector<VisibleSyncPoint> &lhs_points,
+                           const std::vector<VisibleSyncPoint> &rhs_points,
+                           const DepClosure &closure, bool allow_cross_iter,
+                           bool allow_mixed_iter) {
+    for (const VisibleSyncPoint &lhs_visible : lhs_points) {
+      for (const VisibleSyncPoint &rhs_visible : rhs_points) {
+        size_t lhs = lhs_visible.sync_point_id;
+        size_t rhs = rhs_visible.sync_point_id;
+        if (lhs == rhs || !CanReuse(lhs_visible, rhs_visible, closure,
+                                    allow_cross_iter, allow_mixed_iter)) {
+          continue;
+        }
+        reusable_pairs_.emplace(std::min(lhs, rhs), std::max(lhs, rhs));
+      }
+    }
+  }
+
+private:
+  const SyncSiteRegistry &site_registry_;
+  const std::vector<SyncPoint> &sync_points_;
+  const ScalarAdmissionProof &scalar_admission_;
+  std::set<std::pair<size_t, size_t>> reusable_pairs_;
+  mutable std::map<size_t, std::optional<ClosedScalarWaitPhase>>
+      closed_scalar_wait_phases_;
+};
+
 class SyncAnalyzer : public BufferAliasAnalysisContext {
 public:
   explicit SyncAnalyzer(
@@ -1010,7 +1454,9 @@ public:
         closed_c_byte_retirement_(closed_c_byte_retirement),
         site_registry_(domains),
         trace_c_lifetimes_(
-            runtime::detail::VerboseLoggingEnabled(__FILE__, 1)) {
+            runtime::detail::VerboseLoggingEnabled(__FILE__, 1)),
+        scalar_admission_(architecture, site_registry_),
+        flag_reuse_(site_registry_, sync_points_, scalar_admission_) {
     for (const MultiBufferInfo &info : multi_buffer_plan_.Infos()) {
       ICHECK(!info.owners.empty());
       std::vector<ControlNode *> owners;
@@ -1102,7 +1548,7 @@ public:
   const std::vector<SyncPoint> &SyncPoints() const { return sync_points_; }
 
   const std::set<std::pair<size_t, size_t>> &ReusablePairs() const {
-    return reusable_pairs_;
+    return flag_reuse_.ReusablePairs();
   }
 
   const BufferAliasMap &BufferAliases() const { return buffer_aliases_; }
@@ -1635,62 +2081,6 @@ private:
     return ContiguousLocalBinarySpan(source_guard, loop, trip_count, step);
   }
 
-  bool StableLocalBinaryBoundary(const PrimExpr &expression,
-                                 const ControlNode *loop,
-                                 bool allow_epoch = false) const {
-    // Root fill/drain may use parameters and enclosing thread coordinates,
-    // but not values defined or changed inside the active loop. Follow outer
-    // Bind definitions only to validate their purity; this is not a second
-    // binding/rewriting mechanism.
-    std::unordered_set<const VarNode *> changing;
-    for (const Var &var : loop->GetWriteVars())
-      changing.insert(var.get());
-    std::function<void(const ControlNode *)> collect_loops =
-        [&](const ControlNode *control) {
-          changing.insert(control->control->loop_var.get());
-          for (const auto &child : control->children)
-            if (child->IsControl())
-              collect_loops(static_cast<const ControlNode *>(child.get()));
-        };
-    collect_loops(loop);
-    std::unordered_set<const VarNode *> checked, resolving;
-    std::function<bool(const PrimExpr &)> stable;
-    stable = [&](const PrimExpr &value) {
-      bool valid = true;
-      PostOrderVisit(value, [&](const ObjectRef &node) {
-        if (node.as<BufferLoadNode>() || node.as<ProducerLoadNode>() ||
-            node.as<CallNode>() || node.as<ReduceNode>())
-          valid = false;
-        const auto *var = node.as<VarNode>();
-        if (!var || !valid)
-          return;
-        if (allow_epoch && var == loop->control->loop_var.get())
-          return;
-        if (changing.count(var) || !var->dtype.is_scalar() ||
-            (!var->dtype.is_int() && !var->dtype.is_uint() &&
-             !var->dtype.is_bool())) {
-          valid = false;
-          return;
-        }
-        if (checked.count(var))
-          return;
-        if (!resolving.insert(var).second) {
-          valid = false;
-          return;
-        }
-        for (const Constr &constraint : loop->task->outer_ctx.constrs_)
-          if (constraint.kind == Constr::kBindValue &&
-              constraint.var.get() == var)
-            valid &= stable(constraint.value);
-        resolving.erase(var);
-        if (valid)
-          checked.insert(var);
-      });
-      return valid;
-    };
-    return stable(expression);
-  }
-
   std::optional<LocalBinaryEpochSpan>
   ContiguousLocalBinarySpan(const PrimExpr &source_guard, ControlNode *loop,
                             const PrimExpr &trip_count,
@@ -1930,13 +2320,13 @@ private:
 
     for (size_t i = 0; i < child_sync_points.size(); ++i) {
       for (size_t j = i + 1; j < child_sync_points.size(); ++j) {
-        RecordReusablePairs(
+        flag_reuse_.RecordReusablePairs(
             child_sync_points[i], child_sync_points[j], result.closure,
             /*allow_cross_iter=*/true, /*allow_mixed_iter=*/false);
       }
-      RecordReusablePairs(child_sync_points[i], local_points, result.closure,
-                          /*allow_cross_iter=*/false,
-                          /*allow_mixed_iter=*/false);
+      flag_reuse_.RecordReusablePairs(
+          child_sync_points[i], local_points, result.closure,
+          /*allow_cross_iter=*/false, /*allow_mixed_iter=*/false);
       result.visible_sync_points.insert(result.visible_sync_points.end(),
                                         child_sync_points[i].begin(),
                                         child_sync_points[i].end());
@@ -1944,8 +2334,9 @@ private:
 
     // Mixed same/cross-iteration reuse is checked only at the collection level
     // where both points still have the same ring context.
-    RecordReusablePairs(local_points, local_points, result.closure,
-                        /*allow_cross_iter=*/false, /*allow_mixed_iter=*/true);
+    flag_reuse_.RecordReusablePairs(
+        local_points, local_points, result.closure,
+        /*allow_cross_iter=*/false, /*allow_mixed_iter=*/true);
     result.visible_sync_points.insert(result.visible_sync_points.end(),
                                       local_points.begin(), local_points.end());
     RecordLifetimeOrder(task_site_ids, loop, result.closure);
@@ -1972,7 +2363,7 @@ private:
       if (!control->BodyHasLoopBreak()) {
         std::vector<VisibleSyncPoint> promoted_sync_points;
         for (VisibleSyncPoint &visible : result.visible_sync_points) {
-          if (PromoteReuseSites(visible))
+          if (flag_reuse_.PromoteReuseSites(visible))
             promoted_sync_points.push_back(std::move(visible));
         }
         result.visible_sync_points = std::move(promoted_sync_points);
@@ -3914,7 +4305,7 @@ private:
           ICHECK_LE(reverse_completion,
                     std::numeric_limits<int>::max() - distance);
           sync_point.num_versions = distance + reverse_completion;
-          if (HasShiftedScalarWaitWidth(sync_point, loop))
+          if (scalar_admission_.HasShiftedScalarWaitWidth(sync_point, loop))
             sync_point.num_versions = 1;
         }
         sync_point.local_binary_plan =
@@ -3958,8 +4349,8 @@ private:
             << src.pipe << "->" << dst.pipe;
         if (is_innermost) {
           sync_point.num_versions = min_distance;
-          if (HasScalarAdmissionLexicalClock(sync_point, loop) &&
-              ComputeClosedScalarWaitPhase(sync_point, true))
+          if (scalar_admission_.HasScalarAdmissionLexicalClock(sync_point, loop) &&
+              scalar_admission_.ComputeClosedScalarWaitPhase(sync_point, true))
             sync_point.num_versions = 1;
         } else {
           // The owner clock does not advance within a descendant loop. Its
@@ -4013,353 +4404,6 @@ private:
     }
   }
 
-  struct ClosedScalarWaitPhase {
-    ControlNode *scope;
-    IRStructure *first;
-    IRStructure *last;
-  };
-
-  bool HasScalarAdmissionLexicalClock(const SyncPoint &point,
-                                      ControlNode *loop) const {
-    if (architecture_ != AscendArchitecture::kDav2201 || !loop ||
-        point.flag_loop != loop || loop->GetParentControl() != nullptr ||
-        loop->HasConditions() || loop->BodyHasLoopBreak() ||
-        loop->control->kind != ForKind::kSerial ||
-        point.counter_group_id != 0 || !point.proof.HasOriginalEndpoints() ||
-        point.local_binary_plan || point.single_iteration_binary_plan ||
-        point.unit_boundary != UnitFlagBoundaryRole::kNone)
-      return false;
-    const SyncInsertionSite &src = site_registry_.Src(point);
-    const SyncInsertionSite &dst = site_registry_.Dst(point);
-    if (src.core != kCoreVector || dst.core != src.core || src.pipe != "V" ||
-        dst.pipe != "S" || src.at_beginning || !dst.at_beginning ||
-        src.EpochDomainId() != dst.EpochDomainId())
-      return false;
-    const EpochDomain &domain = site_registry_.Domain(src);
-    if (domain.IsCounter() || domain.owner != loop)
-      return false;
-    const ForNode *node = loop->control.get();
-    PrimExpr step = node->step.has_value() ? node->step.value()
-                                           : IntImm(node->extent.dtype(), 1);
-    if (!point.flag_iteration.dtype().is_int() ||
-        SideEffect(node->min) != CallEffectKind::kPure ||
-        SideEffect(node->extent) != CallEffectKind::kPure ||
-        SideEffect(step) != CallEffectKind::kPure ||
-        !loop->task->outer_ctx.CanProve(step > make_zero(step.dtype())))
-      return false;
-    return loop->GetLoopBodyContext().CanProve(
-        point.flag_iteration == indexdiv(node->loop_var - node->min, step));
-  }
-
-  bool HasShiftedScalarWaitWidth(const SyncPoint &point,
-                                 ControlNode *loop) const {
-    if (point.edge.distance != 1 ||
-        !HasScalarAdmissionLexicalClock(point, loop))
-      return false;
-    const SyncInsertionSite &src = site_registry_.Src(point);
-    const SyncInsertionSite &dst = site_registry_.Dst(point);
-    if (src.path_begin != src.path_end || src.path_end != dst.path_begin ||
-        dst.path_begin != dst.path_end || !src.path_end->IsControl() ||
-        src.path_begin->GetParent() != loop || src.path_begin->GetStage() < 0)
-      return false;
-    // These are real sibling insertions around one Control, including when
-    // its body has zero trips. The old epoch's Scalar wait consumes the bit
-    // before dispatch can reach this epoch's V notification. Retain the exact
-    // shifted clock/activation validation and one seed/drain in the caller.
-    // This bounds flag lifetime; it supplies no new data-completion edge.
-    for (const SyncInsertionSite *site : {&src, &dst}) {
-      PrimExpr guard = owner_result_detail::Expand(
-          site->GetGuard(),
-          owner_result_detail::TaskBindings(
-              static_cast<ControlNode *>(site->path_end)->task.get()));
-      if (!StableLocalBinaryBoundary(guard, loop, true) ||
-          !loop->GetLoopBodyContext().CanProve(guard))
-        return false;
-    }
-    return true;
-  }
-
-  std::optional<ClosedScalarWaitPhase>
-  ComputeClosedScalarWaitPhase(const SyncPoint &point,
-                               bool for_width = false) const {
-    if (architecture_ != AscendArchitecture::kDav2201 || !point.flag_loop ||
-        point.edge.distance != 0 || (!for_width && point.num_versions != 1) ||
-        !point.proof.HasOriginalEndpoints() || point.local_binary_plan ||
-        point.single_iteration_binary_plan ||
-        point.unit_boundary != UnitFlagBoundaryRole::kNone)
-      return std::nullopt;
-    const SyncInsertionSite &src = site_registry_.Src(point);
-    const SyncInsertionSite &dst = site_registry_.Dst(point);
-    ControlNode *scope = point.flag_loop;
-    if (src.core != kCoreVector || dst.core != src.core || src.pipe != "V" ||
-        dst.pipe != "S" || src.at_beginning || !dst.at_beginning ||
-        src.path_begin != src.path_end || !src.path_end->IsTask() ||
-        src.path_begin->GetParent() != scope ||
-        dst.path_begin->GetParent() != scope ||
-        src.path_begin->GetIndex() >= dst.path_begin->GetIndex())
-      return std::nullopt;
-    // PerCoreTask materialization can migrate a site into several guarded
-    // internal tasks. The ordinary-task sibling insertion contract used by
-    // this certificate does not establish those occurrences' activation.
-    if (static_cast<TaskNode *>(src.path_end)->IsPerCoreTask() ||
-        (dst.path_end->IsTask() &&
-         static_cast<TaskNode *>(dst.path_end)->IsPerCoreTask()))
-      return std::nullopt;
-    // Width reduction may use a common pipeline stage: the matching Scalar
-    // wait still executes before the next physical iteration can dispatch a
-    // new notification. Cross-channel phase sharing remains stage-zero only.
-    int stage = for_width ? src.path_begin->GetStage() : 0;
-    if (stage < 0 || dst.path_begin->GetStage() != stage)
-      return std::nullopt;
-
-    auto stable = [&](const PrimExpr &guard, const TaskNode *task) {
-      PrimExpr expanded = owner_result_detail::Expand(
-          guard, owner_result_detail::TaskBindings(task));
-      return StableLocalBinaryBoundary(expanded, scope, true)
-                 ? std::optional<PrimExpr>(std::move(expanded))
-                 : std::nullopt;
-    };
-    auto activation =
-        [&](const SyncInsertionSite &site) -> std::optional<PrimExpr> {
-      PrimExpr guard = site.GetGuard();
-      ffi::Map<Var, PrimExpr> entries;
-      // The existing insertion-site constructor descends a control only
-      // after proving it nonempty and attaches its first-iteration selector.
-      // Recover the activation by substituting those entry coordinates. A
-      // site that stopped at a Control is already outside its loop/guard;
-      // retain that real boundary, including execution for an empty loop.
-      for (IRStructure *node : site.path_end->PathFrom(site.path_begin)) {
-        if (node->GetStage() != (node == site.path_begin ? stage : 0))
-          return std::nullopt;
-        if (node == site.path_end)
-          break;
-        if (!node->IsControl())
-          return std::nullopt;
-        auto *control = static_cast<ControlNode *>(node);
-        if (control->BodyHasLoopBreak() ||
-            control->control->kind != ForKind::kSerial ||
-            SideEffect(control->control->min) != CallEffectKind::kPure ||
-            SideEffect(control->control->extent) != CallEffectKind::kPure)
-          return std::nullopt;
-        guard = guard && control->GetConditionGuard();
-        entries.Set(control->control->loop_var,
-                    Substitute(control->control->min, entries));
-        guard = Substitute(guard, entries);
-      }
-      const TaskNode *endpoint =
-          site.path_end->IsTask()
-              ? static_cast<TaskNode *>(site.path_end)
-              : static_cast<ControlNode *>(site.path_end)->task.get();
-      return stable(guard, endpoint);
-    };
-    auto source_activation = activation(src);
-    auto wait_activation = activation(dst);
-    if (!source_activation || !wait_activation ||
-        !GuardsEquivalent(*source_activation, *wait_activation,
-                          scope->GetLoopBodyContext()))
-      return std::nullopt;
-    return ClosedScalarWaitPhase{scope, src.path_begin, dst.path_begin};
-  }
-
-  const std::optional<ClosedScalarWaitPhase> &
-  GetClosedScalarWaitPhase(size_t index) const {
-    auto it = closed_scalar_wait_phases_.find(index);
-    if (it == closed_scalar_wait_phases_.end())
-      it = closed_scalar_wait_phases_
-               .emplace(index, ComputeClosedScalarWaitPhase(sync_points_[index]))
-               .first;
-    return it->second;
-  }
-
-  bool CanReuseClosedScalarWaitPhases(size_t lhs, size_t rhs) const {
-    const auto &left = GetClosedScalarWaitPhase(lhs);
-    const auto &right = GetClosedScalarWaitPhase(rhs);
-    if (!left || !right)
-      return false;
-    IRStructure *ancestor =
-        left->scope->GetLowestCommonAncestor(right->scope);
-    if (!ancestor || !ancestor->IsControl())
-      return false;
-    auto *common = static_cast<ControlNode *>(ancestor);
-    auto unshifted_path = [&](ControlNode *scope) {
-      for (;;) {
-        if (scope->GetStage() != 0 || scope->BodyHasLoopBreak() ||
-            scope->control->kind != ForKind::kSerial)
-          return false;
-        PrimExpr guard = owner_result_detail::Expand(
-            scope->GetConditionGuard(),
-            owner_result_detail::TaskBindings(scope->task.get()));
-        if (!StableLocalBinaryBoundary(guard, common, true) ||
-            SideEffect(scope->control->min) != CallEffectKind::kPure ||
-            SideEffect(scope->control->extent) != CallEffectKind::kPure ||
-            (scope->control->step.has_value() &&
-             SideEffect(scope->control->step.value()) != CallEffectKind::kPure))
-          return false;
-        if (scope == common)
-          return true;
-        scope = scope->GetParentControl();
-        ICHECK(scope != nullptr);
-      }
-    };
-    if (!unshifted_path(left->scope) || !unshifted_path(right->scope))
-      return false;
-    auto span = [&](const ClosedScalarWaitPhase &phase) {
-      IRStructure *first = phase.first->GetChildOnPathFrom(common);
-      IRStructure *last = phase.last->GetChildOnPathFrom(common);
-      return std::pair<int, int>{first->GetIndex(), last->GetIndex()};
-    };
-    auto [left_first, left_last] = span(*left);
-    auto [right_first, right_last] = span(*right);
-    // Each phase clears its single notification before leaving its own
-    // activation. A real WaitFlag(V,S) stalls Scalar, which dispatches later
-    // asynchronous commands: its consumption precedes a disjoint phase's
-    // later V notification, including the next enclosing-loop activation.
-    // This is a flag-lifetime admission inference, not Vector data completion.
-    // Storage epoch domains and DepClosure are deliberately unchanged.
-    return left_last < right_first || right_last < left_first;
-  }
-
-  bool CanReuse(const VisibleSyncPoint &lhs, const VisibleSyncPoint &rhs,
-                const DepClosure &closure, bool allow_cross_iter,
-                bool allow_mixed_iter) const {
-    const SyncPoint &lhs_sync = sync_points_[lhs.sync_point_id];
-    const SyncPoint &rhs_sync = sync_points_[rhs.sync_point_id];
-    if (!lhs_sync.proof.HasOriginalEndpoints() ||
-        !rhs_sync.proof.HasOriginalEndpoints())
-      return false;
-    if (lhs_sync.unit_boundary == UnitFlagBoundaryRole::kDrain ||
-        rhs_sync.unit_boundary == UnitFlagBoundaryRole::kDrain)
-      return false;
-    // Existing reuse proofs compare equal event phases. Keep a shifted local
-    // binary channel exclusive rather than sharing its partial seed/drain.
-    if (lhs_sync.local_binary_plan || rhs_sync.local_binary_plan ||
-        lhs_sync.single_iteration_binary_plan ||
-        rhs_sync.single_iteration_binary_plan)
-      return false;
-    if (!site_registry_.UsesFlag(lhs_sync) ||
-        !site_registry_.UsesFlag(rhs_sync) ||
-        !site_registry_.HasCompatibleFlagKind(lhs_sync, rhs_sync)) {
-      return false;
-    }
-    if (CanReuseClosedScalarWaitPhases(lhs.sync_point_id, rhs.sync_point_id))
-      return true;
-
-    auto by_domain = [&](const VisibleSyncPoint &visible) {
-      std::map<int, DepEdge> result;
-      for (const DepEdge &edge : visible.projected_edges) {
-        int src_domain = site_registry_.Src(edge).EpochDomainId();
-        int dst_domain = site_registry_.Dst(edge).EpochDomainId();
-        ICHECK_EQ(src_domain, dst_domain);
-        auto [_, inserted] = result.emplace(src_domain, edge);
-        ICHECK(inserted)
-            << "A visible synchronization point has duplicate projections in "
-               "one epoch domain";
-      }
-      return result;
-    };
-    std::map<int, DepEdge> lhs_edges = by_domain(lhs);
-    std::map<int, DepEdge> rhs_edges = by_domain(rhs);
-    if (lhs_edges.empty() || lhs_edges.size() != rhs_edges.size())
-      return false;
-
-    bool lhs_cross_iter = lhs_sync.edge.distance > 0;
-    bool rhs_cross_iter = rhs_sync.edge.distance > 0;
-    if (lhs_cross_iter != rhs_cross_iter) {
-      // A mixed same/cross-iteration handshake alternates on one flag ring.
-      if (!allow_mixed_iter || !site_registry_.IsCrossCore(lhs_sync) ||
-          !site_registry_.IsCrossCore(rhs_sync) ||
-          lhs_sync.num_versions != rhs_sync.num_versions ||
-          lhs_sync.flag_loop != rhs_sync.flag_loop) {
-        return false;
-      }
-      for (const auto &[domain_id, lhs_edge] : lhs_edges) {
-        auto rhs_it = rhs_edges.find(domain_id);
-        if (rhs_it == rhs_edges.end())
-          return false;
-        const DepEdge &rhs_edge = rhs_it->second;
-        const DepEdge &cross_edge = lhs_cross_iter ? lhs_edge : rhs_edge;
-        const DepEdge &same_edge = lhs_cross_iter ? rhs_edge : lhs_edge;
-        if (!closure.HasEdge(cross_edge.dst, same_edge.src, 0) ||
-            !closure.HasEdge(same_edge.dst, cross_edge.src, 0)) {
-          return false;
-        }
-      }
-      return true;
-    }
-
-    std::optional<bool> lhs_before;
-    for (const auto &[domain_id, lhs_edge] : lhs_edges) {
-      auto rhs_it = rhs_edges.find(domain_id);
-      if (rhs_it == rhs_edges.end())
-        return false;
-      const DepEdge &rhs_edge = rhs_it->second;
-      bool current_lhs_before;
-      bool current_rhs_before;
-      if (!lhs_cross_iter) {
-        current_lhs_before = closure.HasEdge(lhs_edge.dst, rhs_edge.src, 0) &&
-                             closure.HasEdge(rhs_edge.dst, lhs_edge.src, 1);
-        current_rhs_before = closure.HasEdge(rhs_edge.dst, lhs_edge.src, 0) &&
-                             closure.HasEdge(lhs_edge.dst, rhs_edge.src, 1);
-      } else {
-        if (!allow_cross_iter)
-          return false;
-        current_lhs_before = closure.HasEdge(lhs_edge.src, rhs_edge.dst, 0) &&
-                             closure.HasEdge(rhs_edge.src, lhs_edge.dst, 1);
-        current_rhs_before = closure.HasEdge(rhs_edge.src, lhs_edge.dst, 0) &&
-                             closure.HasEdge(lhs_edge.src, rhs_edge.dst, 1);
-      }
-      if (current_lhs_before == current_rhs_before)
-        return false;
-      if (lhs_before.has_value() && lhs_before.value() != current_lhs_before) {
-        return false;
-      }
-      lhs_before = current_lhs_before;
-    }
-    return lhs_before.has_value();
-  }
-
-  bool PromoteReuseSites(VisibleSyncPoint &visible) const {
-    const SyncPoint &sync_point = sync_points_[visible.sync_point_id];
-    bool cross_iter = sync_point.edge.distance > 0;
-    std::set<DepEdge> promoted;
-    for (const DepEdge &edge : visible.projected_edges) {
-      site_registry_.ForEachParentSitePair(edge, [&](const DepEdge &parent) {
-        size_t src = parent.src;
-        size_t dst = parent.dst;
-        if (site_registry_.Src(parent).path_end !=
-            site_registry_.Src(edge).path_end) {
-          src = site_registry_.FindBoundarySite(src, !cross_iter);
-        }
-        if (site_registry_.Dst(parent).path_end !=
-            site_registry_.Dst(edge).path_end) {
-          dst = site_registry_.FindBoundarySite(dst, cross_iter);
-        }
-        promoted.emplace(src, dst, edge.distance, edge.strict);
-      });
-    }
-    if (promoted.empty())
-      return false;
-    visible.projected_edges.assign(promoted.begin(), promoted.end());
-    return true;
-  }
-
-  void RecordReusablePairs(const std::vector<VisibleSyncPoint> &lhs_points,
-                           const std::vector<VisibleSyncPoint> &rhs_points,
-                           const DepClosure &closure, bool allow_cross_iter,
-                           bool allow_mixed_iter) {
-    for (const VisibleSyncPoint &lhs_visible : lhs_points) {
-      for (const VisibleSyncPoint &rhs_visible : rhs_points) {
-        size_t lhs = lhs_visible.sync_point_id;
-        size_t rhs = rhs_visible.sync_point_id;
-        if (lhs == rhs || !CanReuse(lhs_visible, rhs_visible, closure,
-                                    allow_cross_iter, allow_mixed_iter)) {
-          continue;
-        }
-        reusable_pairs_.emplace(std::min(lhs, rhs), std::max(lhs, rhs));
-      }
-    }
-  }
-
   L0StorageGroups storage_groups_;
   const MultiBufferPlan &multi_buffer_plan_;
   const EpochDomainRegistry &domains_;
@@ -4382,9 +4426,8 @@ private:
   const bool trace_c_lifetimes_;
   mutable std::unordered_set<size_t> trace_c_sites_;
   std::vector<SyncPoint> sync_points_;
-  std::set<std::pair<size_t, size_t>> reusable_pairs_;
-  mutable std::map<size_t, std::optional<ClosedScalarWaitPhase>>
-      closed_scalar_wait_phases_;
+  ScalarAdmissionProof scalar_admission_;
+  FlagReuseAnalysis flag_reuse_;
   DependencyCache dependency_cache_;
   std::map<ControlNode *, DepClosure> scope_closures_;
   std::map<ControlNode *, IterationOrder> lifetime_orders_;

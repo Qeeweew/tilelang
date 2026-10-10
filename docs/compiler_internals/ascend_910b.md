@@ -331,6 +331,22 @@ finite fill/drain. It performs no candidate selection or retry. The dependency
 proof rules, fallback priorities, event allocation order and 2201/3510 protocol
 choices remain independent of this orchestration boundary.
 
+Within an attempt, `SyncAnalyzer` drives recursive dependency/completion
+analysis. `ScalarAdmissionProof` reads only the architecture and insertion
+sites to certify Scalar wait lifetimes; both flag-width reduction and event
+sharing consume these proofs. A matching V-to-S event still proves completion
+of the Vector operations covered by its notification. The extra inference
+that Scalar consumes an old flag before dispatching a later notification only
+bounds event lifetime; it adds no data-completion edges and does not authorize
+storage aliases. `FlagReuseAnalysis` reads the finalized sync points,
+insertion sites and each scope's dependency closure, owns the closed-phase
+certificate cache and reusable event pairs, and promotes visible sites across
+scope boundaries. It cannot change dependencies, choose fallback protocols or
+allocate physical flags. The analyzer owns both objects for one attempt;
+failed attempts discard their caches and results with the analyzer. The site
+registry and sync-point vector outlive these readers, and appended points keep
+stable numeric IDs. Proof checks and pair enumeration retain their order.
+
 The early L0 max-budget choice is a required physical-alias contract, not
 evidence that storage can already overlap. A typed storage-pair snapshot owns
 its annotation decoding and exact conflict-list identity. It keeps pair order
