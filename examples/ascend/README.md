@@ -1,6 +1,12 @@
 # Ascend examples
 
-These examples demonstrate complete kernels on Ascend 950. Use the explicit
+The top-level `example_*.py` programs below target Ascend 950 (`dav-3510`).
+For 910B (`dav-2201`), use [gemm_910b.py](gemm_910b.py) and
+[910B attention](flash_attention/910b.md); start with the
+[910B developer guide](../../docs/ascend/README.md) and
+[performance report](../../docs/ascend/910b_performance.md).
+
+For the 950 examples, use the explicit
 `tilelang.ascend.language` dialect and an Ascend-enabled build; see the
 [backend guide](../../tilelang/ascend/README.md) for setup.
 Inputs, reference computations and correctness checks run on the NPU.

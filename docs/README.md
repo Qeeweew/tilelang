@@ -2,6 +2,9 @@
 
 The documentation was built upon [Sphinx](https://www.sphinx-doc.org/en/master/).
 
+For Ascend 910B, start with the [developer guide](ascend/README.md) or the
+[GEMM and attention performance report](ascend/910b_performance.md).
+
 ## Dependencies
 
 Run the following command in this directory to install dependencies first:

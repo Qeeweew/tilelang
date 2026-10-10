@@ -1,4 +1,8 @@
-# FlashAttention (Ascend NPU)
+# FlashAttention (Ascend 950 / dav-3510)
+
+For **910B / dav-2201**, use the separate [910B forward contract](910b.md)
+and [910B performance report](../../../docs/ascend/910b_performance.md).
+The implementations and measurements below are for 950.
 
 Online-softmax FlashAttention forward and GQA backward kernels. MHA and GQA
 forward share the `flash_attention_fwd` builder in `core.py`. MHA is a special
