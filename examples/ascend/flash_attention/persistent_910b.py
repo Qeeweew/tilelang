@@ -55,6 +55,7 @@ def persistent_attention_fwd(
     separate_score_input=False,
     inplace_final_division=True,
     qk_chunk=None,
+    reuse_qk_b=False,
     pv_chunk=None,
     pv_rows=None,
     cache_pv=False,
@@ -90,6 +91,10 @@ def persistent_attention_fwd(
     These choices preserve the same online recurrence and P rounding.
 
     qk_chunk optionally retains Q in L0A while computing complete N chunks.
+    reuse_qk_b=True retains both query owners in L0A and visits N chunks
+    first, so each K/L0B generation serves both owners before reuse. It
+    requires qk_chunk and additional L0A residency, but keeps all Score
+    regions, P rounding points and PV work unchanged.
     cache_pv=True instead retains the complete V tile in L1 and loads one
     full-KV P cache per pv_rows part. An ordinary automatic Pipelined loop
     consumes pv_chunk slices and exports each complete FP32 result once.
@@ -114,11 +119,14 @@ def persistent_attention_fwd(
             or any(x % 8 or block_q % x for x in (row_block, row_block_vec2))):
         raise ValueError("Aligned dense tiles and complete UB row subtiles are required")
     if any(not isinstance(x, bool) for x in
-           (separate_score_input, inplace_final_division, cache_pv, preserve_issue_order)):
-        raise ValueError("Score staging, final division, and PV cache options must be bools")
+           (separate_score_input, inplace_final_division, reuse_qk_b,
+            cache_pv, preserve_issue_order)):
+        raise ValueError("Persistent strategy options must be bools")
     if qk_chunk is not None and (not isinstance(qk_chunk, int) or isinstance(qk_chunk, bool)
                                  or qk_chunk <= 0 or qk_chunk % 16 or block_kv % qk_chunk):
         raise ValueError("qk_chunk must be positive, 16-aligned, and divide block_kv")
+    if reuse_qk_b and qk_chunk is None:
+        raise ValueError("reuse_qk_b requires an explicit qk_chunk")
     if pv_chunk is not None and (not isinstance(pv_chunk, int) or isinstance(pv_chunk, bool) or pv_chunk <= 0):
         raise ValueError("pv_chunk must be a positive integer or None")
     if pv_chunk is not None and (pv_chunk % 16 or block_kv % pv_chunk):
@@ -169,7 +177,8 @@ def persistent_attention_fwd(
             score_acc = T.alloc_l0c((block_q, qk_extent), "float32")
             pv_acc = T.alloc_l0c(pv_acc_shape, "float32")
             if qk_chunk is not None:
-                qk_a_l0 = T.alloc_l0a((block_q, head_dim), dtype)
+                qk_a_l0 = T.alloc_l0a(
+                    (2, block_q, head_dim) if reuse_qk_b else (block_q, head_dim), dtype)
                 qk_b_l0 = T.alloc_l0b((qk_extent, head_dim), dtype)
                 T.annotate_buffer_versions({qk_a_l0: 1, qk_b_l0: 2})
 
@@ -234,8 +243,18 @@ def persistent_attention_fwd(
                             T.copy(V[batch_index, head_index,
                                      kv * block_kv:(kv + 1) * block_kv, :],
                                    v_l1)
-                        for owner in T.serial(2):
-                            if qk_chunk is not None:
+                        if reuse_qk_b:
+                            for owner in T.serial(2):
+                                T.copy(q_l1[owner, :, :], qk_a_l0[owner, :, :])
+                            for n in T.serial(block_kv // qk_extent):
+                                T.copy(k_l1[n * qk_extent:(n + 1) * qk_extent, :], qk_b_l0)
+                                for owner in T.serial(2):
+                                    T.gemm(qk_a_l0[owner, :, :], qk_b_l0, score_acc,
+                                           transpose_B=True, clear_accum=True)
+                                    T.copy(score_acc, Score[group, owner, :,
+                                                            n * qk_extent:(n + 1) * qk_extent])
+                        elif qk_chunk is not None:
+                            for owner in T.serial(2):
                                 T.copy(q_l1[owner, :, :], qk_a_l0)
                                 for n in T.serial(block_kv // qk_extent):
                                     T.copy(k_l1[n * qk_extent:(n + 1) * qk_extent, :], qk_b_l0)
@@ -243,7 +262,8 @@ def persistent_attention_fwd(
                                            transpose_B=True, clear_accum=True)
                                     T.copy(score_acc, Score[group, owner, :,
                                                             n * qk_extent:(n + 1) * qk_extent])
-                            else:
+                        else:
+                            for owner in T.serial(2):
                                 T.gemm(q_l1[owner, :, :], k_l1, score_acc,
                                        transpose_B=True, clear_accum=True)
                                 T.copy(score_acc, Score[group, owner, :, :])

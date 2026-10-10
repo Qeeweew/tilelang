@@ -290,14 +290,15 @@ def test_chunked_frontend_shares_v_and_keeps_owner_accumulators_until_final_expo
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 @pytest.mark.parametrize("grains,separate,inplace", [((8, 32), True, True), ((16, 8), False, False)])
 @pytest.mark.parametrize("pv_rows", [16, 32], ids=["split-rows", "complete-rows"])
+@pytest.mark.parametrize("reuse_qk_b", [False, True])
 def test_cache_strategy_and_independent_grains_preserve_complete_gm_handoffs(
-        example, dtype, grains, separate, inplace, pv_rows):
+        example, dtype, grains, separate, inplace, pv_rows, reuse_qk_b):
     row_block, row_block_vec2 = grains
     program = example.persistent_attention_fwd(
         batch=2, heads=2, query_pairs=3, kv_tiles=3, groups=2,
         block_q=32, block_kv=32, head_dim=16, row_block=row_block,
         row_block_vec2=row_block_vec2, separate_score_input=separate,
-        inplace_final_division=inplace, qk_chunk=16, pv_chunk=16,
+        inplace_final_division=inplace, qk_chunk=16, reuse_qk_b=reuse_qk_b, pv_chunk=16,
         pv_rows=pv_rows, cache_pv=True, dtype=dtype)
     actual, buffers = _gm_transfers(program, 2)
     assert actual == _expected_transfers(
@@ -325,6 +326,31 @@ def test_cache_strategy_and_independent_grains_preserve_complete_gm_handoffs(
     score_input = score_copy.args[1].args[0].buffer
     assert any(score_input.data.same_as(storage) for storage in private)
 
+    # Count actual shared K/L0B loads while checking that each MAD retains
+    # its query owner's Q. GM coverage above remains the same in both plans.
+    definitions = {binding.var: binding.value for binding in nodes(program, tirx.Bind)}
+    counts = collections.Counter()
+    for call, loops, guards, cube in sites:
+        if call.op.name != "tl.tileop.ascend_copy":
+            continue
+        source, destination = (region.args[0].buffer for region in call.args[:2])
+        if destination.scope() != "shared.l0b":
+            continue
+        assert source.name == "k_l1"
+        for values in _loop_values(loops, definitions):
+            counts["loads"] += 1
+    # Frontend mixed launch includes both SIDs, but Cube is executed once.
+    assert counts["loads"] == 2 * 12 * 3 * 2 * (1 if reuse_qk_b else 2)
+    qk, = [site for site in sites if site[0].op.name == "tl.tileop.gemm" and int(site[0].args[4])]
+    a_region, b_region = qk[0].args[:2]
+    a, b = a_region.args[0].buffer, b_region.args[0].buffer
+    assert tuple(map(int, a.shape)) == ((2, 32, 16) if reuse_qk_b else (32, 16))
+    assert tuple(map(int, b.shape)) == (16, 16)
+    if reuse_qk_b:
+        owner, = [loop.loop_var for loop in qk[1] if loop.loop_var.name == "owner"]
+        assert tvm.ir.structural_equal(a_region.args[0].indices[0], owner)
+        assert int(a_region.args[2]) == 1
+
 
 @pytest.mark.parametrize("changes,message", [
     ({"batch": True}, "positive integers"),
@@ -339,6 +365,8 @@ def test_cache_strategy_and_independent_grains_preserve_complete_gm_handoffs(
     ({"row_block_vec2": 24}, "complete UB row subtiles"),
     ({"separate_score_input": 1}, "must be bools"),
     ({"qk_chunk": 8}, "qk_chunk must be positive"),
+    ({"reuse_qk_b": 1}, "must be bools"),
+    ({"reuse_qk_b": True}, "requires an explicit qk_chunk"),
     ({"cache_pv": True}, "requires an explicit pv_chunk"),
     ({"pv_rows": 16}, "pv_rows requires cache_pv"),
 ])

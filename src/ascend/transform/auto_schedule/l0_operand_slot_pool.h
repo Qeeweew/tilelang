@@ -265,8 +265,13 @@ Member(const ScheduledTIR &scheduled, const MultiBufferPlan &plan,
     if (info.num_versions < 1 || info.num_versions > 2 ||
         info.owners.size() != 1 ||
         info.owners.front().loop != result.generation ||
-        result.reader->GetParent() != result.generation)
+        (info.UsesCounter() &&
+         result.reader->GetParent() != result.generation))
       return reject("prepared-version-ownership");
+    // An iteration-owned tile can serve the already-proven finite serial
+    // reader nest. All readers use the generation's slot; last_reader returns
+    // its whole-MAD credit only after the final occurrence. Counter commits
+    // retain their direct writer/reader/advance contract.
     if (info.UsesCounter() &&
         !ClosedCounter(scheduled.tree, resource_epochs, info, result))
       return reject("closed-counter");

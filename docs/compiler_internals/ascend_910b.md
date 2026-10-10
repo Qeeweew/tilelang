@@ -785,6 +785,17 @@ capacity; they do not invent completion edges for disjoint slots or FIX.
 The final alias and capacity gates remain mandatory. Selection facts are
 consumed after successful synchronization, before later IR rewrites.
 
+An iteration-versioned operand generation can serve one MAD reader site
+inside a finite serial reader nest. Every intervening loop must be positive,
+static, unguarded and at stage zero; the unique full load and all reader
+occurrences use that generation's selected slot. Its credit returns after the
+last occurrence's whole-MAD completion, rather than after the first reader or
+unit result readiness. This permits an ordinary N-chunk traversal to load K
+once for several query owners while keeping each owner's A operand separate.
+Counter-owned generations retain the direct load/reader/commit contract.
+Additional reader sites, independently guarded readers and unmodeled accesses
+do not acquire this proof.
+
 A retained child ring can cover a direct parent's WAR for that same storage.
 The prepared version clock and physical materialization use the same complete
 ancestor iteration count, so an odd child trip count does not reset the slot.
