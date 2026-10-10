@@ -21,7 +21,7 @@ from testing.ascend.auto_schedule.test_sync_binary_flags import _prove_binary_pr
 
 
 def _program(dtype="float16", unit_streams=True, extra_reader=False, active_epochs=3,
-             logical_stages=False, pv_native_k=256):
+             logical_stages=False, pv_native_k=256, pv_b_versions=None):
     # The unsupported-reader case must also fit without a C phase alias.
     q_rows = 64 if extra_reader or logical_stages else 128
 
@@ -45,6 +45,8 @@ def _program(dtype="float16", unit_streams=True, extra_reader=False, active_epoc
             cp = T.alloc_l0c((64, 64), "float32")
             T.annotate_buffer_versions({q_l1: 1, k_l1: 1, p_l1: 1, v_l1: 1,
                                         aq: 1, bq: 2, cq: 1, cp: 1})
+            if pv_b_versions is not None:
+                T.annotate_buffer_versions({bp: pv_b_versions})
             if not unit_streams:
                 T.set_mmad_direction("m")
             for epoch in T.serial(active_epochs if logical_stages else active_epochs + 2,
@@ -93,7 +95,8 @@ def _physical(argument, env):
     buffer, origin, _ = _region(argument, env)
     assert buffer.scope() in ("shared.l0a", "shared.l0b")
     slot = origin[0] if len(origin) == 3 else 0
-    assert origin[-2:] == (0, 0) and slot in (0, 1)
+    versions = int(buffer.shape[0]) if len(origin) == 3 else 1
+    assert origin[-2:] == (0, 0) and 0 <= slot < versions
     plane = math.prod(map(int, buffer.shape[-2:]))
     return buffer.scope(), tuple(range(slot * plane // 256, (slot + 1) * plane // 256))
 
@@ -242,3 +245,25 @@ def test_automatic_phases_share_the_static_epoch_and_physical_credits():
     # require the specific next-slot prefetch allowed by their chosen stages.
     _check_physical_completions(snapshots["tl.LowerScheduledTIR"], 3,
                                 pv_native_k=128, check_prefetch=False)
+
+
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+def test_three_version_b_ring_preserves_shifted_byte_credits(dtype):
+    # A two-slot 32 KiB QK ring intersects a three-slot 16 KiB PV ring.
+    # Three active epochs exercise both wraps and the final shifted reader.
+    _, snapshots = _lower(_program(dtype=dtype, logical_stages=True,
+                                   active_epochs=3, pv_native_k=128,
+                                   pv_b_versions=3))
+    prepared = snapshots["tl.PrepareMultiBuffer"]
+    bp = allocated_buffer(prepared, "bp")
+    assert int(_root(prepared).annotations["tl.buffer_versions_map"][bp.data]) == 3
+    _check_physical_completions(snapshots["tl.LowerScheduledTIR"], 3,
+                                pv_native_k=128)
+
+
+def test_slot_pool_ring_keeps_physical_capacity_gate():
+    # Five 16 KiB slots cannot fit in L0B even when phases share a base.
+    with pytest.raises(tvm.error.InternalError,
+                       match="L0 phase reuse exceeds scope shared.l0b capacity"):
+        _lower(_program(logical_stages=True, active_epochs=3,
+                        pv_native_k=128, pv_b_versions=5))

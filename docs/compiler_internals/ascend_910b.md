@@ -785,6 +785,13 @@ capacity; they do not invent completion edges for disjoint slots or FIX.
 The final alias and capacity gates remain mandatory. Selection facts are
 consumed after successful synchronization, before later IR rewrites.
 
+Prepared rings are not limited to two versions. A three-version operand ring
+uses the same per-byte-interval credit protocol, with its original generation
+index and stage shift. Admission checks the complete versioned byte footprint;
+flag allocation checks the combined credits of both L0 banks and other
+`M_MTE1` protocols against that eight-ID bank. A larger legal ring does not relax
+the full typed load, finite reader, ownership or whole-MAD completion proof.
+
 An iteration-versioned operand generation can serve one MAD reader site
 inside a finite serial reader nest. Every intervening loop must be positive,
 static, unguarded and at stage zero; the unique full load and all reader

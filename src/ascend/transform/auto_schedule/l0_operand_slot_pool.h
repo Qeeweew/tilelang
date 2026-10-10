@@ -262,12 +262,14 @@ Member(const ScheduledTIR &scheduled, const MultiBufferPlan &plan,
   result.versions = plan.Find(buffer->data);
   if (result.versions) {
     const auto &info = *result.versions;
-    if (info.num_versions < 1 || info.num_versions > 2 ||
-        info.owners.size() != 1 ||
+    if (info.num_versions < 1 || info.owners.size() != 1 ||
         info.owners.front().loop != result.generation ||
         (info.UsesCounter() &&
          result.reader->GetParent() != result.generation))
       return reject("prepared-version-ownership");
+    // Ring size is bounded by physical byte capacity below and the shared
+    // event bank during flag allocation. A legal three-slot ring needs the
+    // same per-slot whole-MAD credit as a two-slot ring.
     // An iteration-owned tile can serve the already-proven finite serial
     // reader nest. All readers use the generation's slot; last_reader returns
     // its whole-MAD credit only after the final occurrence. Counter commits
