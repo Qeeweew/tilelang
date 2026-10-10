@@ -38,9 +38,9 @@ def Pipelined(
     ``annotations`` controlling task stage offsets. An explicit zero retains
     the serial default and disables automatic pipeline selection. Manual
     ``T.Stage`` scopes retain their requested stages. In particular,
-    ``num_stages=0`` with ``annotations={"enable_offset": True,
+    ``num_stages=3`` with ``annotations={"enable_offset": True,
     "tl.ascend_preserve_issue_order": True}`` expresses a complete manual
-    plan without automatic pipeline selection. Use a false issue-order
+    plan with an explicit buffer-version bound of three. Use a false issue-order
     annotation for Stage-only cross-pipe search.
 
     The common TileLang dialect and its default ``num_stages=0`` are unchanged.

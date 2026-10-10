@@ -15,10 +15,10 @@ def test_pipelined_manual_annotations_match_explicit_serial_contract(preserve, s
         def main(A: T.Tensor((16,), "float32")):
             with T.Kernel(1):
                 for i in (
-                    T.Pipelined(start, 16, num_stages=0, annotations={"enable_offset": True, "tl.ascend_preserve_issue_order": preserve})
+                    T.Pipelined(start, 16, num_stages=3, annotations={"enable_offset": True, "tl.ascend_preserve_issue_order": preserve})
                     if use_api
                     else T.serial(start, 16, annotations={"enable_offset": True, "tl.ascend_preserve_issue_order": preserve,
-                                                        "tl.ascend_auto_pipeline": False})
+                                                        "tl.ascend_auto_pipeline": False, "num_stages": T.int32(3)})
                 ):
                     with T.Stage(1):
                         A[i] = 1.0

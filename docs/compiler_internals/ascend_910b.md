@@ -532,10 +532,11 @@ Plain serial loops and explicit `num_stages=0` without an offset request keep
 all tasks at stage zero. They do not search arbitrary cross-pipe epoch offsets.
 Explicit positive version bounds retain their existing scheduling policy.
 
-Manual plans use the same `T.Pipelined` entry: pass `num_stages=0` and
+Manual plans use the same `T.Pipelined` entry: pass a positive buffer-version
+bound (for example `num_stages=3`) and
 `annotations={"enable_offset": True, "tl.ascend_preserve_issue_order": True}`.
-The explicit zero disables automatic pipeline selection; it does not cancel
-explicit `T.Stage` offsets. A false issue-order annotation retains Stage-only
+The explicit bound retains the manual `T.Stage` offsets and limits buffer
+version selection, not the largest stage index. A false issue-order annotation retains Stage-only
 cross-pipe search. No separate manual-loop API is needed.
 `with T.AIVPrivate():` collects new root UB allocations and emits the existing
 `tl.ascend_aiv_private` membership list. Use one scope for the complete private

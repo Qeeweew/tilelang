@@ -221,6 +221,8 @@ def test_real_frontend_keeps_query_ownership_and_group_private_rings(example, dt
     stages = [int(marker.node) for marker in nodes(program, tirx.AttrStmt)
               if marker.attr_key == "tl.ascend_stage"]
     assert stages == [0, 1, 1, 2]
+    task_loop = next(loop for loop in nodes(program, tirx.For) if loop.loop_var.name == "t")
+    assert int(task_loop.annotations["num_stages"]) == max(stages) + 1 == 3
     output = collections.Counter(key[4] for key, count in actual.items() if key[0] == "O" for _ in range(count))
     assert output == collections.Counter((batch, head, query, owner, row, 0)
                                          for batch, head, query, owner, row in itertools.product(range(2), range(2), range(3), range(2), (0, 16)))

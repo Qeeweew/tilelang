@@ -219,7 +219,9 @@ def persistent_attention_fwd(
             # Count only this group's round-robin pairs. All three cores in
             # the group share the same extent, including fill and drain.
             tasks = ((total_pairs + groups - 1 - group) // groups) * kv_tiles
-            for t in T.Pipelined(tasks, num_stages=0, annotations={
+            # Stages 0/1/2 use the same version bound previously inferred
+            # by the scheduler as max(Stage) + 1.
+            for t in T.Pipelined(tasks, num_stages=3, annotations={
                     "enable_offset": True,
                     "tl.ascend_preserve_issue_order": preserve_issue_order}):
                 local_pair = t // kv_tiles
