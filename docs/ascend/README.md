@@ -7,7 +7,7 @@
 
 | 目的 | 文档 |
 | --- | --- |
-| 了解 GEMM、MHA、GQA、decode 的表现及差距 | [910B 性能报告](910b_performance.md) |
+| 查看 GEMM、dense MHA 代码与性能 | [910B 性能报告](910b_performance.md) |
 | 选择 FA 接口、分块、缓存和手排策略 | [FA 使用契约](../../examples/ascend/flash_attention/910b.md) |
 | 了解硬件边界、lowering、依赖与同步 | [编译器契约](../compiler_internals/ascend_910b.md) |
 | 理解自动、Stage-only 和完整手排 | [调度契约](../compiler_internals/ascend_910b_scheduling.md) |

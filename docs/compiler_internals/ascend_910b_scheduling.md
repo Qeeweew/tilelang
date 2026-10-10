@@ -440,4 +440,4 @@ units. Fields named latency and II are scheduling distances; measured
 cycle/tick overrides cannot be mixed into them. Typed dependencies, versions
 and native synchronization establish completion independently of the objective.
 A favorable objective is not a performance acceptance result; see the
-[measured scheduling comparisons](../ascend/910b_performance.md#自动流水同组证据-b).
+[measured scheduling comparisons](../ascend/910b_performance.md#dense-mha).
