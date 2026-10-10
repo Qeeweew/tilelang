@@ -289,27 +289,28 @@ def test_chunked_frontend_shares_v_and_keeps_owner_accumulators_until_final_expo
 
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 @pytest.mark.parametrize("grains,separate,inplace", [((8, 32), True, True), ((16, 8), False, False)])
+@pytest.mark.parametrize("pv_rows", [16, 32], ids=["split-rows", "complete-rows"])
 def test_cache_strategy_and_independent_grains_preserve_complete_gm_handoffs(
-        example, dtype, grains, separate, inplace):
+        example, dtype, grains, separate, inplace, pv_rows):
     row_block, row_block_vec2 = grains
     program = example.persistent_attention_fwd(
         batch=2, heads=2, query_pairs=3, kv_tiles=3, groups=2,
         block_q=32, block_kv=32, head_dim=16, row_block=row_block,
         row_block_vec2=row_block_vec2, separate_score_input=separate,
         inplace_final_division=inplace, qk_chunk=16, pv_chunk=16,
-        pv_rows=16, cache_pv=True, dtype=dtype)
+        pv_rows=pv_rows, cache_pv=True, dtype=dtype)
     actual, buffers = _gm_transfers(program, 2)
     assert actual == _expected_transfers(
         2, 32, 16, row_block=row_block, row_block_vec2=row_block_vec2,
-        qk_chunk=16, cache_pv=True, pv_rows=16)
+        qk_chunk=16, cache_pv=True, pv_rows=pv_rows)
 
     sites = list(_tile_sites(program.body, operation=None))
     pv_gemm, = [site for site in sites if site[0].op.name == "tl.tileop.gemm" and not int(site[0].args[4])]
     gemm, loops, _, _ = pv_gemm
     p_l1, v_l1, accumulator = [region.args[0].buffer for region in gemm.args[:3]]
-    assert tuple(map(int, p_l1.shape)) == (16, 32)
+    assert tuple(map(int, p_l1.shape)) == (pv_rows, 32)
     assert tuple(map(int, v_l1.shape)) == (32, 16)
-    assert tuple(map(int, accumulator.shape)) == (16, 16)
+    assert tuple(map(int, accumulator.shape)) == (pv_rows, 16)
     assert any(bool(loop.annotations.get("tl.ascend_auto_pipeline", False)) for loop in loops)
     exports = [site for site in sites if site[0].op.name == "tl.tileop.ascend_copy"
                and site[0].args[1].args[0].buffer.data.same_as(buffers["PV"].data)]
@@ -349,11 +350,14 @@ def test_invalid_contract_is_rejected_before_frontend_construction(example, chan
         example.persistent_attention_fwd(**options)
 
 
-def test_cached_policy_configs_use_existing_tuner_and_distinct_cache_identity(example):
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_cached_policy_configs_use_existing_tuner_and_distinct_cache_identity(example, head_dim):
     from tilelang.autotuner import AutoTuner
-    configs = example.get_tuning_configs(1, 32, 4096, 4096, 128)
+    configs = example.get_tuning_configs(1, 32, 4096, 4096, head_dim)
     assert json.loads(json.dumps(configs)) == configs
     assert [(c["block_kv"], c["kv_tiles"]) for c in configs] == [(256, 16), (512, 8)]
+    assert [c["row_block"] for c in configs] == [32, 16]
+    assert all(c["pv_rows"] == c["block_q"] == 64 and c["pv_chunk"] == 128 for c in configs)
     for config in configs:
         program = example.persistent_attention_fwd(**config)
         assert len(program.params) == 4

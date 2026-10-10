@@ -205,13 +205,16 @@ def test_native_load_prefetch_keeps_payload_and_all_reader_completions(dtype, tr
             T.set_mmad_direction("m")
             T.copy(A, a)
             T.copy(B, b)
-            for chunk in T.Pipelined(trip, max_stages=2):
-                with T.Task(latency=1, ii=1):
-                    T.copy(a[:, chunk * 64:(chunk + 1) * 64], aa)
-                with T.Task(latency=1, ii=1):
-                    T.copy(b[:, chunk * 64:(chunk + 1) * 64], bb)
-                with T.Task(latency=1, ii=1):
-                    T.gemm(aa, bb, c, transpose_B=True, clear_accum=chunk == 0)
+            # A complete M tile has one part. Its ordinary ancestor must not
+            # hide the automatic chunk loop's last MAD from the final FIX.
+            for part in T.serial(1):
+                for chunk in T.Pipelined(trip, max_stages=2):
+                    with T.Task(latency=1, ii=1):
+                        T.copy(a[:, chunk * 64:(chunk + 1) * 64], aa)
+                    with T.Task(latency=1, ii=1):
+                        T.copy(b[:, chunk * 64:(chunk + 1) * 64], bb)
+                    with T.Task(latency=1, ii=1):
+                        T.gemm(aa, bb, c, transpose_B=True, clear_accum=chunk == 0)
             T.copy(c, O)
 
     _, snapshots = _lower(main)

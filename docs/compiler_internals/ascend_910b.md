@@ -75,8 +75,12 @@ Before scheduling, a serial unit-step loop with extent one can be replaced by
 its body. Ordinary automatic pipeline intent alone does not prevent this:
 the annotation set must be exactly `tl.ascend_auto_pipeline=True` and a positive
 integer `num_stages`. Its minimum retains evaluate-on-entry semantics. Manual
-annotations, explicit stages, loop-control targets and annotated descendants
-keep their control boundary; larger loops are not expanded.
+annotations, explicit stages, loop-control targets and descendants with other
+annotations keep their control boundary. A nested loop with only automatic
+pipeline intent retains its own domain after substituting the one-trip parent;
+this happens before version ownership and scheduling. The final child MAD
+therefore remains visible to the following accumulator export without an
+extra parent clock. Larger loops are not expanded.
 
 L1 GEMM is expanded before layout inference into explicit L0 allocations,
 L1-to-L0 copies and ordinary L0 GEMM tasks. A bounded sub-K loop keeps IR size

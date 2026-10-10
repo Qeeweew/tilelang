@@ -150,13 +150,28 @@ def test_non_singleton_or_nonunit_step_is_not_inlined(extent, step, annotations)
     assert len(nodes(_normalize(loop), tirx.For)) == 1
 
 
-def test_automatic_singleton_preserves_annotated_native_child_domain():
+@pytest.mark.parametrize("annotations", [None, _AUTO], ids=["ordinary", "automatic"])
+@pytest.mark.parametrize("child_annotations", [_AUTO, {**_AUTO, "custom_loop_contract": 1}],
+                         ids=["automatic-child", "explicit-child"])
+def test_singleton_substitutes_parent_and_preserves_automatic_child_domain(
+        annotations, child_annotations):
     cache, native = tirx.Var("cache", "int32"), tirx.Var("native", "int32")
-    child = tirx.For(native, 0, 3, tirx.ForKind.SERIAL, tirx.Evaluate(cache + native), annotations=_AUTO)
-    parent = tirx.For(cache, 0, 1, tirx.ForKind.SERIAL, child, annotations=_AUTO)
+    child = tirx.For(native, 0, 3, tirx.ForKind.SERIAL, tirx.Evaluate(cache + native),
+                     annotations=child_annotations)
+    parent = tirx.For(cache, 2, 1, tirx.ForKind.SERIAL, child, annotations=annotations)
     after = _normalize(parent)
     retained = nodes(after, tirx.For)
-    assert len(retained) == 2
-    assert {loop.loop_var.name: int(loop.extent) for loop in retained} == {"cache": 1, "native": 3}
-    for loop in retained:
-        assert set(loop.annotations) == set(_AUTO)
+    if "custom_loop_contract" in child_annotations:
+        assert len(retained) == 2
+        loops = {loop.loop_var.name: loop for loop in retained}
+        assert set(loops) == {"cache", "native"}
+        assert loops["cache"].body.same_as(loops["native"])
+        assert dict(loops["native"].annotations) == child_annotations
+        return
+    assert len(retained) == 1
+    loop = retained[0]
+    assert loop.loop_var.same_as(native) and int(loop.extent) == 3
+    assert dict(loop.annotations) == _AUTO
+    assert not tirx.analysis.undefined_vars(after["main"].body, after["main"].params)
+    analyzer = tvm.arith.Analyzer()
+    assert analyzer.can_prove(loop.body.value == 2 + native)

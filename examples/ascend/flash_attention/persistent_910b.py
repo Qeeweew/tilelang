@@ -12,9 +12,12 @@ def get_tuning_configs(batch, heads, query_len, kv_len, head_dim, *,
                        dtype="bfloat16", groups=16, preserve_issue_order=True):
     """Two finite cached-PV policies for long dense inputs, for AutoTuner.
 
-    A larger logical KV block amortizes online updates and GM handoffs. It
-    also increases K/V/P residency and changes P rounding points; the compiler
-    must validate capacity and the caller must validate dtype tolerances.
+    Complete Q rows reuse each cached V slice in one PV MAD per owner, while
+    128-wide PV K slices amortize instruction issue. Vec1 targets 8192
+    score elements per private UB grain, independently of the head dimension.
+    A larger logical KV block amortizes online updates and GM handoffs but
+    increases K/V/P residency and changes P rounding points; the compiler must
+    validate capacity and the caller must validate dtype tolerances.
     This is a starting policy, not a shape-specific winner or a cost model.
     Use the factory directly for other tiles, grains and streaming policies.
     """
@@ -29,8 +32,9 @@ def get_tuning_configs(batch, heads, query_len, kv_len, head_dim, *,
         raise ValueError("Persistent tuning requires FP16/BF16 and a bool issue-order policy")
     return [dict(batch=batch, heads=heads, query_pairs=query_len // 128,
                  kv_tiles=kv_len // width, groups=groups, head_dim=head_dim,
-                 block_q=64, block_kv=width, row_block=8, row_block_vec2=64,
-                 qk_chunk=128, pv_chunk=64, pv_rows=32, cache_pv=True,
+                 block_q=64, block_kv=width, row_block=min(64, 8192 // width),
+                 row_block_vec2=64, qk_chunk=128, pv_chunk=128, pv_rows=64,
+                 cache_pv=True,
                  separate_score_input=True, inplace_final_division=True,
                  preserve_issue_order=preserve_issue_order, dtype=dtype)
             for width in (256, 512) if kv_len % width == 0]

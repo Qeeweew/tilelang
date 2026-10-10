@@ -64,8 +64,9 @@ bool HasOnlyAutomaticPipelineIntent(const ForNode *loop) {
 
 // Removing a loop must not change the target of a break/continue, the loop
 // whose child list owns an explicit Stage, or an annotated scheduling domain.
-// Conservatively keep a singleton around nested semantic boundaries as well;
-// ordinary data operations, including atomic Tasks, can still be substituted.
+// A nested automatic pipeline owns its own loop domain. Substituting a
+// one-trip ancestor before ownership is established preserves that domain and
+// its annotations. Explicit scheduling/control boundaries remain conservative.
 class SingletonBoundaryDetector : public StmtExprVisitor {
 public:
   static bool Contains(const Stmt &body) {
@@ -86,7 +87,8 @@ private:
   }
 
   void VisitStmt_(const ForNode *op) final {
-    found_ |= !op->annotations.empty() || op->thread_binding.defined();
+    found_ |= (!op->annotations.empty() && !HasOnlyAutomaticPipelineIntent(op)) ||
+              op->thread_binding.defined();
     StmtExprVisitor::VisitStmt_(op);
   }
 
