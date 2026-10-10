@@ -318,6 +318,19 @@ first. It permits moving construction, not reassignment. Mandatory alias and
 event-capacity gates complete before publication. Outer epoch domains, selected
 protocols and the root remain valid until materialization consumes the plan.
 
+The kernel driver separates three lifetimes. `KernelSyncPreparation` owns the
+scheduled tree, pre-unit retry snapshot, storage/epoch facts and candidate
+protocols; it is neither copyable nor movable because epoch analysis borrows
+its multi-buffer plan. `PlanKernelSync` retries optional selections against
+that preparation and returns either a complete `KernelSyncPlan` or value-only
+root options. A root retry destroys the old preparation before rebuilding the
+saved input in the driver's next iteration; it does not recursively retain
+old trees and proof contexts. `MaterializeKernelSync` accepts only a complete
+plan, publishes accepted aliases/diagnostics, then emits synchronization and
+finite fill/drain. It performs no candidate selection or retry. The dependency
+proof rules, fallback priorities, event allocation order and 2201/3510 protocol
+choices remain independent of this orchestration boundary.
+
 The early L0 max-budget choice is a required physical-alias contract, not
 evidence that storage can already overlap. A typed storage-pair snapshot owns
 its annotation decoding and exact conflict-list identity. It keeps pair order

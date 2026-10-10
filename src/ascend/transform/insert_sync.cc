@@ -5993,7 +5993,7 @@ enum class KernelSyncFallback {
   kUnitStreams,
 };
 
-struct KernelSyncRootRetry {
+struct KernelSyncRootOptions {
   bool enable_unit_streams;
   bool enable_c_byte_retirement;
 };
@@ -6004,7 +6004,6 @@ struct KernelSyncSelection {
   std::vector<L0OperandSlotPool> operand_pools;
   std::vector<ValidatedOwnerTransfer> owner_results;
   std::vector<ValidatedOwnerTransfer> owner_inputs;
-  std::optional<ScheduledTIR> unit_fallback;
   bool closed_c_byte_retirement{false};
   bool enable_gm_read_release{true};
   bool enable_gm_write_acquire{true};
@@ -6078,7 +6077,7 @@ struct KernelSyncSelection {
     return KernelSyncFallback::kUnitStreams;
   }
 
-  std::optional<KernelSyncRootRetry>
+  std::optional<KernelSyncRootOptions>
   ApplyFallback(KernelSyncFallback action, const KernelSyncFailure &failure,
                 OptimizationDiagnostics *diagnostics) {
     auto retry = [&](const char *feature) {
@@ -6103,8 +6102,7 @@ struct KernelSyncSelection {
     switch (action) {
     case KernelSyncFallback::kCByteRetirement:
       retry("c-byte-retirement");
-      ICHECK(unit_fallback.has_value());
-      return KernelSyncRootRetry{true, false};
+      return KernelSyncRootOptions{true, false};
     case KernelSyncFallback::kGmWriteAcquire:
       retry("gm-write-acquire");
       enable_gm_write_acquire = false;
@@ -6134,19 +6132,154 @@ struct KernelSyncSelection {
       retry("owner-result");
       break;
     case KernelSyncFallback::kUnitStreams:
-      ICHECK(unit_fallback.has_value());
       retry("unit-flag-stream");
       if (failure.kind == KernelSyncFailureKind::kFlagCapacity)
         LOG(WARNING) << "Unit stream fallback due to flag allocation capacity";
-      return KernelSyncRootRetry{false, true};
+      return KernelSyncRootOptions{false, true};
     }
     return std::nullopt;
   }
 };
 
+// Own every tree and protocol borrowed by an analysis attempt. A root retry
+// destroys this context and all its derived facts before preparing the saved
+// input again. Local selection retries reuse it without mutating the tree.
+// EpochDomainRegistry borrows multi_buffer_plan, so this object cannot move.
+class KernelSyncPreparation {
+public:
+  KernelSyncPreparation(const Stmt &kernel_body, ScheduledTIR input,
+                        Target target, const std::vector<Var> &lane_variables,
+                        KernelSyncRootOptions options,
+                        OptimizationDiagnostics *diagnostics)
+      : scheduled_tir(std::move(input)),
+        selected_reuse(SelectedL0PhaseReuse::Read(
+            scheduled_tir.metadata.kernel_root)),
+        target_info(GetAscendTargetInfo(target)),
+        cross_core_contract{
+            target_info.architecture == AscendArchitecture::kDav2201,
+            scheduled_tir.metadata.num_aiv_subcores.value_or(
+                target_info.aiv_per_aic)},
+        groups(CollectL0SFBindings(scheduled_tir.metadata.kernel_root)),
+        multi_buffer_plan(ReadMultiBufferPlan(
+            scheduled_tir.tree, scheduled_tir.metadata.buffer_versions, groups)) {
+    auto &root = scheduled_tir.tree;
+    auto &operand_pools = selection.operand_pools;
+    auto &owner_results = selection.owner_results;
+    auto &owner_inputs = selection.owner_inputs;
+    auto &closed_c_byte_retirement = selection.closed_c_byte_retirement;
+    if (options.enable_unit_streams &&
+        target_info.architecture == AscendArchitecture::kDav2201) {
+      // An existing direction setter has an explicit state contract. Do not
+      // silently replace its scope or assume the state to restore on exit.
+      bool explicit_state = false;
+      PostOrderVisit(kernel_body, [&](const ffi::ObjectRef &node) {
+        if (const auto *call = node.as<CallNode>())
+          explicit_state |= call->op.same_as(ascend_set_mmad_direction()) ||
+                            call->op.same_as(ascend_set_atomic()) ||
+                            call->op.same_as(ascend_set_atomic_none()) ||
+                            call->op.same_as(builtin::call_extern()) ||
+                            call->op.same_as(builtin::call_pure_extern());
+      });
+      if (!explicit_state) {
+        unit_streams =
+            AnalyzeUnitFlagStreams(root, scheduled_tir.metadata.kernel_root,
+                                   scheduled_tir.metadata.buffer_versions,
+                                   scheduled_tir.metadata.manual_buffer_versions);
+        if (!unit_streams.empty()) {
+          diagnostics->Record("unit-flag-stream", OptimizationStatus::kSelected,
+                              "native-stream-candidates");
+          unit_fallback.emplace();
+          unit_fallback->metadata = scheduled_tir.metadata;
+          for (const auto &node : root)
+            unit_fallback->tree.push_back(node->Clone());
+        }
+        bool kernel_direction =
+            HasClosedKernelUnitDirection(root, unit_streams, kernel_body);
+        closed_c_byte_retirement =
+            options.enable_c_byte_retirement && kernel_direction &&
+            HasClosedCByteRetirement(scheduled_tir.metadata, selected_reuse,
+                                     unit_streams, target_info.l0c_bytes);
+        if (runtime::detail::VerboseLoggingEnabled(__FILE__, 1)) {
+          LOG(INFO) << "Unit streams=" << unit_streams.size()
+                    << " kernel direction=" << kernel_direction
+                    << " closed C retirement=" << closed_c_byte_retirement;
+          for (const auto &plan : unit_streams)
+            LOG(INFO) << "Unit result=" << plan.result_loop->control->loop_var
+                      << " C=" << plan.c->data << " mads=" << plan.mads.size();
+        }
+        ApplyUnitFlagStreams(unit_streams);
+        InsertUnitFlagBoundaries(root, nullptr, unit_streams, &unit_boundaries,
+                                 kernel_direction, closed_c_byte_retirement);
+        if (kernel_direction)
+          InsertKernelUnitDirection(root, &unit_boundaries);
+      } else {
+        diagnostics->Record("unit-flag-stream", OptimizationStatus::kRejected,
+                            "explicit-native-state-or-extern");
+      }
+    }
+    // Keep this after the original unit-fallback snapshot. A root retry
+    // rebuilds one marker from the unmodified tree; owner-analysis retries below
+    // reuse this tree without inserting another initialization consumer.
+    if (target_info.architecture == AscendArchitecture::kDav2201)
+      InsertRootLoad3DInitMarker(root, kernel_body);
+    operand_pools =
+        AnalyzeL0OperandSlotPools(scheduled_tir, multi_buffer_plan,
+                                  selected_reuse, target_info, diagnostics);
+    if (runtime::detail::VerboseLoggingEnabled(__FILE__, 1))
+      for (const auto &pool : operand_pools)
+        LOG(INFO) << "L0 operand slot pool " << pool.first.buffer->data << " / "
+                  << pool.second.buffer->data << " slots=" << pool.slots
+                  << " pitch_bytes=" << pool.slot_bytes;
+    std::vector<TaskNode *> tasks;
+    CollectAllTaskNodes(root, tasks);
+    for (TaskNode *task : tasks) {
+      ICHECK_NE(task->GetCoreMask(), kCoreUnassigned)
+          << "InsertSync requires ResolveCore to assign every T.Task";
+    }
+    domains.emplace(root, multi_buffer_plan);
+    cross_core_flag_reservation =
+        CollectExplicitCrossCoreFlags(kernel_body, cross_core_contract);
+    if (cross_core_contract.collective &&
+        cross_core_contract.num_aiv_subcores == 2) {
+      owner_results = AnalyzeOwnerResults(
+          root, scheduled_tir.metadata.kernel_root,
+          scheduled_tir.metadata.manual_buffer_versions, lane_variables);
+      owner_inputs = AnalyzeOwnerInputs(
+          root, scheduled_tir.metadata.kernel_root,
+          scheduled_tir.metadata.manual_buffer_versions, lane_variables);
+    }
+  }
+
+  KernelSyncPreparation(const KernelSyncPreparation &) = delete;
+  KernelSyncPreparation &operator=(const KernelSyncPreparation &) = delete;
+  KernelSyncPreparation(KernelSyncPreparation &&) = delete;
+  KernelSyncPreparation &operator=(KernelSyncPreparation &&) = delete;
+
+  ScheduledTIR TakeRetryInput() {
+    ICHECK(unit_fallback.has_value())
+        << "A synchronization root retry requires a pre-unit snapshot";
+    return std::move(unit_fallback.value());
+  }
+
+  ScheduledTIR scheduled_tir;
+  const SelectedL0PhaseReuse selected_reuse;
+  const AscendTargetInfo &target_info;
+  const CrossCoreSyncContract cross_core_contract;
+  const L0StorageGroups groups;
+  const MultiBufferPlan multi_buffer_plan;
+  std::vector<UnitFlagStreamPlan> unit_streams;
+  std::vector<UnitFlagBoundary> unit_boundaries;
+  KernelSyncSelection selection;
+  std::optional<EpochDomainRegistry> domains;
+  CrossCoreFlagReservation cross_core_flag_reservation;
+
+private:
+  std::optional<ScheduledTIR> unit_fallback;
+};
+
 // A complete attempt owns the site graph before the allocator that borrows
-// it. Inputs and selected protocols remain owned by this InsertKernelSync
-// invocation; selection and the root stay unchanged until materialization.
+// it. The enclosing KernelSyncPreparation owns all borrowed protocol inputs;
+// selection and the root stay unchanged until materialization.
 class KernelSyncPlan {
 public:
   KernelSyncPlan(std::unique_ptr<SyncAnalyzer> analyzer,
@@ -6181,15 +6314,18 @@ using KernelSyncAttempt = std::variant<KernelSyncFailure, KernelSyncPlan>;
 // Failed attempts return only retry observations. Their sites, proofs and
 // partial allocations have already been destroyed when selection changes.
 // Only the complete plan crosses the publication/materialization boundary.
-KernelSyncAttempt TryPlanKernelSync(
-    const ScheduledTIR &scheduled_tir, const MultiBufferPlan &multi_buffer_plan,
-    const EpochDomainRegistry &domains, const AscendTargetInfo &target_info,
-    const CrossCoreSyncContract &cross_core_contract,
-    const CrossCoreFlagReservation &cross_core_flag_reservation,
-    const L0StorageGroups &groups, const SelectedL0PhaseReuse &selected_reuse,
-    const std::vector<UnitFlagStreamPlan> &unit_streams,
-    const std::vector<UnitFlagBoundary> &unit_boundaries,
-    const KernelSyncSelection &selection) {
+KernelSyncAttempt TryPlanKernelSync(const KernelSyncPreparation &prepared) {
+  const auto &scheduled_tir = prepared.scheduled_tir;
+  const auto &multi_buffer_plan = prepared.multi_buffer_plan;
+  const auto &domains = prepared.domains.value();
+  const auto &target_info = prepared.target_info;
+  const auto &cross_core_contract = prepared.cross_core_contract;
+  const auto &cross_core_flag_reservation = prepared.cross_core_flag_reservation;
+  const auto &groups = prepared.groups;
+  const auto &selected_reuse = prepared.selected_reuse;
+  const auto &unit_streams = prepared.unit_streams;
+  const auto &unit_boundaries = prepared.unit_boundaries;
+  const auto &selection = prepared.selection;
   const auto &root = scheduled_tir.tree;
   const auto &operand_pools = selection.operand_pools;
   const auto &owner_results = selection.owner_results;
@@ -6308,137 +6444,47 @@ KernelSyncAttempt TryPlanKernelSync(
                         std::move(owner_events.value()));
 }
 
-SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
-                        Target target, const std::vector<Var> &lane_variables,
-                        bool enable_unit_streams = true,
-                        bool enable_c_byte_retirement = true,
-                        OptimizationDiagnostics *diagnostics = nullptr) {
-  OptimizationDiagnostics local_diagnostics;
-  if (!diagnostics)
-    diagnostics = &local_diagnostics;
-  KernelSyncSelection selection;
-  auto &operand_pools = selection.operand_pools;
-  auto &owner_results = selection.owner_results;
-  auto &owner_inputs = selection.owner_inputs;
-  auto &unit_fallback = selection.unit_fallback;
-  auto &closed_c_byte_retirement = selection.closed_c_byte_retirement;
-  std::vector<std::shared_ptr<IRStructure>> &root = scheduled_tir.tree;
-  const SelectedL0PhaseReuse selected_reuse =
-      SelectedL0PhaseReuse::Read(scheduled_tir.metadata.kernel_root);
-  const AscendTargetInfo &target_info = GetAscendTargetInfo(target);
-  CrossCoreSyncContract cross_core_contract{
-      target_info.architecture == AscendArchitecture::kDav2201,
-      scheduled_tir.metadata.num_aiv_subcores.value_or(
-          target_info.aiv_per_aic)};
-  L0StorageGroups groups(
-      CollectL0SFBindings(scheduled_tir.metadata.kernel_root));
-  MultiBufferPlan multi_buffer_plan =
-      ReadMultiBufferPlan(root, scheduled_tir.metadata.buffer_versions, groups);
-  std::vector<UnitFlagStreamPlan> unit_streams;
-  std::vector<UnitFlagBoundary> unit_boundaries;
-  if (enable_unit_streams &&
-      target_info.architecture == AscendArchitecture::kDav2201) {
-    // An existing direction setter has an explicit state contract. Do not
-    // silently replace its scope or assume the state to restore on exit.
-    bool explicit_state = false;
-    PostOrderVisit(kernel_body, [&](const ffi::ObjectRef &node) {
-      if (const auto *call = node.as<CallNode>())
-        explicit_state |= call->op.same_as(ascend_set_mmad_direction()) ||
-                          call->op.same_as(ascend_set_atomic()) ||
-                          call->op.same_as(ascend_set_atomic_none()) ||
-                          call->op.same_as(builtin::call_extern()) ||
-                          call->op.same_as(builtin::call_pure_extern());
-    });
-    if (!explicit_state) {
-      unit_streams =
-          AnalyzeUnitFlagStreams(root, scheduled_tir.metadata.kernel_root,
-                                 scheduled_tir.metadata.buffer_versions,
-                                 scheduled_tir.metadata.manual_buffer_versions);
-      if (!unit_streams.empty()) {
-        diagnostics->Record("unit-flag-stream", OptimizationStatus::kSelected,
-                            "native-stream-candidates");
-        unit_fallback.emplace();
-        unit_fallback->metadata = scheduled_tir.metadata;
-        for (const auto &node : root)
-          unit_fallback->tree.push_back(node->Clone());
-      }
-      bool kernel_direction =
-          HasClosedKernelUnitDirection(root, unit_streams, kernel_body);
-      closed_c_byte_retirement =
-          enable_c_byte_retirement && kernel_direction &&
-          HasClosedCByteRetirement(scheduled_tir.metadata, selected_reuse,
-                                   unit_streams, target_info.l0c_bytes);
-      if (runtime::detail::VerboseLoggingEnabled(__FILE__, 1)) {
-        LOG(INFO) << "Unit streams=" << unit_streams.size()
-                  << " kernel direction=" << kernel_direction
-                  << " closed C retirement=" << closed_c_byte_retirement;
-        for (const auto &plan : unit_streams)
-          LOG(INFO) << "Unit result=" << plan.result_loop->control->loop_var
-                    << " C=" << plan.c->data << " mads=" << plan.mads.size();
-      }
-      ApplyUnitFlagStreams(unit_streams);
-      InsertUnitFlagBoundaries(root, nullptr, unit_streams, &unit_boundaries,
-                               kernel_direction, closed_c_byte_retirement);
-      if (kernel_direction)
-        InsertKernelUnitDirection(root, &unit_boundaries);
-    } else {
-      diagnostics->Record("unit-flag-stream", OptimizationStatus::kRejected,
-                          "explicit-native-state-or-extern");
-    }
-  }
-  // Keep this after the original unit-fallback snapshot. A recursive retry
-  // rebuilds one marker from the unmodified tree; owner-analysis retries below
-  // reuse this tree without inserting another initialization consumer.
-  if (target_info.architecture == AscendArchitecture::kDav2201)
-    InsertRootLoad3DInitMarker(root, kernel_body);
-  operand_pools =
-      AnalyzeL0OperandSlotPools(scheduled_tir, multi_buffer_plan,
-                                selected_reuse, target_info, diagnostics);
-  if (runtime::detail::VerboseLoggingEnabled(__FILE__, 1))
-    for (const auto &pool : operand_pools)
-      LOG(INFO) << "L0 operand slot pool " << pool.first.buffer->data << " / "
-                << pool.second.buffer->data << " slots=" << pool.slots
-                << " pitch_bytes=" << pool.slot_bytes;
-  std::vector<TaskNode *> tasks;
-  CollectAllTaskNodes(root, tasks);
-  for (TaskNode *task : tasks) {
-    ICHECK_NE(task->GetCoreMask(), kCoreUnassigned)
-        << "InsertSync requires ResolveCore to assign every T.Task";
-  }
-  EpochDomainRegistry domains(root, multi_buffer_plan);
-  CrossCoreFlagReservation cross_core_flag_reservation =
-      CollectExplicitCrossCoreFlags(kernel_body, cross_core_contract);
-  if (cross_core_contract.collective &&
-      cross_core_contract.num_aiv_subcores == 2) {
-    owner_results = AnalyzeOwnerResults(
-        root, scheduled_tir.metadata.kernel_root,
-        scheduled_tir.metadata.manual_buffer_versions, lane_variables);
-    owner_inputs = AnalyzeOwnerInputs(
-        root, scheduled_tir.metadata.kernel_root,
-        scheduled_tir.metadata.manual_buffer_versions, lane_variables);
-  }
-  std::optional<KernelSyncPlan> completed_plan;
-  while (!completed_plan) {
-    KernelSyncAttempt attempt = TryPlanKernelSync(
-        scheduled_tir, multi_buffer_plan, domains, target_info,
-        cross_core_contract, cross_core_flag_reservation, groups, selected_reuse,
-        unit_streams, unit_boundaries, selection);
+// Local retries replace only optional selections. No analysis sites, partial
+// allocations or insertions escape a failed attempt. A root retry carries only
+// options; the driver must discard the entire preparation before retrying.
+using KernelSyncPlanningResult =
+    std::variant<KernelSyncRootOptions, KernelSyncPlan>;
+
+KernelSyncPlanningResult PlanKernelSync(
+    KernelSyncPreparation &prepared, OptimizationDiagnostics *diagnostics) {
+  for (;;) {
+    KernelSyncAttempt attempt = TryPlanKernelSync(prepared);
     if (const auto *failure = std::get_if<KernelSyncFailure>(&attempt)) {
+      auto &selection = prepared.selection;
       KernelSyncFallback action = selection.SelectFallback(*failure);
-      // A root retry starts from the pre-unit snapshot, including fresh
-      // candidates, domains and enabled GM proofs, rather than this selection.
       if (auto retry = selection.ApplyFallback(action, *failure, diagnostics))
-        return InsertKernelSync(
-            kernel_body, std::move(unit_fallback.value()), target, lane_variables,
-            retry->enable_unit_streams, retry->enable_c_byte_retirement,
-            diagnostics);
+        return *retry;
     } else {
-      completed_plan.emplace(std::get<KernelSyncPlan>(std::move(attempt)));
+      return std::get<KernelSyncPlan>(std::move(attempt));
     }
   }
-  const SyncAnalyzer &analyzer = completed_plan->Analysis();
-  FlagAllocator &flag_allocator = completed_plan->Allocator();
-  const auto &owner_events = completed_plan->OwnerEvents();
+}
+
+// Publication has no candidate selection or retry path. Only a fully proven
+// and allocated plan can consume the tree and publish its aliases and flags.
+SBlock MaterializeKernelSync(KernelSyncPreparation &prepared,
+                            KernelSyncPlan &plan,
+                            const std::vector<Var> &lane_variables,
+                            OptimizationDiagnostics *diagnostics) {
+  auto &scheduled_tir = prepared.scheduled_tir;
+  auto &root = scheduled_tir.tree;
+  const auto &selected_reuse = prepared.selected_reuse;
+  const auto &target_info = prepared.target_info;
+  const auto &cross_core_contract = prepared.cross_core_contract;
+  const auto &unit_streams = prepared.unit_streams;
+  const auto &selection = prepared.selection;
+  const auto &operand_pools = selection.operand_pools;
+  const auto &owner_results = selection.owner_results;
+  const auto &owner_inputs = selection.owner_inputs;
+  bool closed_c_byte_retirement = selection.closed_c_byte_retirement;
+  const SyncAnalyzer &analyzer = plan.Analysis();
+  FlagAllocator &flag_allocator = plan.Allocator();
+  const auto &owner_events = plan.OwnerEvents();
   if (selected_reuse.Present()) {
     scheduled_tir.metadata.kernel_root.CopyOnWrite()->annotations.erase(
         kL0PhaseReusePairs);
@@ -6504,6 +6550,25 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
     root[i]->SetParent(nullptr);
   }
   return EncodeScheduledTIR(std::move(scheduled_tir));
+}
+
+
+SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir,
+                       Target target, const std::vector<Var> &lane_variables) {
+  OptimizationDiagnostics diagnostics;
+  KernelSyncRootOptions options{true, true};
+  for (;;) {
+    KernelSyncPreparation prepared(kernel_body, std::move(scheduled_tir), target,
+                                   lane_variables, options, &diagnostics);
+    KernelSyncPlanningResult result = PlanKernelSync(prepared, &diagnostics);
+    if (const auto *retry = std::get_if<KernelSyncRootOptions>(&result)) {
+      options = *retry;
+      scheduled_tir = prepared.TakeRetryInput();
+      continue;
+    }
+    return MaterializeKernelSync(prepared, std::get<KernelSyncPlan>(result),
+                                 lane_variables, &diagnostics);
+  }
 }
 
 } // namespace

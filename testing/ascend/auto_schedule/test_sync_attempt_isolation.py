@@ -8,6 +8,8 @@ an allocator or retry hook. They do not claim native unit completion.
 
 from collections import Counter
 
+import pytest
+
 from tilelang import tvm
 from tilelang.ascend import transform
 from tvm import tirx
@@ -22,6 +24,7 @@ from testing.ascend.auto_schedule.test_owner_result_completion import (
     _trace as _owner_trace, _value,
 )
 from testing.ascend.auto_schedule.test_unit_flag_kernel_direction import _prove_kernel
+from testing.ascend.auto_schedule.test_sync_binary_flags import _counter_mask_program
 from testing.ascend.auto_schedule.test_unit_flag_stream import (
     _COPY, _DIRECTION, _GEMM, _SET, _WAIT, _fixture,
     _trace as _unit_trace, _value as _unit_value,
@@ -189,6 +192,27 @@ def test_unit_stream_root_retry_is_repeatable_and_kernel_local():
     # only this comparison excludes that intentional metadata difference. All
     # repeated/serialized and independent-root checks above retain layouts.
     _assert_same_kernels(fallback, _insert(transform.InsertSync(), ordinary), compare_layouts=False)
+
+
+@pytest.mark.parametrize("reject_first", [False, True])
+@pytest.mark.parametrize("serialized", [False, True])
+def test_rejected_kernel_does_not_publish_or_poison_next_invocation(reject_first, serialized):
+    # A hard proof failure can occur before or after another kernel has reached
+    # materialization. Neither source IR nor the next pass invocation may keep
+    # partial publication, epoch domains or allocation state from that call.
+    rejected, _ = _counter_mask_program(tick="add-two")
+    selected = _scheduled_handoff()
+    combined = _combine(rejected, selected) if reject_first else _combine(selected, rejected)
+    if serialized:
+        combined = tvm.ir.load_json(tvm.ir.save_json(combined))
+    original = tvm.ir.save_json(combined)
+    insert = transform.InsertSync()
+    with tvm.transform.PassContext(config={"tl.disable_shared_memory_reuse": True}):
+        expected = _insert(insert, selected)
+        with pytest.raises(tvm.error.InternalError, match="no reverse completion path for S->V"):
+            _insert(insert, combined)
+        assert tvm.ir.save_json(combined) == original
+        _assert_same_kernels(_insert(insert, selected), expected)
 
 
 def test_owner_result_capacity_retry_is_repeatable_and_kernel_local():
