@@ -134,7 +134,8 @@ def _gm_transfers(program, groups):
 
 
 def _expected_transfers(groups, block_kv=16, pv_chunk=None, *, row_block=16,
-                        row_block_vec2=16, qk_chunk=None, cache_pv=False, pv_rows=32):
+                        row_block_vec2=16, qk_chunk=None, cache_pv=False, pv_rows=32,
+                        stream_qk_b=False, reuse_qk_b=False, stream_pv_p=False):
     expected = collections.Counter()
 
     def add(name, writing, group, epoch, origin, shape):
@@ -155,7 +156,9 @@ def _expected_transfers(groups, block_kv=16, pv_chunk=None, *, row_block=16,
                         add("Score", True, group, task, (group, owner, 0, column), (1, 1, 32, qk_extent))
                     if cache_pv:
                         for row in range(0, 32, pv_rows):
-                            add("P", False, group, task, (group, owner, row, 0), (1, 1, pv_rows, block_kv))
+                            p_width = pv_chunk if stream_pv_p else block_kv
+                            for column in range(0, block_kv, p_width):
+                                add("P", False, group, task, (group, owner, row, column), (1, 1, pv_rows, p_width))
                             add("PV", True, group, task, (group, owner, row, 0), (1, 1, pv_rows, 16))
                     elif pv_chunk is None:
                         add("P", False, group, task, (group, owner, 0, 0), (1, 1, 32, block_kv))
@@ -178,7 +181,13 @@ def _expected_transfers(groups, block_kv=16, pv_chunk=None, *, row_block=16,
                             add("OState", True, group, task, state, (1, 1, 1, row_block_vec2, 16))
                         else:
                             add("O", True, group, task, (batch, head, query, owner, row, 0), (1, 1, 1, 1, row_block_vec2, 16))
-                add("K", False, group, task, (batch, head, kv * block_kv, 0), (1, 1, block_kv, 16))
+                if stream_qk_b:
+                    for _ in range(1 if reuse_qk_b else 2):
+                        for column in range(0, block_kv, qk_chunk):
+                            add("K", False, group, task, (batch, head, kv * block_kv + column, 0),
+                                (1, 1, qk_chunk, 16))
+                else:
+                    add("K", False, group, task, (batch, head, kv * block_kv, 0), (1, 1, block_kv, 16))
                 if cache_pv:
                     add("V", False, group, task, (batch, head, kv * block_kv, 0), (1, 1, block_kv, 16))
                 elif pv_chunk is None:
@@ -291,25 +300,28 @@ def test_chunked_frontend_shares_v_and_keeps_owner_accumulators_until_final_expo
 @pytest.mark.parametrize("grains,separate,inplace", [((8, 32), True, True), ((16, 8), False, False)])
 @pytest.mark.parametrize("pv_rows", [16, 32], ids=["split-rows", "complete-rows"])
 @pytest.mark.parametrize("reuse_qk_b", [False, True])
+@pytest.mark.parametrize("stream", [False, True], ids=["full-cache", "bounded-K-P"])
 def test_cache_strategy_and_independent_grains_preserve_complete_gm_handoffs(
-        example, dtype, grains, separate, inplace, pv_rows, reuse_qk_b):
+        example, dtype, grains, separate, inplace, pv_rows, reuse_qk_b, stream):
     row_block, row_block_vec2 = grains
     program = example.persistent_attention_fwd(
         batch=2, heads=2, query_pairs=3, kv_tiles=3, groups=2,
         block_q=32, block_kv=32, head_dim=16, row_block=row_block,
         row_block_vec2=row_block_vec2, separate_score_input=separate,
-        inplace_final_division=inplace, qk_chunk=16, reuse_qk_b=reuse_qk_b, pv_chunk=16,
+        inplace_final_division=inplace, qk_chunk=16, reuse_qk_b=reuse_qk_b,
+        stream_qk_b=stream, stream_pv_p=stream, pv_chunk=16,
         pv_rows=pv_rows, cache_pv=True, dtype=dtype)
     actual, buffers = _gm_transfers(program, 2)
     assert actual == _expected_transfers(
         2, 32, 16, row_block=row_block, row_block_vec2=row_block_vec2,
-        qk_chunk=16, cache_pv=True, pv_rows=pv_rows)
+        qk_chunk=16, cache_pv=True, pv_rows=pv_rows,
+        stream_qk_b=stream, reuse_qk_b=reuse_qk_b, stream_pv_p=stream)
 
     sites = list(_tile_sites(program.body, operation=None))
     pv_gemm, = [site for site in sites if site[0].op.name == "tl.tileop.gemm" and not int(site[0].args[4])]
     gemm, loops, _, _ = pv_gemm
     p_l1, v_l1, accumulator = [region.args[0].buffer for region in gemm.args[:3]]
-    assert tuple(map(int, p_l1.shape)) == (pv_rows, 32)
+    assert tuple(map(int, p_l1.shape)) == (pv_rows, 16 if stream else 32)
     assert tuple(map(int, v_l1.shape)) == (32, 16)
     assert tuple(map(int, accumulator.shape)) == (pv_rows, 16)
     assert any(bool(loop.annotations.get("tl.ascend_auto_pipeline", False)) for loop in loops)
@@ -346,6 +358,10 @@ def test_cache_strategy_and_independent_grains_preserve_complete_gm_handoffs(
     a, b = a_region.args[0].buffer, b_region.args[0].buffer
     assert tuple(map(int, a.shape)) == ((2, 32, 16) if reuse_qk_b else (32, 16))
     assert tuple(map(int, b.shape)) == (16, 16)
+    k_buffers = [buffer for block in nodes(program, tirx.SBlock)
+                 for buffer in block.alloc_buffers if buffer.name == "k_l1"]
+    assert len(k_buffers) == 1
+    assert tuple(map(int, k_buffers[0].shape)) == (16 if stream else 32, 16)
     if reuse_qk_b:
         owner, = [loop.loop_var for loop in qk[1] if loop.loop_var.name == "owner"]
         assert tvm.ir.structural_equal(a_region.args[0].indices[0], owner)
@@ -367,7 +383,11 @@ def test_cache_strategy_and_independent_grains_preserve_complete_gm_handoffs(
     ({"qk_chunk": 8}, "qk_chunk must be positive"),
     ({"reuse_qk_b": 1}, "must be bools"),
     ({"reuse_qk_b": True}, "requires an explicit qk_chunk"),
+    ({"stream_qk_b": 1}, "must be bools"),
+    ({"stream_qk_b": True}, "requires an explicit qk_chunk"),
     ({"cache_pv": True}, "requires an explicit pv_chunk"),
+    ({"stream_pv_p": 1}, "must be bools"),
+    ({"stream_pv_p": True}, "requires cache_pv"),
     ({"pv_rows": 16}, "pv_rows requires cache_pv"),
 ])
 def test_invalid_contract_is_rejected_before_frontend_construction(example, changes, message):

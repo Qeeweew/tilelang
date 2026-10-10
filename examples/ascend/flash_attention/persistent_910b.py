@@ -56,9 +56,11 @@ def persistent_attention_fwd(
     inplace_final_division=True,
     qk_chunk=None,
     reuse_qk_b=False,
+    stream_qk_b=False,
     pv_chunk=None,
     pv_rows=None,
     cache_pv=False,
+    stream_pv_p=False,
     preserve_issue_order=False,
     dtype="float16",
 ):
@@ -95,9 +97,15 @@ def persistent_attention_fwd(
     first, so each K/L0B generation serves both owners before reuse. It
     requires qk_chunk and additional L0A residency, but keeps all Score
     regions, P rounding points and PV work unchanged.
+    stream_qk_b=True stages only one qk_chunk of K in L1. The default
+    owner-first traversal reloads that chunk for each owner; reuse_qk_b keeps
+    the N-first traversal and stages it once for both owners. This bounds K
+    residency independently of the logical softmax width.
     cache_pv=True instead retains the complete V tile in L1 and loads one
     full-KV P cache per pv_rows part. An ordinary automatic Pipelined loop
     consumes pv_chunk slices and exports each complete FP32 result once.
+    stream_pv_p=True bounds that P cache to one pv_chunk, retaining the full
+    V cache and the complete FP32 accumulation before its single export.
     pv_rows defaults to block_q and cache_pv requires pv_chunk. Tile/cache
     choices are Python policy; the compiler checks physical feasibility.
     preserve_issue_order fixes the complete outer task issue order instead
@@ -120,19 +128,23 @@ def persistent_attention_fwd(
         raise ValueError("Aligned dense tiles and complete UB row subtiles are required")
     if any(not isinstance(x, bool) for x in
            (separate_score_input, inplace_final_division, reuse_qk_b,
-            cache_pv, preserve_issue_order)):
+            stream_qk_b, cache_pv, stream_pv_p, preserve_issue_order)):
         raise ValueError("Persistent strategy options must be bools")
     if qk_chunk is not None and (not isinstance(qk_chunk, int) or isinstance(qk_chunk, bool)
                                  or qk_chunk <= 0 or qk_chunk % 16 or block_kv % qk_chunk):
         raise ValueError("qk_chunk must be positive, 16-aligned, and divide block_kv")
     if reuse_qk_b and qk_chunk is None:
         raise ValueError("reuse_qk_b requires an explicit qk_chunk")
+    if stream_qk_b and qk_chunk is None:
+        raise ValueError("stream_qk_b requires an explicit qk_chunk")
     if pv_chunk is not None and (not isinstance(pv_chunk, int) or isinstance(pv_chunk, bool) or pv_chunk <= 0):
         raise ValueError("pv_chunk must be a positive integer or None")
     if pv_chunk is not None and (pv_chunk % 16 or block_kv % pv_chunk):
         raise ValueError("pv_chunk must be 16-aligned and divide block_kv into complete PV chunks")
     if cache_pv and pv_chunk is None:
         raise ValueError("cache_pv requires an explicit pv_chunk")
+    if stream_pv_p and not cache_pv:
+        raise ValueError("stream_pv_p requires cache_pv=True")
     if not cache_pv and pv_rows != block_q:
         raise ValueError("pv_rows requires cache_pv=True")
     total_pairs = batch * heads * query_pairs
@@ -152,7 +164,8 @@ def persistent_attention_fwd(
     pv_chunks = block_kv // pv_extent
     pv_acc_shape = ((pv_rows, head_dim) if cache_pv else
                     (2, block_q, head_dim) if chunked_pv else (block_q, head_dim))
-    p_shape = (pv_rows, block_kv) if cache_pv else (block_q, pv_extent)
+    p_shape = ((pv_rows, pv_extent if stream_pv_p else block_kv)
+               if cache_pv else (block_q, pv_extent))
     v_shape = ((pv_extent, head_dim) if chunked_pv and not cache_pv
                else (block_kv, head_dim))
     qk_extent = block_kv if qk_chunk is None else qk_chunk
@@ -171,7 +184,7 @@ def persistent_attention_fwd(
             PV = T.alloc_workspace((groups, 2, block_q, head_dim), "float32")
             OState = T.alloc_workspace((groups, 2, 2, block_q, head_dim), "float32")
             q_l1 = T.alloc_l1((2, block_q, head_dim), dtype)
-            k_l1 = T.alloc_l1((block_kv, head_dim), dtype)
+            k_l1 = T.alloc_l1((qk_extent if stream_qk_b else block_kv, head_dim), dtype)
             v_l1 = T.alloc_l1(v_shape, dtype)
             p_l1 = T.alloc_l1(p_shape, dtype)
             score_acc = T.alloc_l0c((block_q, qk_extent), "float32")
@@ -237,8 +250,9 @@ def persistent_attention_fwd(
                             for owner in T.serial(2):
                                 T.copy(Q[batch_index, head_index, query_pair, owner, :, :],
                                        q_l1[owner, :, :])
-                        T.copy(K[batch_index, head_index,
-                                 kv * block_kv:(kv + 1) * block_kv, :], k_l1)
+                        if not stream_qk_b:
+                            T.copy(K[batch_index, head_index,
+                                     kv * block_kv:(kv + 1) * block_kv, :], k_l1)
                         if not chunked_pv:
                             T.copy(V[batch_index, head_index,
                                      kv * block_kv:(kv + 1) * block_kv, :],
@@ -247,7 +261,13 @@ def persistent_attention_fwd(
                             for owner in T.serial(2):
                                 T.copy(q_l1[owner, :, :], qk_a_l0[owner, :, :])
                             for n in T.serial(block_kv // qk_extent):
-                                T.copy(k_l1[n * qk_extent:(n + 1) * qk_extent, :], qk_b_l0)
+                                if stream_qk_b:
+                                    T.copy(K[batch_index, head_index,
+                                             kv * block_kv + n * qk_extent:
+                                             kv * block_kv + (n + 1) * qk_extent, :], k_l1)
+                                    T.copy(k_l1, qk_b_l0)
+                                else:
+                                    T.copy(k_l1[n * qk_extent:(n + 1) * qk_extent, :], qk_b_l0)
                                 for owner in T.serial(2):
                                     T.gemm(qk_a_l0[owner, :, :], qk_b_l0, score_acc,
                                            transpose_B=True, clear_accum=True)
@@ -257,7 +277,13 @@ def persistent_attention_fwd(
                             for owner in T.serial(2):
                                 T.copy(q_l1[owner, :, :], qk_a_l0)
                                 for n in T.serial(block_kv // qk_extent):
-                                    T.copy(k_l1[n * qk_extent:(n + 1) * qk_extent, :], qk_b_l0)
+                                    if stream_qk_b:
+                                        T.copy(K[batch_index, head_index,
+                                                 kv * block_kv + n * qk_extent:
+                                                 kv * block_kv + (n + 1) * qk_extent, :], k_l1)
+                                        T.copy(k_l1, qk_b_l0)
+                                    else:
+                                        T.copy(k_l1[n * qk_extent:(n + 1) * qk_extent, :], qk_b_l0)
                                     T.gemm(qk_a_l0, qk_b_l0, score_acc,
                                            transpose_B=True, clear_accum=True)
                                     T.copy(score_acc, Score[group, owner, :,
@@ -304,12 +330,21 @@ def persistent_attention_fwd(
                                      kv * block_kv:(kv + 1) * block_kv, :], v_l1)
                             for owner in T.serial(2):
                                 for part in T.serial(block_q // pv_rows):
-                                    T.copy(P[group, owner,
-                                             part * pv_rows:(part + 1) * pv_rows, :], p_l1)
+                                    if not stream_pv_p:
+                                        T.copy(P[group, owner,
+                                                 part * pv_rows:(part + 1) * pv_rows, :], p_l1)
                                     for chunk in T.Pipelined(pv_chunks):
-                                        T.gemm(p_l1[:, chunk * pv_extent:(chunk + 1) * pv_extent],
-                                               v_l1[chunk * pv_extent:(chunk + 1) * pv_extent, :],
-                                               pv_acc, transpose_B=False, clear_accum=(chunk == 0))
+                                        if stream_pv_p:
+                                            T.copy(P[group, owner,
+                                                     part * pv_rows:(part + 1) * pv_rows,
+                                                     chunk * pv_extent:(chunk + 1) * pv_extent], p_l1)
+                                            T.gemm(p_l1,
+                                                   v_l1[chunk * pv_extent:(chunk + 1) * pv_extent, :],
+                                                   pv_acc, transpose_B=False, clear_accum=(chunk == 0))
+                                        else:
+                                            T.gemm(p_l1[:, chunk * pv_extent:(chunk + 1) * pv_extent],
+                                                   v_l1[chunk * pv_extent:(chunk + 1) * pv_extent, :],
+                                                   pv_acc, transpose_B=False, clear_accum=(chunk == 0))
                                     T.copy(pv_acc, PV[group, owner,
                                                        part * pv_rows:(part + 1) * pv_rows, :])
                         elif chunked_pv:
