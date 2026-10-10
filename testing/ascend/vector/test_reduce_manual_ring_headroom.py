@@ -109,7 +109,7 @@ def test_flat_manual_owner_aliases_are_charged_once_at_their_maximum_footprint(p
 
 
 @pytest.mark.parametrize("operand", ["source", "output"])
-@pytest.mark.parametrize("columns", [128, 1024])
+@pytest.mark.parametrize("columns", [128, 256, 1024])
 @pytest.mark.parametrize("automatic", [False, True])
 def test_native_operand_keeps_existing_plan_until_its_layout_is_known(operand, columns, automatic):
     # A leading version axis may acquire a different row stride later. In

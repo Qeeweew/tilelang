@@ -357,6 +357,54 @@ private:
         analyzer_.CanProveEqual(
             floormod(raw_dst_base[0], make_const(raw_dst_base[0].dtype(), 8)),
             make_zero(raw_dst_base[0].dtype()));
+    // Four-VL rows can compact complete datablocks directly to 32 lanes:
+    // [R,256] -> [R,32] -> [R]. The second instruction uses a partial normal
+    // mask and a four-datablock row pitch, rather than four whole-VL row
+    // reductions followed by three binary combines. Keep both V tasks and
+    // their disjoint scratch visible to versioning and completion analysis.
+    // Datablock's late pointer boundary requires a static count. Dynamic
+    // rows retain the established guarded chunk plan below.
+    if (input_count == 256 && native_dst_compact &&
+        row_extent.as<IntImmNode>()) {
+      constexpr int64_t partial_columns = 32;
+      Buffer partials = decl_buffer(
+          {make_const(DataType::Int(32), count),
+           make_const(DataType::Int(32), partial_columns)},
+          DataType::Float(32),
+          "membase_reduce_datablocks_" + std::to_string(next_temporary_),
+          "shared.dyn");
+      if (HasMultiVLHeadroom(op->src, op->dst, {partials})) {
+        Require(task_depth_ == 0,
+                "this reduction expands to multiple dependency-bearing tasks; "
+                "use T.Stage rather than an opaque T.Task/PerCoreTask wrapper");
+        ++next_temporary_;
+        scratch_.push_back(partials);
+        BufferLoad partial_base(partials, {0, 0});
+        const Op &count_intrinsic = Op::Get(
+            op->type->IsSum() ? "tl.ascend_membase.datablock_reduce_sum"
+                              : "tl.ascend_membase.datablock_reduce_max");
+        Array<Stmt> tasks{Evaluate(Call(
+            DataType::Void(), count_intrinsic,
+            {Ptr(partial_base, count * partial_columns, kAccessWrite),
+             Ptr(src_base, count * input_count, kAccessRead),
+             make_const(DataType::UInt(32), count * input_count)}))};
+        PrimExpr partial_region = Call(
+            DataType::Handle(), tl::region(),
+            {partial_base, make_const(DataType::Int(32), kAccessRead), row_extent,
+             make_const(DataType::Int(32), partial_columns)});
+        Array<PrimExpr> destination_args{
+            dst_base, make_const(DataType::Int(32), kAccessWrite)};
+        for (const Range &range : dst_ranges)
+          destination_args.push_back(range->extent);
+        tasks.push_back(Evaluate(ascend::MakeRepeatRowReduceF32(
+            row_reduce_kind,
+            Call(DataType::Handle(), tl::region(), destination_args),
+            partial_region, repeats,
+            make_const(DataType::UInt(16), partial_columns / 8),
+            make_const(DataType::UInt(8), partial_columns))));
+        return MakeSeq(tasks);
+      }
+    }
     // Full datablock count repeats compact each group of eight elements.
     // For these widths both count stages end on complete 256B repeats and
     // preserve row boundaries: [R,C] -> [R,C/8] -> [R,C/64]. Prefer this

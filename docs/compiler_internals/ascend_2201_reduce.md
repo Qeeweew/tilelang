@@ -26,6 +26,16 @@ Bounded dynamic owners use their actual row count in effects and native repeats;
 an enclosing `rows > 0` guard prevents zero-repeat instructions. Scratch and
 structural candidate selection use the proved maximum, not a sampled row count.
 
+Static `C=256` rows have a two-task candidate: one count-mode BlockReduce
+contracts `[R,256]` to an explicit `[R,32]` FP32 scratch, then a normal-mask
+WholeReduce consumes 32 active lanes per row. The source repeat stride is four
+32-byte blocks and destination repeat stride is one element. Scratch costs
+`128*R` bytes, including 4096 bytes for R=32. The candidate requires a compact
+raw destination and common UB headroom. If that larger scratch does not fit,
+the existing four-chunk tree remains available; bounded dynamic rows also
+retain their existing plan. This selection changes the FP32 sum tree, not the
+algorithm's input dtype, tile size or explicit cast boundaries.
+
 For static positive rows and `512 <= C <= 4096` with `C % 512 == 0`, the preferred candidate uses
 three native tasks. Two count-mode BlockReduce operations compact each group
 of eight FP32 elements, producing `[R,C/8]` and then `[R,C/64]` in independent
@@ -121,7 +131,7 @@ noncompact original row view. The existing row/column linearity proof and the
 candidate's row-pitch proof jointly establish the physical rectangle before
 selection; unsupported layouts retain the existing plan or its established
 legality diagnostic.
-Both compact candidates write the user's output directly through a native
+The compact candidates write the user's output directly through a native
 row operation, so it also proves the original destination's compact row pitch
 and aligned base independently of an inferred layout.
 
@@ -177,8 +187,9 @@ expansion; the diagnostic requests ordinary expressions or Stage boundaries.
 
 ## Numerical contract and validation boundary
 
-Sum uses either two levels of native eight-element block sums followed by a
-masked partial-row sum, native 64-lane partial sums followed by that masked
+Sum uses one eight-element block-sum level followed by a masked 32-lane sum
+for the static C256 candidate, two levels of native eight-element block sums
+followed by a masked partial-row sum, native 64-lane partial sums followed by that masked
 sum, or native chunks followed by explicit balanced FP32 Add nodes. It neither
 widens to FP64 nor fuses rounding nodes. Its tree
 can differ from the prior per-row partial tree, so numerical validation must
@@ -200,7 +211,12 @@ manual slot padding, alias/layout footprints and unknown future allocation sizes
 Odd chunk trees have a cancellation-sensitive FP32 oracle; unrelated Parallel
 scratch retains its final capacity gate. Successful CPU lowering alone does not establish
 native stride legality or numerical/device performance: CANN offline compilation
-and locked finite numerical comparisons are subsequent gates.
+and finite numerical comparisons on a healthy idle device are subsequent gates.
+The C256 regressions additionally cover its nonzero source/output origins,
+32-lane mask restoration, two separate tasks, private scratch ownership,
+individually aligned manual slots and a second reduction falling back after
+the first candidate consumes the available headroom. Finite cancellation
+cases compare against FP64 with a FP32 error tolerance.
 
 ## Bounded normal-mask reuse
 

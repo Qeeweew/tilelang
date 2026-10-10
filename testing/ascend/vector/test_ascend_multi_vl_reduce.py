@@ -366,8 +366,9 @@ def test_layout_compactness_cannot_override_the_native_raw_row_stride_boundary()
     assert [int(call.args[-1]) for call in calls(after, PREFIX + "sum")] == [128, 2]
 
 
-def test_two_level_layout_cannot_override_the_native_raw_destination_stride():
-    before, source, _ = _program(columns=1024)
+@pytest.mark.parametrize("columns", [256, 1024])
+def test_two_level_layout_cannot_override_the_native_raw_destination_stride(columns):
+    before, source, _ = _program(columns=columns)
     destination = tirx.decl_buffer((3,), "float32", "raw_strided_destination",
                                    scope="shared.dyn", strides=[2])
     original = calls(before, "tl.tileop.reduce")[0]
@@ -380,7 +381,7 @@ def test_two_level_layout_cannot_override_the_native_raw_destination_stride():
     mod["main"] = mod["main"].with_attr("target", tvm.target.Target(TARGET))
     after = _lower(mod)
     assert not _strided(after)
-    assert [int(call.args[-1]) for call in calls(after, PREFIX + "sum")] == [1024, 16]
+    assert [int(call.args[-1]) for call in calls(after, PREFIX + "sum")] == [columns, columns // 64]
 
 
 @pytest.mark.parametrize("bad", ["rows", "stride", "lanes", "width", "pitch", "alignment", "leading"])
