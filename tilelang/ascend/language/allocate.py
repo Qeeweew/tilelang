@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 from tvm import arith
 
 from tilelang._typing import DType, ShapeType
@@ -10,6 +12,37 @@ from tvm import DataType
 from tvm.script import tirx as T
 from tvm.tirx.buffer import Buffer
 from tvm.tirx.script.builder.ir import sblock_attr
+
+
+@contextmanager
+def AIVPrivate():
+    """Declare UB allocations in this scope as independently owned by each AIV.
+
+    Use once around the complete private UB declarations in the kernel root.
+    The scope emits no block, allocation or runtime operation of its own.
+    Conditional Python allocations are included only when created. All existing
+    ``annotate_aiv_private`` ownership and disjoint-write checks still apply.
+    Do not nest scopes or combine with an explicit private declaration in the
+    same block. Allocate only UB buffers here; L1/L0/workspace stay outside.
+    """
+    from tvm.script.ir_builder import IRBuilder
+    from tvm.tirx.script.builder.frame import SBlockFrame
+    from .annotations import annotate_aiv_private
+
+    frames = IRBuilder.current().frames
+    blocks = [frame for frame in frames if isinstance(frame, SBlockFrame)]
+    if len(blocks) != 1:
+        raise ValueError("AIVPrivate requires the kernel root block")
+    root = blocks[0]
+    if not frames[-1].same_as(root):
+        raise ValueError("AIVPrivate declarations must be outside control flow")
+    if root.annotations is not None and "tl.ascend_aiv_private" in root.annotations:
+        raise ValueError("AIVPrivate requires one private declaration per block")
+    begin = len(root.alloc_buffers)
+    yield
+    if root.annotations is not None and "tl.ascend_aiv_private" in root.annotations:
+        raise ValueError("AIVPrivate scopes cannot nest or contain another private declaration")
+    annotate_aiv_private(*list(root.alloc_buffers)[begin:])
 
 
 def alloc_shared(shape: ShapeType, dtype: DType, scope="shared.dyn") -> Buffer:
@@ -146,6 +179,7 @@ def alloc_l0b_sf(buf: Buffer, sf_dtype: DType = "uint16", sf_shape: ShapeType | 
 
 
 __all__ = [
+    "AIVPrivate",
     "alloc_shared",
     "alloc_workspace",
     "alloc_l1",

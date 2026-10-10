@@ -9,8 +9,33 @@ from tvm.tirx.script.builder import frame
 
 from tilelang.language.loop import Pipelined as _common_pipelined
 from tilelang.language.loop import unroll as _common_unroll
+from tilelang.language.loop import serial as _serial
 
-__all__ = ["Pipelined", "unroll"]
+__all__ = ["Pipelined", "ManualPipeline", "unroll"]
+
+
+def ManualPipeline(
+    start: tirx.PrimExpr,
+    stop: tirx.PrimExpr | None = None,
+    *,
+    preserve_issue_order: bool = True,
+) -> frame.ForFrame:
+    """Construct a logical task loop whose offsets are specified by ``Stage``.
+
+    The default preserves complete source issue order. With
+    ``preserve_issue_order=False``, stages and per-pipe source order remain
+    fixed while the scheduler may choose cross-pipe order. Buffer versions,
+    fill/drain and synchronization retain the ordinary compiler contracts.
+    This is a frontend spelling of the existing serial-loop annotations;
+    it introduces neither automatic pipeline intent nor a version limit.
+    """
+    if not isinstance(preserve_issue_order, bool):
+        raise ValueError("ManualPipeline preserve_issue_order must be a bool")
+    return _serial(
+        start,
+        stop,
+        annotations={"enable_offset": True, "tl.ascend_preserve_issue_order": preserve_issue_order},
+    )
 
 
 def Pipelined(

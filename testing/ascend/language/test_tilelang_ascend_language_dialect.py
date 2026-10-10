@@ -7,6 +7,8 @@ from tvm import tirx
 from testing.ascend._ir import allocated_buffer, nodes
 
 ASCEND_ONLY_NAMES = {
+    "AIVPrivate",
+    "ManualPipeline",
     "AscendTileScheduler",
     "Cube",
     "MixedKernel",

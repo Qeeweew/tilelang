@@ -187,31 +187,21 @@ def persistent_attention_fwd(
                 qk_b_l0 = T.alloc_l0b((qk_extent, head_dim), dtype)
                 T.annotate_buffer_versions({qk_a_l0: 1, qk_b_l0: 2})
 
-            scores = T.alloc_shared((row_block, block_kv), "float32")
-            probabilities = T.alloc_shared((row_block, block_kv), dtype)
-            pv = T.alloc_shared((row_block_vec2, head_dim), "float32")
-            output = T.alloc_shared((row_block_vec2, head_dim), "float32")
-            output_cast = T.alloc_shared((row_block_vec2, head_dim), dtype)
-            block_maximum = T.alloc_shared((row_block,), "float32")
-            next_maximum = T.alloc_shared((row_block,), "float32")
-            row_sum = T.alloc_shared((row_block,), "float32")
-            maximum = T.alloc_shared((2, block_q), "float32")
-            denominator = T.alloc_shared((2, block_q), "float32")
-            alpha = T.alloc_shared((block_q,), "float32")
-            if separate_score_input:
-                score_input = T.alloc_shared((row_block, block_kv), "float32")
-                T.annotate_aiv_private(
-                    score_input, scores, probabilities, pv, output, output_cast,
-                    block_maximum, next_maximum, row_sum,
-                    maximum, denominator, alpha,
-                )
-                T.annotate_buffer_versions({score_input: 1})
-            else:
-                T.annotate_aiv_private(
-                    scores, probabilities, pv, output, output_cast,
-                    block_maximum, next_maximum, row_sum,
-                    maximum, denominator, alpha,
-                )
+            with T.AIVPrivate():
+                scores = T.alloc_shared((row_block, block_kv), "float32")
+                probabilities = T.alloc_shared((row_block, block_kv), dtype)
+                pv = T.alloc_shared((row_block_vec2, head_dim), "float32")
+                output = T.alloc_shared((row_block_vec2, head_dim), "float32")
+                output_cast = T.alloc_shared((row_block_vec2, head_dim), dtype)
+                block_maximum = T.alloc_shared((row_block,), "float32")
+                next_maximum = T.alloc_shared((row_block,), "float32")
+                row_sum = T.alloc_shared((row_block,), "float32")
+                maximum = T.alloc_shared((2, block_q), "float32")
+                denominator = T.alloc_shared((2, block_q), "float32")
+                alpha = T.alloc_shared((block_q,), "float32")
+                if separate_score_input:
+                    score_input = T.alloc_shared((row_block, block_kv), "float32")
+                    T.annotate_buffer_versions({score_input: 1})
             T.annotate_buffer_versions({
                 q_l1: 1, k_l1: 1, p_l1: 1, score_acc: 1, pv_acc: 1,
                 scores: 1, probabilities: 1, pv: 1, output: 1, output_cast: 1,
@@ -229,9 +219,7 @@ def persistent_attention_fwd(
             # Count only this group's round-robin pairs. All three cores in
             # the group share the same extent, including fill and drain.
             tasks = ((total_pairs + groups - 1 - group) // groups) * kv_tiles
-            for t in T.serial(tasks, annotations={
-                    "enable_offset": True,
-                    "tl.ascend_preserve_issue_order": preserve_issue_order}):
+            for t in T.ManualPipeline(tasks, preserve_issue_order=preserve_issue_order):
                 local_pair = t // kv_tiles
                 flat_pair = group + local_pair * groups
                 batch_index = flat_pair // (heads * query_pairs)
