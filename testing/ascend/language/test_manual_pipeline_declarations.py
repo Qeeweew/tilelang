@@ -9,26 +9,21 @@ from testing.ascend._ir import nodes
 
 @pytest.mark.parametrize("preserve", [False, True])
 @pytest.mark.parametrize("start", [0, 3])
-def test_manual_pipeline_is_the_existing_serial_contract(preserve, start):
+def test_pipelined_manual_annotations_match_explicit_serial_contract(preserve, start):
     def make(use_api):
         @T.prim_func
         def main(A: T.Tensor((16,), "float32")):
             with T.Kernel(1):
                 for i in (
-                    T.ManualPipeline(start, 16, preserve_issue_order=preserve)
+                    T.Pipelined(start, 16, num_stages=0, annotations={"enable_offset": True, "tl.ascend_preserve_issue_order": preserve})
                     if use_api
-                    else T.serial(start, 16, annotations={"enable_offset": True, "tl.ascend_preserve_issue_order": preserve})
+                    else T.serial(start, 16, annotations={"enable_offset": True, "tl.ascend_preserve_issue_order": preserve,
+                                                        "tl.ascend_auto_pipeline": False})
                 ):
                     with T.Stage(1):
                         A[i] = 1.0
         return main
     tvm.ir.assert_structural_equal(make(True), make(False))
-
-
-@pytest.mark.parametrize("policy", [None, 0, 1, "complete"])
-def test_manual_pipeline_rejects_non_boolean_policy(policy):
-    with pytest.raises(ValueError, match="must be a bool"):
-        T.ManualPipeline(8, preserve_issue_order=policy)
 
 
 @pytest.mark.parametrize("extra", [False, True])

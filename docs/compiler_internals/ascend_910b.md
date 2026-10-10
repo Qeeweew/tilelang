@@ -532,14 +532,15 @@ Plain serial loops and explicit `num_stages=0` without an offset request keep
 all tasks at stage zero. They do not search arbitrary cross-pipe epoch offsets.
 Explicit positive version bounds retain their existing scheduling policy.
 
-`T.ManualPipeline(start, stop=None, preserve_issue_order=True)` is the
-frontend constructor for a serial logical-task loop with `enable_offset`
-and `tl.ascend_preserve_issue_order`. `False` retains Stage-only cross-pipe
-search. It introduces no automatic intent or implicit version bound.
+Manual plans use the same `T.Pipelined` entry: pass `num_stages=0` and
+`annotations={"enable_offset": True, "tl.ascend_preserve_issue_order": True}`.
+The explicit zero disables automatic pipeline selection; it does not cancel
+explicit `T.Stage` offsets. A false issue-order annotation retains Stage-only
+cross-pipe search. No separate manual-loop API is needed.
 `with T.AIVPrivate():` collects new root UB allocations and emits the existing
 `tl.ascend_aiv_private` membership list. Use one scope for the complete private
 component declarations, outside control flow; non-UB and empty declarations
-are rejected. Neither construct adds a compiler pass or changes the common
+are rejected. Neither frontend declaration adds a compiler pass or changes the common
 TileLang dialect. Existing raw annotations remain supported.
 
 Automatic, Stage-only and complete source-order loop plans share a native

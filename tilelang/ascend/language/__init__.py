@@ -44,7 +44,7 @@ from .reduce_op import (  # noqa: F401
 
 # Ascend preserves automatic Pipelined intent and owns the unroll-factor knob.
 # The common loop defaults remain unchanged.
-from .loop import ManualPipeline, Pipelined, unroll  # noqa: F401
+from .loop import Pipelined, unroll  # noqa: F401
 
 # Ascend owns its launch and its thread-scope accessors. These deliberately
 # shadow the common surface imported above: `T.Kernel` here is the 1-D NPU core
@@ -86,7 +86,6 @@ from .sync import __all__ as _SYNC_ALL
 
 _ASCEND_API_ALL = (
     "AIVPrivate",
-    "ManualPipeline",
     "AscendBaseTileScheduler",
     "AscendBatchedTileScheduler",
     "AscendKGroupedTileScheduler",

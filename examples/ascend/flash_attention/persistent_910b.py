@@ -219,7 +219,9 @@ def persistent_attention_fwd(
             # Count only this group's round-robin pairs. All three cores in
             # the group share the same extent, including fill and drain.
             tasks = ((total_pairs + groups - 1 - group) // groups) * kv_tiles
-            for t in T.ManualPipeline(tasks, preserve_issue_order=preserve_issue_order):
+            for t in T.Pipelined(tasks, num_stages=0, annotations={
+                    "enable_offset": True,
+                    "tl.ascend_preserve_issue_order": preserve_issue_order}):
                 local_pair = t // kv_tiles
                 flat_pair = group + local_pair * groups
                 batch_index = flat_pair // (heads * query_pairs)

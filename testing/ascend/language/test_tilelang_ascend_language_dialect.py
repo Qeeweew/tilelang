@@ -8,7 +8,6 @@ from testing.ascend._ir import allocated_buffer, nodes
 
 ASCEND_ONLY_NAMES = {
     "AIVPrivate",
-    "ManualPipeline",
     "AscendTileScheduler",
     "Cube",
     "MixedKernel",
@@ -28,6 +27,7 @@ ASCEND_ONLY_NAMES = {
 def test_ascend_language_composes_common_and_ascend_symbols():
     from tilelang.ascend import language as T
 
+    assert not hasattr(T, "ManualPipeline")
     assert T.__tilelang_dialect__ == "ascend"
     assert set(T.__all__) >= set(common_language.__all__)
     assert set(T.__all__) >= ASCEND_ONLY_NAMES
