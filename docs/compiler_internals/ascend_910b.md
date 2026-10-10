@@ -70,6 +70,11 @@ are selected by the compiler; expressing nested pipeline intent alone does
 not guarantee that a parent prefetch overlaps its child loop.
 The compiler retains operand-slot completion and
 last-MAD-to-FIX/FIX-to-next-clear completion when physical storage is reused.
+Static leading operand planes can also share a bank with an independent native
+ring after their last whole-MAD readers retire. A complete result loop at a
+consumed incoming parent stage retains its full unit-stream transaction through
+fill/drain. See [fixed operand planes and shifted streams](ascend_2201_fixed_plane_credits.md)
+for admission, physical credits and completion obligations.
 
 Before scheduling, a serial unit-step loop with extent one can be replaced by
 its body. Ordinary automatic pipeline intent alone does not prevent this:

@@ -5333,6 +5333,10 @@ void InsertUnitFlagBoundaries(std::vector<std::shared_ptr<IRStructure>> &nodes,
       }
       activation->SetGuards(std::move(guards));
       plan->result_loop->SetGuards({});
+      // The activation shell owns the incoming parent stage. Its children
+      // execute at local stage zero; retaining the result's incoming stage
+      // here would shift the transaction a second time during fill/drain.
+      plan->result_loop->SetStage(0);
       // Guard reads now belong to the shell control, while the original
       // result control retains only its original bounds/step reads. Existing
       // task contexts still describe the same condition, now an ancestor.
@@ -5670,9 +5674,11 @@ public:
         for (int interval = 0; interval < member->credit_span; ++interval) {
           PrimExpr event = member->slot * member->credit_span +
                            Integer(operand_pool_bases_[index] + interval);
+          PrimExpr read_event = member->read_slot * member->credit_span +
+                                Integer(operand_pool_bases_[index] + interval);
           InsertStatement(member->writer, MakeAscendWaitFlag("M_MTE1", event),
                           true, kCoreCube);
-          InsertStatement(member->reader, MakeAscendSetFlag("M_MTE1", event),
+          InsertStatement(member->reader, MakeAscendSetFlag("M_MTE1", read_event),
                           false, kCoreCube, member->last_reader);
         }
       }

@@ -36,6 +36,7 @@
 #include "ascend/op/builtin.h"
 #include "ascend/op/copy.h"
 #include "ascend/op/cube_load.h"
+#include "ascend/op/utils.h"
 #include "ascend/target_utils.h"
 #include "op/gemm.h"
 
@@ -52,6 +53,8 @@ struct L0PhaseReusePair {
   ControlNode *epoch{nullptr};
   IRStructure *first_phase{nullptr};
   IRStructure *second_phase{nullptr};
+  IRStructure *first_phase_end{nullptr};
+  IRStructure *second_phase_end{nullptr};
 };
 
 namespace l0ab_phase_reuse_detail {
@@ -307,17 +310,26 @@ private:
   std::unordered_set<std::string> scopes_;
 };
 
-inline bool CanonicalAllocation(const Buffer &buffer, const LayoutMap &layouts,
-                                int64_t capacity) {
+inline bool CanonicalPlaneAllocation(const Buffer &buffer,
+                                     const LayoutMap &layouts,
+                                     int64_t capacity) {
   if (buffer->dtype.lanes() != 1 ||
       (buffer->dtype != DataType::Float(16) && !buffer->dtype.is_bfloat16()) ||
-      buffer->shape.size() != 2 || !buffer->strides.empty() ||
+      buffer->shape.size() < 2 || !buffer->strides.empty() ||
       !buffer->axis_separators.empty() || Constant(buffer->elem_offset) != 0)
     return false;
-  auto rows = Constant(buffer->shape[0]), cols = Constant(buffer->shape[1]);
-  if (!rows || !cols || *rows <= 0 || *cols <= 0 || *rows % 16 || *cols % 16 ||
-      *rows > capacity / 2 / *cols)
+  size_t rank = buffer->shape.size();
+  auto rows = Constant(buffer->shape[rank - 2]);
+  auto cols = Constant(buffer->shape[rank - 1]);
+  if (!rows || !cols || *rows <= 0 || *cols <= 0 || *rows % 16 || *cols % 16)
     return false;
+  int64_t elements = 1;
+  for (const PrimExpr &axis : buffer->shape) {
+    auto extent = Constant(axis);
+    if (!extent || *extent <= 0 || elements > capacity / 2 / *extent)
+      return false;
+    elements *= *extent;
+  }
   auto layout = layouts.Get(buffer);
   if (!layout.has_value() || !IsAscendFractalLayout(layout.value()))
     return false;
@@ -332,6 +344,34 @@ inline bool CanonicalAllocation(const Buffer &buffer, const LayoutMap &layouts,
           layout.value()->IsEqual(MakeAscendMajorKLayout(buffer).get())) ||
          (info.kind == AscendFractalKind::kMajorMN &&
           layout.value()->IsEqual(MakeAscendMajorMNLayout(buffer).get()));
+}
+
+// Whole-allocation operand credits retain their two-dimensional contract.
+// Static leading planes can share bytes at a closed phase boundary, but do
+// not thereby acquire a common generation or a whole-allocation slot credit.
+inline bool CanonicalAllocation(const Buffer &buffer, const LayoutMap &layouts,
+                                int64_t capacity) {
+  return buffer->shape.size() == 2 &&
+         CanonicalPlaneAllocation(buffer, layouts, capacity);
+}
+
+inline bool FullMatrixPlane(const TaskNode *task, const Buffer &buffer,
+                            const Array<Range> &ranges) {
+  size_t rank = buffer->shape.size();
+  if (rank < 2 || ranges.size() != rank)
+    return false;
+  for (size_t axis = rank - 2; axis < rank; ++axis)
+    if (Constant(ranges[axis]->min) != 0 ||
+        Constant(ranges[axis]->extent) != Constant(buffer->shape[axis]))
+      return false;
+  arith::Analyzer analyzer;
+  task->outer_ctx.Populate(analyzer);
+  for (size_t axis = 0; axis + 2 < rank; ++axis)
+    if (Constant(ranges[axis]->extent) != 1 ||
+        !CanProveAscendRangeInBounds(ranges[axis]->min, ranges[axis]->extent,
+                                    buffer->shape[axis], &analyzer))
+      return false;
+  return true;
 }
 
 inline bool DefaultAnnotations(const Map<String, ObjectRef> &annotations) {
@@ -365,7 +405,7 @@ inline bool AdmissibleAccess(const TaskNode *task, const Buffer &buffer,
     const BufferRegion &region =
         Scope(buffer->data) == "shared.l0a" ? gemm->aRegion_ : gemm->bRegion_;
     if (!region->buffer.same_as(buffer) ||
-        !FullAllocation(buffer, region->region))
+        !FullMatrixPlane(task, buffer, region->region))
       return false;
     if (Scope(buffer->data) == "shared.l0b") {
       Layout expected = gemm->transB_ ? MakeAscendMajorKLayout(buffer)
@@ -384,13 +424,14 @@ inline bool AdmissibleAccess(const TaskNode *task, const Buffer &buffer,
     return IsL1Buffer(copy->src->buffer) &&
            copy->src->buffer->dtype == buffer->dtype &&
            copy->dst->buffer.same_as(buffer) &&
-           FullAllocation(buffer, copy->dst->region);
+           FullMatrixPlane(task, buffer, copy->dst->region);
   }
   if (!IsAscendCopyCall(call.get()) || !call->annotations.empty())
     return false;
   AscendCopy copy(call->args, call->annotations);
   return IsL1Buffer(copy->src) && copy->src->dtype == buffer->dtype &&
-         copy->dst.same_as(buffer) && FullAllocation(buffer, copy->dst_range);
+         copy->dst.same_as(buffer) &&
+         FullMatrixPlane(task, buffer, copy->dst_range);
 }
 
 inline void
@@ -494,7 +535,7 @@ AnalyzeL0ABPhaseReuse(const ScheduledTIR &scheduled,
                !audit.invalid.count(buffer->data) &&
                !metadata.manual_buffer_versions.count(buffer->data) &&
                !metadata.buffer_version_modes.count(buffer->data) &&
-               CanonicalAllocation(buffer, audit.layouts, capacity);
+               CanonicalPlaneAllocation(buffer, audit.layouts, capacity);
     for (ControlNode *control : controls)
       if (control->IsMultiBufferEligible(a->data) &&
           control->IsMultiBufferEligible(b->data))
@@ -503,6 +544,7 @@ AnalyzeL0ABPhaseReuse(const ScheduledTIR &scheduled,
       continue;
     ControlNode *epoch = nullptr;
     IRStructure *phases[2] = {nullptr, nullptr};
+    IRStructure *last_phases[2] = {nullptr, nullptr};
     for (size_t index = 0; index < 2 && valid; ++index) {
       const Buffer &buffer = members[index];
       bool has_read = false, has_write = false;
@@ -528,17 +570,32 @@ AnalyzeL0ABPhaseReuse(const ScheduledTIR &scheduled,
           valid = false;
           break;
         }
-        valid &= LocateClosedPhase(task, &epoch, &phases[index], false,
+        IRStructure *phase = nullptr;
+        valid &= LocateClosedPhase(task, &epoch, &phase, false,
                                    &resource_epochs, {a->data, b->data});
+        if (valid) {
+          if (!phases[index] || phase->GetIndex() < phases[index]->GetIndex())
+            phases[index] = phase;
+          if (!last_phases[index] ||
+              phase->GetIndex() > last_phases[index]->GetIndex())
+            last_phases[index] = phase;
+        }
       }
       valid &= has_read && has_write;
     }
-    if (!valid || !epoch || !phases[0] || !phases[1] || phases[0] == phases[1])
+    if (!valid || !epoch || !phases[0] || !phases[1])
       continue;
-    if (phases[0]->GetIndex() < phases[1]->GetIndex())
-      plans.push_back({a->data, b->data, scope, epoch, phases[0], phases[1]});
-    else
-      plans.push_back({b->data, a->data, scope, epoch, phases[1], phases[0]});
+    // A cache may be loaded by one finite control and read by the following
+    // control. Select the entire lexical interval, never just its first
+    // access. Interleaving intervals cannot share a max-budget bank. Ordinary
+    // conflict synchronization must still prove all accesses retired before
+    // the other interval, including the next outer epoch.
+    if (last_phases[0]->GetIndex() < phases[1]->GetIndex())
+      plans.push_back({a->data, b->data, scope, epoch, phases[0], phases[1],
+                       last_phases[0], last_phases[1]});
+    else if (last_phases[1]->GetIndex() < phases[0]->GetIndex())
+      plans.push_back({b->data, a->data, scope, epoch, phases[1], phases[0],
+                       last_phases[1], last_phases[0]});
   }
   return plans;
 }

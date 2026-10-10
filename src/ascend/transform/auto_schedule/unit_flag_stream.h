@@ -102,7 +102,8 @@ inline std::optional<Call> Operation(const TaskNode *task,
 }
 
 inline bool StaticLoopBounds(const ControlNode *loop, int64_t *count,
-                            bool scheduled_descendant = false) {
+                            bool scheduled_descendant = false,
+                            bool shifted_entry = false) {
   auto min = Constant(loop->control->min);
   auto extent = Constant(loop->control->extent);
   auto step = loop->control->step.has_value()
@@ -112,7 +113,7 @@ inline bool StaticLoopBounds(const ControlNode *loop, int64_t *count,
   // validated by its direct parent before recursion; its logical bounds
   // remain unchanged until LowerScheduledTIR recursively applies offsets.
   if (loop->GetStage() < 0 ||
-      (!scheduled_descendant && loop->GetStage() != 0) ||
+      (!scheduled_descendant && !shifted_entry && loop->GetStage() != 0) ||
       loop->control->kind != ForKind::kSerial ||
       !min || *min != 0 || !extent || *extent <= 0 ||
       *extent > kMaxProofIterations || !step || *step != 1)
@@ -254,7 +255,42 @@ inline bool StableActivationGuards(const ControlNode *result) {
 }
 
 inline bool StaticResultLoop(const ControlNode *loop, int64_t *count) {
-  return StaticLoopBounds(loop, count) &&
+  bool shifted_entry = loop->GetStage() > 0;
+  if (shifted_entry) {
+    // A complete result control may enter at a consumed parent stage. Its
+    // own iterations and native-K transaction remain unshifted. Every real
+    // boundary is a sibling at this same incoming stage, so parent lowering
+    // moves the complete transaction through fill/drain as one domain.
+    const ControlNode *parent = loop->GetParentControl();
+    if (!parent || parent->control->kind != ForKind::kSerial ||
+        Constant(parent->control->min) != 0 ||
+        !Constant(parent->control->extent) ||
+        *Constant(parent->control->extent) <= 0 ||
+        (parent->control->step.has_value() &&
+         Constant(parent->control->step.value()) != 1) ||
+        parent->BodyHasLoopBreak())
+      return false;
+    auto bound = parent->control->annotations.Get("num_stages");
+    auto stages = bound ? StageCount(bound.value()) : std::nullopt;
+    if (bound && (!stages || *stages <= loop->GetStage() ||
+                  *stages > kMaxProofIterations))
+      return false;
+    auto offsets = parent->control->annotations.Get("enable_offset");
+    if ((offsets && !offsets.value().cast<bool>()) ||
+        (!bound && (!offsets || !offsets.value().cast<bool>())))
+      return false;
+    // Complete manual scheduling uses the children's actual finite stages,
+    // with explicit offsets, rather than retaining an automatic search bound.
+    for (const auto &child : parent->children)
+      if (child->GetStage() < 0 || child->GetStage() >= kMaxProofIterations ||
+          (stages && child->GetStage() >= *stages))
+        return false;
+    if (auto automatic =
+            parent->control->annotations.Get("tl.ascend_auto_pipeline"))
+      if (automatic.value().cast<bool>())
+        return false;
+  }
+  return StaticLoopBounds(loop, count, false, shifted_entry) &&
          (!loop->HasConditions() || StableActivationGuards(loop));
 }
 

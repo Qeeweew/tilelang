@@ -208,7 +208,7 @@ def _name(call):
     return call.op.name if isinstance(call.op, tvm.ir.Op) else ""
 
 
-def _trace(ir):
+def _trace(ir, *, max_extent=4):
     """Expand finite scalar control, retaining actual loop identity at each op."""
     body = ir["main"].body if isinstance(ir, tvm.IRModule) else ir
 
@@ -225,7 +225,7 @@ def _trace(ir):
             yield from visit(stmt.body, env, loops)
         elif isinstance(stmt, tirx.For):
             start, extent = _value(stmt.min, env), _value(stmt.extent, env)
-            assert stmt.kind == tirx.ForKind.SERIAL and 0 <= extent <= 4
+            assert stmt.kind == tirx.ForKind.SERIAL and 0 <= extent <= max_extent
             for index in range(start, start + extent):
                 local = {**env, stmt.loop_var: tirx.const(index, stmt.loop_var.dtype)}
                 yield from visit(stmt.body, local, (*loops, stmt.loop_var))

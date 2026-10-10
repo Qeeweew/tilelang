@@ -37,8 +37,11 @@ struct L0OperandSlotMember {
   ControlNode *generation{nullptr};
   ControlNode *epoch{nullptr};
   IRStructure *phase{nullptr};
+  IRStructure *phase_end{nullptr};
   const MultiBufferInfo *versions{nullptr};
   PrimExpr slot;
+  PrimExpr read_slot;
+  int fixed_planes{1};
   PrimExpr last_reader{Bool(true)};
   int credit_span{1};
 };
@@ -79,7 +82,8 @@ inline bool PureTypedArguments(const Call &call, const Buffer &buffer) {
   return true;
 }
 
-inline bool IsFullEndpoint(TaskNode *task, const Buffer &buffer, bool write) {
+inline bool IsFullEndpoint(TaskNode *task, const Buffer &buffer, bool write,
+                            bool fixed_planes = false) {
   auto call = Operation(task);
   if (!call || task->HasGuards() || !PureTypedArguments(*call, buffer) ||
       task->GetCoreMask() != kCoreCube)
@@ -114,7 +118,8 @@ inline bool IsFullEndpoint(TaskNode *task, const Buffer &buffer, bool write) {
     return false;
   }
   return operand->buffer.same_as(buffer) &&
-         FullAllocation(buffer, operand->region);
+         (fixed_planes ? FullMatrixPlane(task, buffer, operand->region)
+                       : FullAllocation(buffer, operand->region));
 }
 
 inline bool ClosedCounter(const std::vector<std::shared_ptr<IRStructure>> &root,
@@ -187,6 +192,81 @@ inline bool SelectedPhaseConflicts(const ScheduledTIR &scheduled,
                                    local.value().cast<ConflictHintList>());
 }
 
+// A fixed leading axis is a collection of resident logical planes, not an
+// automatic ring. One complete writer loop initializes every plane before a
+// disjoint finite reader nest; the inner reader loop visits every plane once
+// per repetition. Its own plane returns a whole-MAD credit only on the final
+// repetition. Both endpoint indices remain in their original lexical clocks.
+inline bool FixedPlaneMember(L0OperandSlotMember *member,
+                              const ScheduledTIR &scheduled,
+                              const MultiBufferPlan &plan,
+                              const SelectedL0PhaseReuse &selected,
+                              const ResourceEpochAnalysis &resource_epochs,
+                              ResourceEpochDecision *epoch_decision) {
+  const Buffer &buffer = member->buffer;
+  auto count = Constant(buffer->shape[0]);
+  if (buffer->shape.size() != 3 || !count || *count < 2 ||
+      plan.Find(buffer->data))
+    return false;
+  auto operand = [&](TaskNode *task, bool write) -> BufferRegion {
+    Call call = *Operation(task);
+    if (write && call->op.same_as(AscendCubeLoad3D::Get()))
+      return AscendCubeLoad3D(call->args, call->annotations)->dst;
+    if (write) {
+      AscendCopy copy(call->args, call->annotations);
+      return BufferRegion(copy->dst, copy->dst_range);
+    }
+    Gemm gemm(call->args, call->annotations);
+    return gemm->a_.same_as(buffer) ? gemm->aRegion_ : gemm->bRegion_;
+  };
+  ControlNode *writer = ParentControl(member->writer);
+  ControlNode *reader = ParentControl(member->reader);
+  auto complete_plane_loop = [&](ControlNode *loop, TaskNode *task,
+                                  const BufferRegion &region) {
+    return loop && PositiveStaticLoop(loop) && !loop->HasGuards() &&
+           task->GetStage() == 0 &&
+           Constant(loop->control->extent) == count &&
+           region->region[0]->min.same_as(loop->control->loop_var);
+  };
+  BufferRegion written = operand(member->writer, true);
+  BufferRegion read = operand(member->reader, false);
+  if (!complete_plane_loop(writer, member->writer, written) ||
+      !complete_plane_loop(reader, member->reader, read))
+    return false;
+  IRStructure *write_phase = nullptr, *read_phase = nullptr;
+  if (!LocateClosedPhase(member->writer, &member->epoch, &write_phase, true,
+                         &resource_epochs, {buffer->data}, epoch_decision) ||
+      !LocateClosedPhase(member->reader, &member->epoch, &read_phase, true,
+                         &resource_epochs, {buffer->data}, epoch_decision) ||
+      write_phase != writer ||
+      write_phase->GetIndex() >= read_phase->GetIndex() ||
+      write_phase->GetStage() < 0 ||
+      write_phase->GetStage() != read_phase->GetStage() ||
+      !SelectedPhaseConflicts(scheduled, selected, member->epoch))
+    return false;
+  for (IRStructure *node : member->reader->PathFrom(member->epoch)) {
+    if (node == member->epoch || node == member->reader)
+      continue;
+    if (!node->IsControl())
+      return false;
+    auto *loop = static_cast<ControlNode *>(node);
+    if (!PositiveStaticLoop(loop) || loop->HasGuards() ||
+        (loop != read_phase && !StageZero(loop)))
+      return false;
+    if (loop != reader)
+      member->last_reader = member->last_reader &&
+                            (loop->control->loop_var ==
+                             loop->control->extent - 1);
+  }
+  member->generation = member->epoch;
+  member->phase = write_phase;
+  member->phase_end = read_phase;
+  member->slot = written->region[0]->min;
+  member->read_slot = read->region[0]->min;
+  member->fixed_planes = static_cast<int>(*count);
+  return true;
+}
+
 inline std::optional<L0OperandSlotMember> RejectMember(const Buffer &buffer,
                                                        const char *reason) {
   if (runtime::detail::VerboseLoggingEnabled(__FILE__, 1))
@@ -205,7 +285,9 @@ Member(const ScheduledTIR &scheduled, const MultiBufferPlan &plan,
     *rejection_reason = reason;
     return RejectMember(buffer, reason);
   };
-  if (!CanonicalAllocation(buffer, layouts, capacity))
+  bool fixed_planes = buffer->shape.size() == 3;
+  if (!(fixed_planes ? CanonicalPlaneAllocation(buffer, layouts, capacity)
+                     : CanonicalAllocation(buffer, layouts, capacity)))
     return reject("canonical-allocation");
   if (auto physical =
           scheduled.metadata.manual_buffer_versions.Get(buffer->data))
@@ -226,7 +308,7 @@ Member(const ScheduledTIR &scheduled, const MultiBufferPlan &plan,
         return reject("unmodeled-operand-access");
       continue;
     }
-    if (reads == writes || !IsFullEndpoint(task, buffer, writes))
+    if (reads == writes || !IsFullEndpoint(task, buffer, writes, fixed_planes))
       return reject("typed-full-endpoint");
     TaskNode *&endpoint = writes ? result.writer : result.reader;
     if (endpoint)
@@ -235,60 +317,68 @@ Member(const ScheduledTIR &scheduled, const MultiBufferPlan &plan,
   }
   if (!result.writer || !result.reader)
     return reject("missing-endpoint");
-  result.generation = ParentControl(result.writer);
-  if (!result.generation || !PositiveStaticLoop(result.generation) ||
-      !result.reader->IsWithin(result.generation))
-    return reject("finite-generation");
-  IRStructure *read_child =
-      result.reader->GetChildOnPathFrom(result.generation);
-  if (result.writer->GetStage() > read_child->GetStage() ||
-      (result.writer->GetStage() == read_child->GetStage() &&
-       result.writer->GetIndex() >= read_child->GetIndex()))
-    return reject("logical-endpoint-order");
-  // All intervening controls are finite. An activation may skip an entire
-  // generation, never its writer or one of its readers independently.
-  for (IRStructure *node : result.reader->PathFrom(result.generation)) {
-    if (node == result.generation || node == result.reader)
-      continue;
-    if (!node->IsControl())
-      return reject("reader-path");
-    auto *control = static_cast<ControlNode *>(node);
-    if (!PositiveStaticLoop(control) || control->HasGuards() ||
-        !StageZero(control))
-      return reject("finite-reader-path");
-    result.last_reader = result.last_reader && (control->control->loop_var ==
-                                                control->control->extent - 1);
-  }
-  result.versions = plan.Find(buffer->data);
-  if (result.versions) {
-    const auto &info = *result.versions;
-    if (info.num_versions < 1 || info.owners.size() != 1 ||
-        info.owners.front().loop != result.generation ||
-        (info.UsesCounter() &&
-         result.reader->GetParent() != result.generation))
-      return reject("prepared-version-ownership");
-    // Ring size is bounded by physical byte capacity below and the shared
-    // event bank during flag allocation. A legal three-slot ring needs the
-    // same per-slot whole-MAD credit as a two-slot ring.
-    // An iteration-owned tile can serve the already-proven finite serial
-    // reader nest. All readers use the generation's slot; last_reader returns
-    // its whole-MAD credit only after the final occurrence. Counter commits
-    // retain their direct writer/reader/advance contract.
-    if (info.UsesCounter() &&
-        !ClosedCounter(scheduled.tree, resource_epochs, info, result))
-      return reject("closed-counter");
-    result.slot = MultiBufferVersionIndex(info);
+  if (fixed_planes) {
+    if (!FixedPlaneMember(&result, scheduled, plan, selected, resource_epochs,
+                          epoch_decision))
+      return reject("fixed-plane-generation");
   } else {
-    if (result.writer->GetStage() != 0 || result.reader->GetStage() != 0)
-      return reject("fixed-endpoint-stage");
-    result.slot = Integer(0);
+    result.generation = ParentControl(result.writer);
+    if (!result.generation || !PositiveStaticLoop(result.generation) ||
+        !result.reader->IsWithin(result.generation))
+      return reject("finite-generation");
+    IRStructure *read_child =
+        result.reader->GetChildOnPathFrom(result.generation);
+    if (result.writer->GetStage() > read_child->GetStage() ||
+        (result.writer->GetStage() == read_child->GetStage() &&
+         result.writer->GetIndex() >= read_child->GetIndex()))
+      return reject("logical-endpoint-order");
+    // All intervening controls are finite. An activation may skip an entire
+    // generation, never its writer or one of its readers independently.
+    for (IRStructure *node : result.reader->PathFrom(result.generation)) {
+      if (node == result.generation || node == result.reader)
+        continue;
+      if (!node->IsControl())
+        return reject("reader-path");
+      auto *control = static_cast<ControlNode *>(node);
+      if (!PositiveStaticLoop(control) || control->HasGuards() ||
+          !StageZero(control))
+        return reject("finite-reader-path");
+      result.last_reader = result.last_reader && (control->control->loop_var ==
+                                                  control->control->extent - 1);
+    }
+    result.versions = plan.Find(buffer->data);
+    if (result.versions) {
+      const auto &info = *result.versions;
+      if (info.num_versions < 1 || info.owners.size() != 1 ||
+          info.owners.front().loop != result.generation ||
+          (info.UsesCounter() &&
+           result.reader->GetParent() != result.generation))
+        return reject("prepared-version-ownership");
+      // Ring size is bounded by physical byte capacity below and the shared
+      // event bank during flag allocation. A legal three-slot ring needs the
+      // same per-slot whole-MAD credit as a two-slot ring.
+      // An iteration-owned tile can serve the already-proven finite serial
+      // reader nest. All readers use the generation's slot; last_reader returns
+      // its whole-MAD credit only after the final occurrence. Counter commits
+      // retain their direct writer/reader/advance contract.
+      if (info.UsesCounter() &&
+          !ClosedCounter(scheduled.tree, resource_epochs, info, result))
+        return reject("closed-counter");
+      result.slot = MultiBufferVersionIndex(info);
+    } else {
+      if (result.writer->GetStage() != 0 || result.reader->GetStage() != 0)
+        return reject("fixed-endpoint-stage");
+      result.slot = Integer(0);
+    }
+    if (!LocateClosedPhase(result.writer, &result.epoch, &result.phase, true,
+                           &resource_epochs, {buffer->data}, epoch_decision) ||
+        !LocateClosedPhase(result.reader, &result.epoch, &result.phase, true,
+                           &resource_epochs, {buffer->data}, epoch_decision) ||
+        !SelectedPhaseConflicts(scheduled, selected, result.epoch))
+      return reject("closed-prepared-phase");
+    result.read_slot = result.slot;
+    result.phase_end = result.phase;
   }
-  if (!LocateClosedPhase(result.writer, &result.epoch, &result.phase, true,
-                         &resource_epochs, {buffer->data}, epoch_decision) ||
-      !LocateClosedPhase(result.reader, &result.epoch, &result.phase, true,
-                         &resource_epochs, {buffer->data}, epoch_decision) ||
-      !SelectedPhaseConflicts(scheduled, selected, result.epoch))
-    return reject("closed-prepared-phase");
   std::function<bool(IRStructure *)> controls = [&](IRStructure *node) {
     if (node->GuardsTouchStorage(buffer->data))
       return false;
@@ -413,11 +503,19 @@ inline std::vector<L0OperandSlotPool> AnalyzeL0OperandSlotPools(
       record(OptimizationStatus::kRejected, "different-or-shared-phase");
       continue;
     }
+    if (!(a->phase_end->GetIndex() < b->phase->GetIndex() ||
+          b->phase_end->GetIndex() < a->phase->GetIndex())) {
+      record(OptimizationStatus::kRejected, "interleaved-physical-phases",
+             a->epoch);
+      continue;
+    }
     auto bytes = [](const Buffer &buffer) {
-      return *Constant(buffer->shape[0]) * *Constant(buffer->shape[1]) * 2;
+      size_t rank = buffer->shape.size();
+      return *Constant(buffer->shape[rank - 2]) *
+             *Constant(buffer->shape[rank - 1]) * 2;
     };
-    int av = a->versions ? a->versions->num_versions : 1;
-    int bv = b->versions ? b->versions->num_versions : 1;
+    int av = a->versions ? a->versions->num_versions : a->fixed_planes;
+    int bv = b->versions ? b->versions->num_versions : b->fixed_planes;
     int64_t ab = bytes(a->buffer), bb = bytes(b->buffer);
     int64_t pitch = std::max(ab, bb);
     bool same_intervals = !((av > 1 && bv > 1 && ab != bb) ||

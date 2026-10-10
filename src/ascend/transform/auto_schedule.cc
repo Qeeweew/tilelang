@@ -1708,6 +1708,36 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
   // This is a soft issue preference after the minimum-II solve. All directed,
   // resource, owner, stage, version and SPR constraints remain hard. Compound
   // units keep their existing boundaries; no wait is moved into lane guards.
+  // A resident allocation spanning two controls cannot independently choose
+  // opposite modulo orders against its physical mate. That would insert the
+  // mate between the cache's acquire and last release, creating a credit
+  // cycle. Keep the selected interval closed in physical issue order and its
+  // unversioned endpoints in one logical stage. Single-control native rings
+  // retain their ordinary, freely oriented owner exclusions.
+  for (const L0PhaseReusePair &pair : l0_phase_reuse_) {
+    if (pair.epoch != ctrl)
+      continue;
+    IRStructure *first_end =
+        pair.first_phase_end ? pair.first_phase_end : pair.first_phase;
+    IRStructure *second_end =
+        pair.second_phase_end ? pair.second_phase_end : pair.second_phase;
+    if (first_end == pair.first_phase && second_end == pair.second_phase)
+      continue;
+    size_t first = node_idx.at(pair.first_phase), last = node_idx.at(first_end);
+    size_t second = node_idx.at(pair.second_phase);
+    size_t second_last = node_idx.at(second_end);
+    auto close_interval = [&](size_t begin, size_t end) {
+      if (begin == end)
+        return;
+      pipe_order_deps.emplace_back(begin, end);
+      stage_order_deps.emplace_back(begin, end);
+      stage_order_deps.emplace_back(end, begin);
+    };
+    close_interval(first, last);
+    close_interval(second, second_last);
+    pipe_order_deps.emplace_back(last, second);
+  }
+
   std::vector<std::pair<int64_t, int64_t>> issue_priority_pairs;
   if (prefer_handoff_issue_ && auto_pipeline && !manual_schedule)
     issue_priority_pairs = CollectHandoffIssuePreferences(nodes, deps);
