@@ -1,6 +1,6 @@
 # 910B：GEMM 与 Dense MHA
 
-以下数据于2026-10-10使用当前实现重新测量。代码和参数如下。
+GEMM 数据于2026-10-11测量，Dense MHA 数据于2026-10-10测量。代码和参数如下。
 设备为 Ascend 910B3（20 AIC / 40 AIV，1800 MHz），CANN 9.1，目标 `dav-2201`。
 表中时间单位为 µs，越小越好；MFU 只列 TileLang：
 
@@ -17,17 +17,32 @@ MHA 的 FLOPs 计 QK 和 PV，不计 softmax。各形状均先验证正确性，
 
 计算 `C = A @ B.T`，FP16/BF16 输入、FP32 累加，输出与输入同 dtype。
 统一使用persistent20，Tile M/N/K固定为128/256/256。Torch基线是 `torch.matmul(A, B.T)`。
+原实现每个输出执行一段 K 流水；连续流水使用显式 `pipeline_outputs=True`，将每核
+全部输出的 K panels 放进同一段自动流水。两者在同组比较，数学运算和分块相同。
 
-| M/N/K | dtype | TileLang | Torch | MFU |
-| --- | --- | ---: | ---: | ---: |
-| 2048/2048/2048 | FP16 | 83.08 | 82.42 | 70.1% |
-| 4096/4096/4096 | BF16 | 543.78 | 526.48 | 85.7% |
-| 512/4096/2048 | BF16 | 50.94 | 55.32 | 57.2% |
+| M/N/K | dtype | 原实现 | 连续流水 | Torch | MFU（连续流水） |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 2048/2048/2048 | FP16 | 82.94 | 80.32 | 80.20 | 72.5% |
+| 4096/4096/4096 | BF16 | 543.90 | 538.48 | 525.70 | 86.5% |
+| 512/4096/2048 | BF16 | 50.18 | 50.10 | 56.06 | 58.1% |
+
+连续流水相对原实现分别下降3.16%、1.00%、0.16%。每形状一次默认replay，
+没有独立时延样本，微小差异不作统计显著性结论。unit flag 的独立对照没有稳定
+收益；本轮 `a_cache_k=512` 缓存候选未改善4096³性能，不推荐该缓存策略。
+
+4096³本轮对照的三条TileLang路径与Torch均为32768 MAD、1572864 KiB GM→L1请求；
+TileLang/Torch的MTE2指令为16424/12328，MTE1为65656/73788。公开ops-nn
+MatMulV3源码有独立A/B缓存及unit flag策略；实际二进制的tiling没有通过源码公式
+反推为已知值。当前差异仍在请求粒度和流水组织，不能从active时间相加归因关键路径。
+矩形Torch匹配到 `MatMulV2_ND_ND_FP16_FP16_false_true_all_99026`；本轮未核对其
+内部转换流程，表中只计匹配的矩阵kernel，不是完整调用的端到端耗时。
 
 ### TileLang 代码
 
-以下展示persistent20、无额外A缓存的完整逻辑；[实际工厂](../../examples/ascend/gemm_910b.py)
-还支持尾块和显式 A 缓存。`T.Pipelined` 自动选择 K 循环的排步和 buffer 版本。
+以下展示persistent20、无额外A缓存的连续流水逻辑；[实际工厂](../../examples/ascend/gemm_910b.py)
+还支持尾块和显式 A 缓存。`T.Pipelined` 自动选择排步和 buffer 版本。
+`pipeline_outputs` 默认false；启用时要求显式 `num_cores`，不能与A缓存策略组合。
+覆盖、容量与完成契约见[连续GEMM说明](../compiler_internals/ascend_910b_gemm.md)。
 
 ```python
 from tilelang.ascend import language as T
@@ -38,33 +53,31 @@ def make_gemm(M, N, K, dtype="bfloat16"):
     n_tiles = (N + BN - 1) // BN
     tiles = ((M + BM - 1) // BM) * n_tiles
     groups = min(tiles, 20)
-
-    @T.macro
-    def output_tile(A, B, C, tile_id):
-        mi = tile_id // n_tiles
-        ni = tile_id % n_tiles
-        a_l1 = T.alloc_l1((BM, BK), dtype)
-        b_l1 = T.alloc_l1((BN, BK), dtype)
-        accumulator = T.alloc_l0c((BM, BN), "float32")
-        for ki in T.Pipelined(T.ceildiv(K, BK)):
-            T.copy(A[mi * BM:(mi + 1) * BM, ki * BK:(ki + 1) * BK], a_l1)
-            T.copy(B[ni * BN:(ni + 1) * BN, ki * BK:(ki + 1) * BK], b_l1)
-            T.gemm(a_l1, b_l1, accumulator, transpose_B=True, clear_accum=(ki == 0))
-        T.copy(accumulator, C[mi * BM:(mi + 1) * BM, ni * BN:(ni + 1) * BN])
+    panels = (K + BK - 1) // BK
 
     @T.prim_func
     def main(A: T.Tensor((M, K), dtype),
              B: T.Tensor((N, K), dtype),
              C: T.Tensor((M, N), dtype)):
         with T.Kernel(groups) as block:
-            for iteration in T.serial(T.ceildiv(tiles - block, groups)):
-                output_tile(A, B, C, block + iteration * groups)
+            a_l1 = T.alloc_l1((BM, BK), dtype)
+            b_l1 = T.alloc_l1((BN, BK), dtype)
+            accumulator = T.alloc_l0c((BM, BN), "float32")
+            for task in T.Pipelined(T.ceildiv(tiles - block, groups) * panels):
+                tile_id = block + (task // panels) * groups
+                mi, ni, ki = tile_id // n_tiles, tile_id % n_tiles, task % panels
+                T.copy(A[mi * BM:(mi + 1) * BM, ki * BK:(ki + 1) * BK], a_l1)
+                T.copy(B[ni * BN:(ni + 1) * BN, ki * BK:(ki + 1) * BK], b_l1)
+                T.gemm(a_l1, b_l1, accumulator, transpose_B=True, clear_accum=(ki == 0))
+                if ki == panels - 1:
+                    T.copy(accumulator, C[mi * BM:(mi + 1) * BM, ni * BN:(ni + 1) * BN])
 
     return main
 ```
 
-20个block轮转处理输出tile；外层循环表达输出分配，内层 `T.Pipelined` 的
-K流水由编译器自动排步。下面调用与表中使用同一策略。
+20个block轮转处理输出tile；一个逻辑task同时确定输出tile和K panel。
+每个输出仅首panel清零、末panel导出，跨输出预取与同步由编译器自动排步。
+下面调用与表中使用同一策略。
 
 编译与调用使用实际工厂：
 
@@ -75,7 +88,7 @@ import torch_npu
 from examples.ascend.gemm_910b import gemm
 
 M, N, K = 4096, 4096, 4096
-program = gemm(M, N, K, dtype="bfloat16", num_cores=20)
+program = gemm(M, N, K, dtype="bfloat16", num_cores=20, pipeline_outputs=True)
 kernel = tilelang.compile(program, target={"kind": "ascend", "arch": "dav-2201"},
                           execution_backend="tvm_ffi", out_idx=None)
 torch.npu.set_device("npu:0")
