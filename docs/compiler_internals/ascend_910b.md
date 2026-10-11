@@ -344,20 +344,25 @@ proof rules, fallback priorities, event allocation order and 2201/3510 protocol
 choices remain independent of this orchestration boundary.
 
 Within an attempt, `SyncAnalyzer` drives recursive dependency/completion
-analysis. `ScalarAdmissionProof` reads only the architecture and insertion
-sites to certify Scalar wait lifetimes; both flag-width reduction and event
-sharing consume these proofs. A matching V-to-S event still proves completion
-of the Vector operations covered by its notification. The extra inference
-that Scalar consumes an old flag before dispatching a later notification only
-bounds event lifetime; it adds no data-completion edges and does not authorize
-storage aliases. `FlagReuseAnalysis` reads the finalized sync points,
-insertion sites and each scope's dependency closure, owns the closed-phase
-certificate cache and reusable event pairs, and promotes visible sites across
-scope boundaries. It cannot change dependencies, choose fallback protocols or
-allocate physical flags. The analyzer owns both objects for one attempt;
-failed attempts discard their caches and results with the analyzer. The site
-registry and sync-point vector outlive these readers, and appended points keep
-stable numeric IDs. Proof checks and pair enumeration retain their order.
+analysis. Once retained sync endpoints are fixed, `ScalarAdmissionProof`
+certifies their closed Scalar-wait phases once and stores the result on each
+`SyncPoint`. Flag-width reduction and event sharing consume the same
+width-independent certificate: width reduction additionally requires the
+lexical admission clock, while sharing requires one-bit, stage-zero phases.
+There is no separate sharing-mode proof or certificate cache.
+A matching V-to-S event still proves completion of the Vector operations
+covered by its notification. The extra inference that Scalar consumes an old
+flag before dispatching a later notification only bounds event lifetime; it
+adds no data-completion edges and does not authorize storage aliases.
+`FlagReuseAnalysis` reads finalized sync points, insertion sites and each
+scope's dependency closure, records reusable event pairs, and promotes visible
+sites across scope boundaries. Same-iteration and carried-channel pair checks
+use the same interval-order test with opposite endpoint orientation; mixed
+channels retain their separate handshake contract. It cannot change
+dependencies, choose fallback protocols or allocate physical flags. Proofs and
+results belong to one attempt and are discarded on failure. The site registry
+and sync-point vector outlive these readers; appended points keep stable IDs.
+
 
 The early L0 max-budget choice is a required physical-alias contract, not
 evidence that storage can already overlap. A typed storage-pair snapshot owns

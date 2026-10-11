@@ -426,6 +426,15 @@ private:
   std::variant<OriginalEndpointProof, GmStoragePermission> proof_;
 };
 
+// A matched V notification and blocking Scalar wait close one activation.
+// This certificate is independent of event width. It proves event consumption,
+// not an additional data-completion edge or permission to alias storage.
+struct ClosedScalarWaitPhase {
+  ControlNode *scope;
+  IRStructure *first;
+  IRStructure *last;
+};
+
 struct SyncPoint {
   DepEdge edge;
   DependencyKind dependency_kind;
@@ -442,6 +451,7 @@ struct SyncPoint {
   // Only an exact child-generation edge can enter the ordinary closure.
   bool operand_pool_release{false};
   SyncPointProof proof;
+  std::optional<ClosedScalarWaitPhase> scalar_wait_phase;
 
   SyncPoint(DepEdge edge, DependencyKind dependency_kind, int num_versions,
             ControlNode *flag_loop)
@@ -1047,12 +1057,6 @@ public:
                        const SyncSiteRegistry &sites)
       : architecture_(architecture), site_registry_(sites) {}
 
-  struct ClosedScalarWaitPhase {
-    ControlNode *scope;
-    IRStructure *first;
-    IRStructure *last;
-  };
-
   bool HasScalarAdmissionLexicalClock(const SyncPoint &point,
                                       ControlNode *loop) const {
     if (architecture_ != AscendArchitecture::kDav2201 || !loop ||
@@ -1114,10 +1118,9 @@ public:
   }
 
   std::optional<ClosedScalarWaitPhase>
-  ComputeClosedScalarWaitPhase(const SyncPoint &point,
-                               bool for_width = false) const {
+  ComputeClosedScalarWaitPhase(const SyncPoint &point) const {
     if (architecture_ != AscendArchitecture::kDav2201 || !point.flag_loop ||
-        point.edge.distance != 0 || (!for_width && point.num_versions != 1) ||
+        point.edge.distance != 0 ||
         !point.proof.HasOriginalEndpoints() || point.local_binary_plan ||
         point.single_iteration_binary_plan ||
         point.unit_boundary != UnitFlagBoundaryRole::kNone)
@@ -1139,10 +1142,10 @@ public:
         (dst.path_end->IsTask() &&
          static_cast<TaskNode *>(dst.path_end)->IsPerCoreTask()))
       return std::nullopt;
-    // Width reduction may use a common pipeline stage: the matching Scalar
-    // wait still executes before the next physical iteration can dispatch a
-    // new notification. Cross-channel phase sharing remains stage-zero only.
-    int stage = for_width ? src.path_begin->GetStage() : 0;
+    // The matching Scalar wait closes the activation at any common stage.
+    // Consumers separately decide whether this phase can shrink a ring or
+    // share its physical ID with another phase.
+    int stage = src.path_begin->GetStage();
     if (stage < 0 || dst.path_begin->GetStage() != stage)
       return std::nullopt;
 
@@ -1205,33 +1208,24 @@ private:
 class FlagReuseAnalysis {
 public:
   FlagReuseAnalysis(const SyncSiteRegistry &sites,
-                    const std::vector<SyncPoint> &points,
-                    const ScalarAdmissionProof &scalar_admission)
-      : site_registry_(sites), sync_points_(points),
-        scalar_admission_(scalar_admission) {}
+                    const std::vector<SyncPoint> &points)
+      : site_registry_(sites), sync_points_(points) {}
 
   const std::set<std::pair<size_t, size_t>> &ReusablePairs() const {
     return reusable_pairs_;
   }
 
 private:
-  using ClosedScalarWaitPhase = ScalarAdmissionProof::ClosedScalarWaitPhase;
-
-  const std::optional<ClosedScalarWaitPhase> &
-  GetClosedScalarWaitPhase(size_t index) const {
-    auto it = closed_scalar_wait_phases_.find(index);
-    if (it == closed_scalar_wait_phases_.end())
-      it = closed_scalar_wait_phases_
-               .emplace(index, scalar_admission_.ComputeClosedScalarWaitPhase(
-                                   sync_points_[index]))
-               .first;
-    return it->second;
-  }
-
   bool CanReuseClosedScalarWaitPhases(size_t lhs, size_t rhs) const {
-    const auto &left = GetClosedScalarWaitPhase(lhs);
-    const auto &right = GetClosedScalarWaitPhase(rhs);
-    if (!left || !right)
+    const SyncPoint &lhs_point = sync_points_[lhs];
+    const SyncPoint &rhs_point = sync_points_[rhs];
+    const auto &left = lhs_point.scalar_wait_phase;
+    const auto &right = rhs_point.scalar_wait_phase;
+    // Phase sharing requires one bit and unshifted phases. Width reduction
+    // can use the same certificate at a nonzero common stage.
+    if (!left || !right || lhs_point.num_versions != 1 ||
+        rhs_point.num_versions != 1 || left->first->GetStage() != 0 ||
+        right->first->GetStage() != 0)
       return false;
     IRStructure *ancestor =
         left->scope->GetLowestCommonAncestor(right->scope);
@@ -1344,27 +1338,25 @@ private:
       return true;
     }
 
+    if (lhs_cross_iter && !allow_cross_iter)
+      return false;
+    // Same-iteration channels live from set to wait; carried channels use
+    // the complementary wait-to-set interval between initial tokens.
+    auto interval = [&](const DepEdge &edge) {
+      return lhs_cross_iter ? std::pair{edge.dst, edge.src}
+                            : std::pair{edge.src, edge.dst};
+    };
     std::optional<bool> lhs_before;
     for (const auto &[domain_id, lhs_edge] : lhs_edges) {
       auto rhs_it = rhs_edges.find(domain_id);
       if (rhs_it == rhs_edges.end())
         return false;
-      const DepEdge &rhs_edge = rhs_it->second;
-      bool current_lhs_before;
-      bool current_rhs_before;
-      if (!lhs_cross_iter) {
-        current_lhs_before = closure.HasEdge(lhs_edge.dst, rhs_edge.src, 0) &&
-                             closure.HasEdge(rhs_edge.dst, lhs_edge.src, 1);
-        current_rhs_before = closure.HasEdge(rhs_edge.dst, lhs_edge.src, 0) &&
-                             closure.HasEdge(lhs_edge.dst, rhs_edge.src, 1);
-      } else {
-        if (!allow_cross_iter)
-          return false;
-        current_lhs_before = closure.HasEdge(lhs_edge.src, rhs_edge.dst, 0) &&
-                             closure.HasEdge(rhs_edge.src, lhs_edge.dst, 1);
-        current_rhs_before = closure.HasEdge(rhs_edge.src, lhs_edge.dst, 0) &&
-                             closure.HasEdge(lhs_edge.src, rhs_edge.dst, 1);
-      }
+      auto [lhs_begin, lhs_end] = interval(lhs_edge);
+      auto [rhs_begin, rhs_end] = interval(rhs_it->second);
+      bool current_lhs_before = closure.HasEdge(lhs_end, rhs_begin, 0) &&
+                                closure.HasEdge(rhs_end, lhs_begin, 1);
+      bool current_rhs_before = closure.HasEdge(rhs_end, lhs_begin, 0) &&
+                                closure.HasEdge(lhs_end, rhs_begin, 1);
       if (current_lhs_before == current_rhs_before)
         return false;
       if (lhs_before.has_value() && lhs_before.value() != current_lhs_before) {
@@ -1421,10 +1413,7 @@ public:
 private:
   const SyncSiteRegistry &site_registry_;
   const std::vector<SyncPoint> &sync_points_;
-  const ScalarAdmissionProof &scalar_admission_;
   std::set<std::pair<size_t, size_t>> reusable_pairs_;
-  mutable std::map<size_t, std::optional<ClosedScalarWaitPhase>>
-      closed_scalar_wait_phases_;
 };
 
 class SyncAnalyzer : public BufferAliasAnalysisContext {
@@ -1456,7 +1445,7 @@ public:
         trace_c_lifetimes_(
             runtime::detail::VerboseLoggingEnabled(__FILE__, 1)),
         scalar_admission_(architecture, site_registry_),
-        flag_reuse_(site_registry_, sync_points_, scalar_admission_) {
+        flag_reuse_(site_registry_, sync_points_) {
     for (const MultiBufferInfo &info : multi_buffer_plan_.Infos()) {
       ICHECK(!info.owners.empty());
       std::vector<ControlNode *> owners;
@@ -3806,6 +3795,11 @@ private:
                              projection_scope);
       emit.push_back(std::move(sync_point));
     }
+    // Endpoints and activation are now fixed. Prove consumption once before
+    // choosing ring widths; later reuse consumes this same certificate.
+    for (SyncPoint &point : emit)
+      point.scalar_wait_phase =
+          scalar_admission_.ComputeClosedScalarWaitPhase(point);
     sync_points = std::move(emit);
   }
 
@@ -4350,7 +4344,7 @@ private:
         if (is_innermost) {
           sync_point.num_versions = min_distance;
           if (scalar_admission_.HasScalarAdmissionLexicalClock(sync_point, loop) &&
-              scalar_admission_.ComputeClosedScalarWaitPhase(sync_point, true))
+              sync_point.scalar_wait_phase)
             sync_point.num_versions = 1;
         } else {
           // The owner clock does not advance within a descendant loop. Its
