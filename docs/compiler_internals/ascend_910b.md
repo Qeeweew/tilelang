@@ -13,6 +13,24 @@ that default into the target before lowering and binary caching. Explicit
 `arch` or `mcpu` takes precedence; when both are given they must agree. Without
 an explicit architecture or environment default, the target uses `dav-3510`.
 
+For the synchronization algorithm, proof categories and source reading order,
+see the [InsertSync reading guide](ascend_910b_insert_sync.md).
+
+Event lifetime planning returns an updated synchronization point or a retry
+reason; it does not mutate analyzer retry state. Pending and proven
+parent lifetimes are mutually exclusive states. Hardware allocation owns its
+point-to-allocation mapping and reads synchronization points without modifying
+them. Selected owner RAW coverage is indexed once per analysis attempt, with
+storage, endpoints, scope, distance and core direction in the key; coverage does
+not introduce an all-participant completion edge.
+
+Site collection resolves parent IDs after canonicalization; per-scope analysis
+reads the sorted site interval instead of enumerating task/domain keys again.
+Input and result owner transfers share release validation and event construction.
+Ordinary and owner flags share explicit reservation masks and contiguous-range
+search, preserving low-ID versus high-ID preference and result-before-input order.
+
+
 ## Hardware capabilities and storage
 
 The target descriptor owns legality and storage capacities. It contains no
@@ -363,6 +381,20 @@ dependencies, choose fallback protocols or allocate physical flags. Proofs and
 results belong to one attempt and are discarded on failure. The site registry
 and sync-point vector outlive these readers; appended points keep stable IDs.
 
+
+Parent storage obligations consume one `ParentMemoryCycle` certificate per
+analysis scope and storage plan. Its unique full writer/reader and retained
+ready/release ring are proved once, then matched against individual dependency
+pairs. Lexical cycles cover WAR and operand WAW; counter cycles additionally
+cover their killed incoming RAW. Both use the same retained-ring matcher,
+while rectangular lexical traversal and actual counter advancement keep their
+separate admission proofs. These certificates never add parent completion
+edges and are discarded with the analysis attempt, including cached failures.
+
+Lexical event-clock construction shares immutable-bound and positive-step
+validation. Each consumer still checks its own scope, signedness and active
+interval. Binary-proof failure has one retry/error exit; private GM cuts may
+trigger a fresh ordinary-release attempt, never weaken a failed condition.
 
 The early L0 max-budget choice is a required physical-alias contract, not
 evidence that storage can already overlap. A typed storage-pair snapshot owns

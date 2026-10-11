@@ -9,6 +9,7 @@
 #include "ascend/op/utils.h"
 #include "op/gemm.h"
 #include "transform/common/constr_visitor.h"
+#include "../attr.h"
 #include <tvm/tirx/stmt_functor.h>
 
 #include <algorithm>
@@ -16,6 +17,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -34,6 +36,24 @@ namespace ascend {
 using namespace tirx;
 using ffi::Any;
 using ffi::String;
+
+// Match one atomic statement through semantic task markers only. A condition,
+// sequence, loop or unrelated attribute is not transparent to this pattern.
+template <typename Node>
+const Node *MatchTaskBody(Stmt body) {
+  while (const auto *marker = body.as<AttrStmtNode>()) {
+    if (marker->attr_key != attr::kAscendTask)
+      return nullptr;
+    body = marker->body;
+  }
+  return body.as<Node>();
+}
+
+inline std::optional<Call> MatchTaskCall(const Stmt &body) {
+  const auto *evaluate = MatchTaskBody<EvaluateNode>(body);
+  const auto *call = evaluate ? evaluate->value.as<CallNode>() : nullptr;
+  return call ? std::optional<Call>(GetRef<Call>(call)) : std::nullopt;
+}
 
 // Forward declarations
 class IRStructure;

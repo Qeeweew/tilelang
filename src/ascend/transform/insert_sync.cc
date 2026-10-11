@@ -380,8 +380,17 @@ enum class UnitFlagBoundaryRole {
 struct SingleIterationBinaryPlan {
   ControlNode *parent;
   PrimExpr activation{Bool(true)};
-  bool validated{false};
 };
+
+// Finite rings, unresolved parent obligations and parent-proven lifetimes
+// are mutually exclusive. A resolved parent lifetime remains ineligible for
+// ordinary cross-channel sharing, without retaining pending proof state.
+struct ParentBoundBinaryLifetime {};
+using BinaryLifetime =
+    std::variant<std::monostate, LocalBinaryFlagPlan,
+                 SingleIterationBinaryPlan, ParentBoundBinaryLifetime>;
+
+enum class FlagLifetimeFailure { kOwnerProtocol, kUnitStream };
 
 // These alternatives describe the strength of a point's original endpoints,
 // not its emission mechanism. A GM cut keeps the ordinary event protocol but
@@ -442,10 +451,19 @@ struct SyncPoint {
   PrimExpr flag_iteration;
   ControlNode *flag_loop;
   int counter_group_id;
-  size_t allocation_index;
   std::optional<CounterChannelKey> counter_channel;
-  std::optional<LocalBinaryFlagPlan> local_binary_plan;
-  std::optional<SingleIterationBinaryPlan> single_iteration_binary_plan;
+  BinaryLifetime binary_lifetime;
+
+  const LocalBinaryFlagPlan *LocalBinaryPlan() const {
+    return std::get_if<LocalBinaryFlagPlan>(&binary_lifetime);
+  }
+  const SingleIterationBinaryPlan *PendingParentLifetime() const {
+    return std::get_if<SingleIterationBinaryPlan>(&binary_lifetime);
+  }
+  bool HasParentLifetime() const {
+    return PendingParentLifetime() ||
+           std::holds_alternative<ParentBoundBinaryLifetime>(binary_lifetime);
+  }
   UnitFlagBoundaryRole unit_boundary{UnitFlagBoundaryRole::kNone};
   // Emitted by the selected physical pool, not this logical-storage ring.
   // Only an exact child-generation edge can enter the ordinary closure.
@@ -505,65 +523,60 @@ public:
     sites_.clear();
     site_ids_.clear();
     parent_site_ids_.clear();
-
-    std::map<SyncInsertionSite, std::map<int, SyncInsertionSite>> parent_sites;
-    std::map<SyncInsertionSiteKey, SyncInsertionSite> keyed_sites;
+    std::map<SyncInsertionSiteKey, SyncInsertionSite> placements;
     std::vector<TaskNode *> tasks;
     for (IRStructure *node : nodes)
       CollectAllTaskNodes(node, tasks);
-
     for (TaskNode *task : tasks) {
       if (task->GetCoreMask() == kCoreUnassigned)
         continue;
-      for (IRStructure *path_begin : task->PathFrom()) {
-        SyncInsertionSiteList inner_sites;
-        IRStructure *parent = path_begin->GetParent();
-        ICHECK(parent == nullptr || parent->IsControl());
-        auto *scope =
-            parent == nullptr ? nullptr : static_cast<ControlNode *>(parent);
-        std::vector<int> domain_ids = SiteDomainsForTaskAtScope(task, scope);
-        AddInsertionSites(path_begin, task, domain_ids, inner_sites,
-                          keyed_sites);
-        sites_.insert(sites_.end(), inner_sites.begin(), inner_sites.end());
-
-        if (parent == nullptr)
-          continue;
-        auto *parent_scope =
-            static_cast<ControlNode *>(parent)->GetParentControl();
-        std::vector<int> parent_domain_ids =
-            SiteDomainsForTaskAtScope(task, parent_scope);
-        for (const SyncInsertionSite &inner_site : inner_sites) {
-          for (int parent_domain_id : parent_domain_ids) {
-            SyncInsertionSiteKey parent_key{parent, task,
-                                            inner_site.at_beginning,
-                                            inner_site.core, parent_domain_id};
-            auto parent_it = keyed_sites.find(parent_key);
-            ICHECK(parent_it != keyed_sites.end())
-                << "Synchronization insertion site is missing its parent site";
-            // One child endpoint may promote into several parent domains, but
-            // each domain must select exactly one physical parent endpoint.
-            auto [recorded_it, inserted] = parent_sites[inner_site].emplace(
-                parent_domain_id, parent_it->second);
-            ICHECK(inserted || recorded_it->second.HasSamePhysicalPosition(
-                                   parent_it->second))
-                << "One synchronization site has conflicting parent sites "
-                   "in the same epoch domain";
+      for (IRStructure *begin : task->PathFrom()) {
+        auto domains = SiteDomainsForTaskAtScope(task, begin->GetParent());
+        for (bool at_beginning : {false, true})
+          for (CoreMask core : kConcreteCores) {
+            if (!HasCore(task->GetCoreMask(), core))
+              continue;
+            for (int domain : domains) {
+              SyncInsertionSite site(begin, task, at_beginning, core,
+                                     domains_.Domain(domain));
+              auto [it, inserted] = placements.emplace(
+                  SyncInsertionSiteKey{begin, task, at_beginning, core, domain},
+                  site);
+              ICHECK(inserted || it->second == site)
+                  << "Synchronization insertion-site key has inconsistent sites";
+            }
           }
-        }
       }
     }
+    for (const auto &[key, site] : placements)
+      sites_.push_back(site);
     std::sort(sites_.begin(), sites_.end());
     sites_.erase(std::unique(sites_.begin(), sites_.end()), sites_.end());
-    for (const auto &[key, site] : keyed_sites) {
-      auto [_, inserted] = site_ids_.emplace(key, FindSiteId(site));
-      ICHECK(inserted) << "Duplicate synchronization insertion-site key";
+    for (const auto &[key, site] : placements)
+      site_ids_.emplace(key, FindSiteId(site));
+
+    // Resolve parents only after canonical IDs exist. Multiple task keys may
+    // name one physical site; each domain must still select one parent ID.
+    std::vector<std::map<int, size_t>> parents(sites_.size());
+    for (const auto &[key, id] : site_ids_) {
+      const auto &[begin, task, at_beginning, core, domain] = key;
+      IRStructure *parent = begin->GetParent();
+      if (!parent)
+        continue;
+      for (int parent_domain :
+           SiteDomainsForTaskAtScope(task, parent->GetParent())) {
+        size_t parent_id = FindSiteId(SyncInsertionSiteKey{
+            parent, task, at_beginning, core, parent_domain});
+        auto [it, inserted] = parents[id].emplace(parent_domain, parent_id);
+        ICHECK(inserted || it->second == parent_id)
+            << "One synchronization site has conflicting parent sites "
+               "in the same epoch domain";
+      }
     }
     parent_site_ids_.resize(sites_.size());
-    for (const auto &[site, parents] : parent_sites) {
-      std::vector<size_t> &parent_ids = parent_site_ids_[FindSiteId(site)];
-      for (const auto &[_, parent] : parents)
-        parent_ids.push_back(FindSiteId(parent));
-    }
+    for (size_t id = 0; id < parents.size(); ++id)
+      for (const auto &[domain, parent_id] : parents[id])
+        parent_site_ids_[id].push_back(parent_id);
   }
 
   const SyncInsertionSiteList &Sites() const { return sites_; }
@@ -707,29 +720,27 @@ public:
     return FindSiteId(boundary);
   }
 
-  std::vector<size_t>
-  CollectSiteIds(const std::vector<IRStructure *> &nodes) const {
+  // AnalyzeNodeList always visits the complete child list of one scope.
+  // Site ordering already groups that scope; do not rediscover its tasks,
+  // domains and keys in a second traversal.
+  std::vector<size_t> CollectSiteIds(ControlNode *scope) const {
+    auto first = std::lower_bound(
+        sites_.begin(), sites_.end(), scope,
+        [](const SyncInsertionSite &site, IRStructure *parent) {
+          return CompareIRStructure(site.path_begin->GetParent(), parent) < 0;
+        });
     std::vector<size_t> result;
-    for (IRStructure *node : nodes) {
-      std::vector<TaskNode *> tasks;
-      CollectAllTaskNodes(node, tasks);
-      IRStructure *parent = node->GetParent();
-      ICHECK(parent == nullptr || parent->IsControl());
-      auto *scope =
-          parent == nullptr ? nullptr : static_cast<ControlNode *>(parent);
-      for (TaskNode *task : tasks) {
-        AddInsertionSiteIds(node, task, SiteDomainsForTaskAtScope(task, scope),
-                            result);
-      }
-    }
-    std::sort(result.begin(), result.end());
-    result.erase(std::unique(result.begin(), result.end()), result.end());
+    for (auto it = first; it != sites_.end() &&
+                          it->path_begin->GetParent() == scope; ++it)
+      result.push_back(std::distance(sites_.begin(), it));
     return result;
   }
 
 private:
   std::vector<int> SiteDomainsForTaskAtScope(const TaskNode *task,
-                                             ControlNode *scope) const {
+                                            IRStructure *parent) const {
+    ICHECK(parent == nullptr || parent->IsControl());
+    auto *scope = static_cast<ControlNode *>(parent);
     std::vector<int> result = domains_.DomainsForTaskAtScope(task, scope);
     int lexical_domain = domains_.UnconditionalLexicalDomain(scope);
     if (std::find(result.begin(), result.end(), lexical_domain) == result.end())
@@ -775,45 +786,6 @@ private:
       visit(src, dst);
       ++src_index;
       ++dst_index;
-    }
-  }
-
-  void AddInsertionSites(
-      IRStructure *path_begin, TaskNode *task,
-      const std::vector<int> &domain_ids, SyncInsertionSiteList &sites,
-      std::map<SyncInsertionSiteKey, SyncInsertionSite> &keyed_sites) const {
-    for (bool at_beginning : {false, true}) {
-      for (CoreMask core : kConcreteCores) {
-        if (!HasCore(task->GetCoreMask(), core))
-          continue;
-        auto add = [&](int domain_id) {
-          const EpochDomain &domain = domains_.Domain(domain_id);
-          sites.emplace_back(path_begin, task, at_beginning, core, domain);
-          const SyncInsertionSite &site = sites.back();
-          SyncInsertionSiteKey key{path_begin, task, at_beginning, core,
-                                   site.EpochDomainId()};
-          auto [it, inserted] = keyed_sites.emplace(std::move(key), site);
-          ICHECK(inserted || it->second == site)
-              << "Synchronization insertion-site key has inconsistent sites";
-        };
-        for (int domain_id : domain_ids)
-          add(domain_id);
-      }
-    }
-  }
-
-  void AddInsertionSiteIds(IRStructure *path_begin, TaskNode *task,
-                           const std::vector<int> &domain_ids,
-                           std::vector<size_t> &site_ids) const {
-    for (bool at_beginning : {false, true}) {
-      for (CoreMask core : kConcreteCores) {
-        if (!HasCore(task->GetCoreMask(), core))
-          continue;
-        for (int domain_id : domain_ids) {
-          site_ids.push_back(FindSiteId(SyncInsertionSiteKey{
-              path_begin, task, at_beginning, core, domain_id}));
-        }
-      }
     }
   }
 
@@ -1049,6 +1021,29 @@ bool StableLocalBinaryBoundary(const PrimExpr &expression,
   return stable(expression);
 }
 
+// One loop's lexical clock, never a flattened ancestor or mutable counter.
+// Construct arithmetic only after proving immutable bounds and positive step.
+// Consumers retain their own scope, activation and signedness requirements.
+struct LexicalEventClock {
+  PrimExpr step;
+  PrimExpr ordinal;
+  PrimExpr trip_count;
+};
+
+std::optional<LexicalEventClock> AnalyzeLexicalEventClock(ControlNode *loop) {
+  const ForNode *node = loop->control.get();
+  PrimExpr step = node->step.has_value() ? node->step.value()
+                                       : IntImm(node->extent.dtype(), 1);
+  if (SideEffect(node->min) != CallEffectKind::kPure ||
+      SideEffect(node->extent) != CallEffectKind::kPure ||
+      SideEffect(step) != CallEffectKind::kPure ||
+      !loop->task->outer_ctx.CanProve(step > make_zero(step.dtype())))
+    return std::nullopt;
+  return LexicalEventClock{
+      step, indexdiv(node->loop_var - node->min, step),
+      max(ceildiv(node->extent, step), make_zero(node->extent.dtype()))};
+}
+
 // Flag lifetime admission is deliberately separate from data completion.
 // These certificates neither add DepClosure edges nor authorize storage reuse.
 class ScalarAdmissionProof {
@@ -1064,7 +1059,7 @@ public:
         loop->HasConditions() || loop->BodyHasLoopBreak() ||
         loop->control->kind != ForKind::kSerial ||
         point.counter_group_id != 0 || !point.proof.HasOriginalEndpoints() ||
-        point.local_binary_plan || point.single_iteration_binary_plan ||
+        point.LocalBinaryPlan() || point.HasParentLifetime() ||
         point.unit_boundary != UnitFlagBoundaryRole::kNone)
       return false;
     const SyncInsertionSite &src = site_registry_.Src(point);
@@ -1076,17 +1071,11 @@ public:
     const EpochDomain &domain = site_registry_.Domain(src);
     if (domain.IsCounter() || domain.owner != loop)
       return false;
-    const ForNode *node = loop->control.get();
-    PrimExpr step = node->step.has_value() ? node->step.value()
-                                           : IntImm(node->extent.dtype(), 1);
-    if (!point.flag_iteration.dtype().is_int() ||
-        SideEffect(node->min) != CallEffectKind::kPure ||
-        SideEffect(node->extent) != CallEffectKind::kPure ||
-        SideEffect(step) != CallEffectKind::kPure ||
-        !loop->task->outer_ctx.CanProve(step > make_zero(step.dtype())))
+    if (!point.flag_iteration.dtype().is_int())
       return false;
-    return loop->GetLoopBodyContext().CanProve(
-        point.flag_iteration == indexdiv(node->loop_var - node->min, step));
+    auto clock = AnalyzeLexicalEventClock(loop);
+    return clock && loop->GetLoopBodyContext().CanProve(
+                        point.flag_iteration == clock->ordinal);
   }
 
   bool HasShiftedScalarWaitWidth(const SyncPoint &point,
@@ -1121,8 +1110,8 @@ public:
   ComputeClosedScalarWaitPhase(const SyncPoint &point) const {
     if (architecture_ != AscendArchitecture::kDav2201 || !point.flag_loop ||
         point.edge.distance != 0 ||
-        !point.proof.HasOriginalEndpoints() || point.local_binary_plan ||
-        point.single_iteration_binary_plan ||
+        !point.proof.HasOriginalEndpoints() || point.LocalBinaryPlan() ||
+        point.HasParentLifetime() ||
         point.unit_boundary != UnitFlagBoundaryRole::kNone)
       return std::nullopt;
     const SyncInsertionSite &src = site_registry_.Src(point);
@@ -1283,9 +1272,9 @@ private:
       return false;
     // Existing reuse proofs compare equal event phases. Keep a shifted local
     // binary channel exclusive rather than sharing its partial seed/drain.
-    if (lhs_sync.local_binary_plan || rhs_sync.local_binary_plan ||
-        lhs_sync.single_iteration_binary_plan ||
-        rhs_sync.single_iteration_binary_plan)
+    if (lhs_sync.LocalBinaryPlan() || rhs_sync.LocalBinaryPlan() ||
+        lhs_sync.HasParentLifetime() ||
+        rhs_sync.HasParentLifetime())
       return false;
     if (!site_registry_.UsesFlag(lhs_sync) ||
         !site_registry_.UsesFlag(rhs_sync) ||
@@ -1416,6 +1405,38 @@ private:
   std::set<std::pair<size_t, size_t>> reusable_pairs_;
 };
 
+template <typename Access>
+bool IsCounterElement(const Access *access, const Buffer &counter) {
+  return access && access->buffer.same_as(counter) &&
+         access->indices.size() == 1 && is_zero(access->indices[0]) &&
+         !access->predicate.has_value();
+}
+
+std::string LifetimeNodeName(IRStructure *node) {
+  if (node == nullptr)
+    return "<root>";
+  std::ostringstream name;
+  if (node->IsControl()) {
+    name << "loop:" << static_cast<ControlNode *>(node)->control->loop_var;
+  } else {
+    auto *task = static_cast<TaskNode *>(node);
+    Stmt body = task->stmt;
+    while (const auto *attribute = body.as<AttrStmtNode>())
+      body = attribute->body;
+    const auto *evaluate = body.as<EvaluateNode>();
+    const auto *call = evaluate ? evaluate->value.as<CallNode>() : nullptr;
+    name << "task:";
+    if (call)
+      name << call->op;
+    else
+      name << body->GetTypeKey();
+  }
+  name << "[index=" << node->GetIndex() << ",stage=" << node->GetStage()
+       << "]";
+  return name.str();
+}
+
+
 class SyncAnalyzer : public BufferAliasAnalysisContext {
 public:
   explicit SyncAnalyzer(
@@ -1446,6 +1467,18 @@ public:
             runtime::detail::VerboseLoggingEnabled(__FILE__, 1)),
         scalar_admission_(architecture, site_registry_),
         flag_reuse_(site_registry_, sync_points_) {
+    // Selection is immutable for one attempt. Index its exact RAW facts once;
+    // input/result direction remains part of the key, not a completion edge.
+    auto index_owner_raw = [&](const auto *plans, CoreMask producer_core,
+                               CoreMask consumer_core) {
+      if (plans)
+        for (const auto &plan : *plans)
+          owner_raw_coverage_.emplace(plan.storage.get(), plan.producer,
+                                      plan.consumer, plan.epoch, plan.distance,
+                                      producer_core, consumer_core);
+    };
+    index_owner_raw(owner_results_, kCoreCube, kCoreVector);
+    index_owner_raw(owner_inputs_, kCoreVector, kCoreCube);
     for (const MultiBufferInfo &info : multi_buffer_plan_.Infos()) {
       ICHECK(!info.owners.empty());
       std::vector<ControlNode *> owners;
@@ -1476,6 +1509,7 @@ public:
     trace_c_sites_.clear();
     scope_closures_.clear();
     lifetime_orders_.clear();
+    parent_memory_cycles_.clear();
     SyncAnalysisResult root_result = AnalyzeNodeList(nodes, /*loop=*/nullptr);
     scope_closures_.insert_or_assign(nullptr, std::move(root_result.closure));
     if (owner_fallback_required_ || unit_fallback_required_)
@@ -1503,8 +1537,7 @@ public:
       }
     }
     for (const SyncPoint &point : sync_points_) {
-      ICHECK(!point.single_iteration_binary_plan ||
-             point.single_iteration_binary_plan->validated)
+      ICHECK(!point.PendingParentLifetime())
           << "dav-2201 local binary flag: unresolved single-iteration "
              "parent lifetime";
     }
@@ -1533,7 +1566,6 @@ public:
 
   const SyncSiteRegistry &SiteRegistry() const { return site_registry_; }
 
-  std::vector<SyncPoint> &SyncPoints() { return sync_points_; }
   const std::vector<SyncPoint> &SyncPoints() const { return sync_points_; }
 
   const std::set<std::pair<size_t, size_t>> &ReusablePairs() const {
@@ -1557,78 +1589,43 @@ public:
     return gm_write_acquires_;
   }
 
-  bool HasOwnerResultRelease(const ValidatedOwnerTransfer &plan) const {
+  bool HasOwnerRelease(const ValidatedOwnerTransfer &plan) const {
+    const bool input = plan.IsInput();
     for (const SyncPoint &point : sync_points_) {
-      if (const auto *permission = point.proof.StoragePermission();
-          permission && permission->read_release) {
-        const auto &cut = gm_read_releases_.at(*permission->read_release);
-        if (cut.plan.MatchesResult(plan) &&
-            cut.plan.MatchesProtocol(point.flag_loop, point.edge.distance,
-                                     point.num_versions,
-                                     point.counter_group_id))
+      const auto *permission = point.proof.StoragePermission();
+      if (!permission)
+        continue;
+      if (permission->read_release) {
+        const auto &cut = gm_read_releases_.at(*permission->read_release).plan;
+        if ((input ? cut.MatchesInput(plan) : cut.MatchesResult(plan)) &&
+            cut.MatchesProtocol(point.flag_loop, point.edge.distance,
+                                point.num_versions, point.counter_group_id))
           return true;
       }
-      if (const auto *permission = point.proof.StoragePermission();
-          permission && permission->write_acquire) {
-        const auto &cut = gm_write_acquires_.at(*permission->write_acquire);
-        if (cut.plan.MatchesResult(plan) &&
-            cut.plan.MatchesProtocol(point.flag_loop, point.edge.distance,
-                                     point.num_versions,
-                                     point.counter_group_id))
+      if (!input && permission->write_acquire) {
+        const auto &cut = gm_write_acquires_.at(*permission->write_acquire).plan;
+        if (cut.MatchesResult(plan) &&
+            cut.MatchesProtocol(point.flag_loop, point.edge.distance,
+                                point.num_versions, point.counter_group_id))
           return true;
       }
     }
     int domain = domains_.DomainForStorage(plan.storage, plan.epoch);
     size_t read_end = site_registry_.FindSiteId(
         SyncInsertionSiteKey{plan.consumer->GetChildOnPathFrom(plan.epoch),
-                             plan.consumer, false, kCoreVector, domain});
+                             plan.consumer, false,
+                             input ? kCoreCube : kCoreVector, domain});
     size_t write_begin = site_registry_.FindSiteId(
         SyncInsertionSiteKey{plan.producer->GetChildOnPathFrom(plan.epoch),
-                             plan.producer, true, kCoreCube, domain});
-    const DepClosure &closure = scope_closures_.at(plan.epoch);
-    int distance = MinCompletionDistance(closure, read_end, write_begin);
-    // The ordinary collective release must retire all reads before this GM
-    // slot is written again. No owner-result edge contributes to this proof.
-    return distance <= plan.num_slots - plan.distance;
-  }
-
-  bool HasOwnerInputRelease(const ValidatedOwnerTransfer &plan) const {
-    for (const SyncPoint &point : sync_points_) {
-      if (const auto *permission = point.proof.StoragePermission();
-          permission && permission->read_release) {
-        const auto &cut = gm_read_releases_.at(*permission->read_release);
-        if (cut.plan.MatchesInput(plan) &&
-            cut.plan.MatchesProtocol(point.flag_loop, point.edge.distance,
-                                     point.num_versions,
-                                     point.counter_group_id))
-          return true;
-      }
-    }
-    int domain = domains_.DomainForStorage(plan.storage, plan.epoch);
-    size_t read_end = site_registry_.FindSiteId(
-        SyncInsertionSiteKey{plan.consumer->GetChildOnPathFrom(plan.epoch),
-                             plan.consumer, false, kCoreCube, domain});
-    size_t write_begin = site_registry_.FindSiteId(
-        SyncInsertionSiteKey{plan.producer->GetChildOnPathFrom(plan.epoch),
-                             plan.producer, true, kCoreVector, domain});
-    const DepClosure &closure = scope_closures_.at(plan.epoch);
-    // This must be the ordinary paired input-consumed release, independent
-    // of the new readiness protocol. It retires both owners' reads before
-    // either lane may contribute a token for the next use of this GM slot.
-    return MinCompletionDistance(closure, read_end, write_begin) <=
-           plan.num_slots - plan.distance;
+                             plan.producer, true,
+                             input ? kCoreVector : kCoreCube, domain});
+    // Readiness never supplies this proof: the ordinary collective release
+    // must retire all owners' reads before the GM slot can be written again.
+    return MinCompletionDistance(scope_closures_.at(plan.epoch), read_end,
+                                 write_begin) <= plan.num_slots - plan.distance;
   }
 
 private:
-  bool GmHandoffNeedsFallback(bool valid) {
-    if (valid || !HasPrivateGmHandoffs())
-      return false;
-    // The private GM cut may remove an unrelated flag's old wide witness.
-    // Retry the same owner/unit/pool choices with ordinary GM release first.
-    owner_fallback_required_ = true;
-    return true;
-  }
-
   void SelectGmReadRelease(SyncPoint *point, const DepInfo &dep,
                           TaskNode *reader, TaskNode *writer,
                           ControlNode *loop) {
@@ -1752,30 +1749,6 @@ private:
       }
     }
     return nullptr;
-  }
-
-  static std::string LifetimeNodeName(IRStructure *node) {
-    if (node == nullptr)
-      return "<root>";
-    std::ostringstream name;
-    if (node->IsControl()) {
-      name << "loop:" << static_cast<ControlNode *>(node)->control->loop_var;
-    } else {
-      auto *task = static_cast<TaskNode *>(node);
-      Stmt body = task->stmt;
-      while (const auto *attribute = body.as<AttrStmtNode>())
-        body = attribute->body;
-      const auto *evaluate = body.as<EvaluateNode>();
-      const auto *call = evaluate ? evaluate->value.as<CallNode>() : nullptr;
-      name << "task:";
-      if (call)
-        name << call->op;
-      else
-        name << body->GetTypeKey();
-    }
-    name << "[index=" << node->GetIndex() << ",stage=" << node->GetStage()
-         << "]";
-    return name.str();
   }
 
   bool TraceCStorage(const Var &storage) const {
@@ -2267,7 +2240,7 @@ private:
   SyncAnalysisResult AnalyzeNodeList(const std::vector<IRStructure *> &nodes,
                                      ControlNode *loop) {
     SyncAnalysisResult result{DepClosure(site_registry_.Size()), {}};
-    std::vector<size_t> task_site_ids = site_registry_.CollectSiteIds(nodes);
+    std::vector<size_t> task_site_ids = site_registry_.CollectSiteIds(loop);
 
     std::vector<std::vector<VisibleSyncPoint>> child_sync_points;
     for (IRStructure *node : nodes) {
@@ -2527,16 +2500,7 @@ private:
                                 const MultiBufferInfo &info, TaskNode *reader,
                                 TaskNode *writer, bool operand) const {
     auto uses_storage = [&](const ObjectRef &expression) {
-      bool found = false;
-      PostOrderVisit(expression, [&](const ObjectRef &node) {
-        if (const auto *load = node.as<BufferLoadNode>())
-          found |= load->buffer->data.same_as(info.storage);
-        if (const auto *store = node.as<BufferStoreNode>())
-          found |= store->buffer->data.same_as(info.storage);
-        if (const auto *var = node.as<VarNode>())
-          found |= var == info.storage.get();
-      });
-      return found;
+      return resource_epoch_detail::Touches(expression, info.storage);
     };
     auto storage_region = [&](TaskNode *task,
                               bool writing) -> Optional<BufferRegion> {
@@ -2672,12 +2636,10 @@ private:
     for (const auto &guard : task->GetGuards())
       if (!guard->IsCondition())
         return false;
-    Stmt body = task->stmt;
-    while (const auto *wrapper = body.as<AttrStmtNode>()) {
-      if (wrapper->attr_key != attr::kAscendTask)
-        return false;
-      body = wrapper->body;
-    }
+    const auto *matched = MatchTaskBody<StmtNode>(task->stmt);
+    if (!matched)
+      return false;
+    Stmt body = GetRef<Stmt>(matched);
     PrimExpr activation = task->GetConditionGuard();
     // Prepare may put the tick's If inside its atomic Scalar task. Match
     // exactly one common activation, never discard an independent condition.
@@ -2738,18 +2700,10 @@ private:
         ++advances;
         return;
       }
-      Stmt body = task->stmt;
-      while (const auto *wrapper = body.as<AttrStmtNode>()) {
-        if (wrapper->attr_key != attr::kAscendTask)
-          break;
-        body = wrapper->body;
-      }
-      const auto *store = body.as<BufferStoreNode>();
+      const auto *store = MatchTaskBody<BufferStoreNode>(task->stmt);
       if (!task->GetParent() && task->GetStage() == 0 && !task->HasGuards() &&
           task->GetIndex() < owner->GetOutermostControl()->GetIndex() &&
-          store && store->buffer.same_as(info.counter) &&
-          store->indices.size() == 1 && is_zero(store->indices[0]) &&
-          !store->predicate.has_value() && is_zero(store->value)) {
+          IsCounterElement(store, info.counter) && is_zero(store->value)) {
         ++initializers;
         return;
       }
@@ -2764,42 +2718,22 @@ private:
   // cycle. A full current write kills the incoming old value (RAW); the real
   // ready and per-slot release also cover WAW and WAR. This removes no
   // phase-completion edge and does not project a counter into a parent clock.
-  bool IsParentCounterOperandCovered(const DepInfo &dep,
-                                     const MultiBufferInfo &info,
-                                     TaskNode *producer, TaskNode *consumer,
-                                     ControlNode *parent) const {
-    if (architecture_ != AscendArchitecture::kDav2201 || !parent ||
-        dep.kind != DependencyKind::kData || dep.distance != -1 ||
-        dep.cross_storage_conflict || !info.UsesCounter() ||
-        info.num_versions < 1 || info.owners.size() != 1)
-      return false;
+  bool ProveCounterMemoryCycle(const MultiBufferInfo &info,
+                               TaskNode *reader, TaskNode *writer,
+                               ControlNode *parent) const {
     ControlNode *owner = info.owners.front().loop;
-    if (owner == parent || !owner->IsWithin(parent) ||
-        dep.prod_node != owner->GetChildOnPathFrom(parent) ||
-        dep.cons_node != dep.prod_node || owner->GetStage() < 0 ||
+    if (owner->GetStage() < 0 ||
         !resource_epoch_detail::PositiveStaticLoop(owner))
       return false;
     for (ControlNode *ancestor = owner->GetParentControl(); ancestor;
          ancestor = ancestor->GetParentControl())
       if (ancestor->BodyHasLoopBreak())
         return false;
-    TaskNode *writer = nullptr, *reader = nullptr;
-    for (const auto &child : owner->children) {
-      bool writes = child->WritesStorage(info.storage);
-      bool reads = child->ReadsStorage(info.storage);
-      if (!writes && !reads)
-        continue;
-      if (!child->IsTask() || child->GetStage() < 0 ||
-          static_cast<TaskNode *>(child.get())->IsPerCoreTask() ||
-          static_cast<TaskNode *>(child.get())->GetCoreMask() != kCoreCube ||
-          (writes && (writer || reads)) || (reads && reader))
+    for (TaskNode *task : {reader, writer})
+      if (task->GetStage() < 0 || task->IsPerCoreTask() ||
+          task->GetCoreMask() != kCoreCube)
         return false;
-      if (writes)
-        writer = static_cast<TaskNode *>(child.get());
-      else
-        reader = static_cast<TaskNode *>(child.get());
-    }
-    if (!writer || !reader || writer->GetIndex() >= reader->GetIndex() ||
+    if (writer->GetIndex() >= reader->GetIndex() ||
         writer->GetStage() != reader->GetStage() ||
         !HasCounterOperandActivation(writer, owner,
                                      info.owners.front().active_guard) ||
@@ -2807,9 +2741,6 @@ private:
                                      info.owners.front().active_guard) ||
         !writer->UsesOnlyPipe(ResourcePipe::kMTE1) ||
         !reader->UsesOnlyPipe(ResourcePipe::kCube) ||
-        !((producer == writer && consumer == reader) ||
-          (producer == reader && consumer == writer) ||
-          (producer == writer && consumer == writer)) ||
         !ClosedFullMemoryAccesses(parent, info, reader, writer, true) ||
         !ClosedOperandCounter(info, owner, reader))
       return false;
@@ -2821,65 +2752,7 @@ private:
     if (mad->mbar_.defined() || mad->wgWait_ || mad->isWgmma_ ||
         mad->isTcgen05_)
       return false;
-    auto closure = scope_closures_.find(owner);
-    if (closure == scope_closures_.end())
-      return false;
-    PrimExpr clock = MultiBufferIteration(info);
-    bool ready = false, released = false;
-    for (const SyncPoint &point : sync_points_) {
-      const auto &src = site_registry_.Src(point);
-      const auto &dst = site_registry_.Dst(point);
-      const EpochDomain &domain = site_registry_.Domain(src);
-      if (point.flag_loop != owner ||
-          point.dependency_kind != DependencyKind::kData ||
-          !point.edge.strict || !point.counter_channel.has_value() ||
-          point.counter_group_id != info.counter_group_id ||
-          point.num_versions != info.num_versions ||
-          !point.proof.HasOriginalEndpoints() || point.local_binary_plan ||
-          point.single_iteration_binary_plan ||
-          point.unit_boundary != UnitFlagBoundaryRole::kNone ||
-          !ffi::StructuralEqual()(point.flag_iteration, clock) ||
-          src.EpochDomainId() != dst.EpochDomainId() || !domain.IsCounter() ||
-          domain.owner != owner || !domain.counter.same_as(info.counter) ||
-          src.core != kCoreCube || dst.core != kCoreCube ||
-          src.path_begin != src.path_end || dst.path_begin != dst.path_end ||
-          !src.path_end->IsTask() || !dst.path_end->IsTask() ||
-          static_cast<TaskNode *>(src.path_end)->IsPerCoreTask() ||
-          static_cast<TaskNode *>(dst.path_end)->IsPerCoreTask() ||
-          src.path_end->GetParent() != owner ||
-          dst.path_end->GetParent() != owner)
-        continue;
-      // All actual ring endpoints, including merged adjacent operand loads,
-      // must share the same stage and activation as writer/MAD/tick. This is
-      // one counter epoch translated together, not independent leaf guards.
-      auto same_activation = [&](const SyncInsertionSite &site) {
-        const auto *task = static_cast<const TaskNode *>(site.path_end);
-        return task->GetStage() == reader->GetStage() &&
-               HasCounterOperandActivation(task, owner,
-                                           info.owners.front().active_guard) &&
-               CounterOperandGuardsEquivalent(
-                   site_registry_.Domain(site).active_guard && site.GetGuard(),
-                   info.owners.front().active_guard, task, owner);
-      };
-      if (!same_activation(src) || !same_activation(dst))
-        continue;
-      ready |= point.edge.distance == 0 && src.pipe == "MTE1" &&
-               dst.pipe == "M" && dst.path_end == reader;
-      released |= point.edge.distance == info.num_versions && src.pipe == "M" &&
-                  dst.pipe == "MTE1" && src.path_end == reader &&
-                  MinCompletionDistance(closure->second, point.edge.dst,
-                                        point.edge.src) == 0;
-    }
-    int domain = domains_.DomainForStorage(info.storage, owner);
-    auto site = [&](TaskNode *task, bool beginning) {
-      return site_registry_.FindSiteId(
-          SyncInsertionSiteKey{task, task, beginning, kCoreCube, domain});
-    };
-    return ready && released &&
-           MinCompletionDistance(closure->second, site(writer, false),
-                                 site(reader, true)) == 0 &&
-           MinCompletionDistance(closure->second, site(reader, false),
-                                 site(writer, true)) <= info.num_versions;
+    return HasRetainedMemoryRing(info, reader, writer, true);
   }
 
   // Discharge a storage WAR, not a whole-loop completion relation. With a
@@ -2889,18 +2762,13 @@ private:
   // Consequently delta >= W, and the retained child release protects each
   // actual overwritten slot, including an odd T. Its last read need not
   // complete before the next parent's first write (those slots may differ).
-  bool IsParentVersionedWarCovered(const DepInfo &dep,
-                                   const MultiBufferInfo &info,
-                                   TaskNode *reader, TaskNode *writer,
-                                   ControlNode *parent) const {
+  bool ProveLexicalMemoryCycle(const MultiBufferInfo &info,
+                               TaskNode *reader, TaskNode *writer,
+                               ControlNode *parent) const {
     const bool operand =
         reader->GetPipeMask() == PipeMask(ResourcePipe::kCube) &&
         writer->GetPipeMask() == PipeMask(ResourcePipe::kMTE1);
-    if (architecture_ != AscendArchitecture::kDav2201 || !parent ||
-        dep.kind != DependencyKind::kData || dep.distance != -1 ||
-        dep.cross_storage_conflict || info.UsesCounter() ||
-        info.num_versions <= 1 || info.owners.size() != 1 ||
-        reader->GetCoreMask() != kCoreCube ||
+    if (info.num_versions <= 1 || reader->GetCoreMask() != kCoreCube ||
         writer->GetCoreMask() != kCoreCube ||
         (!operand &&
          (reader->GetPipeMask() != PipeMask(ResourcePipe::kMTE1) ||
@@ -2930,13 +2798,8 @@ private:
           node->extent, owner_result_detail::TaskBindings(loop->task.get()));
       return loop->task->outer_ctx.CanProve(count >= make_zero(count.dtype()));
     };
-    if (child == parent || !child->IsWithin(parent) ||
-        reader->GetParent() != child || writer->GetParent() != child ||
-        !finite_loop(parent, operand, operand) ||
+    if (!finite_loop(parent, operand, operand) ||
         !reader->GetGuards().empty() || !writer->GetGuards().empty())
-      return false;
-    IRStructure *projection = child->GetChildOnPathFrom(parent);
-    if (dep.prod_node != projection || dep.cons_node != projection)
       return false;
     if (!operand && child->GetParentControl() != parent)
       return false;
@@ -2965,91 +2828,161 @@ private:
     if (!ClosedFullMemoryAccesses(parent, info, reader, writer, operand))
       return false;
 
-    PrimExpr clock = MultiBufferIteration(info);
-    auto full_ring_point = [&](const SyncPoint &point, bool release) {
-      const auto &src = site_registry_.Src(point);
-      const auto &dst = site_registry_.Dst(point);
-      return point.flag_loop == child &&
-             point.dependency_kind == DependencyKind::kData &&
-             point.edge.strict && point.counter_group_id == 0 &&
-             !point.local_binary_plan && !point.single_iteration_binary_plan &&
-             point.unit_boundary == UnitFlagBoundaryRole::kNone &&
-             point.num_versions == info.num_versions &&
-             point.edge.distance == (release ? info.num_versions : 0) &&
-             ffi::StructuralEqual()(point.flag_iteration, clock) &&
-             (release ? src.path_end == reader : dst.path_end == reader) &&
-             ((release ? dst.path_end : src.path_end) == writer ||
-              (operand && (release ? dst.path_end : src.path_end)->IsTask() &&
-               (release ? dst.path_end : src.path_end)->GetParent() == child)) &&
-             src.path_begin == src.path_end && dst.path_begin == dst.path_end &&
-             src.core == kCoreCube && dst.core == kCoreCube &&
-             src.pipe == (release ? (operand ? "M" : "MTE1")
-                                 : (operand ? "MTE1" : "MTE2")) &&
-             dst.pipe == (release ? (operand ? "MTE1" : "MTE2")
-                                 : (operand ? "M" : "MTE1")) &&
-             is_one(src.GetGuard()) && is_one(dst.GetGuard()) &&
-             !site_registry_.Domain(src).IsCounter() &&
-             !site_registry_.Domain(dst).IsCounter() &&
-             is_one(site_registry_.Domain(src).active_guard) &&
-             is_one(site_registry_.Domain(dst).active_guard);
-    };
-    auto closure = scope_closures_.find(child);
+    return HasRetainedMemoryRing(info, reader, writer, operand);
+  }
+
+  // Match the two directions of one retained ready/release ring. Both clock
+  // kinds use the same endpoint, width and completion checks; their epoch
+  // admission remains distinct. A ring never creates a parent completion edge.
+  bool HasRetainedMemoryRing(const MultiBufferInfo &info, TaskNode *reader,
+                             TaskNode *writer, bool operand) const {
+    ControlNode *owner = info.owners.front().loop;
+    auto closure = scope_closures_.find(owner);
     if (closure == scope_closures_.end())
       return false;
+    PrimExpr clock = MultiBufferIteration(info);
+    const char *write_pipe = operand ? "MTE1" : "MTE2";
+    const char *read_pipe = operand ? "M" : "MTE1";
     bool ready = false, released = false;
-    // These points were appended only after child optimization and ordinary
-    // binary validation. Both real protocols (including root seed/drain)
-    // remain emitted; no parent completion edge is manufactured here.
     for (const SyncPoint &point : sync_points_) {
-      ready |= full_ring_point(point, false);
-      if (full_ring_point(point, true) &&
-          MinCompletionDistance(closure->second, point.edge.dst,
-                                point.edge.src) == 0)
-        released = true;
+      const auto &src = site_registry_.Src(point);
+      const auto &dst = site_registry_.Dst(point);
+      if (point.flag_loop != owner ||
+          point.dependency_kind != DependencyKind::kData || !point.edge.strict ||
+          point.num_versions != info.num_versions || point.LocalBinaryPlan() ||
+          point.HasParentLifetime() ||
+          point.unit_boundary != UnitFlagBoundaryRole::kNone ||
+          !ffi::StructuralEqual()(point.flag_iteration, clock) ||
+          src.core != kCoreCube || dst.core != kCoreCube ||
+          src.path_begin != src.path_end || dst.path_begin != dst.path_end)
+        continue;
+      bool release = point.edge.distance == info.num_versions;
+      if (!release && point.edge.distance != 0)
+        continue;
+      const auto &read = release ? src : dst;
+      const auto &write = release ? dst : src;
+      if (read.path_end != reader || read.pipe != read_pipe ||
+          write.pipe != write_pipe)
+        continue;
+      if (info.UsesCounter()) {
+        const auto &domain = site_registry_.Domain(src);
+        if (!point.counter_channel ||
+            point.counter_group_id != info.counter_group_id ||
+            !point.proof.HasOriginalEndpoints() ||
+            src.EpochDomainId() != dst.EpochDomainId() || !domain.IsCounter() ||
+            domain.owner != owner || !domain.counter.same_as(info.counter))
+          continue;
+        // Merged operand loads must share writer/MAD/tick activation and stage.
+        auto same_activation = [&](const SyncInsertionSite &site) {
+          if (!site.path_end->IsTask() || site.path_end->GetParent() != owner)
+            return false;
+          const auto *task = static_cast<const TaskNode *>(site.path_end);
+          return !task->IsPerCoreTask() &&
+                 task->GetStage() == reader->GetStage() &&
+                 HasCounterOperandActivation(task, owner,
+                                             info.owners.front().active_guard) &&
+                 CounterOperandGuardsEquivalent(
+                     site_registry_.Domain(site).active_guard && site.GetGuard(),
+                     info.owners.front().active_guard, task, owner);
+        };
+        if (!same_activation(src) || !same_activation(dst))
+          continue;
+      } else {
+        if (point.counter_group_id != 0 ||
+            !(write.path_end == writer ||
+              (operand && write.path_end->IsTask() &&
+               write.path_end->GetParent() == owner)))
+          continue;
+        auto unconditional = [&](const SyncInsertionSite &site) {
+          const auto &domain = site_registry_.Domain(site);
+          return is_one(site.GetGuard()) && !domain.IsCounter() &&
+                 is_one(domain.active_guard);
+        };
+        if (!unconditional(src) || !unconditional(dst))
+          continue;
+      }
+      if (release)
+        released |= MinCompletionDistance(closure->second, point.edge.dst,
+                                          point.edge.src) == 0;
+      else
+        ready = true;
     }
     if (!ready || !released)
       return false;
     if (!operand)
       return true;
-    // Child optimization may put one ready after the last operand load and
-    // one release wait before the first. Consume the existing complete paths
-    // for this exact Buffer's writer; MTE1 issue order alone is insufficient.
-    // The strict segment must still come from the retained real hard events.
-    int domain = domains_.DomainForStorage(info.storage, child);
+    // Merged loads can move event endpoints. Require actual completion paths
+    // for this writer, not merely issue order on MTE1.
+    int domain = domains_.DomainForStorage(info.storage, owner);
     auto site = [&](TaskNode *task, bool beginning) {
       return site_registry_.FindSiteId(
           SyncInsertionSiteKey{task, task, beginning, kCoreCube, domain});
     };
     return MinCompletionDistance(closure->second, site(writer, false),
-                                  site(reader, true)) == 0 &&
+                                 site(reader, true)) == 0 &&
            MinCompletionDistance(closure->second, site(reader, false),
-                                  site(writer, true)) <= info.num_versions;
+                                 site(writer, true)) <= info.num_versions;
   }
 
-  // A repeated full operand load also has a parent WAW. Its exact slot's
-  // previous load completes before MAD can read it, and MAD's real release
-  // completes before the next overwrite. Reuse that same closed RAW+WAR
-  // certificate instead of issuing a wider MTE1 barrier. Merely finding the
-  // same writer in a descendant, or same-pipe issue order, proves nothing.
-  bool IsParentOperandWriteCovered(const DepInfo &dep,
-                                   const MultiBufferInfo &info,
-                                   TaskNode *producer, TaskNode *consumer,
-                                   ControlNode *parent) const {
-    if (producer != consumer ||
-        producer->GetPipeMask() != PipeMask(ResourcePipe::kMTE1) ||
-        !producer->WritesStorage(info.storage) || info.owners.size() != 1)
-      return false;
-    ControlNode *child = info.owners.front().loop;
-    TaskNode *reader = nullptr;
-    for (const auto &node : child->children) {
-      if (!node->IsTask() || !node->ReadsStorage(info.storage))
-        continue;
-      if (reader)
-        return false;
-      reader = static_cast<TaskNode *>(node.get());
+  // One certificate describes a closed storage cycle, not a parent
+  // completion edge. Match its obligations without re-proving the cycle for
+  // each RAW/WAR/WAW pair. Counter cycles kill the incoming value; lexical
+  // cycles retain the narrower WAR (and operand WAW) coverage contract.
+  struct ParentMemoryCycle {
+    TaskNode *reader;
+    TaskNode *writer;
+    bool counter;
+
+    bool Covers(TaskNode *producer, TaskNode *consumer) const {
+      return (producer == reader && consumer == writer) ||
+             (producer == writer && consumer == writer &&
+              writer->UsesOnlyPipe(ResourcePipe::kMTE1)) ||
+             (counter && producer == writer && consumer == reader);
     }
-    return reader && reader->GetPipeMask() == PipeMask(ResourcePipe::kCube) &&
-           IsParentVersionedWarCovered(dep, info, reader, producer, parent);
+  };
+
+  std::optional<ParentMemoryCycle>
+  ProveParentMemoryCycle(const MultiBufferInfo &info,
+                        ControlNode *parent) const {
+    TaskNode *reader = nullptr, *writer = nullptr;
+    for (const auto &child : info.owners.front().loop->children) {
+      bool writes = child->WritesStorage(info.storage);
+      bool reads = child->ReadsStorage(info.storage);
+      if (!writes && !reads)
+        continue;
+      if (!child->IsTask() || (writes && reads) || (writes && writer) ||
+          (reads && reader))
+        return std::nullopt;
+      (writes ? writer : reader) = static_cast<TaskNode *>(child.get());
+    }
+    if (!reader || !writer)
+      return std::nullopt;
+    bool counter = info.UsesCounter();
+    bool proven = counter ? ProveCounterMemoryCycle(info, reader, writer, parent)
+                          : ProveLexicalMemoryCycle(info, reader, writer, parent);
+    if (!proven)
+      return std::nullopt;
+    return ParentMemoryCycle{reader, writer, counter};
+  }
+
+  bool IsParentMemoryCovered(const DepInfo &dep, const MultiBufferInfo &info,
+                             TaskNode *producer, TaskNode *consumer,
+                             ControlNode *parent) {
+    if (architecture_ != AscendArchitecture::kDav2201 || !parent ||
+        dep.kind != DependencyKind::kData || dep.distance != -1 ||
+        dep.cross_storage_conflict || info.num_versions < 1 ||
+        info.owners.size() != 1)
+      return false;
+    ControlNode *owner = info.owners.front().loop;
+    if (owner == parent || !owner->IsWithin(parent) ||
+        dep.prod_node != owner->GetChildOnPathFrom(parent) ||
+        dep.cons_node != dep.prod_node)
+      return false;
+    auto key = std::make_pair(parent, &info);
+    auto [it, inserted] = parent_memory_cycles_.try_emplace(key);
+    if (inserted)
+      it->second = ProveParentMemoryCycle(info, parent);
+    return it->second && it->second->Covers(producer, consumer);
   }
 
   std::vector<SyncPoint>
@@ -3201,10 +3134,7 @@ private:
         if (pool_member && !pool_local_release)
           continue;
         if (info != nullptr) {
-          if (IsParentCounterOperandCovered(dep, *info, producer, consumer,
-                                            loop) ||
-              IsParentVersionedWarCovered(dep, *info, producer, consumer, loop) ||
-              IsParentOperandWriteCovered(dep, *info, producer, consumer, loop))
+          if (IsParentMemoryCovered(dep, *info, producer, consumer, loop))
             continue;
         }
         // A forced conflict between distinct storages requests ordering in
@@ -3243,36 +3173,12 @@ private:
                HasUnitFlagCtrl(consumer->stmt))));
         for (CoreMask producer_core : expand_cores(producer->GetCoreMask())) {
           for (CoreMask consumer_core : expand_cores(consumer->GetCoreMask())) {
-            if (owner_results_ && dep.kind == DependencyKind::kData &&
-                dep.storage.has_value() && producer_core == kCoreCube &&
-                consumer_core == kCoreVector &&
-                std::any_of(
-                    owner_results_->begin(), owner_results_->end(),
-                    [&](const ValidatedOwnerTransfer &plan) {
-                      return plan.storage.same_as(dep.storage.value()) &&
-                             plan.producer == producer &&
-                             plan.consumer == consumer && plan.epoch == loop &&
-                             plan.distance == distance;
-                    })) {
-              // A qualified RAW is materialized as a per-owner result. Keep
-              // it out of the all-participant closure: it cannot discharge an
-              // unrelated GM hazard or prove a collective allocation lifetime.
-              continue;
-            }
-            if (owner_inputs_ && dep.kind == DependencyKind::kData &&
-                dep.storage.has_value() && producer_core == kCoreVector &&
-                consumer_core == kCoreCube &&
-                std::any_of(
-                    owner_inputs_->begin(), owner_inputs_->end(),
-                    [&](const ValidatedOwnerTransfer &plan) {
-                      return plan.storage.same_as(dep.storage.value()) &&
-                             plan.producer == producer &&
-                             plan.consumer == consumer && plan.epoch == loop &&
-                             plan.distance == distance;
-                    })) {
-              // Only this exact per-owner RAW receives staggered collective
-              // readiness. It contributes no all-participant completion edge;
-              // ordinary WAR/reuse and unrelated buffer proofs stay intact.
+            if (dep.kind == DependencyKind::kData && dep.storage.has_value() &&
+                owner_raw_coverage_.count(
+                    {dep.storage.value().get(), producer, consumer, loop,
+                     distance, producer_core, consumer_core})) {
+              // Coverage discharges only this storage RAW. It is not an
+              // all-participant completion edge or a collective lifetime proof.
               continue;
             }
             if (producer_core == kCoreCube && consumer_core == kCoreCube &&
@@ -3516,7 +3422,7 @@ private:
     auto persistent = [&](const SyncPoint &point) {
       return point.edge.strict && point.edge.distance == 1 &&
              point.num_versions == 1 && point.counter_group_id == 0 &&
-             !point.local_binary_plan.has_value() &&
+             !point.LocalBinaryPlan() &&
              point.unit_boundary == UnitFlagBoundaryRole::kNone &&
              !site_registry_.IsCrossCore(point) &&
              site_registry_.UsesFlag(point);
@@ -3804,26 +3710,12 @@ private:
   }
 
   bool IsCanonicalCounterAdvanceBody(Stmt body, const Buffer &counter) const {
-    while (const auto *wrapper = body.as<AttrStmtNode>()) {
-      if (wrapper->attr_key != attr::kAscendTask)
-        return false;
-      body = wrapper->body;
-    }
-    const auto *store = body.as<BufferStoreNode>();
-    if (!store || !store->buffer.same_as(counter) ||
-        store->indices.size() != 1 || !is_zero(store->indices[0]) ||
-        store->predicate.has_value())
+    const auto *store = MatchTaskBody<BufferStoreNode>(body);
+    if (!IsCounterElement(store, counter))
       return false;
     const auto *add = store->value.as<AddNode>();
     const auto *load = add ? add->a.as<BufferLoadNode>() : nullptr;
-    return load && load->buffer.same_as(counter) && load->indices.size() == 1 &&
-           is_zero(load->indices[0]) && !load->predicate.has_value() &&
-           is_one(add->b);
-  }
-
-  bool IsCanonicalCounterAdvance(const TaskNode *task,
-                                 const Buffer &counter) const {
-    return IsCanonicalCounterAdvanceBody(task->stmt, counter);
+    return IsCounterElement(load, counter) && is_one(add->b);
   }
 
   void CompleteCounterBinaryPoints(std::vector<SyncPoint> &sync_points,
@@ -3864,9 +3756,7 @@ private:
       if (!flat(src) || !flat(dst))
         continue;
       const auto *clock = point.flag_iteration.as<BufferLoadNode>();
-      if (!clock || !clock->buffer.same_as(domain.counter) ||
-          clock->indices.size() != 1 || !is_zero(clock->indices[0]) ||
-          clock->predicate.has_value())
+      if (!IsCounterElement(clock, domain.counter))
         continue;
 
       TaskNode *advance = nullptr;
@@ -3885,7 +3775,7 @@ private:
           advance->GetStage() != 0 ||
           advance->GetIndex() <= dst.path_begin->GetIndex() ||
           !context.CanProve(advance->GetConditionGuard()) ||
-          !IsCanonicalCounterAdvance(advance, domain.counter))
+          !IsCanonicalCounterAdvanceBody(advance->stmt, domain.counter))
         continue;
 
       // Protect every reader in this exact counter group, not just an early
@@ -3986,7 +3876,7 @@ private:
                                            ControlNode *loop,
                                            PrimExpr *activation) const {
     if (!loop || point.flag_loop != loop || point.edge.distance != 0 ||
-        point.counter_group_id != 0 || point.local_binary_plan ||
+        point.counter_group_id != 0 || point.LocalBinaryPlan() ||
         point.unit_boundary != UnitFlagBoundaryRole::kNone)
       return nullptr;
     ControlNode *parent = loop->GetParentControl();
@@ -4048,9 +3938,8 @@ private:
     for (const auto &points : child_points) {
       for (const VisibleSyncPoint &visible : points) {
         SyncPoint &point = sync_points_[visible.sync_point_id];
-        if (!point.single_iteration_binary_plan ||
-            point.single_iteration_binary_plan->parent != parent ||
-            point.single_iteration_binary_plan->validated)
+        if (!point.PendingParentLifetime() ||
+            point.PendingParentLifetime()->parent != parent)
           continue;
         int reverse = std::numeric_limits<int>::max();
         for (const DepEdge &edge : visible.projected_edges) {
@@ -4079,7 +3968,7 @@ private:
               owner_result_detail::Expand(
                   site_registry_.Domain(dst).active_guard && dst.GetGuard(),
                   owner_result_detail::TaskBindings(consumer));
-          if (!GuardImplies(point.single_iteration_binary_plan->activation,
+          if (!GuardImplies(point.PendingParentLifetime()->activation,
                             parent_guard,
                             point.flag_loop->GetLoopBodyContext()))
             continue;
@@ -4112,289 +4001,278 @@ private:
         // remains sufficient when matched activations skip notifications.
         // Storage width or a single child trip cannot replace this proof.
         point.num_versions = reverse;
-        point.single_iteration_binary_plan->validated = true;
+        point.binary_lifetime = ParentBoundBinaryLifetime{};
       }
     }
   }
 
-  void OptimizeFlagVersions(std::vector<SyncPoint> &sync_points,
-                            const DepClosure &closure, ControlNode *loop) {
-    for (SyncPoint &sync_point : sync_points) {
-      if (!sync_point.proof.HasOriginalEndpoints())
-        continue; // Preserve the original paired clock, seeds and drains.
-      const SyncInsertionSite &src = site_registry_.Src(sync_point);
-      const SyncInsertionSite &dst = site_registry_.Dst(sync_point);
-      if (src.pipe == dst.pipe)
-        continue;
-      bool is_innermost = loop == sync_point.flag_loop;
-      int innermost_num_versions = is_innermost ? sync_point.num_versions : 1;
-      bool local_binary = architecture_ == AscendArchitecture::kDav2201 &&
-                          !site_registry_.IsCrossCore(sync_point);
-      if (sync_point.unit_boundary == UnitFlagBoundaryRole::kDrain) {
-        ICHECK(local_binary && src.pipe == "FIX" && dst.pipe == "M" &&
-               sync_point.edge.distance == 0 && sync_point.num_versions == 1 &&
-               sync_point.counter_group_id == 0 && is_innermost);
-        // This is a flag-bit lifetime proof, not a C completion edge. The
-        // drain's M wait clears FIX_M before the following M_S notification;
-        // its PIPE_S wait blocks dispatch before the next activation can
-        // issue another FIX_M notification. The complete boundary bracket
-        // is constructed together and retained above. Give this point its
-        // own ID; never use unit protection to manufacture a reverse whole-
-        // MAD/FIX completion relation in DepClosure.
-        continue;
-      }
-      int min_distance =
-          local_binary
-              ? MinCompletionDistance(closure, sync_point.edge.dst,
-                                      sync_point.edge.src)
-              : closure.MinDistance(sync_point.edge.dst, sync_point.edge.src);
-      auto binary_context = [&]() {
-        std::ostringstream detail;
-        detail << " [pipe=" << src.pipe << "->" << dst.pipe
-               << ", distance=" << sync_point.edge.distance
-               << ", reverse_completion="
-               << (min_distance == std::numeric_limits<int>::max()
-                       ? "unproved"
-                       : std::to_string(min_distance))
-               << ", width=" << sync_point.num_versions << ", analysis_loop="
-               << (loop ? loop->control->loop_var->name_hint : String("<none>"))
-               << ", flag_loop="
-               << (sync_point.flag_loop
-                       ? sync_point.flag_loop->control->loop_var->name_hint
-                       : String("<none>"))
-               << ", clock=" << sync_point.flag_iteration
-               << ", counter_group=" << sync_point.counter_group_id
-               << ", source=" << src.path_begin->GetIndex() << ":"
-               << src.path_end->GetIndex()
-               << ", destination=" << dst.path_begin->GetIndex() << ":"
-               << dst.path_end->GetIndex()
-               << ", source_guard=" << src.GetGuard()
-               << ", destination_guard=" << dst.GetGuard()
-               << ", source_domain=" << src.EpochDomainId() << ":"
-               << site_registry_.Domain(src).active_guard
-               << ", destination_domain=" << dst.EpochDomainId() << ":"
-               << site_registry_.Domain(dst).active_guard << "]";
-        return detail.str();
-      };
+  // Plan one event without mutating the obligation or retry state. A caller
+  // publishes the complete result, defers its parent obligation, or retries.
+  std::variant<SyncPoint, FlagLifetimeFailure>
+  PlanFlagLifetime(SyncPoint sync_point, const DepClosure &closure,
+                   ControlNode *loop) const {
+    if (!sync_point.proof.HasOriginalEndpoints())
+      return sync_point; // Preserve the original paired clock, seeds and drains.
+    const SyncInsertionSite &src = site_registry_.Src(sync_point);
+    const SyncInsertionSite &dst = site_registry_.Dst(sync_point);
+    if (src.pipe == dst.pipe)
+      return sync_point;
+    bool is_innermost = loop == sync_point.flag_loop;
+    int innermost_num_versions = is_innermost ? sync_point.num_versions : 1;
+    bool local_binary = architecture_ == AscendArchitecture::kDav2201 &&
+                        !site_registry_.IsCrossCore(sync_point);
+    if (sync_point.unit_boundary == UnitFlagBoundaryRole::kDrain) {
+      ICHECK(local_binary && src.pipe == "FIX" && dst.pipe == "M" &&
+             sync_point.edge.distance == 0 && sync_point.num_versions == 1 &&
+             sync_point.counter_group_id == 0 && is_innermost);
+      // This is a flag-bit lifetime proof, not a C completion edge. The
+      // drain's M wait clears FIX_M before the following M_S notification;
+      // its PIPE_S wait blocks dispatch before the next activation can
+      // issue another FIX_M notification. The complete boundary bracket
+      // is constructed together and retained above. Give this point its
+      // own ID; never use unit protection to manufacture a reverse whole-
+      // MAD/FIX completion relation in DepClosure.
+      return sync_point;
+    }
+    int min_distance =
+        local_binary
+            ? MinCompletionDistance(closure, sync_point.edge.dst,
+                                    sync_point.edge.src)
+            : closure.MinDistance(sync_point.edge.dst, sync_point.edge.src);
+    auto binary_context = [&]() {
+      std::ostringstream detail;
+      detail << " [pipe=" << src.pipe << "->" << dst.pipe
+             << ", distance=" << sync_point.edge.distance
+             << ", reverse_completion="
+             << (min_distance == std::numeric_limits<int>::max()
+                     ? "unproved"
+                     : std::to_string(min_distance))
+             << ", width=" << sync_point.num_versions << ", analysis_loop="
+             << (loop ? loop->control->loop_var->name_hint : String("<none>"))
+             << ", flag_loop="
+             << (sync_point.flag_loop
+                     ? sync_point.flag_loop->control->loop_var->name_hint
+                     : String("<none>"))
+             << ", clock=" << sync_point.flag_iteration
+             << ", counter_group=" << sync_point.counter_group_id
+             << ", source=" << src.path_begin->GetIndex() << ":"
+             << src.path_end->GetIndex()
+             << ", destination=" << dst.path_begin->GetIndex() << ":"
+             << dst.path_end->GetIndex()
+             << ", source_guard=" << src.GetGuard()
+             << ", destination_guard=" << dst.GetGuard()
+             << ", source_domain=" << src.EpochDomainId() << ":"
+             << site_registry_.Domain(src).active_guard
+             << ", destination_domain=" << dst.EpochDomainId() << ":"
+             << site_registry_.Domain(dst).active_guard << "]";
+      return detail.str();
+    };
 
-      if (local_binary && min_distance == std::numeric_limits<int>::max()) {
-        PrimExpr activation;
-        if (ControlNode *parent =
-                SingleIterationBinaryParent(sync_point, loop, &activation)) {
-          sync_point.single_iteration_binary_plan =
-              SingleIterationBinaryPlan{parent, std::move(activation)};
-          continue;
-        }
+    auto require_binary = [&](bool valid, const char *reason) {
+      if (valid)
+        return true;
+      if (HasPrivateGmHandoffs()) {
+        // A private cut can remove an unrelated flag's old wide witness.
+        // Retry ordinary GM release without weakening the proof.
+        return false;
       }
+      LOG(FATAL) << "dav-2201 local binary flag: " << reason
+                 << binary_context();
+      return false;
+    };
 
-      if (local_binary && min_distance == std::numeric_limits<int>::max() &&
-          ((owner_results_ && !owner_results_->empty()) ||
-           (owner_inputs_ && !owner_inputs_->empty()))) {
-        // The old pair-ready may have supplied this unrelated ring's only
-        // reverse-completion witness. Do not use an owner edge as its proof
-        // or weaken binary validation; retry the normal collective analysis.
-        owner_fallback_required_ = true;
-        return;
+    if (local_binary && min_distance == std::numeric_limits<int>::max()) {
+      PrimExpr activation;
+      if (ControlNode *parent =
+              SingleIterationBinaryParent(sync_point, loop, &activation)) {
+        sync_point.binary_lifetime =
+            SingleIterationBinaryPlan{parent, std::move(activation)};
+        return sync_point;
       }
-      if (local_binary && min_distance == std::numeric_limits<int>::max() &&
-          unit_streams_ && !unit_streams_->empty()) {
-        // Unit protection cannot supply an unrelated flag's reverse whole-
-        // completion witness. Retry the untouched ordinary program instead
-        // of relaxing that phase contract or keeping half of the selection.
-        LOG(WARNING) << "Unit stream fallback due to unrelated local flag "
-                        "missing reverse completion"
-                     << binary_context();
-        unit_fallback_required_ = true;
-        return;
+    }
+
+    if (local_binary && min_distance == std::numeric_limits<int>::max() &&
+        ((owner_results_ && !owner_results_->empty()) ||
+         (owner_inputs_ && !owner_inputs_->empty()))) {
+      // The old pair-ready may have supplied this unrelated ring's only
+      // reverse-completion witness. Do not use an owner edge as its proof
+      // or weaken binary validation; retry the normal collective analysis.
+      return FlagLifetimeFailure::kOwnerProtocol;
+    }
+    if (local_binary && min_distance == std::numeric_limits<int>::max() &&
+        unit_streams_ && !unit_streams_->empty()) {
+      // Unit protection cannot supply an unrelated flag's reverse whole-
+      // completion witness. Retry the untouched ordinary program instead
+      // of relaxing that phase contract or keeping half of the selection.
+      LOG(WARNING) << "Unit stream fallback due to unrelated local flag "
+                      "missing reverse completion"
+                   << binary_context();
+      return FlagLifetimeFailure::kUnitStream;
+    }
+
+    if (local_binary && sync_point.edge.distance > 0) {
+      // Weak MTE/FIX issue edges alone do not establish that a previous
+      // WaitFlag has cleared the bit before its next SetFlag completes.
+      int reverse_completion = min_distance;
+      int distance = sync_point.edge.distance;
+      // Preserve the existing persistent protocol when every ring slot is
+      // an initial token and the consumer completes before the next set.
+      if (reverse_completion == 0 && distance == innermost_num_versions)
+        return sync_point;
+
+      // A shifted lexical phase has one root clock, with at most one
+      // contiguous active interval. Re-seeding an inner loop at each entry
+      // is unsafe: a local drain only blocks its destination pipe, not the
+      // next source seed.
+      bool shifted_scope =
+          is_innermost && sync_point.counter_group_id == 0 &&
+          loop != nullptr && loop->GetParentControl() == nullptr &&
+          !loop->HasConditions() && !loop->BodyHasLoopBreak();
+      if (!require_binary(shifted_scope,
+                          "shifted carried events require an unconditional "
+                          "outermost lexical loop"))
+        return FlagLifetimeFailure::kOwnerProtocol;
+      auto clock = AnalyzeLexicalEventClock(loop);
+      if (!require_binary(clock.has_value(),
+                          "loop bounds must be immutable and step must be "
+                          "positive"))
+        return FlagLifetimeFailure::kOwnerProtocol;
+      PrimExpr trip_count = clock->trip_count;
+      bool signed_clock = sync_point.flag_iteration.dtype().is_int() &&
+                          trip_count.dtype().is_int();
+      if (!require_binary(signed_clock,
+                          "shifted epoch clocks require signed integer "
+                          "iteration and trip-count types"))
+        return FlagLifetimeFailure::kOwnerProtocol;
+      PrimExpr lexical_ordinal = clock->ordinal;
+      if (!require_binary(loop->GetLoopBodyContext().CanProve(
+                              sync_point.flag_iteration == lexical_ordinal),
+                          "shifted epoch clock must equal the root lexical "
+                          "iteration ordinal"))
+        return FlagLifetimeFailure::kOwnerProtocol;
+      std::optional<LocalBinaryEpochSpan> active_span =
+          LocalBinaryActiveSpan(sync_point, loop, trip_count, clock->step);
+      if (!require_binary(active_span.has_value(),
+                          "shifted carried events require one exact "
+                          "contiguous active-epoch interval with "
+                          "loop-invariant cut points"))
+        return FlagLifetimeFailure::kOwnerProtocol;
+      sync_point.flag_iteration = lexical_ordinal - active_span->first;
+      trip_count = active_span->trip_count;
+      if (reverse_completion == std::numeric_limits<int>::max()) {
+        std::optional<int> finite_width =
+            FiniteLocalBinaryWidth(loop, trip_count, distance);
+        if (!require_binary(finite_width.has_value(),
+                            "no reverse completion path; the whole lexical "
+                            "clock also exceeds the finite non-reusing "
+                            "event capacity"))
+          return FlagLifetimeFailure::kOwnerProtocol;
+        sync_point.num_versions = *finite_width;
+      } else {
+        if (!require_binary(reverse_completion <=
+                                std::numeric_limits<int>::max() - distance,
+                            "event ring width exceeds integer range"))
+          return FlagLifetimeFailure::kOwnerProtocol;
+        sync_point.num_versions = distance + reverse_completion;
+        if (scalar_admission_.HasShiftedScalarWaitWidth(sync_point, loop))
+          sync_point.num_versions = 1;
       }
+      sync_point.binary_lifetime =
+          LocalBinaryFlagPlan{distance, trip_count};
+      return sync_point;
+    }
 
-      if (local_binary && sync_point.edge.distance > 0) {
-        // Weak MTE/FIX issue edges alone do not establish that a previous
-        // WaitFlag has cleared the bit before its next SetFlag completes.
-        int reverse_completion = min_distance;
-        int distance = sync_point.edge.distance;
-        // Preserve the existing persistent protocol when every ring slot is
-        // an initial token and the consumer completes before the next set.
-        if (reverse_completion == 0 && distance == innermost_num_versions)
-          continue;
-
-        // A shifted lexical phase has one root clock, with at most one
-        // contiguous active interval. Re-seeding an inner loop at each entry
-        // is unsafe: a local drain only blocks its destination pipe, not the
-        // next source seed.
-        bool shifted_scope =
-            is_innermost && sync_point.counter_group_id == 0 &&
-            loop != nullptr && loop->GetParentControl() == nullptr &&
-            !loop->HasConditions() && !loop->BodyHasLoopBreak();
-        if (GmHandoffNeedsFallback(shifted_scope))
-          return;
-        ICHECK(shifted_scope)
-            << "dav-2201 local binary flag: shifted carried events require "
-               "an unconditional outermost lexical loop"
-            << binary_context();
-        const ForNode *for_node = loop->control.get();
-        PrimExpr step = for_node->step.has_value()
-                            ? for_node->step.value()
-                            : IntImm(for_node->extent.dtype(), 1);
-        bool positive_step =
-            loop->task->outer_ctx.CanProve(step > make_zero(step.dtype()));
-        if (GmHandoffNeedsFallback(positive_step))
-          return;
-        ICHECK(positive_step)
-            << "dav-2201 local binary flag: loop step must be positive";
-        bool immutable_bounds =
-            SideEffect(for_node->min) == CallEffectKind::kPure &&
-            SideEffect(for_node->extent) == CallEffectKind::kPure &&
-            SideEffect(step) == CallEffectKind::kPure;
-        if (GmHandoffNeedsFallback(immutable_bounds))
-          return;
-        ICHECK(immutable_bounds)
-            << "dav-2201 local binary flag: loop bounds must be immutable";
-        PrimExpr trip_count = max(ceildiv(for_node->extent, step),
-                                  make_zero(for_node->extent.dtype()));
-        bool signed_clock = sync_point.flag_iteration.dtype().is_int() &&
-                            trip_count.dtype().is_int();
-        if (GmHandoffNeedsFallback(signed_clock))
-          return;
-        ICHECK(signed_clock)
-            << "dav-2201 local binary flag: shifted epoch clocks require "
-               "signed integer iteration and trip-count types";
-        PrimExpr lexical_ordinal =
-            indexdiv(for_node->loop_var - for_node->min, step);
-        bool lexical_clock = loop->GetLoopBodyContext().CanProve(
-            sync_point.flag_iteration == lexical_ordinal);
-        if (GmHandoffNeedsFallback(lexical_clock))
-          return;
-        ICHECK(lexical_clock)
-            << "dav-2201 local binary flag: shifted epoch clock must equal "
-               "the root lexical iteration ordinal"
-            << binary_context();
-        std::optional<LocalBinaryEpochSpan> active_span =
-            LocalBinaryActiveSpan(sync_point, loop, trip_count, step);
-        if (GmHandoffNeedsFallback(active_span.has_value()))
-          return;
-        ICHECK(active_span.has_value())
-            << "dav-2201 local binary flag: shifted carried events require "
-               "one exact contiguous active-epoch interval with "
-               "loop-invariant cut points"
-            << binary_context();
-        sync_point.flag_iteration = lexical_ordinal - active_span->first;
-        trip_count = active_span->trip_count;
-        if (reverse_completion == std::numeric_limits<int>::max()) {
-          std::optional<int> finite_width =
-              FiniteLocalBinaryWidth(loop, trip_count, distance);
-          if (GmHandoffNeedsFallback(finite_width.has_value()))
-            return;
-          ICHECK(finite_width.has_value())
-              << "dav-2201 local binary flag: no reverse completion path for "
-              << src.pipe << "->" << dst.pipe
-              << "; the whole lexical clock also exceeds the finite "
-                 "non-reusing event capacity";
-          sync_point.num_versions = *finite_width;
-        } else {
-          if (GmHandoffNeedsFallback(reverse_completion <=
-                                     std::numeric_limits<int>::max() -
-                                         distance))
-            return;
-          ICHECK_LE(reverse_completion,
-                    std::numeric_limits<int>::max() - distance);
-          sync_point.num_versions = distance + reverse_completion;
-          if (scalar_admission_.HasShiftedScalarWaitWidth(sync_point, loop))
-            sync_point.num_versions = 1;
-        }
-        sync_point.local_binary_plan =
-            LocalBinaryFlagPlan{distance, trip_count};
-        continue;
-      }
-
-      if (local_binary && sync_point.edge.distance == 0) {
-        // A finite root lexical clock can reserve one ID per producer epoch,
-        // without a reverse dependency. One inner trip-count bound does not
-        // establish this for a repeated outer owner or a mutable counter.
-        if (min_distance == std::numeric_limits<int>::max() && is_innermost &&
-            sync_point.counter_group_id == 0 && loop != nullptr &&
-            loop->GetParentControl() == nullptr) {
-          const ForNode *for_node = loop->control.get();
-          PrimExpr step = for_node->step.has_value()
-                              ? for_node->step.value()
-                              : IntImm(for_node->extent.dtype(), 1);
-          bool whole_clock =
-              SideEffect(for_node->min) == CallEffectKind::kPure &&
-              SideEffect(for_node->extent) == CallEffectKind::kPure &&
-              SideEffect(step) == CallEffectKind::kPure &&
-              loop->task->outer_ctx.CanProve(step > make_zero(step.dtype()));
-          if (whole_clock) {
-            PrimExpr trip_count = max(ceildiv(for_node->extent, step),
-                                      make_zero(for_node->extent.dtype()));
-            if (std::optional<int> width =
-                    FiniteLocalBinaryWidth(loop, trip_count, 0)) {
-              sync_point.num_versions = *width;
-              sync_point.local_binary_plan = LocalBinaryFlagPlan{0, trip_count};
-              continue;
-            }
+    if (local_binary && sync_point.edge.distance == 0) {
+      // A finite root lexical clock can reserve one ID per producer epoch,
+      // without a reverse dependency. One inner trip-count bound does not
+      // establish this for a repeated outer owner or a mutable counter.
+      if (min_distance == std::numeric_limits<int>::max() && is_innermost &&
+          sync_point.counter_group_id == 0 && loop != nullptr &&
+          loop->GetParentControl() == nullptr) {
+        if (auto clock = AnalyzeLexicalEventClock(loop)) {
+          if (auto width = FiniteLocalBinaryWidth(loop, clock->trip_count, 0)) {
+            sync_point.num_versions = *width;
+            sync_point.binary_lifetime =
+                LocalBinaryFlagPlan{0, clock->trip_count};
+            return sync_point;
           }
         }
-        ICHECK_NE(min_distance, std::numeric_limits<int>::max())
-            << "dav-2201 local binary flag: no reverse completion path for "
-            << src.pipe << "->" << dst.pipe << binary_context();
-        ICHECK_GT(min_distance, 0)
-            << "dav-2201 local binary flag: nonpositive reverse completion "
-               "distance for "
-            << src.pipe << "->" << dst.pipe;
-        if (is_innermost) {
-          sync_point.num_versions = min_distance;
-          if (scalar_admission_.HasScalarAdmissionLexicalClock(sync_point, loop) &&
-              sync_point.scalar_wait_phase)
-            sync_point.num_versions = 1;
-        } else {
-          // The owner clock does not advance within a descendant loop. Its
-          // repeated uses of one ID need completion before the next child
-          // iteration, irrespective of the owner's physical storage width.
-          if (GmHandoffNeedsFallback(min_distance <= 1))
-            return;
-          ICHECK_LE(min_distance, 1)
-              << "dav-2201 local binary flag: reverse completion is too loose "
-                 "for a descendant loop sharing its owner's clock";
-        }
-        continue;
       }
-
-      // If the loop trip count is no larger than the ring, no version is
-      // reused.
-      if (loop != nullptr) {
-        const ForNode *inner = loop->control.get();
-        PrimExpr step = inner->step.has_value()
-                            ? inner->step.value()
-                            : IntImm(inner->extent.dtype(), 1);
-        // Bound only this loop's trip count; outer context may help prove its
-        // symbolic extent without flattening any enclosing iterations.
-        if (loop->task->outer_ctx.CanProve(
-                inner->extent <=
-                IntImm(inner->extent.dtype(), innermost_num_versions) * step)) {
-          continue;
-        }
-      }
-      if (sync_point.edge.distance > 0) {
-        if (sync_point.edge.distance != innermost_num_versions ||
-            min_distance > 0) {
-          LOG(WARNING) << "cross-iteration flag " << src.pipe << "->"
-                       << dst.pipe
-                       << ": the synchronization ring is malformed.";
-        }
-        continue;
-      }
-      if (min_distance > innermost_num_versions) {
-        LOG(WARNING) << "flag " << src.pipe << "->" << dst.pipe
-                     << ": reverse ordering too loose to bound flag reuse.";
-        continue;
-      }
-      if (min_distance <= 0) {
-        LOG(WARNING) << "flag " << src.pipe << "->" << dst.pipe
-                     << ": dependency cycle (reverse distance <= 0).";
-        continue;
-      }
-      if (is_innermost)
+      ICHECK_NE(min_distance, std::numeric_limits<int>::max())
+          << "dav-2201 local binary flag: no reverse completion path for "
+          << src.pipe << "->" << dst.pipe << binary_context();
+      ICHECK_GT(min_distance, 0)
+          << "dav-2201 local binary flag: nonpositive reverse completion "
+             "distance for "
+          << src.pipe << "->" << dst.pipe;
+      if (is_innermost) {
         sync_point.num_versions = min_distance;
+        if (scalar_admission_.HasScalarAdmissionLexicalClock(sync_point, loop) &&
+            sync_point.scalar_wait_phase)
+          sync_point.num_versions = 1;
+      } else {
+        // The owner clock does not advance within a descendant loop. Its
+        // repeated uses of one ID need completion before the next child
+        // iteration, irrespective of the owner's physical storage width.
+        if (!require_binary(min_distance <= 1,
+                            "reverse completion is too loose for a "
+                            "descendant loop sharing its owner's clock"))
+          return FlagLifetimeFailure::kOwnerProtocol;
+      }
+      return sync_point;
+    }
+
+    // If the loop trip count is no larger than the ring, no version is
+    // reused.
+    if (loop != nullptr) {
+      const ForNode *inner = loop->control.get();
+      PrimExpr step = inner->step.has_value()
+                          ? inner->step.value()
+                          : IntImm(inner->extent.dtype(), 1);
+      // Bound only this loop's trip count; outer context may help prove its
+      // symbolic extent without flattening any enclosing iterations.
+      if (loop->task->outer_ctx.CanProve(
+              inner->extent <=
+              IntImm(inner->extent.dtype(), innermost_num_versions) * step)) {
+        return sync_point;
+      }
+    }
+    if (sync_point.edge.distance > 0) {
+      if (sync_point.edge.distance != innermost_num_versions ||
+          min_distance > 0) {
+        LOG(WARNING) << "cross-iteration flag " << src.pipe << "->"
+                     << dst.pipe
+                     << ": the synchronization ring is malformed.";
+      }
+      return sync_point;
+    }
+    if (min_distance > innermost_num_versions) {
+      LOG(WARNING) << "flag " << src.pipe << "->" << dst.pipe
+                   << ": reverse ordering too loose to bound flag reuse.";
+      return sync_point;
+    }
+    if (min_distance <= 0) {
+      LOG(WARNING) << "flag " << src.pipe << "->" << dst.pipe
+                   << ": dependency cycle (reverse distance <= 0).";
+      return sync_point;
+    }
+    if (is_innermost)
+      sync_point.num_versions = min_distance;
+    return sync_point;
+  }
+
+  void OptimizeFlagVersions(std::vector<SyncPoint> &points,
+                            const DepClosure &closure, ControlNode *loop) {
+    for (SyncPoint &point : points) {
+      auto decision = PlanFlagLifetime(point, closure, loop);
+      if (auto *plan = std::get_if<SyncPoint>(&decision)) {
+        point = std::move(*plan);
+      } else {
+        auto failure = std::get<FlagLifetimeFailure>(decision);
+        owner_fallback_required_ = failure == FlagLifetimeFailure::kOwnerProtocol;
+        unit_fallback_required_ = failure == FlagLifetimeFailure::kUnitStream;
+        return;
+      }
     }
   }
 
@@ -4406,6 +4284,10 @@ private:
   MultiBufferOwnerMap multi_buffer_owners_;
   ConflictHintList root_conflicts_;
   std::vector<IRStructure *> root_nodes_;
+  using OwnerRawKey =
+      std::tuple<const VarNode *, TaskNode *, TaskNode *, ControlNode *, int,
+                 CoreMask, CoreMask>;
+  std::set<OwnerRawKey> owner_raw_coverage_;
   const std::vector<ValidatedOwnerTransfer> *owner_results_;
   const std::vector<ValidatedOwnerTransfer> *owner_inputs_;
   const std::vector<UnitFlagStreamPlan> *unit_streams_;
@@ -4427,6 +4309,8 @@ private:
   std::map<ControlNode *, IterationOrder> lifetime_orders_;
   std::unordered_map<ControlNode *, std::map<CounterSyncSignature, int>>
       counter_channel_occurrences_;
+  std::map<std::pair<ControlNode *, const MultiBufferInfo *>,
+           std::optional<ParentMemoryCycle>> parent_memory_cycles_;
   BufferAliasMap buffer_aliases_;
   bool disable_buffer_reuse_{false};
   bool owner_fallback_required_{false};
@@ -4457,7 +4341,39 @@ struct CrossCoreFlagReservation {
   // from their enclosing loops.
   std::vector<std::pair<int64_t, int64_t>> explicit_id_ranges;
   bool has_unbounded_id{false};
+
+  std::array<bool, 16> OccupiedSlots() const {
+    std::array<bool, 16> slots{};
+    for (const auto &[lo, hi] : explicit_id_ranges) {
+      ICHECK_LE(lo, hi);
+      uint64_t span = static_cast<uint64_t>(hi) - static_cast<uint64_t>(lo);
+      if (span >= static_cast<uint64_t>(16 - 1)) {
+        slots.fill(true);
+        continue;
+      }
+      for (uint64_t offset = 0; offset <= span; ++offset) {
+        int64_t explicit_id = lo + static_cast<int64_t>(offset);
+        int normalized_id = static_cast<int>(explicit_id % 16);
+        if (normalized_id < 0)
+          normalized_id += 16;
+        slots[normalized_id] = true;
+      }
+    }
+    return slots;
+  }
 };
+
+// Ordinary flags allocate low IDs first; owner readiness reserves from the top.
+int FindFreeFlagRange(const std::array<bool, 16> &used, int width,
+                      bool from_high = false) {
+  for (int offset = 0; offset + width <= 16; ++offset) {
+    int base = from_high ? 16 - width - offset : offset;
+    if (std::none_of(used.begin() + base, used.begin() + base + width,
+                     [](bool occupied) { return occupied; }))
+      return base;
+  }
+  return -1;
+}
 
 struct FlagAllocation {
   std::vector<size_t> sync_points;
@@ -4547,7 +4463,7 @@ CollectExplicitCrossCoreFlags(const Stmt &kernel_body,
 class FlagAllocator {
 public:
   FlagAllocator(const SyncSiteRegistry &site_registry,
-                std::vector<SyncPoint> &sync_points,
+                const std::vector<SyncPoint> &sync_points,
                 const std::set<std::pair<size_t, size_t>> &reusable_pairs,
                 const CrossCoreFlagReservation &cross_core_flag_reservation,
                 const CrossCoreSyncContract &cross_core_contract,
@@ -4562,6 +4478,8 @@ public:
   bool Plan(bool allow_fallback = false,
             bool require_intra_core_capacity = false) {
     allocations_.clear();
+    allocation_indices_.assign(sync_points_.size(),
+                               std::numeric_limits<size_t>::max());
     flag_infos_.clear();
     GroupCounterChannels();
 
@@ -4599,36 +4517,10 @@ public:
 
     // All cross-core modes share 16 base slots. Only dav-3510 mode 4 has
     // separate Cube-side channels addressed by slot + 16 * AIV lane.
-    std::array<bool, kCrossCoreFlagLimit> cross_core_slots{};
-    for (const auto &[lo, hi] :
-         cross_core_flag_reservation_.explicit_id_ranges) {
-      ICHECK_LE(lo, hi);
-      uint64_t span = static_cast<uint64_t>(hi) - static_cast<uint64_t>(lo);
-      if (span >= static_cast<uint64_t>(kCrossCoreFlagLimit - 1)) {
-        cross_core_slots.fill(true);
-        continue;
-      }
-      for (uint64_t offset = 0; offset <= span; ++offset) {
-        int64_t explicit_id = lo + static_cast<int64_t>(offset);
-        int normalized_id = static_cast<int>(explicit_id % kCrossCoreFlagLimit);
-        if (normalized_id < 0)
-          normalized_id += kCrossCoreFlagLimit;
-        cross_core_slots[normalized_id] = true;
-      }
-    }
+    auto cross_core_slots = cross_core_flag_reservation_.OccupiedSlots();
 
     int explicit_cross_core_slots =
         std::count(cross_core_slots.begin(), cross_core_slots.end(), true);
-    auto find_cross_core_range = [&](int width) {
-      for (int base = 0; base + width <= kCrossCoreFlagLimit; ++base) {
-        bool available = true;
-        for (int offset = 0; offset < width; ++offset)
-          available &= !cross_core_slots[base + offset];
-        if (available)
-          return base;
-      }
-      return -1;
-    };
 
     for (bool cross_iter : {true, false}) {
       std::vector<size_t> candidates;
@@ -4645,16 +4537,16 @@ public:
                        });
 
       for (size_t index : candidates) {
-        SyncPoint &sync_point = sync_points_[index];
+        const SyncPoint &sync_point = sync_points_[index];
         if (sync_point.counter_channel.has_value()) {
           size_t representative = counter_channel_representative_[index];
           if (representative != index) {
             size_t allocation_index =
-                sync_points_[representative].allocation_index;
+                allocation_indices_[representative];
             ICHECK_LT(allocation_index, allocations_.size())
                 << "Counter channel representative was not allocated first";
             allocations_[allocation_index].sync_points.push_back(index);
-            sync_point.allocation_index = allocation_index;
+            allocation_indices_[index] = allocation_index;
             continue;
           }
         }
@@ -4663,7 +4555,7 @@ public:
         bool cross_core = site_registry_.IsCrossCore(sync_point);
         int limit = cross_core ? kCrossCoreFlagLimit : kIntraCoreFlagLimit;
         int cross_core_base =
-            cross_core ? find_cross_core_range(sync_point.num_versions) : -1;
+            cross_core ? FindFreeFlagRange(cross_core_slots, sync_point.num_versions) : -1;
         bool needs_reuse =
             cross_core ? required_ids[domain] + explicit_cross_core_slots >
                                  kCrossCoreFlagLimit ||
@@ -4700,7 +4592,7 @@ public:
               ICHECK_GE(allocation.num_versions, sync_point.num_versions);
               required_ids[domain] -= sync_point.num_versions;
               allocation.sync_points.push_back(index);
-              sync_point.allocation_index = allocation_index;
+              allocation_indices_[index] = allocation_index;
               break;
             }
           }
@@ -4708,7 +4600,7 @@ public:
         if (compatible)
           continue;
 
-        sync_point.allocation_index = allocations_.size();
+        allocation_indices_[index] = allocations_.size();
         int base_id = 0;
         if (cross_core) {
           if (cross_core_base < 0 && allow_fallback)
@@ -4738,31 +4630,6 @@ public:
       // TVM_LOG_DEBUG controls this diagnostic. Report the already allocated
       // protocols without performing any additional dependency/proof query.
       if (runtime::detail::VerboseLoggingEnabled(__FILE__, 1)) {
-        auto node_name = [](IRStructure *node) {
-          if (node == nullptr)
-            return std::string("<root>");
-          std::ostringstream name;
-          if (node->IsControl()) {
-            name << "loop:"
-                 << static_cast<ControlNode *>(node)->control->loop_var;
-          } else {
-            Stmt body = static_cast<TaskNode *>(node)->stmt;
-            while (const auto *attribute = body.as<AttrStmtNode>())
-              body = attribute->body;
-            const auto *evaluate = body.as<EvaluateNode>();
-            const auto *call =
-                evaluate ? evaluate->value.as<CallNode>() : nullptr;
-            name << "task:";
-            const auto *op = call ? call->op.as<OpNode>() : nullptr;
-            if (op)
-              name << op->name;
-            else
-              name << body->GetTypeKey();
-          }
-          name << "[index=" << node->GetIndex() << ",stage=" << node->GetStage()
-               << "]";
-          return name.str();
-        };
         for (size_t allocation_index = 0;
              allocation_index < allocations_.size(); ++allocation_index) {
           const FlagAllocation &allocation = allocations_[allocation_index];
@@ -4779,18 +4646,18 @@ public:
                       << "] point=" << point_index
                       << " versions=" << point.num_versions
                       << " distance=" << point.edge.distance
-                      << " flag_loop=" << node_name(point.flag_loop)
+                      << " flag_loop=" << LifetimeNodeName(point.flag_loop)
                       << " clock=" << point.flag_iteration
                       << " counter_group=" << point.counter_group_id
                       << " unit_boundary="
                       << static_cast<int>(point.unit_boundary)
-                      << " src=" << node_name(src.path_begin) << "/"
-                      << node_name(src.path_end) << " src_pipe=" << src.pipe
+                      << " src=" << LifetimeNodeName(src.path_begin) << "/"
+                      << LifetimeNodeName(src.path_end) << " src_pipe=" << src.pipe
                       << " src_domain=" << src.EpochDomainId()
                       << " src_guard=" << src.GetGuard() << " src_active="
                       << site_registry_.Domain(src).active_guard
-                      << " dst=" << node_name(dst.path_begin) << "/"
-                      << node_name(dst.path_end) << " dst_pipe=" << dst.pipe
+                      << " dst=" << LifetimeNodeName(dst.path_begin) << "/"
+                      << LifetimeNodeName(dst.path_end) << " dst_pipe=" << dst.pipe
                       << " dst_domain=" << dst.EpochDomainId()
                       << " dst_guard=" << dst.GetGuard() << " dst_active="
                       << site_registry_.Domain(dst).active_guard;
@@ -4844,6 +4711,10 @@ public:
 
   const std::vector<FlagAllocation> &Allocations() const {
     return allocations_;
+  }
+
+  const std::vector<size_t> &AllocationIndices() const {
+    return allocation_indices_;
   }
 
   FlagInfoList TakeFlagInfos() { return std::move(flag_infos_); }
@@ -4909,9 +4780,9 @@ private:
     int base_id = allocation.base_id;
 
     if (!site_registry_.IsCrossCore(sync_point)) {
-      if (sync_point.local_binary_plan) {
+      if (sync_point.LocalBinaryPlan()) {
         ICHECK_EQ(allocation.sync_points.size(), 1U);
-        const LocalBinaryFlagPlan &plan = *sync_point.local_binary_plan;
+        const LocalBinaryFlagPlan &plan = *sync_point.LocalBinaryPlan();
         for (int token = 0; token < plan.distance; ++token) {
           int epoch = token - plan.distance;
           int residue =
@@ -4968,7 +4839,7 @@ private:
   static constexpr int kCrossCoreFlagLimit = 16;
 
   const SyncSiteRegistry &site_registry_;
-  std::vector<SyncPoint> &sync_points_;
+  const std::vector<SyncPoint> &sync_points_;
   const std::set<std::pair<size_t, size_t>> &reusable_pairs_;
   const CrossCoreFlagReservation &cross_core_flag_reservation_;
   const CrossCoreSyncContract &cross_core_contract_;
@@ -4976,6 +4847,7 @@ private:
   AscendArchitecture architecture_;
   std::vector<int> operand_pool_bases_;
   std::vector<FlagAllocation> allocations_;
+  std::vector<size_t> allocation_indices_;
   FlagInfoList flag_infos_;
   std::vector<size_t> counter_channel_representative_;
   std::vector<size_t> counter_channel_size_;
@@ -5586,15 +5458,7 @@ AllocateOwnerCompletionEvents(const std::vector<ValidatedOwnerTransfer> &plans,
     return std::vector<OwnerCompletionEvent>{};
   if (reservation.has_unbounded_id)
     return std::nullopt;
-  std::array<bool, 16> used{};
-  for (const auto &[lo, hi] : reservation.explicit_id_ranges) {
-    if (hi - lo >= 15) {
-      used.fill(true);
-      break;
-    }
-    for (int64_t id = lo; id <= hi; ++id)
-      used[(id % 16 + 16) % 16] = true;
-  }
+  auto used = reservation.OccupiedSlots();
   for (const FlagAllocation &allocation : allocations) {
     if (!site_registry.IsCrossCore(sync_points[allocation.sync_points.front()]))
       continue;
@@ -5602,78 +5466,51 @@ AllocateOwnerCompletionEvents(const std::vector<ValidatedOwnerTransfer> &plans,
       used[allocation.base_id + offset] = true;
   }
   std::vector<OwnerCompletionEvent> result;
-  auto reserve = [&](int width) {
-    int base = -1;
-    for (int candidate = 16 - width; candidate >= 0; --candidate) {
-      bool free = true;
-      for (int offset = 0; offset < width; ++offset)
-        free &= !used[candidate + offset];
-      if (free) {
-        base = candidate;
-        break;
+  // Preserve result-before-input allocation order. Direction only changes
+  // which endpoint traverses owners; input mode2 also needs the other AIV token.
+  for (const auto *direction : {&plans, &inputs}) {
+    for (const ValidatedOwnerTransfer &plan : *direction) {
+      int width = 2 * plan.num_slots;
+      int base = FindFreeFlagRange(used, width, true);
+      if (base < 0)
+        return std::nullopt;
+      std::fill_n(used.begin() + base, width, true);
+      const bool input = plan.IsInput();
+      const EpochDomain &domain =
+          domains.Domain(domains.DomainForStorage(plan.storage, plan.epoch));
+      IRStructure *begin = plan.producer->GetChildOnPathFrom(plan.epoch);
+      SyncInsertionSite producer(begin, plan.producer, false,
+                                 input ? kCoreVector : kCoreCube, domain,
+                                 input ? nullptr : plan.owner, true);
+      SyncInsertionSite consumer(plan.consumer->GetChildOnPathFrom(plan.epoch),
+                                 plan.consumer, true,
+                                 input ? kCoreCube : kCoreVector, domain,
+                                 input ? plan.owner : nullptr, true);
+      producer.guard = producer.guard && plan.producer_activation;
+      consumer.guard = consumer.guard && plan.consumer_activation;
+      PrimExpr owner = plan.owner->control->loop_var;
+      PrimExpr sid = plan.sid;
+      PrimExpr producer_id = (input ? sid : owner) * plan.num_slots +
+                             plan.producer_slot + base;
+      PrimExpr consumer_id = (input ? owner : sid) * plan.num_slots +
+                             plan.consumer_slot + base;
+      std::optional<SyncInsertionSite> empty;
+      PrimExpr empty_id;
+      if (input) {
+        // Use the producer entry whose old-slot release was proved; do not
+        // hoist the other AIV's contribution across that release.
+        empty = site_registry.Sites()[site_registry.FindSiteId(
+            SyncInsertionSiteKey{begin, plan.producer, true, kCoreVector,
+                                 domain.id})];
+        empty->guard = empty->guard && plan.producer_activation;
+        empty_id = cast(DataType::Int(32),
+                        (1 - plan.sid) * plan.num_slots + plan.producer_slot + base);
       }
+      result.push_back({std::move(producer), std::move(consumer),
+                        cast(DataType::Int(32), producer_id),
+                        cast(DataType::Int(32), consumer_id), std::move(empty),
+                        std::move(empty_id)});
     }
-    if (base >= 0)
-      for (int offset = 0; offset < width; ++offset)
-        used[base + offset] = true;
-    return base;
-  };
-  for (const ValidatedOwnerTransfer &plan : plans) {
-    int base = reserve(2 * plan.num_slots);
-    if (base < 0)
-      return std::nullopt;
-    const EpochDomain &domain =
-        domains.Domain(domains.DomainForStorage(plan.storage, plan.epoch));
-    SyncInsertionSite producer(plan.producer->GetChildOnPathFrom(plan.epoch),
-                               plan.producer, false, kCoreCube, domain,
-                               plan.owner, true);
-    SyncInsertionSite consumer(plan.consumer->GetChildOnPathFrom(plan.epoch),
-                               plan.consumer, true, kCoreVector, domain,
-                               nullptr, true);
-    // Include activation captured inside an atomic copy task as well as its
-    // enclosing control. The proof expands immutable Binds and excludes
-    // descendant-loop coordinates from these predicates.
-    producer.guard = producer.guard && plan.producer_activation;
-    consumer.guard = consumer.guard && plan.consumer_activation;
-    PrimExpr producer_id = plan.owner->control->loop_var * plan.num_slots +
-                           plan.producer_slot + base;
-    PrimExpr consumer_id =
-        plan.sid * plan.num_slots + plan.consumer_slot + base;
-    result.push_back({std::move(producer), std::move(consumer),
-                      cast(DataType::Int(32), producer_id),
-                      cast(DataType::Int(32), consumer_id), std::nullopt,
-                      PrimExpr()});
-  }
-  for (const ValidatedOwnerTransfer &plan : inputs) {
-    int base = reserve(2 * plan.num_slots);
-    if (base < 0)
-      return std::nullopt;
-    const EpochDomain &domain =
-        domains.Domain(domains.DomainForStorage(plan.storage, plan.epoch));
-    IRStructure *producer_begin = plan.producer->GetChildOnPathFrom(plan.epoch);
-    SyncInsertionSite producer(producer_begin, plan.producer, false,
-                               kCoreVector, domain, nullptr, true);
-    SyncInsertionSite consumer(plan.consumer->GetChildOnPathFrom(plan.epoch),
-                               plan.consumer, true, kCoreCube, domain,
-                               plan.owner, true);
-    // Use the exact ordinary producer entry whose old-slot completion was
-    // proved by HasOwnerInputRelease, rather than hoisting over that release.
-    SyncInsertionSite empty =
-        site_registry.Sites()[site_registry.FindSiteId(SyncInsertionSiteKey{
-            producer_begin, plan.producer, true, kCoreVector, domain.id})];
-    producer.guard = producer.guard && plan.producer_activation;
-    consumer.guard = consumer.guard && plan.consumer_activation;
-    empty.guard = empty.guard && plan.producer_activation;
-    PrimExpr producer_id =
-        plan.sid * plan.num_slots + plan.producer_slot + base;
-    PrimExpr consumer_id = plan.owner->control->loop_var * plan.num_slots +
-                           plan.consumer_slot + base;
-    PrimExpr empty_id =
-        (1 - plan.sid) * plan.num_slots + plan.producer_slot + base;
-    result.push_back({std::move(producer), std::move(consumer),
-                      cast(DataType::Int(32), producer_id),
-                      cast(DataType::Int(32), consumer_id), std::move(empty),
-                      cast(DataType::Int(32), empty_id)});
   }
   return result;
 }
@@ -5683,6 +5520,7 @@ public:
   SyncMaterializer(const SyncSiteRegistry &site_registry,
                    const std::vector<SyncPoint> &sync_points,
                    const std::vector<FlagAllocation> &allocations,
+                   const std::vector<size_t> &allocation_indices,
                    AscendArchitecture architecture,
                    const CrossCoreSyncContract &cross_core_contract,
                    const std::vector<Var> &lane_variables,
@@ -5692,7 +5530,8 @@ public:
                    const std::vector<GmReadReleaseCut> &gm_read_releases,
                    const std::vector<GmWriteAcquireCut> &gm_write_acquires)
       : site_registry_(site_registry), sync_points_(sync_points),
-        allocations_(allocations), architecture_(architecture),
+        allocations_(allocations), allocation_indices_(allocation_indices),
+        architecture_(architecture),
         cross_core_contract_(cross_core_contract),
         lane_variables_(lane_variables), owner_events_(owner_events),
         operand_pools_(operand_pools), operand_pool_bases_(operand_pool_bases),
@@ -5761,7 +5600,8 @@ public:
 
 private:
   void InsertSyncPoints() {
-    for (const SyncPoint &sync_point : sync_points_) {
+    for (size_t index = 0; index < sync_points_.size(); ++index) {
+      const SyncPoint &sync_point = sync_points_[index];
       const SyncInsertionSite &src = site_registry_.Src(sync_point);
       const SyncInsertionSite &dst = site_registry_.Dst(sync_point);
       std::string hard_event = GetHardEvent(src.pipe, dst.pipe);
@@ -5782,7 +5622,7 @@ private:
       }
 
       const FlagAllocation &allocation =
-          allocations_[sync_point.allocation_index];
+          allocations_.at(allocation_indices_.at(index));
       int base_id = allocation.base_id;
       PrimExpr event_id = MakeFlagEventId(sync_point.flag_iteration,
                                           sync_point.num_versions, base_id);
@@ -5876,11 +5716,11 @@ private:
       InsertStatement(src.path_end, MakeAscendSetFlag(hard_event, event_id),
                       false, src.core, producer_guard);
       PrimExpr wait_id = event_id;
-      if (sync_point.local_binary_plan) {
+      if (sync_point.LocalBinaryPlan()) {
         PrimExpr producer_epoch =
             sync_point.flag_iteration -
             IntImm(sync_point.flag_iteration.dtype(),
-                   sync_point.local_binary_plan->distance);
+                   sync_point.LocalBinaryPlan()->distance);
         wait_id =
             MakeFlagEventId(producer_epoch, sync_point.num_versions, base_id);
       }
@@ -5981,6 +5821,7 @@ private:
   const SyncSiteRegistry &site_registry_;
   const std::vector<SyncPoint> &sync_points_;
   const std::vector<FlagAllocation> &allocations_;
+  const std::vector<size_t> &allocation_indices_;
   AscendArchitecture architecture_;
   const CrossCoreSyncContract &cross_core_contract_;
   const std::vector<Var> &lane_variables_;
@@ -6404,11 +6245,11 @@ KernelSyncAttempt TryPlanKernelSync(const KernelSyncPreparation &prepared) {
     bool releases_proven =
         std::all_of(owner_results.begin(), owner_results.end(),
                     [&](const ValidatedOwnerTransfer &plan) {
-                      return analyzer->HasOwnerResultRelease(plan);
+                      return analyzer->HasOwnerRelease(plan);
                     }) &&
         std::all_of(owner_inputs.begin(), owner_inputs.end(),
                     [&](const ValidatedOwnerTransfer &plan) {
-                      return analyzer->HasOwnerInputRelease(plan);
+                      return analyzer->HasOwnerRelease(plan);
                     });
     if (!aliases_proven || !releases_proven) {
       return fail(KernelSyncFailureKind::kPrivateGmProof,
@@ -6420,7 +6261,7 @@ KernelSyncAttempt TryPlanKernelSync(const KernelSyncPreparation &prepared) {
   if (!owner_inputs.empty() &&
       std::any_of(owner_results.begin(), owner_results.end(),
                   [&](const ValidatedOwnerTransfer &plan) {
-                    return !analyzer->HasOwnerResultRelease(plan);
+                    return !analyzer->HasOwnerRelease(plan);
                   })) {
     // A new optional input cut must not discard an already admissible
     // result protocol by removing one of its ordinary release witnesses.
@@ -6429,14 +6270,14 @@ KernelSyncAttempt TryPlanKernelSync(const KernelSyncPreparation &prepared) {
   }
   std::vector<size_t> rejected_owner_plans;
   for (size_t i = 0; i < owner_results.size(); ++i)
-    if (!analyzer->HasOwnerResultRelease(owner_results[i]))
+    if (!analyzer->HasOwnerRelease(owner_results[i]))
       rejected_owner_plans.push_back(i);
   if (!rejected_owner_plans.empty()) {
     return fail(KernelSyncFailureKind::kOwnerResultRelease,
                 "missing-release-witness", std::move(rejected_owner_plans));
   }
   for (size_t i = 0; i < owner_inputs.size(); ++i)
-    if (!analyzer->HasOwnerInputRelease(owner_inputs[i]))
+    if (!analyzer->HasOwnerRelease(owner_inputs[i]))
       rejected_owner_plans.push_back(i);
   if (!rejected_owner_plans.empty()) {
     return fail(KernelSyncFailureKind::kOwnerInputRelease,
@@ -6550,7 +6391,8 @@ SBlock MaterializeKernelSync(KernelSyncPreparation &prepared,
   scheduled_tir.metadata.buffer_aliases = analyzer.BufferAliases();
   scheduled_tir.metadata.has_buffer_aliases = true;
   SyncMaterializer(analyzer.SiteRegistry(), analyzer.SyncPoints(),
-                   flag_allocator.Allocations(), target_info.architecture,
+                   flag_allocator.Allocations(),
+                   flag_allocator.AllocationIndices(), target_info.architecture,
                    cross_core_contract, lane_variables, owner_events,
                    operand_pools, flag_allocator.OperandPoolBases(),
                    analyzer.GmReadReleases(), analyzer.GmWriteAcquires())

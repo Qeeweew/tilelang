@@ -169,16 +169,7 @@ inline std::optional<Call> Operation(const TaskNode *task) {
   if (task->IsPerCoreTask() || (task->GetCoreMask() != kCoreUnassigned &&
                                 task->GetCoreMask() != kCoreCube))
     return std::nullopt;
-  Stmt body = task->stmt;
-  while (const auto *attribute = body.as<AttrStmtNode>()) {
-    if (attribute->attr_key != attr::kAscendTask)
-      return std::nullopt;
-    body = attribute->body;
-  }
-  const auto *evaluate = body.as<EvaluateNode>();
-  if (!evaluate || !evaluate->value.as<CallNode>())
-    return std::nullopt;
-  return Downcast<Call>(evaluate->value);
+  return MatchTaskCall(task->stmt);
 }
 
 // Distinguish typed endpoint transport from scalar/pointer escape. A view
