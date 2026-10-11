@@ -3,7 +3,8 @@
 ## Shared transfer contract
 
 `AnalyzeOwnerInputs` and `AnalyzeOwnerResults` establish one pass-local
-`ValidatedOwnerTransfer`: direction, canonical storage, producer/consumer,
+[`ValidatedOwnerTransfer`](../../src/ascend/transform/auto_schedule/owner_result.h):
+direction, canonical storage, producer/consumer,
 owner and SID, physical slots, distance, exact coverage and original finite
 activation. Read-release and write-acquire placement consume that same fact
 and its paired WAR identity; neither reconstructs a second transfer proof.
@@ -16,6 +17,13 @@ Completion closure, parent projection and flag-lifetime optimizations require
 the original endpoint proof; only exact transfer-release queries and event
 materialization consume the storage permission. Other retirement contracts,
 including operand slots and full FIX, retain their separate validation.
+
+The distinction is implemented by `SyncPointProof` in
+[insert_sync.cc](../../src/ascend/transform/insert_sync.cc): selecting a cut
+replaces `OriginalEndpointProof` with `GmStoragePermission`, and completion
+queries check `HasOriginalEndpoints()`. Cut selection consumes the established
+transfer in [gm_read_release.h](../../src/ascend/transform/auto_schedule/gm_read_release.h)
+and [gm_write_acquire.h](../../src/ascend/transform/auto_schedule/gm_write_acquire.h).
 
 ## Output write acquire
 

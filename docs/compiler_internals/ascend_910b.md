@@ -80,8 +80,14 @@ The [ordinary GEMM example](../../examples/ascend/gemm_910b.py) chooses its
 output traversal in Python. Its default launches one logical block per output
 tile. Optional `num_cores` bounds the logical launch and distributes output
 tiles round robin through an ordinary serial loop with a per-core finite
-extent; it does not select a physical NPU. Both paths use the same automatic
-`T.Pipelined` K loop. `cache_a` keeps that output tile's full K in L1;
+extent; it does not select a physical NPU. With the default
+`pipeline_outputs=False`, both paths use the same automatic `T.Pipelined` K
+loop. Explicit `pipeline_outputs=True` combines each core's output/K panels
+into one continuous automatic loop; it requires `num_cores` and streamed A.
+This is a Python loop policy accepted by the existing compiler, with no new
+compiler pass or synchronization protocol. See the
+[continuous GEMM contract](ascend_910b_gemm.md).
+`cache_a` keeps that output tile's full K in L1;
 alternatively, `a_cache_k` chooses a bounded A cache width that is a positive
 multiple of `tile_k`. Ordinary nested pipelines load A once per cache block
 and stream B panels, skipping absent final panels. Both caches remain private

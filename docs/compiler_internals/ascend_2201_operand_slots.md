@@ -94,8 +94,17 @@ stage and the same actual activation predicate. Pure condition bindings are
 expanded when comparing that predicate; an independently guarded or shifted
 endpoint does not qualify. A common guard or outer stage may activate or
 translate the whole owner, including its increment. Skipping that owner leaves
-the counter and slot credits intact. The current full write kills an incoming old value;
-the retained events cover the actual RAW, WAR and WAW obligations without
-inventing a parent completion relation. Independently guarded endpoints,
+the counter and slot credits intact. The current full write kills an incoming
+old value; the retained events cover the actual RAW, WAR and WAW obligations
+without inventing a parent completion relation. Independently guarded endpoints,
 counter resets or escapes, additional accesses and incomplete cycles do not
 qualify. This does not add support for shifted nested lexical event protocols.
+
+These are the existing `ProveLexicalMemoryCycle` and `ProveCounterMemoryCycle`
+paths in [insert_sync.cc](../../src/ascend/transform/insert_sync.cc), both
+checked against retained readiness/release by `HasRetainedMemoryRing`.
+The [ancestor-ring regression](../../testing/ascend/auto_schedule/test_staged_ancestor_operand_ring.py)
+checks translated clocks, physical hazards and rejection of guarded lexical
+owners. The [counter-cycle regression](../../testing/ascend/auto_schedule/test_parent_counter_operand_cycle.py)
+checks common activation and stage, one-slot cycles, and malformed advances.
+These CPU models check compiler protocols; they do not prove device timing.

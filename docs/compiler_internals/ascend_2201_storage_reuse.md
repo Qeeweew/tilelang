@@ -1,4 +1,4 @@
-# 2201 on-chip storage admission
+# 2201 accumulator storage admission
 
 AutoSchedule may repair L0C memory pressure by placing separate logical
 accumulators in one physical allocation. This is a storage choice made before
@@ -53,6 +53,8 @@ checked for those unsupported uses, including an opaque use in the same task
 as a precise typed operand. Scheduler read-vars includes typed storage
 identities and therefore cannot serve as a scalar-escape test.
 
+## Storage budgets and final capacity checks
+
 The 2201 UB budget covers the complete kernel allocation owners, including
 scratch, normalization and output casts used only after a pipelined loop.
 Each owner's aligned physical slot size is charged once, using the selected
@@ -68,3 +70,10 @@ the same bank consume one capacity. The check also applies to single buffers,
 disabled reuse and allocations without an alias contract; unknown physical
 sizes are diagnosed. A scheduler budget override cannot authorize hardware
 over-allocation. Successful AscendC compilation is not a capacity check.
+
+The accumulator choice is `TryCoalesceL0CStorage` in
+[l0c_storage_reuse.h](../../src/ascend/transform/auto_schedule/l0c_storage_reuse.h).
+The UB reservation is in `BuildLoopStorageBudget` in
+[auto_schedule.cc](../../src/ascend/transform/auto_schedule.cc).
+The final physical check is `CheckOnChipCapacity`, called for both alias and
+non-alias plans in [merge_ub_allocations.cc](../../src/ascend/transform/merge_ub_allocations.cc).
