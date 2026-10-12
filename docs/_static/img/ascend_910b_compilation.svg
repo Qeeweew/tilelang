@@ -1,0 +1,115 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="920" viewBox="0 0 1200 920" role="img" aria-labelledby="title description">
+  <title id="title">910B 编译架构：算法 IR 到执行代码</title>
+  <desc id="description">Python 与 Ascend DSL 构造 PrimFunc。TileLang 910B 后端依次补齐实体操作与布局、调度与版本计划、同步与执行 TIR，所有阶段受到 dav-2201 数据通路、原生指令几何与容量约束。地址、存储与 ABI 整理以及 Host/Device 拆分后，host 包装与 AscendC 设备源码分别生成；CANN 编译链接设备模块，runtime 在调用者 stream 上启动 NPU kernel。</desc>
+  <defs>
+    <marker id="flow-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0 L8 4 L0 8 Z" fill="#475569"/>
+    </marker>
+    <marker id="constraint-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0 L8 4 L0 8 Z" fill="#b7791f"/>
+    </marker>
+    <style>
+      text { font-family: "Noto Sans CJK SC", "Noto Sans SC", "Microsoft YaHei", sans-serif; fill: #183047; }
+      .heading { font-size: 28px; font-weight: 700; }
+      .subtitle { font-size: 18px; fill: #526477; }
+      .group-title { font-size: 22px; font-weight: 700; }
+      .card-title { font-size: 22px; font-weight: 700; }
+      .body { font-size: 18px; }
+      .detail { font-size: 16px; fill: #526477; }
+      .output { font-size: 18px; font-weight: 500; }
+      .number { font-size: 14px; font-weight: 700; fill: #ffffff; text-anchor: middle; }
+      .flow { fill: none; stroke: #475569; stroke-width: 2; marker-end: url(#flow-arrow); stroke-linejoin: round; }
+      .constraint { fill: none; stroke: #b7791f; stroke-width: 1.8; stroke-dasharray: 5 5; }
+      .constraint-tip { marker-end: url(#constraint-arrow); }
+      .divider { stroke: #d6e0ea; stroke-width: 1; }
+    </style>
+  </defs>
+
+  <rect width="1200" height="920" fill="#ffffff"/>
+  <text x="32" y="43" class="heading">910B 编译架构：算法 IR → 执行代码</text>
+  <text x="32" y="70" class="subtitle">TileLang 落实物理数据流、流水与同步；CANN 编译并链接设备机器码</text>
+
+  <!-- Inputs: algorithm semantics and the target contract are independent. -->
+  <rect x="32" y="90" width="648" height="96" rx="12" fill="#eff6ff" stroke="#b8cee7"/>
+  <text x="56" y="122" class="card-title">算法输入 · Python / Ascend DSL</text>
+  <text x="56" y="151" class="body">tile / cache / 遍历 / 精度边界 / Stage 意图</text>
+  <text x="56" y="176" class="detail">构造 PrimFunc：T.copy / T.gemm / 循环 / BufferRegion</text>
+
+  <rect x="712" y="90" width="456" height="96" rx="12" fill="#fff8eb" stroke="#ddc79e"/>
+  <text x="736" y="122" class="card-title">目标输入 · dav-2201</text>
+  <text x="736" y="151" class="body">AIC / AIV / pipe 与合法数据通路</text>
+  <text x="736" y="176" class="detail">原生指令几何、对齐与片上容量</text>
+
+  <!-- The lowering boundary contains three responsibilities, not all passes. -->
+  <rect x="32" y="224" width="1136" height="352" rx="16" fill="#f7f9fc" stroke="#c5d2df" stroke-width="1.5"/>
+  <text x="472" y="254" class="group-title">TileLang · 910B 后端</text>
+  <path class="flow" d="M224 186 V294"/>
+  <text x="240" y="213" class="detail">算法 IR</text>
+  <path class="constraint" d="M940 186 V272 H360 M940 272 H1096"/>
+  <text x="956" y="213" class="detail">架构契约</text>
+  <path class="constraint constraint-tip" d="M360 272 V294"/>
+  <path class="constraint constraint-tip" d="M728 272 V294"/>
+  <path class="constraint constraint-tip" d="M1096 272 V294"/>
+
+  <rect x="56" y="294" width="336" height="194" rx="12" fill="#ffffff" stroke="#b8cee7"/>
+  <circle cx="80" cy="324" r="12" fill="#2b6198"/>
+  <text x="80" y="329" class="number">1</text>
+  <text x="102" y="332" class="card-title">实体操作与布局</text>
+  <text x="80" y="364" class="body">GM 交接 / L0 子块 / 私有 UB</text>
+  <text x="80" y="394" class="body">布局、padding 与真实读写范围</text>
+  <line x1="80" y1="414" x2="368" y2="414" class="divider"/>
+  <text x="80" y="442" class="output">物理 copy / MAD / Vector 任务</text>
+  <text x="80" y="466" class="detail">AscendLowerL1Gemm / …</text>
+
+  <path class="flow" d="M392 382 H432"/>
+  <rect x="432" y="294" width="336" height="194" rx="12" fill="#ffffff" stroke="#a9d5d6"/>
+  <circle cx="456" cy="324" r="12" fill="#187b83"/>
+  <text x="456" y="329" class="number">2</text>
+  <text x="478" y="332" class="card-title">调度与版本计划</text>
+  <text x="456" y="364" class="body">依赖分析 / core / pipe 任务</text>
+  <text x="456" y="394" class="body">发射顺序 / stage / version 数</text>
+  <line x1="456" y1="414" x2="744" y2="414" class="divider"/>
+  <text x="456" y="442" class="output">带调度属性与版本数的 TIR</text>
+  <text x="456" y="466" class="detail">AutoSchedule / PrepareMultiBuffer</text>
+
+  <path class="flow" d="M768 382 H808"/>
+  <rect x="808" y="294" width="336" height="194" rx="12" fill="#ffffff" stroke="#c3bdde"/>
+  <circle cx="832" cy="324" r="12" fill="#665393"/>
+  <text x="832" y="329" class="number">3</text>
+  <text x="854" y="332" class="card-title">同步与执行 TIR</text>
+  <text x="832" y="364" class="body">ready / release / 硬件事件</text>
+  <text x="832" y="394" class="body">版本槽 / 循环位移 / 填排 guard</text>
+  <line x1="832" y1="414" x2="1120" y2="414" class="divider"/>
+  <text x="832" y="442" class="output">含版本访问与 wait/set 的 TIR</text>
+  <text x="832" y="466" class="detail">InsertSync / LowerScheduledTIR</text>
+
+  <path class="flow" d="M976 488 V518"/>
+  <rect x="56" y="518" width="1088" height="42" rx="8" fill="#eaf0f6" stroke="#c5d2df"/>
+  <text x="600" y="545" text-anchor="middle" class="body">地址与存储整理 · Host/Device 拆分 · ABI / Codegen</text>
+
+  <!-- Host packaging and device compilation converge only at runtime. -->
+  <path class="flow" d="M600 560 V594 H276 V620"/>
+  <path class="flow" d="M600 594 H924 V620"/>
+  <rect x="56" y="620" width="440" height="138" rx="12" fill="#f2f5f9" stroke="#c5d2df"/>
+  <text x="80" y="655" class="card-title">Host 包装与启动入口</text>
+  <text x="80" y="686" class="body">参数、输出与 GM workspace</text>
+  <text x="80" y="712" class="body">管理 workspace，封装 launch</text>
+  <text x="80" y="740" class="detail">Host codegen / 执行适配器</text>
+
+  <rect x="704" y="620" width="440" height="138" rx="12" fill="#eef8f8" stroke="#a9d5d6"/>
+  <text x="728" y="655" class="card-title">AscendC 设备源码</text>
+  <text x="728" y="686" class="body">load / MAD / FIX / Vector / 同步</text>
+  <rect x="724" y="704" width="400" height="36" rx="6" fill="#dceeee"/>
+  <text x="924" y="729" text-anchor="middle" class="body">CANN / Bisheng → CCE 设备模块</text>
+
+  <path class="flow" d="M276 758 V782 H420 V806"/>
+  <path class="flow" d="M924 758 V782 H780 V806"/>
+  <rect x="224" y="806" width="752" height="76" rx="12" fill="#183047"/>
+  <text x="600" y="837" text-anchor="middle" class="card-title" style="fill: #ffffff">Runtime → 910B NPU</text>
+  <text x="600" y="864" text-anchor="middle" class="body" style="fill: #e2eaf2">Host 入口传参，加载 CCE 模块，在调用者 stream 上启动</text>
+
+  <path class="flow" d="M32 907 H66"/>
+  <text x="78" y="913" class="detail">IR / 产物流向</text>
+  <path class="constraint constraint-tip" d="M272 907 H306"/>
+  <text x="318" y="913" class="detail">dav-2201 合法性约束</text>
+</svg>
